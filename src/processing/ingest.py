@@ -97,3 +97,57 @@ class Ingestor:
         self.graph_store.add_procedure(procedure)
         print(f"Procedure '{procedure.name}' stored with {len(steps)} steps linked to {trigger_entities}.")
         return procedure
+
+    def revise_procedure(self, old_procedure_id: str, new_text: str, trigger_entities: List[str]):
+        """
+        Revises a procedure: deprecates the old version and ingests a new one.
+
+        Learning loop:
+        1. Mark old procedure as deprecated in Graph Store.
+        2. Determine new version number.
+        3. Ingest new text as a fresh Procedure with version = old + 1.
+        """
+        # 1. Deprecate old version
+        self.graph_store.deprecate_procedure(old_procedure_id)
+        print(f"Deprecated old procedure: {old_procedure_id}")
+
+        # 2. Determine old version
+        old_version = 1
+        if self.graph_store.driver:
+            with self.graph_store.driver.session() as session:
+                result = session.run(
+                    "MATCH (p:Procedure {id: $pid}) RETURN p.version AS v",
+                    pid=old_procedure_id
+                )
+                record = result.single()
+                if record and record['v']:
+                    old_version = record['v']
+
+        # 3. Ingest new version
+        procedure_name = new_text.split(".")[0][:80]
+        vector_id = self.vector_store.add_procedure(
+            procedure_id="temp",
+            description=new_text,
+            name=procedure_name
+        )
+        data = self.llm_client.extract_procedure(new_text)
+        steps = [
+            ProcedureStep(
+                step_number=i + 1,
+                action=step.get("action", str(step)),
+                expected_outcome=step.get("expected_outcome")
+            )
+            for i, step in enumerate(data.get("steps", []))
+        ]
+        procedure = Procedure(
+            name=data.get("name", procedure_name),
+            description=new_text,
+            steps=steps,
+            trigger_entities=trigger_entities,
+            confidence=1.0,
+            version=old_version + 1,
+            source_id=vector_id
+        )
+        self.graph_store.add_procedure(procedure)
+        print(f"Revised procedure '{procedure.name}' v{procedure.version} with {len(steps)} steps.")
+        return procedure

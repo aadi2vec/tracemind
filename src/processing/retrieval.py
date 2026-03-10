@@ -11,13 +11,15 @@ class Retriever:
         vector_store: VectorStore,
         llm_client: Any,
         cluster_store: Optional[ClusterStore] = None,
+        governance: Optional[Any] = None,
     ):
         self.graph_store = graph_store
         self.vector_store = vector_store
         self.llm_client = llm_client
         self.cluster_store = cluster_store
+        self.governance = governance
 
-    def retrieve(self, query: str) -> Dict[str, Any]:
+    def retrieve(self, query: str, user_id: str = "system") -> Dict[str, Any]:
         """
         Performs hybrid retrieval.
         1. Vector search to find relevant text chunks.
@@ -88,12 +90,25 @@ class Retriever:
                             seen.add(key)
                             unique_context.append(t_dict)
 
+        procedures = self.graph_store.get_procedures_for_entities(
+            list(candidate_entities)[:10]
+        )
+
+        # Governance filter — if policy is set, filter results by access
+        if self.governance:
+            vector_results = [
+                v for v in vector_results
+                if self.governance.can_access(user_id, v.get('id', ''))
+            ]
+            procedures = [
+                p for p in procedures
+                if self.governance.can_access(user_id, p.get('id', ''))
+            ]
+
         return {
             "vector_context": vector_results,
             "graph_context": unique_context,
             "entities_found": list(candidate_entities),
             "cluster_expanded": cluster_ids,
-            "procedural_context": self.graph_store.get_procedures_for_entities(
-                list(candidate_entities)[:10]
-            ),
+            "procedural_context": procedures,
         }

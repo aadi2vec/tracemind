@@ -51,8 +51,11 @@ class Procedure(BaseModel):
     name: str                        # e.g. "Restart Web Server"
     description: str                 # Natural language, stored in Vector Store
     steps: List[ProcedureStep]
-    trigger_entities: List[str]      # Entities this skill applies to, e.g. ["Server", "Nginx"]
+    trigger_entities: List[str]      # Entities this skill applies to
     confidence: float = 1.0
+    version: int = 1                 # Incremented on revision
+    deprecated: bool = False         # True when superseded by a newer version
+    created_at: datetime = Field(default_factory=datetime.now)
     source_id: Optional[str] = None  # Links back to Vector Store chunk
 
 
@@ -86,6 +89,7 @@ class ContextTrace(BaseModel):
     retrieved_memories: List[Dict[str, Any]] = []
     graph_paths: List[List[str]] = []
     retrieval_arm: Optional[str] = None
+    procedure_ids: List[str] = []        # Procedures used in this trace
 
     # Reasoning
     reasoning_steps: List[str] = []

@@ -138,6 +138,9 @@ class GraphStore:
         p.SET(__.proc.property('description') == procedure.description)
         p.SET(__.proc.property('confidence') == procedure.confidence)
         p.SET(__.proc.property('source_id') == procedure.source_id)
+        p.SET(__.proc.property('version') == procedure.version)
+        p.SET(__.proc.property('deprecated') == procedure.deprecated)
+        p.SET(__.proc.property('created_at') == str(procedure.created_at))
         with self.driver.session() as session:
             session.run(str(p), **p.bound_params)
 
@@ -170,9 +173,10 @@ class GraphStore:
         # Use raw Cypher param passing for lists since Pypher cannot hash list values
         cypher = (
             "MATCH (e:Entity)-[:HAS_PROCEDURE]->(proc:Procedure) "
-            "WHERE e.name IN $names "
+            "WHERE e.name IN $names AND proc.deprecated = false "
             "RETURN e.name AS entity, proc.id AS proc_id, proc.name AS proc_name, "
-            "proc.description AS description, proc.confidence AS confidence"
+            "proc.description AS description, proc.confidence AS confidence, "
+            "proc.version AS version"
         )
 
         procedures: Dict[str, Dict] = {}
@@ -186,6 +190,7 @@ class GraphStore:
                         'name': r['proc_name'],
                         'description': r['description'],
                         'confidence': r['confidence'],
+                        'version': r['version'],
                         'trigger_entities': [],
                         'steps': []
                     }
@@ -209,6 +214,20 @@ class GraphStore:
                     })
 
         return list(procedures.values())
+
+    def deprecate_procedure(self, procedure_id: str):
+        """Marks a procedure as deprecated (superseded by a newer version)."""
+        if not self.driver: return
+        cypher = "MATCH (proc:Procedure {id: $pid}) SET proc.deprecated = true"
+        with self.driver.session() as session:
+            session.run(cypher, pid=procedure_id)
+
+    def update_procedure_confidence(self, procedure_id: str, new_confidence: float):
+        """Updates the confidence of a procedure (reward-based learning)."""
+        if not self.driver: return
+        cypher = "MATCH (proc:Procedure {id: $pid}) SET proc.confidence = $conf"
+        with self.driver.session() as session:
+            session.run(cypher, pid=procedure_id, conf=max(0.0, min(1.0, new_confidence)))
 
     def save(self):
         pass

@@ -182,3 +182,47 @@ class AgentMemController:
             }
             for a in self.arms
         ]
+
+    # ── Procedure Learning ────────────────────────────────────────────────
+
+    def register_procedure_reward(
+        self,
+        procedure_id: str,
+        reward: float,
+        graph_store: Any,
+        decay_factor: float = 0.1,
+    ) -> float:
+        """
+        Updates a procedure's confidence based on outcome reward.
+        
+        new_confidence = old_confidence + decay_factor * reward
+        Clamped to [0.0, 1.0].
+        
+        Returns the new confidence value.
+        """
+        if not hasattr(graph_store, 'get_procedures_for_entities'):
+            logger.warning("GraphStore missing procedural methods; reward skipped.")
+            return 0.0
+
+        # Read current confidence via raw Cypher
+        if not graph_store.driver:
+            return 0.0
+
+        with graph_store.driver.session() as session:
+            result = session.run(
+                "MATCH (proc:Procedure {id: $pid}) RETURN proc.confidence AS conf",
+                pid=procedure_id
+            )
+            record = result.single()
+            if not record:
+                logger.warning("Procedure %s not found for reward.", procedure_id)
+                return 0.0
+            old_conf = record['conf'] or 1.0
+
+        new_conf = max(0.0, min(1.0, old_conf + decay_factor * reward))
+        graph_store.update_procedure_confidence(procedure_id, new_conf)
+        logger.info(
+            "Procedure %s reward=%.2f: conf %.3f → %.3f",
+            procedure_id, reward, old_conf, new_conf,
+        )
+        return new_conf

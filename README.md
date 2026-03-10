@@ -70,6 +70,12 @@ graph TD
         PROC -->|"description vector"| VS
     end
 
+    subgraph Governance ["Governance Layer"]
+        GOV["GovernancePolicy\n(ACL + AuditLog)"] -->|"can_access?"| R
+        GOV -->|"can_execute?"| EXEC
+        GOV -->|"validate_type"| I
+    end
+
     subgraph Retrieval ["Recall Layer"]
         R["Retriever\n(src.processing.retrieval)"] --> VS
         R --> GS
@@ -77,16 +83,20 @@ graph TD
         R -->|"procedural_context"| PROC
     end
 
-    subgraph Reasoning ["Execution Layer"]
+    subgraph Execution ["Execution Layer"]
         R --> MS["Memory Specialist"]
         MS --> AG["AutoGen GroupChat"]
         AG --> D["Decision + Trace"]
+        PROC -->|"execute"| EXEC["ProcedureExecutor\n(dry_run / live)"]
+        EXEC -->|"ExecutionResult"| D
     end
 
     subgraph Feedback ["Closing the Loop"]
         D --> ES["Episodic Store\n(JSONL)"]
         ES -->|"reward_signal"| P
+        ES -->|"procedure_reward"| HC
         GS -->|"TTL expiry"| FORGET["Forgetting Logic"]
+        HC -->|"deprecate / revise"| PROC
     end
 
     subgraph Passive ["MacOS Interaction Monitor"]
@@ -267,10 +277,27 @@ AgentMem directly mirrors the Palantir Ontology model — the foundation of Pala
 |---|---|
 | **Objects** (Nouns) | `Entity` nodes in the Graph Store |
 | **Links** (Relationships) | `Triplet` edges (`RELATED_TO`) |
-| **Properties** | Node/edge properties (`confidence`, `timestamp`) |
-| **Actions / Verbs** (Kinetic) | `Procedure` nodes with `ProcedureStep` children |
-| **AIP Logic** (Ingestion) | `Ingestor.ingest()` / `ingest_procedure()` |
-| **Audit Trail** | `ContextTrace` in `EpisodicStore` |
+| **Properties** | Node/edge properties (`confidence`, `timestamp`, `version`) |
+| **Actions / Verbs** (Kinetic) | `Procedure` nodes → `ProcedureExecutor` (dry-run/live) |
+| **AIP Logic** (Ingestion) | `Ingestor.ingest()` / `ingest_procedure()` / `revise_procedure()` |
+| **Security Model** (Governance) | `GovernancePolicy` (ACL + Visibility + AuditLog) |
+| **Schema Enforcement** | `GovernancePolicy.ALLOWED_ENTITY_TYPES` |
+| **Audit Trail** | `ContextTrace` + `GovernancePolicy.audit_log` |
+| **Object Versioning** | `Procedure.version` + `deprecated` flag |
+
+#### Procedure Learning Lifecycle
+
+```mermaid
+stateDiagram-v2
+    [*] --> Active : ingest_procedure()
+    Active --> Reinforced : reward > 0
+    Active --> Degraded : reward < 0
+    Reinforced --> Active : next query
+    Degraded --> Deprecated : conf < 0.1
+    Degraded --> Revised : revise_procedure()
+    Deprecated --> [*]
+    Revised --> Active : v(n+1) created
+```
 
 #### Remaining Missing Pieces
 
