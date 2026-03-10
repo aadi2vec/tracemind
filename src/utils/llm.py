@@ -4,9 +4,10 @@ from litellm import completion, embedding
 import os
 
 class LLMClient:
-    def __init__(self, model: str = "gpt-4o", embedding_model: str = "text-embedding-3-small"):
-        self.model = model
-        self.embedding_model = embedding_model
+    def __init__(self, model: Optional[str] = None, embedding_model: Optional[str] = None):
+        self.model = model or os.getenv("LLM_MODEL", "gpt-4o")
+        self.embedding_model = embedding_model or os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")
+        self._embedding_dim = None
 
     def get_embedding(self, text: str) -> List[float]:
         """Generates an embedding vector for the given text."""
@@ -15,11 +16,13 @@ class LLMClient:
                 model=self.embedding_model,
                 input=[text]
             )
-            return response.data[0].embedding
+            vec = response.data[0].embedding
+            self._embedding_dim = len(vec)
+            return vec
         except Exception as e:
             print(f"Embedding generation failed: {e}")
-            # Return dummy zero vector of expected dimension (1536)
-            return [0.0] * 1536
+            # Return dummy zero vector of expected dimension (default 1536)
+            return [0.0] * (self._embedding_dim or 1536)
 
     def extract_graph_data(self, text: str) -> Dict[str, Any]:
         """

@@ -5,15 +5,6 @@ Maintains an incremental HDBSCAN cluster index over entity embeddings.
 Augments graph + vector retrieval with cluster-neighbourhood expansion
 so the Recall Engine can surface related entities even without explicit
 graph edges.
-
-Design notes
-------------
-* Uses a FAISS flat index (L2) for fast nearest-neighbour lookup of the
-  query embedding inside each cluster.
-* HDBSCAN is re-fit online in batches (not per-entity) to avoid O(N²)
-  cost on every write.
-* Cluster memberships are stored in-proc as a dict; a SQLite sidecar can
-  be added for persistence without changing the public API.
 """
 import logging
 import threading
@@ -44,21 +35,24 @@ class ClusterStore:
     Entity embedding → soft cluster index.
 
     Usage::
-        cs = ClusterStore(embedding_dim=1536)
-        cs.add_entity("TSLA", embedding_vector)
-        cs.add_entity("AAPL", embedding_vector)
+        cs = ClusterStore(db_path="my_clusters.db")
+        cs.add_entity("TSLA", [0.1, 0.2, ...])
         cs.fit()
         neighbours = cs.expand_query(query_vec, top_k=10)
     """
 
-    def __init__(self, embedding_dim: int = 1536, min_cluster_size: int = 3, db_path: str = "cluster_store.db"):
+    def __init__(self, embedding_dim: Optional[int] = None, min_cluster_size: int = 3, db_path: str = "cluster_store.db"):
         self.embedding_dim = embedding_dim
         self.min_cluster_size = min_cluster_size
         self.persistence = SQLiteClusterPersistence(db_path)
 
-        # Load existing data
+        # Load existing data from SQLite
         self._entity_ids, self._embeddings, self._entity_cluster = self.persistence.load_all()
         
+        # Infer dimension if not provided but we have data
+        if self._embeddings and self.embedding_dim is None:
+            self.embedding_dim = len(self._embeddings[0])
+
         # Rebuild _clusters lookup
         self._clusters: Dict[int, List[str]] = {}
         for eid, cid in self._entity_cluster.items():
@@ -74,15 +68,18 @@ class ClusterStore:
     def add_entity(self, entity_id: str, embedding: List[float]) -> None:
         """Register an entity embedding. Call `fit()` periodically to rebuild clusters."""
         with self._lock:
+            if self.embedding_dim is None:
+                self.embedding_dim = len(embedding)
+            
             if entity_id in self._entity_ids:
-                # Update existing — find and overwrite
+                # Update existing
                 idx = self._entity_ids.index(entity_id)
                 self._embeddings[idx] = embedding
             else:
                 self._entity_ids.append(entity_id)
                 self._embeddings.append(embedding)
             
-            # Persist immediately (unclustered for now)
+            # Persist immediately
             cid = self._entity_cluster.get(entity_id, -1)
             self.persistence.save_entity(entity_id, embedding, cid)
             self._fitted = False
@@ -119,11 +116,11 @@ class ClusterStore:
             for idx, label in enumerate(labels):
                 eid = self._entity_ids[idx]
                 self._entity_cluster[eid] = int(label)
-                if label not in self._clusters:
+                if int(label) not in self._clusters:
                     self._clusters[int(label)] = []
                 self._clusters[int(label)].append(eid)
 
-            # Persist new clusters
+            # Persist cluster assignments
             self.persistence.save_clusters(self._entity_cluster)
 
             self._fitted = True
@@ -140,7 +137,6 @@ class ClusterStore:
     ) -> List[str]:
         """
         Find the cluster(s) nearest to the query and return their member entity IDs.
-        Falls back to brute-force cosine if FAISS is unavailable.
         """
         with self._lock:
             if not self._fitted or not self._embeddings:
@@ -153,11 +149,10 @@ class ClusterStore:
             norms = np.linalg.norm(X, axis=1, keepdims=True) + 1e-8
             X = X / norms
 
-            # Cosine sim via dot product after normalisation
-            sims = X @ q  # shape (N,)
+            # Cosine similarity via dot product
+            sims = X @ q
             top_indices = np.argsort(sims)[::-1][:top_k]
 
-            # Collect entity IDs, then expand to full cluster
             hit_clusters = set()
             for idx in top_indices:
                 eid = self._entity_ids[idx]
@@ -169,7 +164,7 @@ class ClusterStore:
             for cid in hit_clusters:
                 results.extend(self._clusters.get(cid, []))
 
-            # Deduplicate while preserving relevance order
+            # Deduplicate
             seen: set = set()
             ordered = []
             for eid in results:

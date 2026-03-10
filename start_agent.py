@@ -26,9 +26,22 @@ def main():
     neo4j_pass = os.getenv("NEO4J_PASSWORD","password")
     chroma_host= os.getenv("CHROMA_HOST",   "localhost")
     chroma_port= int(os.getenv("CHROMA_PORT","8000"))
+    
+    # AI Models
+    llm_model = os.getenv("LLM_MODEL", "gpt-4o")
+    emb_model = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")
+    
+    if "ollama" in llm_model.lower():
+        import requests
+        try:
+            requests.get("http://localhost:11434/api/tags", timeout=2)
+            print(f"Ollama detected! Using local model: {llm_model}")
+        except Exception:
+            print("WARNING: Ollama model selected but service not detected at :11434. Local inference will fail.")
+
     try:
         graph_store    = GraphStore(uri=neo4j_uri, auth=(neo4j_user, neo4j_pass))
-        cluster_store  = ClusterStore(embedding_dim=1536)
+        cluster_store  = ClusterStore() # dimension will be inferred on first add
         vector_store   = VectorStore(host=chroma_host, port=chroma_port)
         episodic_store = EpisodicStore()
     except Exception as e:
@@ -37,7 +50,7 @@ def main():
 
     # 2. Initialize AgentMem controller + logic
     controller  = AgentMemController()
-    llm_client  = LLMClient()
+    llm_client  = LLMClient(model=llm_model, embedding_model=emb_model)
 
     from src.agent.tools.registry import ToolRegistry
     tool_registry = ToolRegistry(graph_store)

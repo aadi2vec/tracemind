@@ -308,19 +308,25 @@ class Triplet(BaseModel):
 
 ## 7. Operational Guide
 
-### Quick Start (Docker — Recommended)
+### Quick Start (Local AI — Ollama)
 
-```bash
-git clone <repo>
-cd agent_memory_system
-cp .env.example .env          # set OPENAI_API_KEY
-docker-compose up --build
-```
+1. **Install Ollama**: [ollama.com](https://ollama.com)
+2. **Pull Models**:
+   ```bash
+   ollama pull llama3.2
+   ollama pull nomic-embed-text
+   ```
+3. **Configure .env**:
+   ```bash
+   LLM_MODEL=ollama/llama3.2
+   EMBEDDING_MODEL=ollama/nomic-embed-text
+   ```
+4. **Run**:
+   ```bash
+   ENABLE_MACOS_MONITOR=true python3 start_agent.py
+   ```
 
-All three services start with healthcheck ordering:
-- **Neo4j** → available at `localhost:7474` (browser) and `localhost:7687` (Bolt)
-- **ChromaDB** → available at `localhost:8000`
-- **Agent** → interactive CLI once both databases are healthy
+### Quick Start (Docker — Traditional)
 
 ### CLI Reference
 
