@@ -10,7 +10,7 @@ class Ingestor:
         self.vector_store = vector_store
         self.llm_client = llm_client
 
-    def ingest(self, text: str, source: str = "user_input"):
+    def ingest(self, text: str, source: str = "user_input", **kwargs):
         """
         Canonicalizes text into the memory system.
         1. store raw text in vector store
@@ -19,6 +19,7 @@ class Ingestor:
         """
         # 1. Vector Store
         metadata = {"source": source}
+        metadata.update(kwargs) # Add extra metadata like 'app'
         memory_id = self.vector_store.add_memory(text, metadata)
         print(f"Stored in Vector Memory: {memory_id}")
 

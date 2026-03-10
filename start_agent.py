@@ -10,6 +10,7 @@ from src.memory.episodic_store import EpisodicStore
 from src.processing.ingest import Ingestor
 from src.processing.retrieval import Retriever
 from src.processing.monitor import NewsMonitor
+from src.processing.macos_monitor import MacOSInteractionMonitor
 from src.agent.agentmem_controller import AgentMemController
 from src.agent.learning_loop import LearningLoop
 from src.utils.llm import LLMClient
@@ -51,11 +52,19 @@ def main():
     monitor = NewsMonitor(ingestor, interval=60)
     monitor.start()
 
+    macos_monitor = None
+    if os.getenv("ENABLE_MACOS_MONITOR", "false").lower() == "true":
+        macos_monitor = MacOSInteractionMonitor(ingestor, interval=15)
+        macos_monitor.start()
+
     learning_loop = LearningLoop(controller, episodic_store, graph_store)
     learning_loop.start(interval_s=300)  # update every 5 minutes
 
     print("\n[System] Ready. Type your query (or 'exit' to quit, 'bandit' to see arm stats).")
-    print("[System] News monitor + Learning loop running in background...")
+    if macos_monitor:
+        print("[System] News monitor + Learning loop + MacOS monitor running in background...")
+    else:
+        print("[System] News monitor + Learning loop running in background...")
 
     try:
         while True:
@@ -88,6 +97,8 @@ def main():
     finally:
         print("\n[System] Shutting down...")
         monitor.stop()
+        if macos_monitor:
+            macos_monitor.stop()
         learning_loop.stop()
         if graph_store:
             graph_store.close()

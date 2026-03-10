@@ -84,6 +84,11 @@ graph TD
         ES -->|"reward_signal"| P
         GS -->|"TTL expiry"| FORGET["Forgetting Logic"]
     end
+
+    subgraph Passive ["MacOS Interaction Monitor"]
+        M1["Window Observer"] --> I
+        M2["Clipboard Monitor"] --> I
+    end
 ```
 
 ### 4.2 Application UML Diagram (Simplified)
@@ -262,6 +267,7 @@ flowchart TD
 | AgentMemController | `src/agent/agentmem_controller.py` | UCB bandit policy over memory ops |
 | LearningLoop | `src/agent/learning_loop.py` | Background TTL decay + reward updates |
 | FeedbackManager | `src/agent/feedback.py` | Human corrections → graph write-back |
+| MacOSMonitor | `src/processing/macos_monitor.py` | Passive window and clipboard observation |
 | AutoGenWorkflow | `src/agent/workflow_autogen.py` | GroupChat orchestration + Provenance tracking |
 
 ---
@@ -319,8 +325,8 @@ All three services start with healthcheck ordering:
 ### CLI Reference
 
 ```bash
-# Interactive real-time mode (with news monitor + learning loop)
-python start_agent.py
+# Interactive real-time mode (with monitors + learning loop)
+ENABLE_MACOS_MONITOR=true python3 start_agent.py
 
 # One-off ingestion
 python run_agent.py ingest --text "Apple Q4 revenue was $120B"
@@ -434,5 +440,6 @@ python -m unittest discover tests/ -v
 
 - **v2.1** — [DONE] Persistent ClusterStore (SQLite sidecar for cluster memberships)
 - **v2.2** — [DONE] Semantic Cluster Expansion (True query string embeddings)
-- **v2.3** — Phase 3 offline GRPO update over episodic trace batches
-- **v3.0** — Multimodal ingestion (image → entity attributes, chart → structured signals)
+- **v2.3** — [DONE] MacOS Interaction Monitor (Passive window/clipboard tracking)
+- **v3.0** — Phase 3 offline GRPO update over episodic trace batches
+- **v4.0** — Multimodal ingestion (image → entity attributes, chart → structured signals)
