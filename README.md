@@ -165,12 +165,12 @@ stateDiagram-v2
 
     Idle --> Evaluating : Query arrives
 
-    Evaluating --> Retrieve : "Always"
-    Retrieve --> BanditSelect : "UCB arm selection"
-    BanditSelect --> NarrowRetrieve : "Arm: narrow (depth=1, breadth=3)"
-    BanditSelect --> MediumRetrieve : "Arm: medium (depth=1, breadth=5)"
-    BanditSelect --> WideRetrieve   : "Arm: wide (depth=2, breadth=10)"
-    BanditSelect --> DeepRetrieve   : "Arm: deep (depth=3, breadth=15)"
+    Evaluating --> Retrieve : always
+    Retrieve --> BanditSelect : UCB arm selection
+    BanditSelect --> NarrowRetrieve : Arm narrow depth 1
+    BanditSelect --> MediumRetrieve : Arm medium depth 1
+    BanditSelect --> WideRetrieve   : Arm wide depth 2
+    BanditSelect --> DeepRetrieve   : Arm deep depth 3
 
     NarrowRetrieve --> Decide
     MediumRetrieve --> Decide
