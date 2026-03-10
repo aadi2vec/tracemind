@@ -535,6 +535,42 @@ Offline optimization over episodic trace batches. Reward shaping from outcomes +
 ---
 
 ## 11. Testing
+---
+
+## 5. Advanced Architectural Roadmap
+
+The following concepts represent the frontier of AgentMem's development, moving from symbolic memory toward unified latent intelligence.
+
+### 5.1 World Models (Predictive Simulation)
+A World Model is an internal simulation of the environment. Instead of just recalling facts, the agent can simulate the outcomes of its actions before executing them.
+- **Role**: Predictive layer inside `ProcedureExecutor`.
+- **Implementation**: Trains on the `EpisodicStore` (state, action, result) tuples to predict `expected_outcome` and `reward` for proposed procedures.
+
+### 5.2 JEPA (Joint Embedding Predictive Architecture)
+Inspired by Yann LeCun’s vision, JEPA replaces exact matching with **latent prediction**.
+- **Role**: Abstract semantic retrieval.
+- **Implementation**: Instead of finding "similar text," the system predicts what a *good answer embedding* looks like in latent space, then retrieves memories (entities/procedures) that match that predicted latent target. This ignores irrelevant noise and focuses on abstract structure.
+
+### 5.3 SSMs (State Space Models for Temporal Memory)
+SSMs (like Mamba) solve the scaling problem of append-only episodic logs by compressing temporal history into a **fixed-size hidden state**.
+- **Role**: Constant-time temporal memory compression.
+- **Implementation**: Replaces linear scans of the `EpisodicStore`. The hidden state implicitly learns retrieval success patterns, potentially replacing the symbolic UCB bandit with a learned temporal policy.
+
+### The Unified Vision
+
+```mermaid
+graph TD
+    Q["Query"] --> JEPA["JEPA Encoder<br/>(latent prediction)"]
+    JEPA --> R["Retriever<br/>(searches in latent space)"]
+    R --> WM["World Model<br/>(simulate before acting)"]
+    WM -->|"safe?"| EXEC["ProcedureExecutor"]
+    WM -->|"risky?"| PLAN["Re-plan / Ask human"]
+    
+    EXEC --> TRACE["ContextTrace"]
+    TRACE --> SSM["SSM Temporal Memory<br/>(compress episode)"]
+    SSM -->|"update latent space"| JEPA
+    SSM -->|"update world model"| WM
+```
 
 ```bash
 # Run all v2 tests
