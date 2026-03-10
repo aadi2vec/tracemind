@@ -1,7 +1,7 @@
 from neo4j import GraphDatabase
 from typing import List, Dict, Any, Optional
 import os
-from cymple import QueryBuilder as Query
+from pypher.builder import Pypher, __, Param
 from ..types.schema import Entity, Triplet
 
 class GraphStore:
@@ -25,48 +25,48 @@ class GraphStore:
             self.driver.close()
 
     def add_entity(self, entity: Entity):
-        """Adds or updates an entity node in the graph."""
+        """Adds or updates an entity node in the graph using Pypher."""
         if not self.driver: return
         
-        # We use .cypher() for the node patterns to ensure parameters like $name are not quoted
-        query = str(Query()
-                 .merge().cypher('(n:Entity {name: $name})')
-                 .set('n.type = $type, n.description = $description'))
+        p = Pypher()
+        p.MERGE.node('n', labels='Entity', name=entity.name)
+        p.SET(__.n.property('type') == entity.type)
+        p.SET(__.n.property('description') == entity.description)
         
         with self.driver.session() as session:
-            session.run(query, name=entity.name, type=entity.type, description=entity.description)
+            session.run(str(p), **p.bound_params)
 
     def add_triplet(self, triplet: Triplet):
-        """Adds a relationship between two entities."""
+        """Adds a relationship between two entities using Pypher."""
         if not self.driver: return
         
-        query = str(Query()
-                 .merge().cypher('(s:Entity {name: $subject})')
-                 .merge().cypher('(o:Entity {name: $object})')
-                 .merge().cypher('(s)-[r:RELATED_TO {type: $predicate}]->(o)')
-                 .set('r.timestamp = $timestamp, r.confidence = $confidence, r.source_id = $source_id'))
+        p = Pypher()
+        p.MERGE.node('s', labels='Entity', name=triplet.subject)
+        p.MERGE.node('o', labels='Entity', name=triplet.object)
+        p.MERGE.node('s').relationship('r', labels='RELATED_TO', direction='out', type=triplet.predicate).node('o')
+        p.SET(__.r.property('timestamp') == triplet.timestamp)
+        p.SET(__.r.property('confidence') == triplet.confidence)
+        p.SET(__.r.property('source_id') == triplet.source_id)
         
         with self.driver.session() as session:
-            session.run(query, 
-                subject=triplet.subject, 
-                object=triplet.object, 
-                predicate=triplet.predicate,
-                timestamp=triplet.timestamp,
-                confidence=triplet.confidence,
-                source_id=triplet.source_id
-            )
+            session.run(str(p), **p.bound_params)
 
     def get_neighbors(self, node_id: str, depth: int = 1) -> List[Triplet]:
-        """Retrieves outgoing edges/triplets from a node."""
+        """Retrieves outgoing edges/triplets from a node using Pypher."""
         if not self.driver: return []
         
-        query = str(Query()
-                 .match().cypher('(s:Entity {name: $name})-[r:RELATED_TO]->(o:Entity)')
-                 .return_literal('s.name as subject, r.type as predicate, o.name as object, r.timestamp as timestamp, r.confidence as confidence, r.source_id as source_id'))
+        p = Pypher()
+        p.MATCH.node('s', labels='Entity', name=node_id).relationship('r', labels='RELATED_TO', direction='out').node('o', labels='Entity')
+        p.RETURN(__.s.property('name').alias('subject'), 
+                 __.r.property('type').alias('predicate'), 
+                 __.o.property('name').alias('object'), 
+                 __.r.property('timestamp').alias('timestamp'), 
+                 __.r.property('confidence').alias('confidence'), 
+                 __.r.property('source_id').alias('source_id'))
         
         results = []
         with self.driver.session() as session:
-            record_list = session.run(query, name=node_id)
+            record_list = session.run(str(p), **p.bound_params)
             for record in record_list:
                 results.append(Triplet(
                     subject=record["subject"],
@@ -79,34 +79,38 @@ class GraphStore:
         return results
 
     def search_nodes(self, query: str) -> List[str]:
-        """Fuzzy searches for nodes by name."""
+        """Fuzzy searches for nodes by name using Pypher."""
         if not self.driver: return []
         
-        cypher = str(Query()
-                  .match().node(labels=['Entity'], ref_name='n')
-                  .where_literal('toLower(n.name) CONTAINS toLower($query)')
-                  .return_literal('n.name as name')
-                  .limit(5))
+        p = Pypher()
+        p.MATCH.node('n', labels='Entity')
+        p.WHERE(__.toLower(__.n.property('name')).CONTAINS(__.toLower(Param('q', query))))
+        p.RETURN(__.n.property('name').alias('name'))
+        p.LIMIT(5)
         
         results = []
         with self.driver.session() as session:
-            records = session.run(cypher, query=query)
+            records = session.run(str(p), **p.bound_params)
             for r in records:
                 results.append(r["name"])
         return results
 
     def get_triplets_by_source(self, source_ids: List[str]) -> List[Dict[str, Any]]:
-        """Retrieves triplets linked to specific vector memory IDs."""
+        """Retrieves triplets linked to specific vector memory IDs using Pypher."""
         if not self.driver or not source_ids: return []
         
-        cypher = str(Query()
-                  .match().cypher('(s)-[r:RELATED_TO]->(o)')
-                  .where_literal('r.source_id IN $source_ids')
-                  .return_literal('s.name as subject, r.type as predicate, o.name as object, r.timestamp as timestamp, r.confidence as confidence'))
+        p = Pypher()
+        p.MATCH.node('s').relationship('r', labels='RELATED_TO').node('o')
+        p.WHERE(__.r.property('source_id').IN(Param('sid', source_ids)))
+        p.RETURN(__.s.property('name').alias('subject'), 
+                 __.r.property('type').alias('predicate'), 
+                 __.o.property('name').alias('object'), 
+                 __.r.property('timestamp').alias('timestamp'), 
+                 __.r.property('confidence').alias('confidence'))
         
         results = []
         with self.driver.session() as session:
-            records = session.run(cypher, source_ids=source_ids)
+            records = session.run(str(p), **p.bound_params)
             for r in records:
                 results.append(Triplet(
                     subject=r["subject"],
