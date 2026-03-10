@@ -76,8 +76,9 @@ class TestMonitorLogic(unittest.TestCase):
         # 2nd step, same window -> no ingest
         ingestor.ingest.reset_mock()
         with patch.object(monitor, "_get_active_window", return_value=("Safari", "GitHub")):
-             monitor_step(monitor)
-             ingestor.ingest.assert_not_called()
+             with patch.object(monitor, "_get_clipboard_content", return_value=""):
+                 monitor_step(monitor)
+                 ingestor.ingest.assert_not_called()
 
         # Clipboard change
         ingestor.ingest.reset_mock()

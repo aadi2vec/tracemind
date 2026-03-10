@@ -1,6 +1,7 @@
 from neo4j import GraphDatabase
 from typing import List, Dict, Any, Optional
 import os
+from cymple import QueryBuilder as Query
 from ..types.schema import Entity, Triplet
 
 class GraphStore:
@@ -26,30 +27,25 @@ class GraphStore:
     def add_entity(self, entity: Entity):
         """Adds or updates an entity node in the graph."""
         if not self.driver: return
-        query = """
-        MERGE (n:Entity {name: $name})
-        SET n.type = $type, 
-            n.description = $description
-        """
+        
+        # We use .cypher() for the node patterns to ensure parameters like $name are not quoted
+        query = str(Query()
+                 .merge().cypher('(n:Entity {name: $name})')
+                 .set('n.type = $type, n.description = $description'))
+        
         with self.driver.session() as session:
             session.run(query, name=entity.name, type=entity.type, description=entity.description)
 
     def add_triplet(self, triplet: Triplet):
         """Adds a relationship between two entities."""
         if not self.driver: return
-        # Cypher query to merge nodes and create relationship
-        # Note: We use dynamic relationship types effectively by sanitizing the predicate 
-        # or using APOC. For simple storage, we'll store predicate as a property on a generic 'RELATED' edge 
-        # OR better: sanitize and use as type. For MVP safety, let's use a generic type 'RELATED_TO' with a 'type' property.
         
-        query = """
-        MERGE (s:Entity {name: $subject})
-        MERGE (o:Entity {name: $object})
-        MERGE (s)-[r:RELATED_TO {type: $predicate}]->(o)
-        SET r.timestamp = $timestamp,
-            r.confidence = $confidence,
-            r.source_id = $source_id
-        """
+        query = str(Query()
+                 .merge().cypher('(s:Entity {name: $subject})')
+                 .merge().cypher('(o:Entity {name: $object})')
+                 .merge().cypher('(s)-[r:RELATED_TO {type: $predicate}]->(o)')
+                 .set('r.timestamp = $timestamp, r.confidence = $confidence, r.source_id = $source_id'))
+        
         with self.driver.session() as session:
             session.run(query, 
                 subject=triplet.subject, 
@@ -64,11 +60,10 @@ class GraphStore:
         """Retrieves outgoing edges/triplets from a node."""
         if not self.driver: return []
         
-        # Depth 1 query
-        query = """
-        MATCH (s:Entity {name: $name})-[r:RELATED_TO]->(o:Entity)
-        RETURN s.name as subject, r.type as predicate, o.name as object, r.timestamp as timestamp, r.confidence as confidence, r.source_id as source_id
-        """
+        query = str(Query()
+                 .match().cypher('(s:Entity {name: $name})-[r:RELATED_TO]->(o:Entity)')
+                 .return_literal('s.name as subject, r.type as predicate, o.name as object, r.timestamp as timestamp, r.confidence as confidence, r.source_id as source_id'))
+        
         results = []
         with self.driver.session() as session:
             record_list = session.run(query, name=node_id)
@@ -86,12 +81,13 @@ class GraphStore:
     def search_nodes(self, query: str) -> List[str]:
         """Fuzzy searches for nodes by name."""
         if not self.driver: return []
-        # Simple case-insensitive containment
-        cypher = """
-        MATCH (n:Entity)
-        WHERE toLower(n.name) CONTAINS toLower($query)
-        RETURN n.name as name LIMIT 5
-        """
+        
+        cypher = str(Query()
+                  .match().node(labels=['Entity'], ref_name='n')
+                  .where_literal('toLower(n.name) CONTAINS toLower($query)')
+                  .return_literal('n.name as name')
+                  .limit(5))
+        
         results = []
         with self.driver.session() as session:
             records = session.run(cypher, query=query)
@@ -103,11 +99,11 @@ class GraphStore:
         """Retrieves triplets linked to specific vector memory IDs."""
         if not self.driver or not source_ids: return []
         
-        cypher = """
-        MATCH (s)-[r:RELATED_TO]->(o)
-        WHERE r.source_id IN $source_ids
-        RETURN s.name as subject, r.type as predicate, o.name as object, r.timestamp as timestamp, r.confidence as confidence
-        """
+        cypher = str(Query()
+                  .match().cypher('(s)-[r:RELATED_TO]->(o)')
+                  .where_literal('r.source_id IN $source_ids')
+                  .return_literal('s.name as subject, r.type as predicate, o.name as object, r.timestamp as timestamp, r.confidence as confidence'))
+        
         results = []
         with self.driver.session() as session:
             records = session.run(cypher, source_ids=source_ids)
