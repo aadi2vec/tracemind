@@ -1,0 +1,83 @@
+import json
+from typing import List, Dict, Any, Optional
+from litellm import completion, embedding
+import os
+
+class LLMClient:
+    def __init__(self, model: str = "gpt-4o", embedding_model: str = "text-embedding-3-small"):
+        self.model = model
+        self.embedding_model = embedding_model
+
+    def get_embedding(self, text: str) -> List[float]:
+        """Generates an embedding vector for the given text."""
+        try:
+            response = embedding(
+                model=self.embedding_model,
+                input=[text]
+            )
+            return response.data[0].embedding
+        except Exception as e:
+            print(f"Embedding generation failed: {e}")
+            # Return dummy zero vector of expected dimension (1536)
+            return [0.0] * 1536
+
+    def extract_graph_data(self, text: str) -> Dict[str, Any]:
+        """
+        Extracts entities and triplets from text using a structured prompt.
+        Returns a dictionary with 'entities' and 'triplets'.
+        """
+        prompt = f"""
+        You are a knowledge graph extractor. specific for financial and policy domains.
+        Extract relevant entities and their relationships from the text below.
+        
+        Output JSON format:
+        {{
+            "entities": [
+                {{"name": "Fed", "type": "Organization", "description": "US Central Bank"}},
+                ...
+            ],
+            "triplets": [
+                {{"subject": "Fed", "predicate": "raises_rates", "object": "Interest_Rates", "confidence": 0.9}},
+                ...
+            ]
+        }}
+        
+        Text: {text}
+        """
+        
+        try:
+            response = completion(
+                model=self.model,
+                messages=[{"role": "user", "content": prompt}],
+                response_format={"type": "json_object"}
+            )
+            content = response.choices[0].message.content
+            return json.loads(content)
+        except Exception as e:
+            print(f"LLM Extraction failed: {e}")
+            # Return empty structure on failure for MVP robustness
+            return {"entities": [], "triplets": []}
+
+    def generate_reasoning(self, query: str, context: str) -> str:
+        """Generates a reasoning trace based on the query and retrieved context."""
+        prompt = f"""
+        Answer the query using the provided context.
+        Provide a step-by-step reasoning trace.
+        
+        Context:
+        {context}
+        
+        Query: {query}
+        """
+    def completion(self, prompt: str) -> str:
+        """Generic completion for reasoning tasks."""
+        try:
+            response = completion(
+                model=self.model,
+                messages=[{"role": "user", "content": prompt}]
+            )
+            return response.choices[0].message.content
+        except Exception as e:
+            print(f"LLM Completion failed: {e}")
+            return "Error generating response."
+
