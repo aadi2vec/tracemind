@@ -162,7 +162,50 @@ flowchart LR
     V1 -.->|"source_id link"| E1
 ```
 
-### 4.3 AgentMem Controller State Machine
+### 4.4 Memory State Relationships (The Cognitive Pipeline)
+
+Memory in AgentMem is a multi-layered system where each state serves a specific cognitive function. We call this the **Cognitive Pipeline**.
+
+| State | Technology | Role | Analogy |
+|---|---|---|---|
+| **Semantic** | ChromaDB (Vector) | Recalls "anything similar" using text embeddings. | **Intuition**: I've heard something like this before. |
+| **Structured** | Neo4j (Graph) | Connects facts via explicit relationships (Triplets). | **Knowledge**: I know X is related to Y because of Z. |
+| **Clustered** | HDBSCAN (SQLite) | Groups entities into higher-level themes. | **Concepts**: This relates to "Finance" or "Tech". |
+| **Episodic** | JSONL (Log) | Records every interaction, decision, and outcome. | **Experience**: Last time I retrieved the graph, it worked well. |
+
+#### The Cognitive Pipeline Flow
+```mermaid
+graph TD
+    subgraph Ingestion ["1. Ingestion (Creation)"]
+        Raw["Raw Activity / Text"] --> VS["Semantic Chunk\n(Vector Store)"]
+        Raw --> GS["Entities & Triplets\n(Graph Store)"]
+        GS -.-> CS["Cluster Membership\n(Cluster Store)"]
+    end
+
+    subgraph Retrieval ["2. Retrieval (Recall)"]
+        Q["User Query"] --> VS_S["Vector Search"]
+        VS_S -->|"Initial Anchors"| GS_T["Graph Traversal"]
+        GS_T -->|"Broaden"| CS_E["Cluster Expansion"]
+    end
+
+    subgraph Learning ["3. Learning (Feedback)"]
+        Outcome["Decision Outcome"] --> ES["Episodic Trace\n(JSONL)"]
+        ES -->|"Reinforce"| CTRL["Controller Policy"]
+        ES -->|"Refine"| GS_D["Graph Confidence Decay"]
+    end
+
+    Ingestion --> Retrieval
+    Retrieval --> Learning
+    Learning --> Ingestion
+```
+
+**Memory Stage Responsibilities:**
+1.  **Semantic Memory** provides the "seed" entities.
+2.  **Structured Memory** provides context (relationships/triplets) around those seeds.
+3.  **Clustered Memory** ensures theme-level coverage even without direct graph edges.
+4.  **Episodic Memory** validates if the combination was useful, training the controller.
+
+### 4.5 AgentMem Controller State Machine
 
 ```mermaid
 stateDiagram-v2
@@ -194,7 +237,29 @@ stateDiagram-v2
     Decay --> Idle
 ```
 
-### 4.4 Self-Improvement Learning Loop
+### 4.6 TITANS & MIRAS Correspondence (Google DeepMind)
+
+AgentMem draws architectural inspiration from **TITANS** (Learning to Memorize at Test Time) and the **MIRAS** framework.
+
+| Concept | TITANS / MIRAS Equivalent | AgentMem Implementation |
+|---|---|---|
+| **Short-Term Memory** | Sliding Window Attention | AutoGen `GroupChat` context window. |
+| **Long-Term Memory** | Neural Memory Module (MLP) | Hybrid Graph + Vector + Cluster stores. |
+| **Memory Algorithm** | Online Gradient Descent | **Missing piece**: AgentMem uses discrete updates, not neural gradients. |
+| **Updating Logic** | "Surprise" Metric (Loss Gradient) | Confidence gating (conf ≥ 0.4). |
+| **Retention Policy** | Retention Gate / Regularizer | TTL Forgetting & Confidence Decay. |
+
+#### Analysis: What's Missing?
+
+Based on the TITANS/MIRAS state-of-the-art, the following "missing pieces" are candidates for future versions:
+
+1.  **Differentiable Memory Update**: TITANS updates its long-term memory via the gradient of a "memory loss" function. AgentMem is currently symbolic/discrete.
+2.  **Surprise-based Ingestion**: Prioritizing ingestion of facts that cause high "surprise" (information gain) rather than just high confidence.
+3.  **Cross-Modal Associative Memory**: While MIRAS is multimodal, AgentMem is currently text-dominant (multimodal is in the roadmap).
+
+---
+
+### 4.7 Self-Improvement Learning Loop
 
 ```mermaid
 sequenceDiagram
@@ -226,7 +291,7 @@ sequenceDiagram
     Note over C: Next query — UCB prefers 'medium' arm
 ```
 
-### 4.5 Multi-Agent GroupChat
+### 4.8 Multi-Agent GroupChat
 
 ```mermaid
 flowchart TD
