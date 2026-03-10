@@ -61,6 +61,36 @@ class LLMClient:
             # Return empty structure on failure for MVP robustness
             return {"entities": [], "triplets": []}
 
+    def extract_procedure(self, text: str) -> Dict[str, Any]:
+        """
+        Extracts a structured procedure (name + ordered steps) from a 'how-to' text.
+        Returns: {"name": str, "steps": [{"action": str, "expected_outcome": str}]}
+        """
+        prompt = f"""
+        You are a procedure extractor. Given the how-to text below, extract a structured procedure.
+
+        Output JSON format:
+        {{
+            "name": "Brief procedure name (e.g. Restart Nginx)",
+            "steps": [
+                {{"action": "Step description", "expected_outcome": "What should happen"}},
+                ...
+            ]
+        }}
+
+        Text: {text}
+        """
+        try:
+            response = completion(
+                model=self.model,
+                messages=[{"role": "user", "content": prompt}],
+                response_format={"type": "json_object"}
+            )
+            return json.loads(response.choices[0].message.content)
+        except Exception as e:
+            print(f"Procedure extraction failed: {e}")
+            return {"name": text[:50], "steps": []}
+
     def generate_reasoning(self, query: str, context: str) -> str:
         """Generates a reasoning trace based on the query and retrieved context."""
         prompt = f"""

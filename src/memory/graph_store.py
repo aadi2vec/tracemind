@@ -2,7 +2,7 @@ from neo4j import GraphDatabase
 from typing import List, Dict, Any, Optional
 import os
 from pypher.builder import Pypher, __, Param
-from ..types.schema import Entity, Triplet
+from ..types.schema import Entity, Triplet, Procedure
 
 class GraphStore:
     def __init__(self, uri: str = "bolt://localhost:7687", auth: tuple = ("neo4j", "password")):
@@ -120,6 +120,95 @@ class GraphStore:
                     confidence=r["confidence"]
                 ).model_dump())
         return results
+
+    def add_procedure(self, procedure: Procedure):
+        """Stores a Procedure node and its steps in the graph using Pypher.
+        
+        Creates:
+          (:Procedure {id, name, description, confidence, source_id})
+          (:ProcedureStep {step_number, action, expected_outcome}) connected via [:HAS_STEP]
+          Entity nodes connected via [:HAS_PROCEDURE]
+        """
+        if not self.driver: return
+
+        # 1. MERGE the Procedure node
+        p = Pypher()
+        p.MERGE.node('proc', labels='Procedure', id=procedure.id)
+        p.SET(__.proc.property('name') == procedure.name)
+        p.SET(__.proc.property('description') == procedure.description)
+        p.SET(__.proc.property('confidence') == procedure.confidence)
+        p.SET(__.proc.property('source_id') == procedure.source_id)
+        with self.driver.session() as session:
+            session.run(str(p), **p.bound_params)
+
+        # 2. MERGE each ProcedureStep and link to Procedure
+        for step in procedure.steps:
+            ps = Pypher()
+            ps.MATCH.node('proc', labels='Procedure', id=procedure.id)
+            ps.MERGE.node('s', labels='ProcedureStep',
+                          procedure_id=procedure.id,
+                          step_number=step.step_number)
+            ps.SET(__.s.property('action') == step.action)
+            ps.SET(__.s.property('expected_outcome') == step.expected_outcome)
+            ps.MERGE.node('proc').relationship('r', labels='HAS_STEP', direction='out').node('s')
+            with self.driver.session() as session:
+                session.run(str(ps), **ps.bound_params)
+
+        # 3. Link Procedure to trigger entities
+        for entity_name in procedure.trigger_entities:
+            pe = Pypher()
+            pe.MERGE.node('e', labels='Entity', name=entity_name)
+            pe.MERGE.node('proc', labels='Procedure', id=procedure.id)
+            pe.MERGE.node('e').relationship('r', labels='HAS_PROCEDURE', direction='out').node('proc')
+            with self.driver.session() as session:
+                session.run(str(pe), **pe.bound_params)
+
+    def get_procedures_for_entities(self, entity_names: List[str]) -> List[Dict[str, Any]]:
+        """Retrieves all Procedures and their steps linked to the given entity names."""
+        if not self.driver or not entity_names: return []
+
+        # Use raw Cypher param passing for lists since Pypher cannot hash list values
+        cypher = (
+            "MATCH (e:Entity)-[:HAS_PROCEDURE]->(proc:Procedure) "
+            "WHERE e.name IN $names "
+            "RETURN e.name AS entity, proc.id AS proc_id, proc.name AS proc_name, "
+            "proc.description AS description, proc.confidence AS confidence"
+        )
+
+        procedures: Dict[str, Dict] = {}
+        with self.driver.session() as session:
+            records = session.run(cypher, names=entity_names)
+            for r in records:
+                pid = r['proc_id']
+                if pid not in procedures:
+                    procedures[pid] = {
+                        'id': pid,
+                        'name': r['proc_name'],
+                        'description': r['description'],
+                        'confidence': r['confidence'],
+                        'trigger_entities': [],
+                        'steps': []
+                    }
+                procedures[pid]['trigger_entities'].append(r['entity'])
+
+        # Fetch steps for each procedure
+        steps_cypher = (
+            "MATCH (proc:Procedure {id: $proc_id})-[:HAS_STEP]->(s:ProcedureStep) "
+            "RETURN s.step_number AS step_number, s.action AS action, "
+            "s.expected_outcome AS expected_outcome "
+            "ORDER BY s.step_number"
+        )
+        for pid, proc in procedures.items():
+            with self.driver.session() as session:
+                step_records = session.run(steps_cypher, proc_id=pid)
+                for sr in step_records:
+                    proc['steps'].append({
+                        'step_number': sr['step_number'],
+                        'action': sr['action'],
+                        'expected_outcome': sr['expected_outcome']
+                    })
+
+        return list(procedures.values())
 
     def save(self):
         pass

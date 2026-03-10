@@ -39,6 +39,23 @@ class GraphNode(BaseModel):
     properties: Dict[str, Any] = {}
 
 
+# ── Procedural Memory (Kinetic Actions / "Verbs") ─────────────────────────────
+
+class ProcedureStep(BaseModel):
+    step_number: int
+    action: str                      # e.g. "Run `kubectl get pods`"
+    expected_outcome: Optional[str] = None
+
+class Procedure(BaseModel):
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    name: str                        # e.g. "Restart Web Server"
+    description: str                 # Natural language, stored in Vector Store
+    steps: List[ProcedureStep]
+    trigger_entities: List[str]      # Entities this skill applies to, e.g. ["Server", "Nginx"]
+    confidence: float = 1.0
+    source_id: Optional[str] = None  # Links back to Vector Store chunk
+
+
 # ── Soft clustering ──────────────────────────────────────────────────────────
 
 class ClusterMembership(BaseModel):

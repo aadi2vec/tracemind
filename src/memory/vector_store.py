@@ -46,3 +46,10 @@ class VectorStore:
                     "distance": results['distances'][0][i] if results['distances'] else None
                 })
         return formatted_results
+
+    def add_procedure(self, procedure_id: str, description: str, name: str) -> Optional[str]:
+        """Stores a procedure's description in the vector store for semantic discovery."""
+        return self.add_memory(
+            text=description,
+            metadata={"memory_type": "procedure", "procedure_id": procedure_id, "name": name}
+        )

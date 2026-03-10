@@ -70,6 +70,7 @@ class Retriever:
                 unique_context.append(item)
 
         # 3. Cluster expansion (probabilistic) — only if cluster_store available
+        cluster_ids: List[str] = []
         if self.cluster_store is not None:
             # Phase 2.2: Use real query embedding for expansion
             query_embedding = self.llm_client.get_embedding(query)
@@ -92,4 +93,7 @@ class Retriever:
             "graph_context": unique_context,
             "entities_found": list(candidate_entities),
             "cluster_expanded": cluster_ids,
+            "procedural_context": self.graph_store.get_procedures_for_entities(
+                list(candidate_entities)[:10]
+            ),
         }

@@ -65,12 +65,16 @@ graph TD
         HC -->|"DEFER"| SINK["Discard"]
         GS --- CS["Cluster Store\n(SQLite + HDBSCAN)"]
         I -->|"Vectors"| VS["Vector Store\n(ChromaDB)"]
+        I -->|"Kinetic / HowTo"| PROC["Procedural Memory\n(:Procedure nodes)"]
+        PROC -->|"HAS_PROCEDURE"| GS
+        PROC -->|"description vector"| VS
     end
 
     subgraph Retrieval ["Recall Layer"]
         R["Retriever\n(src.processing.retrieval)"] --> VS
         R --> GS
         R --> CS
+        R -->|"procedural_context"| PROC
     end
 
     subgraph Reasoning ["Execution Layer"]
@@ -172,6 +176,7 @@ Memory in AgentMem is a multi-layered system where each state serves a specific 
 | **Structured** | Neo4j (Graph) | Connects facts via explicit relationships (Triplets). | **Knowledge**: I know X is related to Y because of Z. |
 | **Clustered** | HDBSCAN (SQLite) | Groups entities into higher-level themes. | **Concepts**: This relates to "Finance" or "Tech". |
 | **Episodic** | JSONL (Log) | Records every interaction, decision, and outcome. | **Experience**: Last time I retrieved the graph, it worked well. |
+| **Procedural** | Neo4j + ChromaDB | Stores "how-to" sequences (Verbs) linked to entities. | **Skill**: I know how to restart a server. |
 
 #### The Cognitive Pipeline Flow
 ```mermaid
@@ -180,12 +185,15 @@ graph TD
         Raw["Raw Activity / Text"] --> VS["Semantic Chunk\n(Vector Store)"]
         Raw --> GS["Entities & Triplets\n(Graph Store)"]
         GS -.-> CS["Cluster Membership\n(Cluster Store)"]
+        HowTo["How-To / Procedure"] --> PVEC["Procedure Description\n(Vector Store)"]
+        HowTo --> PGRAPH["Procedure+Steps\n(Graph Store :Procedure)"]
     end
 
     subgraph Retrieval ["2. Retrieval (Recall)"]
         Q["User Query"] --> VS_S["Vector Search"]
         VS_S -->|"Initial Anchors"| GS_T["Graph Traversal"]
         GS_T -->|"Broaden"| CS_E["Cluster Expansion"]
+        GS_T -->|"Kinetic Recall"| PR["Procedural Recall\n(HAS_PROCEDURE)"]
     end
 
     subgraph Learning ["3. Learning (Feedback)"]
@@ -204,6 +212,7 @@ graph TD
 2.  **Structured Memory** provides context (relationships/triplets) around those seeds.
 3.  **Clustered Memory** ensures theme-level coverage even without direct graph edges.
 4.  **Episodic Memory** validates if the combination was useful, training the controller.
+5.  **Procedural Memory** recalls *how to act* on what is known — the "Verbs" of the ontology.
 
 ### 4.5 AgentMem Controller State Machine
 
@@ -245,17 +254,29 @@ AgentMem draws architectural inspiration from **TITANS** (Learning to Memorize a
 |---|---|---|
 | **Short-Term Memory** | Sliding Window Attention | AutoGen `GroupChat` context window. |
 | **Long-Term Memory** | Neural Memory Module (MLP) | Hybrid Graph + Vector + Cluster stores. |
-| **Memory Algorithm** | Online Gradient Descent | **Missing piece**: AgentMem uses discrete updates, not neural gradients. |
+| **Kinetic Memory** | Action Policy Head | **Procedural Memory** — `:Procedure` nodes with steps. |
+| **Memory Algorithm** | Online Gradient Descent | Missing: AgentMem uses discrete updates, not neural gradients. |
 | **Updating Logic** | "Surprise" Metric (Loss Gradient) | Confidence gating (conf ≥ 0.4). |
 | **Retention Policy** | Retention Gate / Regularizer | TTL Forgetting & Confidence Decay. |
 
-#### Analysis: What's Missing?
+#### Palantir Ontology Alignment
 
-Based on the TITANS/MIRAS state-of-the-art, the following "missing pieces" are candidates for future versions:
+AgentMem directly mirrors the Palantir Ontology model — the foundation of Palantir AIP:
 
-1.  **Differentiable Memory Update**: TITANS updates its long-term memory via the gradient of a "memory loss" function. AgentMem is currently symbolic/discrete.
-2.  **Surprise-based Ingestion**: Prioritizing ingestion of facts that cause high "surprise" (information gain) rather than just high confidence.
-3.  **Cross-Modal Associative Memory**: While MIRAS is multimodal, AgentMem is currently text-dominant (multimodal is in the roadmap).
+| Palantir Concept | AgentMem Equivalent |
+|---|---|
+| **Objects** (Nouns) | `Entity` nodes in the Graph Store |
+| **Links** (Relationships) | `Triplet` edges (`RELATED_TO`) |
+| **Properties** | Node/edge properties (`confidence`, `timestamp`) |
+| **Actions / Verbs** (Kinetic) | `Procedure` nodes with `ProcedureStep` children |
+| **AIP Logic** (Ingestion) | `Ingestor.ingest()` / `ingest_procedure()` |
+| **Audit Trail** | `ContextTrace` in `EpisodicStore` |
+
+#### Remaining Missing Pieces
+
+1. **Differentiable Memory Update**: TITANS updates long-term memory via gradient descent. AgentMem is currently symbolic.
+2. **Surprise-based Ingestion**: Prioritizing novel facts over high-confidence ones.
+3. **Cross-Modal Associative Memory**: Multimodal ingestion (image → entity) is on the roadmap.
 
 ---
 
