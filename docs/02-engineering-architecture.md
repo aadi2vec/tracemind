@@ -18,6 +18,7 @@
 6. [Memory Controller FSM](#6-memory-controller-fsm)
 7. [Retrieval Algorithm](#7-retrieval-algorithm)
 8. [Learning Pipeline](#8-learning-pipeline)
+8b. [JEPA/World Model/SSM Training Pipeline](#8b-jepaworldmodelssm-training-pipeline)
 9. [IPC and Communication](#9-ipc-and-communication)
 10. [Browser Extension Architecture](#10-browser-extension-architecture)
 11. [Claude Code Integration](#11-claude-code-integration)
@@ -94,8 +95,8 @@ TraceMind is a local-only, privacy-first memory operating system for AI agents a
 |           +----------+----------+----------+-----------+             |
 +=====================================================================+
 |                   RETRIEVAL ENGINE                                   |
-|  Phase 1: Vector ANN   --> Phase 2: Graph  --> Phase 3: Cluster     |
-|  (LanceDB top-k)            Traversal           Expansion           |
+|  Phase 1: Vector ANN --> Phase 2: Graph --> Phase 3: Cluster --> Phase 4: Procedural |
+|  (LanceDB top-k)         Traversal         Expansion            Recall              |
 |                              (BFS, bounded)      (soft membership)  |
 |  Recall budget: max 50 facts total, latency < 100ms p95             |
 +=====================================================================+
@@ -127,7 +128,8 @@ TraceMind is a local-only, privacy-first memory operating system for AI agents a
 |-----------|--------|------------|
 | RAM idle | <150MB | 200MB |
 | RAM active | <400MB | 500MB |
-| Install size | <200MB | 250MB |
+| Install size (Phase 1-2) | <200MB | 250MB |
+| Install size (Phase 3, +JEPA/WM/SSM) | <260MB | 310MB |
 | Binary size (Rust) | <40MB | 50MB |
 | Embedding model | 80MB | 100MB |
 | Startup time | <2s | 3s |
@@ -514,6 +516,27 @@ Triple {
     timestamp:   i64 (Unix millis)
     source_id:   Option<UUID>
 }
+
+Procedure {
+    id: UUID,
+    name: String,
+    version: u32,
+    trigger: String,          // natural language trigger pattern
+    steps: Vec<ProcedureStep>,
+    linked_entities: Vec<EntityId>,
+    confidence: f64,
+    status: enum { Active, Reinforced, Degraded, Deprecated, Revised },
+    parent_version: Option<UUID>,  // points to previous version
+    created_at: DateTime,
+    updated_at: DateTime,
+}
+
+ProcedureStep {
+    action: String,
+    params: HashMap<String, Value>,
+    expected_outcome: String,
+    timeout_ms: u64,
+}
 ```
 
 ### 3.2 Trace Schema (Episodic)
@@ -542,16 +565,43 @@ ContextTrace {
 ### 3.3 Trajectory Schema (Learning)
 
 Trajectories are sequences of (state, action, reward) tuples used for offline RL training.
+Extended in Phase 3 to support JEPA, World Model, and SSM training targets.
+
+```rust
+struct Trajectory {
+    trace_id: Uuid,
+    session_id: Uuid,
+    timestamp: DateTime<Utc>,
+
+    // State (input to JEPA/WM)
+    context_embedding: Vec<f32>,          // 384-dim from MiniLM
+    memory_snapshot_hash: u64,            // seahash of retrieved memory IDs
+    user_activity_type: ActivityType,     // Browser, ClaudeCode, Clipboard, etc.
+    active_entity_ids: Vec<Uuid>,         // entities in current context
+
+    // Action (what the system did)
+    retrieval_arm: RetrievalArm,          // narrow/medium/wide/deep
+    memory_ids_retrieved: Vec<Uuid>,
+    store_decisions: Vec<StoreDecision>,   // (entity_id, stored: bool, confidence)
+    procedure_executed: Option<Uuid>,
+
+    // Outcome (ground truth for training)
+    user_feedback: Option<f64>,           // [-1.0, 1.0]
+    task_success: Option<bool>,
+    correction_applied: bool,
+
+    // World Model targets (null until Phase 3, then filled retroactively)
+    predicted_outcome: Option<Vec<f32>>,  // WM prediction at decision time
+    actual_outcome_embedding: Option<Vec<f32>>,  // actual outcome encoded
+    surprise_score: Option<f64>,          // |predicted - actual|
+}
+```
+
+**Backward compatibility:** Phase 1/2 trajectories omit the World Model target fields (all `None`). Phase 3 backfill job populates `actual_outcome_embedding` and `surprise_score` retroactively from stored episodic traces.
+
+**Legacy sub-types (still used for RL policy training):**
 
 ```
-Trajectory {
-    trajectory_id:  UUID (v7)
-    session_id:     String
-    steps:          Vec<TrajectoryStep>
-    total_reward:   f64
-    created_at:     i64
-}
-
 TrajectoryStep {
     step_index:     u32
     state:          StateVector          // encoded context features
@@ -687,6 +737,15 @@ tracemind/
         policy_net.rs           # Lightweight MLP policy
         trainer.rs              # Offline training loop (idle-time)
 
+    tm-procedural/              # Procedural memory (kinetic actions)
+      Cargo.toml                # deps: tm-core, tm-graph, serde_json, uuid
+      src/
+        lib.rs
+        store.rs                # Procedure CRUD in entity graph (HAS_PROCEDURE edges)
+        executor.rs             # Procedure execution engine (dry-run / live modes)
+        lifecycle.rs            # Status transitions: Active -> Reinforced -> Degraded -> Deprecated -> Revised
+        versioning.rs           # Procedure version chain (parent_version linkage, diff)
+
     tm-reasoning/               # Reasoning & intent layer
       Cargo.toml                # deps: tm-core, tm-retrieval, tm-trace
       src/
@@ -762,6 +821,7 @@ members = [
     "crates/tm-controller",
     "crates/tm-retrieval",
     "crates/tm-learning",
+    "crates/tm-procedural",
     "crates/tm-reasoning",
     "crates/tm-mcp",
     "crates/tm-ipc",
@@ -792,6 +852,7 @@ tm-app ─┬─ tm-controller ──┬── tm-graph
         ├─ tm-governance    │
         ├─ tm-reasoning     │
         ├─ tm-learning      │
+        ├─ tm-procedural ───┤  (depends on tm-graph)
         ├─ tm-mcp           │
         ├─ tm-ipc           │
         └─ tm-embedding     │
@@ -1200,6 +1261,14 @@ Phase 3: Cluster Expansion
   - Filter: only include members NOT already in result set
   - Budget remaining: budget - |Phase 1| - |Phase 2|
   - Truncate to budget remaining
+
+Phase 4: Procedural Recall
+  - After cluster expansion, check all retrieved entity IDs for HAS_PROCEDURE edges
+  - For each linked Procedure with confidence > procedure_threshold (default 0.5):
+    - Include procedure name, trigger, and steps in retrieval context
+  - Filter: only Active or Reinforced procedures (skip Degraded/Deprecated/Revised)
+  - Procedure results are appended to facts but do NOT consume the fact budget
+    (procedures are structural context, not individual facts)
 ```
 
 ### 7.2 Pseudocode
@@ -1307,6 +1376,27 @@ pub fn retrieve(
         all_facts.extend(cluster_facts);
     }
 
+    // ── Phase 4: Procedural Recall ─────────────────────────
+    let mut procedures: Vec<ProcedureContext> = Vec::new();
+    for fact_id in seen_ids.iter() {
+        if let Ok(procs) = self.graph.get_procedures_for_entity(*fact_id) {
+            for proc in procs {
+                if proc.confidence > self.procedure_threshold
+                    && matches!(proc.status, ProcedureStatus::Active | ProcedureStatus::Reinforced)
+                {
+                    procedures.push(ProcedureContext {
+                        id: proc.id,
+                        name: proc.name.clone(),
+                        trigger: proc.trigger.clone(),
+                        steps: proc.steps.clone(),
+                        confidence: proc.confidence,
+                    });
+                }
+            }
+        }
+    }
+    procedures.dedup_by_key(|p| p.id);
+
     // ── Re-rank ─────────────────────────────────────────────
     all_facts.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
     all_facts.truncate(budget);
@@ -1323,7 +1413,7 @@ pub fn retrieve(
         latency_ms: timer.elapsed().as_millis() as u64,
     };
 
-    Ok(RetrievalResult { facts: all_facts, trace })
+    Ok(RetrievalResult { facts: all_facts, procedures, trace })
 }
 ```
 
@@ -1524,6 +1614,110 @@ Training: Offline GRPO over trajectory batches
 This is Phase 3 and will not be implemented in MVP. The trajectory storage
 format in Phase 1/2 is designed to support this future training.
 ```
+
+### 8b. JEPA/World Model/SSM Training Pipeline
+
+All models in this section are Phase 3 and train locally during idle time. No cloud dependencies.
+
+#### 8b.1 JEPA Training (Self-Supervised Representation Learning)
+
+Learns latent representations of memory context by predicting target embeddings from context embeddings, without reconstructing raw inputs.
+
+```
+Architecture:
+  Context Encoder:  MLP (384 -> 256 -> 384), ReLU activations
+  Target Encoder:   EMA copy of Context Encoder (tau = 0.996, updated per batch)
+  Predictor:        MLP (256 -> 384), bridges context -> target latent space
+
+Loss: VICReg (Variance-Invariance-Covariance Regularization)
+  L = lambda * invariance_loss + mu * variance_loss + nu * covariance_loss
+  lambda = 25.0, mu = 25.0, nu = 1.0
+
+Training Data:   Stored trajectories (context_embedding pairs from consecutive steps)
+Batch Size:      64
+Learning Rate:   3e-4 (AdamW, weight_decay = 1e-4)
+Schedule:        Cosine annealing over idle training window
+Parameters:      ~5M total
+Model Size:      ~20MB on disk (f32 weights)
+Training Cadence: During idle (no user queries for >5 min), max 30 min per session
+```
+
+#### 8b.2 World Model Training (Outcome Prediction)
+
+Learns to predict outcomes from (state, action) pairs. Used for intent prediction, procedure simulation (dry-run), and surprise-based ingestion gating.
+
+```
+Architecture:
+  Input:   state_dim (384) + action_dim (one-hot 5 actions + params ~ 32) = 416
+  Hidden:  Linear(416, 256) -> ReLU -> Linear(256, 256) -> ReLU
+  Output:  Linear(256, 384)  (predicted outcome embedding)
+
+Loss: MSE(predicted_outcome, actual_outcome_embedding)
+  + 0.1 * cosine_embedding_loss (directional alignment)
+
+Training Data:   Trajectories where actual_outcome_embedding is non-null
+Batch Size:      32
+Learning Rate:   1e-4 (AdamW)
+Parameters:      ~2-5M total
+Model Size:      ~10-20MB on disk
+Training Cadence: Co-trained with JEPA during idle windows
+
+Applications:
+  - Intent prediction: given current state, predict most likely next outcome
+  - Procedure dry-run: simulate procedure steps through WM before live execution
+  - Surprise scoring: surprise = ||WM_predicted - actual_outcome||
+```
+
+#### 8b.3 SSM (Mamba) Integration (Compressed Episodic History)
+
+State Space Model that compresses full episodic trace history into a fixed-size hidden state, replacing linear episodic scans at inference time.
+
+```
+Architecture:
+  Model:           Mamba block (selective state space model)
+  Input:           Trajectory embeddings (384-dim per step)
+  Hidden State:    Fixed-size (512-dim), carries compressed history
+  Output:          Context vector for retrieval augmentation
+
+Parameters:        ~1-3M total
+Model Size:        ~5-12MB on disk
+Inference:         Single forward pass through hidden state (replaces linear scan)
+Training Cadence:  Extended idle only (overnight), requires >1000 trajectories
+
+Benefit: O(1) inference for episodic context vs O(n) scan over trace history.
+         Hidden state updated incrementally as new trajectories arrive.
+```
+
+#### 8b.4 Surprise-Based Ingestion Gate
+
+Replaces the static confidence gate (section 6.3) with a learned surprise signal from the World Model.
+
+```
+Algorithm:
+  1. On new CaptureEvent, compute context_embedding via MiniLM
+  2. Feed (current_state, predicted_action) into World Model
+  3. Get predicted_outcome embedding
+  4. After actual outcome observed, compute:
+       surprise = ||predicted_outcome - actual_outcome_embedding||_2
+  5. Decision:
+       if surprise > high_threshold (default 0.7):  STORE (novel information)
+       if surprise < low_threshold  (default 0.2):  DEFER (redundant/expected)
+       else:                                         fall back to confidence gate
+
+Thresholds auto-calibrated from trajectory surprise_score distribution
+(target: store top 30% by surprise, defer bottom 30%).
+```
+
+#### 8b.5 Total Model Budget
+
+| Component | Parameters | Disk Size | RAM (loaded) | Phase |
+|-----------|-----------|-----------|--------------|-------|
+| JEPA (context + target + predictor) | ~5M | ~20MB | ~20MB | 3 |
+| World Model (MLP) | ~2-5M | ~10-20MB | ~10-20MB | 3 |
+| SSM / Mamba | ~1-3M | ~5-12MB | ~5-12MB | 3 |
+| **Total** | **~8-13M** | **~40-60MB** | **~40-60MB** | 3 |
+
+All models trainable on CPU (no GPU required). Training uses ONNX Runtime or `candle` for Rust-native inference. Models serialized as safetensors for fast loading.
 
 ---
 
@@ -2133,7 +2327,9 @@ pub fn acquire_lock(data_dir: &Path) -> Result<PidLock> {
 | Tokio runtime | 3 | Thread pool (4 threads), channels |
 | IPC listeners | 2 | Socket buffers |
 | Miscellaneous (logs, config) | 5 | Tracing buffers, config structs |
-| **Total Idle** | **~150MB** | **Target: <200MB** |
+| JEPA/WM/SSM models (Phase 3) | 0-40 | Loaded on-demand; 0 in Phase 1-2 |
+| **Total Idle (Phase 1-2)** | **~150MB** | **Target: <200MB** |
+| **Total Idle (Phase 3, models loaded)** | **~190MB** | **Target: <240MB** |
 
 ### 13.2 RAM Breakdown (Active Query)
 
@@ -2159,6 +2355,8 @@ pub fn acquire_lock(data_dir: &Path) -> Result<PidLock> {
 | Learning loop (policy training) | 100% of 2 threads | Hourly, idle only | <10s |
 | HDBSCAN incremental | 20% of 1 thread | Per 500 entities | <500ms |
 | HDBSCAN full re-cluster | 100% of 2 threads | Weekly | <30s for 50k entities |
+| JEPA + WM training (Phase 3) | 100% of 2 threads | Idle, max 30min/session | <30min |
+| SSM/Mamba training (Phase 3) | 100% of 2 threads | Extended idle (overnight) | <2hr |
 | Parquet compaction | 50% of 1 thread | Monthly | <60s |
 
 **Idle detection:** Policy training and full re-clustering only run when system is idle (no user queries for >5 minutes AND system CPU <20%). Detected via `sysinfo` crate.
@@ -2171,6 +2369,7 @@ pub fn acquire_lock(data_dir: &Path) -> Result<PidLock> {
 | Graph write | 50/s | 100KB/s | Kuzu WAL batching |
 | Vector write | 20/s | 200KB/s | LanceDB append buffer |
 | Compaction | 100/s burst | 10MB/s | Monthly, background |
+| JEPA/WM model checkpoint | 5/s burst | 5MB/s | Per training session, ~60MB write |
 
 ---
 

@@ -183,7 +183,62 @@ add_card(s, 0.8, 5.3, 11.7, 1.2)
 add_text(s, "All on-device  \u2022  Rust core  \u2022  <200MB RAM  \u2022  <250MB install  \u2022  macOS / Windows / Linux",
          1.1, 5.5, 11, 0.8, font_size=18, color=ACCENT, align=PP_ALIGN.CENTER)
 
-# ========== SLIDE 5: CLAUDE CODE INTEGRATION ==========
+# ========== SLIDE 5: COGNITIVE PIPELINE ==========
+s = prs.slides.add_slide(prs.slide_layouts[6])
+dark_bg(s)
+add_text(s, "The Cognitive Pipeline", 0.8, 0.4, 11, 0.8, font_size=36, bold=True, color=WHITE)
+add_text(s, "Five memory layers, each serving a distinct cognitive function", 0.8, 1.0, 11, 0.4, font_size=18, color=GRAY)
+accent_line(s, 0.8, 1.5, 3.0)
+
+layers = [
+    ("1. Semantic", "Intuition", "Recall anything similar\nvia embeddings", "Vector Store\n(LanceDB)", ACCENT),
+    ("2. Structured", "Knowledge", "Connect facts via\ntyped relationships", "Entity Graph\n(Kuzu/SQLite)", ACCENT2),
+    ("3. Clustered", "Concepts", "Group entities into\nhigher-level themes", "HDBSCAN\nIndex", GREEN),
+    ("4. Episodic", "Experience", "Record every interaction,\ndecision, and outcome", "Append-only\nParquet", ORANGE),
+    ("5. Procedural", "Skills", "Store HOW to do things\nas versioned steps", "Graph + Vector\nHybrid", RGBColor(0xC0, 0x84, 0xFC)),
+]
+
+for i, (name, analogy, desc, tech, col) in enumerate(layers):
+    y = 1.9 + i * 1.05
+    add_card(s, 0.8, y, 11.7, 0.9)
+    add_text(s, name, 1.0, y + 0.1, 2.2, 0.7, font_size=17, bold=True, color=col)
+    add_text(s, analogy, 3.3, y + 0.1, 1.8, 0.7, font_size=16, bold=True, color=WHITE)
+    add_text(s, desc, 5.3, y + 0.05, 3.5, 0.8, font_size=14, color=LIGHT)
+    add_text(s, tech, 9.2, y + 0.05, 2.8, 0.8, font_size=13, color=GRAY)
+
+# ========== SLIDE 6: LATENT INTELLIGENCE ROADMAP ==========
+s = prs.slides.add_slide(prs.slide_layouts[6])
+dark_bg(s)
+add_text(s, "Latent Intelligence Roadmap", 0.8, 0.4, 11, 0.8, font_size=36, bold=True, color=WHITE)
+add_text(s, "Not LLM-driven. Small local models trained on YOUR data.", 0.8, 1.0, 11, 0.4, font_size=18, color=GRAY)
+accent_line(s, 0.8, 1.5, 3.0)
+
+# JEPA
+add_card(s, 0.8, 1.9, 3.8, 3.2)
+add_text(s, "JEPA Encoder", 1.0, 2.05, 3.4, 0.4, font_size=20, bold=True, color=ACCENT)
+add_text(s, "Phase 3", 1.0, 2.4, 3.4, 0.3, font_size=13, color=GRAY)
+add_text(s, "Predicts what a good answer\nlooks like in latent space.\nReplaces raw cosine similarity.\n\n~5M params | ~20MB | CPU", 1.0, 2.8, 3.4, 2.0, font_size=14, color=LIGHT)
+
+# World Model
+add_card(s, 5.0, 1.9, 3.8, 3.2)
+add_text(s, "World Model", 5.2, 2.05, 3.4, 0.4, font_size=20, bold=True, color=GREEN)
+add_text(s, "Phase 3-4", 5.2, 2.4, 3.4, 0.3, font_size=13, color=GRAY)
+add_text(s, "Predicts what you need NEXT.\nSimulates procedure outcomes\nbefore execution.\n\n~2-5M params | ~20MB | CPU", 5.2, 2.8, 3.4, 2.0, font_size=14, color=LIGHT)
+
+# SSM
+add_card(s, 9.2, 1.9, 3.8, 3.2)
+add_text(s, "SSM (Mamba)", 9.4, 2.05, 3.4, 0.4, font_size=20, bold=True, color=ORANGE)
+add_text(s, "Phase 4", 9.4, 2.4, 3.4, 0.3, font_size=13, color=GRAY)
+add_text(s, "Compresses temporal history\ninto fixed-size hidden state.\nConstant-time temporal queries.\n\n~1-3M params | ~10MB | CPU", 9.4, 2.8, 3.4, 2.0, font_size=14, color=LIGHT)
+
+# Bottom: total budget
+add_card(s, 0.8, 5.5, 11.7, 1.5)
+add_text(s, "Total model budget: ~8-13M params | ~40-60MB on disk | Trainable on CPU during idle",
+         1.1, 5.65, 11.2, 0.4, font_size=17, color=ACCENT, align=PP_ALIGN.CENTER)
+add_text(s, "For reference: all-MiniLM-L6-v2 is 22M params and runs fine on CPU. These are smaller.\nAll trained on YOUR local trajectory data. No cloud. No GPU. No LLM dependency.",
+         1.1, 6.1, 11.2, 0.8, font_size=14, color=GRAY, align=PP_ALIGN.CENTER)
+
+# ========== SLIDE 7: CLAUDE CODE INTEGRATION ==========
 s = prs.slides.add_slide(prs.slide_layouts[6])
 dark_bg(s)
 add_text(s, "Claude Code + TraceMind", 0.8, 0.4, 11, 0.8, font_size=36, bold=True, color=WHITE)
@@ -324,7 +379,7 @@ moats = [
     ("Merkle Audit Log", "Cryptographic hash chain.\nTamper-evident. Forensic-grade.", GREEN),
     ("RL Learning", "Memory-R1 + Graph-R1 trajectories.\nBandit \u2192 policy net \u2192 GRPO.", ORANGE),
     ("FSM Execution", "Deterministic state machine.\nBitwise reproducible decisions.", ACCENT),
-    ("Cross-Platform", "Tauri: one codebase.\nmacOS, Windows, Linux.", ACCENT2),
+    ("Palantir Ontology", "Same data model as Palantir AIP.\nEnterprise-ready from day one.", ACCENT2),
 ]
 
 for i, (title, desc, col) in enumerate(moats):

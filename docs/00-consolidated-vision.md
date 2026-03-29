@@ -60,7 +60,66 @@ TraceMind synthesizes five separate design documents into one coherent product:
 
 ---
 
-## 3. The Unified Architecture
+## 3. The Cognitive Pipeline
+
+TraceMind's memory is not a single store. It is a **five-layer cognitive pipeline** where each layer serves a distinct cognitive function, inspired by human memory systems and mapped to Google DeepMind's TITANS/MIRAS architecture.
+
+| Layer | Type | Technology | Cognitive Role | Human Analogy | TITANS/MIRAS Equivalent |
+|-------|------|-----------|---------------|---------------|------------------------|
+| 1 | **Semantic** | Vector Store (LanceDB) | Recall "anything similar" via embeddings | **Intuition**: I've heard something like this before | Sliding Window Attention |
+| 2 | **Structured** | Entity Graph (Kuzu/SQLite) | Connect facts via explicit typed relationships | **Knowledge**: I know X relates to Y because of Z | Long-Term Neural Memory (MLP) |
+| 3 | **Clustered** | HDBSCAN Index | Group entities into higher-level themes | **Concepts**: This relates to "Finance" or "Security" | — |
+| 4 | **Episodic** | Append-only Parquet | Record every interaction, decision, outcome | **Experience**: Last time I tried X, it worked/failed | — |
+| 5 | **Procedural** | Graph + Vector hybrid | Store "how to do X" as versioned step sequences | **Skill**: I know how to deploy a service | Action Policy Head (Kinetic Memory) |
+
+**How the pipeline flows:**
+1. **Semantic Memory** provides seed entities (intuition match)
+2. **Structured Memory** provides context around those seeds (relationship traversal)
+3. **Clustered Memory** ensures theme-level coverage even without direct graph edges
+4. **Episodic Memory** validates if the combination was useful, training the controller
+5. **Procedural Memory** recalls *how to act* on what is known — the verbs, not just the nouns
+
+### Procedural Memory: The Missing Piece
+
+Most AI memory systems store facts. TraceMind also stores **skills** — versioned, executable procedures linked to entities:
+
+```
+Procedure {
+    name: "deploy-to-staging"
+    version: 3
+    trigger: "user asks about deployment"
+    steps: [
+        { action: "run_tests", params: {...}, expected_outcome: "pass" },
+        { action: "build_docker", params: {...}, expected_outcome: "image_built" },
+        { action: "push_to_registry", params: {...}, expected_outcome: "pushed" }
+    ]
+    linked_entities: ["staging-server", "docker", "CI-pipeline"]
+    confidence: 0.87
+    status: Active | Reinforced | Degraded | Deprecated | Revised
+}
+```
+
+Procedures have a lifecycle: they're created, reinforced by positive outcomes, degraded by failures, deprecated when stale, and revised into new versions. This mirrors how human skills evolve — you don't delete a skill, you refine it.
+
+### Palantir Ontology Alignment
+
+TraceMind's data model directly mirrors the Palantir Foundry ontology — the same model powering Palantir AIP:
+
+| Palantir Concept | TraceMind Equivalent |
+|---|---|
+| **Objects** (Nouns) | Entity nodes in the Graph Store |
+| **Links** (Relationships) | Triplet edges with confidence/timestamp |
+| **Properties** | Node/edge metadata (confidence, version, source) |
+| **Actions / Verbs** | Procedure nodes with executable steps |
+| **Security Model** | Governance funnel (ACL + PII filter + audit) |
+| **Schema Enforcement** | Type validation in governance layer |
+| **Audit Trail** | ContextTrace + Merkle-chain log |
+
+This alignment is deliberate: it means TraceMind's data model is enterprise-ready from day one, even when the initial user is a consumer.
+
+---
+
+## 4. The Unified Architecture
 
 TraceMind collapses these five streams into a single layered architecture:
 
@@ -89,6 +148,7 @@ TraceMind collapses these five streams into a single layered architecture:
 |              STRUCTURED MEMORY LAYER (Embedded DBs)              |
 |  Entity Graph (Kuzu/SQLite) | Vector Store (LanceDB)             |
 |  Semantic Clusters (HDBSCAN) | Episodic Traces (Append-only)     |
+|  Procedural Memory (Graph + Vector hybrid)                       |
 +------------------------------------------------------------------+
             |
             v
@@ -101,8 +161,9 @@ TraceMind collapses these five streams into a single layered architecture:
             v
 +------------------------------------------------------------------+
 |              RETRIEVAL ENGINE                                    |
-|  Phase 1: Vector Search | Phase 2: Graph Traversal               |
-|  Phase 3: Cluster Expansion | Bounded recall budget              |
+|  Phase 1: Vector Search (→ JEPA latent search in Phase 3)        |
+|  Phase 2: Graph Traversal | Phase 3: Cluster Expansion           |
+|  Phase 4: Procedural Recall | Bounded recall budget              |
 +------------------------------------------------------------------+
             |
             v
@@ -125,13 +186,126 @@ TraceMind collapses these five streams into a single layered architecture:
 |              LEARNING LOOP (Background, Idle-time)               |
 |  Phase 1: UCB Bandit updates from feedback                       |
 |  Phase 2: Lightweight policy networks on trajectories            |
-|  Phase 3: RL-based memory CRUD (Memory-R1 style)                |
+|  Phase 3: JEPA encoder + World Model + Surprise ingestion        |
+|  Phase 4: SSM temporal compression + Memory-R1 CRUD agent        |
 +------------------------------------------------------------------+
 ```
 
 ---
 
-## 4. Core Design Principles
+## 5. Latent Intelligence Roadmap (JEPA / World Models / SSMs)
+
+The advanced roadmap moves TraceMind from symbolic memory toward **unified latent intelligence** — without becoming LLM-dependent. These are small, local models trained on YOUR trajectories.
+
+### 5.1 JEPA — Latent Retrieval (Phase 3)
+
+**Problem:** Vector cosine similarity matches surface text, not semantic intent. "How do I deploy?" and "What's our CI pipeline?" are semantically related but textually different.
+
+**Solution:** A JEPA encoder (~5M params, MLP) predicts what a *good answer embedding* looks like in latent space, then retrieves memories matching that prediction. Trained on stored trajectories where we know which retrievals led to good outcomes.
+
+**Where it fits:** Replaces the vector search phase of 3-phase retrieval. The bandit still selects depth/breadth, but vector phase uses JEPA-predicted targets instead of raw cosine.
+
+**Constraint fit:** ~5M params = ~20MB. Trainable on CPU in ~10 minutes over stored trajectories.
+
+### 5.2 World Models — Intent Prediction (Phase 3-4)
+
+**Problem:** TraceMind surfaces relevant memories reactively. A truly useful assistant predicts what you need BEFORE you ask.
+
+**Solution:** A world model (~2-5M params) trained on episodic traces (state, action, outcome) predicts: "Given your current context, you're probably about to need X." Also enables: "If you take action A, the likely outcome is B" — pre-execution simulation for procedures.
+
+**Where it fits:** Powers the Reasoning & Intent Layer. Trained on the same trajectory data as JEPA. Also gates ProcedureExecutor: simulate before executing.
+
+**Constraint fit:** ~2-5M params = ~10-20MB. Inference is a single forward pass.
+
+### 5.3 SSMs (Mamba) — Temporal Compression (Phase 4)
+
+**Problem:** Episodic traces grow linearly forever. After a year, scanning them is O(N) and RAM-prohibitive.
+
+**Solution:** State Space Models compress temporal history into a **fixed-size hidden state**. Constant-time temporal queries regardless of history length. The hidden state implicitly learns what's worth remembering.
+
+**Where it fits:** Replaces linear episodic store scans. Could eventually replace the UCB bandit with a learned temporal policy. Full trace log remains for audit/replay.
+
+**Constraint fit:** Mamba inference is fast on CPU. Training needs careful batching during idle time.
+
+### 5.4 Surprise-Based Ingestion
+
+**Problem:** The current store/defer gate uses confidence thresholds (conf >= 0.4). This stores HIGH-CONFIDENCE facts, but for a consumer product you want to store NOVEL facts — things that are surprising.
+
+**Solution:** Borrow TITANS' "surprise metric": measure how much a new fact deviates from the world model's prediction. High surprise = worth remembering. Low surprise = redundant, skip.
+
+**Where it fits:** Replaces the static confidence threshold in the governance funnel once the world model exists. Until then, the confidence gate remains as fallback (Principle P6: Graceful Degradation).
+
+### 5.5 The Unified Vision
+
+```
+    Query
+      |
+      v
+  [JEPA Encoder] --- predicts latent target
+      |
+      v
+  [Retriever] --- searches in latent space (not raw cosine)
+      |
+      v
+  [World Model] --- simulates outcome before acting
+      |         \
+      v          v
+  [Execute]   [Re-plan / Ask human]
+      |
+      v
+  [ContextTrace] --- records full trajectory
+      |
+      v
+  [SSM Temporal Memory] --- compresses episode into fixed state
+      |         \
+      v          v
+  [Update JEPA]  [Update World Model]
+```
+
+### 5.6 Why This Isn't LLM-Dependent
+
+| Component | Params | Training Data | Runs On |
+|-----------|--------|--------------|---------|
+| JEPA encoder | ~5M | Your trajectories | CPU, ~10min training |
+| World model | ~2-5M | Your episodic traces | CPU, ~15min training |
+| SSM (Mamba) | ~1-3M | Your temporal sequences | CPU, idle-time training |
+| **Total** | **~8-13M** | **All local, all yours** | **No GPU needed** |
+
+For reference, `all-MiniLM-L6-v2` is 22M params and runs fine on CPU. These models are smaller.
+
+### 5.7 Training Data Strategy: Why Phase 1-2 Matter
+
+JEPA, world models, and SSMs all need the same training data:
+
+```
+Trajectory = {
+    state: (context_embedding, memory_snapshot_hash, user_activity_type),
+    action: (retrieval_arm, memory_ids_retrieved, store_decisions),
+    outcome: (user_feedback, task_success, correction_applied),
+    predicted_outcome: (world_model_prediction — null until Phase 3),
+    timestamp: ...,
+    session_id: ...
+}
+```
+
+**Phase 1-2 store these trajectories from day one.** By the time Phase 3 arrives, you have thousands of trajectories to train on — locally, on the user's own data. This is the critical design-now-build-later decision.
+
+### 5.8 TITANS/MIRAS Gap Analysis
+
+| TITANS Concept | TraceMind Status | Gap |
+|---|---|---|
+| Short-Term Memory (Sliding Window) | Phase 1 — context window in reasoning layer | None |
+| Long-Term Memory (Neural MLP) | Phase 3 — JEPA encoder | Symbolic until Phase 3 |
+| Kinetic Memory (Action Policy) | Phase 1 — Procedural Memory | Done (versioned procedures) |
+| Memory Algorithm (Online Gradient) | Phase 3 — JEPA + WM training | Symbolic until Phase 3 |
+| Surprise Metric (Loss Gradient) | Phase 3 — Surprise-based ingestion | Confidence gate until Phase 3 |
+| Retention Gate (Regularizer) | Phase 1 — TTL decay + confidence gate | Done |
+
+**The key gap:** differentiable memory update. Phases 1-2 are fully symbolic. Phase 3 introduces learned components (JEPA, WM) that update based on gradients — but only on the CONTROL plane (how memory is used), never on the DATA plane (what memory contains). This preserves Tenet #2.
+
+---
+
+## 6. Core Design Principles
 
 These are non-negotiable across all layers:
 
@@ -253,28 +427,36 @@ Claude Code, powered by TraceMind, doesn't ask "what framework are you using?" f
 ## 9. Phased Roadmap
 
 ### Phase 1: Foundation (Weeks 1-4) — "It remembers"
-- Rust core: memory engine (graph + vector + trace store)
-- Canonicalization pipeline (entity extraction, triple generation)
-- Governance funnel (PII filter, schema validation, user rules)
-- UCB bandit retrieval controller
-- Tauri desktop app with memory graph visualization
+- Rust core: 5-layer memory engine (semantic + structured + clustered + episodic + procedural)
+- Canonicalization pipeline (entity extraction, triple generation, procedure detection)
+- Governance funnel (PII filter, schema validation, user rules, confidence gate)
+- UCB bandit retrieval controller with 4-phase recall (vector + graph + cluster + procedural)
+- Tauri desktop app with Cognitive Pipeline visualization
 - Chrome extension for passive capture
-- Claude Code MCP server for memory queries
+- Claude Code MCP server + hooks
+- **Trajectory storage from day one** (designed for JEPA/WM/SSM training in Phase 3)
 
 ### Phase 2: Learning (Weeks 5-8) — "It gets smarter"
-- Trajectory storage for all interactions
 - Feedback loop: user ratings → bandit policy updates
+- Procedure lifecycle: Active → Reinforced → Degraded → Deprecated → Revised
 - Lightweight policy network trained on stored trajectories (idle-time)
 - Context continuation engine ("what you probably need next")
-- Claude Code hook for passive session recording
+- Procedure versioning and confidence decay
 
-### Phase 3: RL Reasoning (Weeks 9-14) — "It reasons"
-- Memory-R1: RL-based memory CRUD decisions
-- Graph-R1: Multi-turn reasoning over the knowledge graph
-- Offline GRPO optimization over trace batches
-- Cross-session pattern detection
+### Phase 3: Latent Intelligence (Weeks 9-14) — "It understands"
+- **JEPA encoder** (~5M params): replaces vector cosine with latent prediction retrieval
+- **World Model** (~2-5M params): intent prediction ("you probably need X next")
+- **Surprise-based ingestion**: replaces static confidence gate with novelty detection
+- Offline GRPO optimization over trajectory batches
+- Cross-session pattern detection via learned latent space
 
-### Phase 4: Enterprise (Weeks 15+) — "It scales"
+### Phase 4: Temporal Intelligence (Weeks 15-20) — "It compresses"
+- **SSM temporal memory** (Mamba): constant-time temporal queries over full history
+- **Memory-R1**: RL-based memory CRUD agent (ADD/UPDATE/DELETE/NOOP)
+- **Graph-R1**: Multi-turn RL reasoning over knowledge graph
+- SSM potentially replaces UCB bandit with learned temporal policy
+
+### Phase 5: Enterprise (Weeks 21+) — "It scales"
 - Docker packaging for team/enterprise deployment
 - Multi-user isolation with shared knowledge graphs
 - SOC2/GDPR compliance toolkit

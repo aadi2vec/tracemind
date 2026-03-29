@@ -88,6 +88,20 @@ A local-only system that builds structured understanding (entity graphs, semanti
 
 TraceMind makes your digital life cumulative. Every article you read, every decision you make, every AI conversation you have builds a structured, private, auditable knowledge system that makes you and your AI tools measurably smarter over time.
 
+### Cognitive Pipeline: 5-Layer Memory Taxonomy
+
+TraceMind organizes memory into five cognitive layers, each serving a distinct role analogous to human memory systems:
+
+| Layer | Type | Cognitive Role | Human Analogy |
+|---|---|---|---|
+| 1 | Semantic | Recall "anything similar" | Intuition |
+| 2 | Structured | Connect facts via relationships | Knowledge |
+| 3 | Clustered | Group into themes | Concepts |
+| 4 | Episodic | Record interactions & outcomes | Experience |
+| 5 | Procedural | Store "how to do X" | Skills |
+
+The retrieval engine traverses these layers in order: semantic similarity finds candidates, structured relationships expand context, clustering groups related concepts, episodic traces add temporal and causal context, and procedural memory surfaces relevant how-to knowledge. Each layer enriches the result set before final ranking and delivery.
+
 ### Design Principles (Non-Negotiable)
 
 | # | Principle | Implication |
@@ -120,6 +134,8 @@ The MVP is scoped to deliver the first two "wow moments" -- "It remembered" and 
 | F10 | UCB bandit retrieval controller (learns which retrieval strategies work) | P1 | Raj, Priya | "It gets smarter" |
 | F11 | Feedback loop (user ratings flow into bandit policy updates) | P1 | All | "It learns from me" |
 | F12 | Chrome extension for passive URL/selection/search capture | P0 | Maya | "It watches what I browse" |
+| F13 | Procedural memory (how-to skills) | P1 | All | "It remembers how to do things" |
+| F14 | Surprise-based ingestion (Phase 3 -- depends on World Model) | P2 | All | "It only stores what's novel" |
 
 ---
 
@@ -351,6 +367,41 @@ The MVP is scoped to deliver the first two "wow moments" -- "It remembered" and 
 
 ---
 
+### F13: Procedural Memory (How-To Skills)
+
+**Description:** TraceMind doesn't just remember facts -- it remembers HOW TO DO things. Procedures are versioned, executable step sequences linked to entities. Users can create, recall, revise, and execute procedures through natural language.
+
+**Acceptance Criteria:**
+
+- [ ] AC13.1: Users can create procedures via natural language ("Remember: to deploy, first run tests, then build docker, then push").
+- [ ] AC13.2: Procedures are stored as versioned graph nodes linked to relevant entities via `HAS_PROCEDURE` edges.
+- [ ] AC13.3: Procedures have lifecycle states: Active, Reinforced, Degraded, Deprecated, Revised.
+- [ ] AC13.4: Positive feedback reinforces procedure confidence; negative feedback degrades it.
+- [ ] AC13.5: Degraded procedures (confidence < 0.1) are auto-deprecated.
+- [ ] AC13.6: Users can revise a procedure, creating version N+1 while preserving full version history.
+- [ ] AC13.7: Procedural recall: when entities with `HAS_PROCEDURE` edges are retrieved, matching procedures are included in context automatically.
+- [ ] AC13.8: Procedures can be executed in dry-run mode (show steps) or live mode (with user confirmation per step).
+
+---
+
+### F14: Surprise-Based Ingestion (Phase 3)
+
+**Description:** Instead of storing everything above a confidence threshold, TraceMind prioritizes NOVEL information. The World Model predicts what it expects to see; high-deviation inputs are "surprising" and prioritized for storage. This depends on the World Model introduced in Phase 3.
+
+**Priority:** P2 (Phase 3 -- depends on World Model)
+
+**Acceptance Criteria:**
+
+- [ ] AC14.1: World model predicts expected outcome for each incoming fact.
+- [ ] AC14.2: Surprise score = ||predicted_embedding - actual_embedding||.
+- [ ] AC14.3: Facts with surprise > threshold are stored (novel information).
+- [ ] AC14.4: Facts with surprise < threshold are deferred (redundant).
+- [ ] AC14.5: Dashboard shows "most surprising things I learned today" widget.
+- [ ] AC14.6: Static confidence gate remains as fallback when World Model is unavailable.
+- [ ] AC14.7: Surprise threshold is tunable by user in Settings.
+
+---
+
 ## 7. Non-Functional Requirements
 
 ### 7.1 Performance
@@ -506,6 +557,39 @@ The MVP is scoped to deliver the first two "wow moments" -- "It remembered" and 
 
 ---
 
+### Journey 4: Learning a Procedure
+
+**Trigger:** Raj sets up a new project and wants TraceMind to remember the setup process.
+
+**Day 1 (Monday):**
+1. Raj tells TraceMind (via Claude Code MCP): "Remember: to set up this project, clone the repo, install deps with npm install, copy .env.example to .env, run database migrations, then start the dev server."
+2. TraceMind creates a Procedural Memory node (v1) with 5 ordered steps, linked to the project entity via a `HAS_PROCEDURE` edge.
+3. The procedure is stored with lifecycle state: Active, confidence: 0.8.
+
+**Day 3 (Wednesday):**
+4. A new team member asks Raj how to set up the project. Raj asks Claude Code: "How do I set up the project?"
+5. Claude Code queries TraceMind. The project entity is retrieved, and the `HAS_PROCEDURE` edge triggers procedural recall.
+6. TraceMind returns the full procedure with all 5 steps in order, including the source ("Raj, Monday") and confidence score.
+7. Raj confirms the steps are correct (positive feedback). Procedure confidence increases; lifecycle state becomes Reinforced.
+
+**Day 10 (Next Wednesday):**
+8. The team switches to Docker. Raj tells TraceMind: "Actually, to set up this project now, just run docker-compose up."
+9. TraceMind creates a revised procedure (v2) with the single Docker step. v1 is marked as Revised (not deleted -- preserved for audit).
+10. v2 is now the active procedure. v1 remains accessible in version history.
+
+**Day 30:**
+11. v2 has been reinforced 5 times by positive feedback from Raj and MCP queries. Confidence is 0.95.
+12. v1 has not been used in 20 days. Confidence has decayed below 0.1. TraceMind auto-deprecates v1.
+13. Querying "how to set up the project" returns v2. Viewing procedure history shows both versions with full provenance.
+
+**Verification Points:**
+- At step 2, procedure is stored as a versioned graph node with ordered steps.
+- At step 6, procedural recall is triggered automatically when the linked entity is retrieved.
+- At step 9, revision creates v2 while preserving v1 with full history.
+- At step 12, confidence decay and auto-deprecation work as specified in F13.
+
+---
+
 ## 9. Success Metrics
 
 ### North Star Metric
@@ -597,37 +681,56 @@ The MVP is scoped to deliver the first two "wow moments" -- "It remembered" and 
 - Trace replay works for any past retrieval event.
 - RAM stays within budget after 30 days of accumulated data.
 
-### Phase 3: RL Reasoning (Weeks 9-14) -- "It Reasons"
+### Phase 3: World Model & Advanced Encoding (Weeks 9-14) -- "It Understands"
 
-**Goal:** Move from bandit-based learning to full RL-based memory management.
+**Goal:** Replace heuristic similarity with learned representations. Introduce the World Model for intent prediction and surprise-based ingestion.
 
 | Deliverable | Owner | Week |
 |---|---|---|
-| Memory-R1: RL-based memory CRUD decisions (store/update/forget/defer) | ML | 9-11 |
-| Trajectory export for offline training | ML | 10 |
-| Lightweight policy network (CPU-trainable on stored trajectories) | ML | 11-12 |
-| Graph-R1: Multi-turn reasoning over the knowledge graph | ML | 12-14 |
+| JEPA encoder replacing vector cosine similarity for retrieval matching | ML | 9-11 |
+| World Model powering intent predictions and surprise-based ingestion (F14) | ML | 10-12 |
+| Surprise-based ingestion gate (novel vs. redundant fact filtering) | ML/Backend | 11-12 |
+| Trajectory-based training during idle time (background model updates) | ML | 12-13 |
 | Cross-session pattern detection (proactive surfacing) | Backend | 13-14 |
 | Plugin architecture for custom retrieval policies | Backend | 14 |
 
 **Exit Criteria:**
-- RL-trained policy outperforms UCB bandit by > 10% on retrieval helpfulness.
-- Policy training completes in < 10 minutes on CPU with 30 days of trajectory data.
+- JEPA encoder outperforms cosine similarity by > 15% on retrieval relevance benchmarks.
+- World Model surprise gate reduces redundant storage by > 30% while preserving recall.
+- Trajectory training completes in < 10 minutes on CPU with 30 days of data.
 - Cross-session patterns are surfaced proactively with > 70% relevance rate.
 
-### Phase 4: Enterprise (Weeks 15-20) -- "It Scales"
+### Phase 4: RL Reasoning & Temporal Compression (Weeks 15-20) -- "It Reasons"
+
+**Goal:** Full RL-based memory management and advanced temporal modeling.
+
+| Deliverable | Owner | Week |
+|---|---|---|
+| SSM (State Space Model) temporal compression of episodic sequences | ML | 15-16 |
+| Memory-R1: RL-based memory CRUD decisions (store/update/forget/defer) | ML | 16-18 |
+| Trajectory export for offline RL training | ML | 17 |
+| Lightweight policy network (CPU-trainable on stored trajectories) | ML | 18-19 |
+| Graph-R1: Multi-turn reasoning over the knowledge graph | ML | 19-20 |
+
+**Exit Criteria:**
+- SSM compression reduces episodic storage by > 40% while preserving temporal relationships.
+- Memory-R1 policy outperforms UCB bandit by > 10% on retrieval helpfulness.
+- Graph-R1 supports multi-hop reasoning queries with < 1s latency.
+- Policy training completes in < 10 minutes on CPU with 30 days of trajectory data.
+
+### Phase 5: Enterprise (Weeks 21-26) -- "It Scales"
 
 **Goal:** Multi-user deployment for teams with compliance requirements.
 
 | Deliverable | Owner | Week |
 |---|---|---|
-| Docker container packaging (single-command deploy) | DevOps | 15 |
-| Multi-user isolation (separate memory graphs, shared knowledge optional) | Backend | 15-17 |
-| REST API with authentication (for programmatic access) | Backend | 16-17 |
-| Policy-as-Code engine (enterprise governance rules) | Backend | 17-18 |
-| Merkle-chain audit log with cryptographic verification | Backend | 18-19 |
-| SOC2/GDPR compliance documentation and controls | Legal/Eng | 19-20 |
-| Admin dashboard (user management, policy deployment, audit review) | Frontend | 19-20 |
+| Docker container packaging (single-command deploy) | DevOps | 21 |
+| Multi-user isolation (separate memory graphs, shared knowledge optional) | Backend | 21-23 |
+| REST API with authentication (for programmatic access) | Backend | 22-23 |
+| Policy-as-Code engine (enterprise governance rules) | Backend | 23-24 |
+| Merkle-chain audit log with cryptographic verification | Backend | 24-25 |
+| SOC2/GDPR compliance documentation and controls | Legal/Eng | 25-26 |
+| Admin dashboard (user management, policy deployment, audit review) | Frontend | 25-26 |
 
 **Exit Criteria:**
 - 5-person team can use TraceMind concurrently with isolated memory and shared knowledge graph.
@@ -642,19 +745,19 @@ The following are explicitly NOT included in the MVP or Phase 1-2 releases:
 
 | Item | Rationale | Planned Phase |
 |---|---|---|
-| **Screen recording / OCR** | Privacy risk; text-based capture is sufficient for MVP | Phase 5+ (if ever) |
-| **Audio/voice capture** | Requires microphone permissions; too invasive for trust-building phase | Phase 5+ |
+| **Screen recording / OCR** | Privacy risk; text-based capture is sufficient for MVP | Phase 6+ (if ever) |
+| **Audio/voice capture** | Requires microphone permissions; too invasive for trust-building phase | Phase 6+ |
 | **Image understanding** | Multimodal canonicalization is complex; text-first | Phase 3+ |
-| **Mobile app** | Desktop-first; mobile adds platform complexity | Phase 5+ |
-| **Cloud sync / multi-device** | Violates local-only principle. May explore encrypted sync later. | Never (or encrypted P2P in Phase 6+) |
+| **Mobile app** | Desktop-first; mobile adds platform complexity | Phase 6+ |
+| **Cloud sync / multi-device** | Violates local-only principle. May explore encrypted sync later. | Never (or encrypted P2P in Phase 7+) |
 | **Firefox / Safari extensions** | Chrome-first to reduce surface area | Phase 3 |
-| **Automatic PII anonymization for sharing** | Complex; v1 supports manual redaction only | Phase 4 |
+| **Automatic PII anonymization for sharing** | Complex; v1 supports manual redaction only | Phase 5 |
 | **Natural language governance rules** | v1 uses simple DSL; NL parsing adds complexity and ambiguity | Phase 3 |
 | **Custom embedding models** | Ship with one model; allow model swapping in Phase 3 | Phase 3 |
-| **Collaborative memory (team knowledge graphs)** | Requires multi-user architecture | Phase 4 |
-| **GPU acceleration** | CPU-only in v1. GPU optional for RL training in Phase 3. | Phase 3 |
-| **Undo/redo for memory edits** | v1 memory edits are final (but traced). Undo requires CRDT-like complexity. | Phase 4 |
-| **Plugin/extension marketplace** | Plugin architecture in Phase 3; marketplace is a distribution problem | Phase 5+ |
+| **Collaborative memory (team knowledge graphs)** | Requires multi-user architecture | Phase 5 |
+| **GPU acceleration** | CPU-only in v1. GPU optional for RL training in Phase 4. | Phase 4 |
+| **Undo/redo for memory edits** | v1 memory edits are final (but traced). Undo requires CRDT-like complexity. | Phase 5 |
+| **Plugin/extension marketplace** | Plugin architecture in Phase 3; marketplace is a distribution problem | Phase 6+ |
 
 ---
 
