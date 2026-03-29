@@ -27,6 +27,7 @@ serde_json = "1"
 
 # Async
 tokio = { version = "1", features = ["full"] }
+futures = "0.3"
 
 # Error handling
 anyhow = "1"
@@ -44,6 +45,13 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Database
 rusqlite = { version = "0.31", features = ["bundled"] }
+kuzu = "0.11"
+
+# Vector / Embeddings
+lancedb = "0.27"
+fastembed = "5"
+arrow-array = "57"
+arrow-schema = "57"
 
 # Hashing
 seahash = "4"

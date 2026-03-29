@@ -8,7 +8,12 @@ tm-types = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 uuid = { workspace = true }
-rusqlite = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 seahash = { workspace = true }
+tokio = { workspace = true }
+fastembed = { workspace = true }
+lancedb = { workspace = true }
+arrow-array = { workspace = true }
+arrow-schema = { workspace = true }
+futures = { workspace = true }
