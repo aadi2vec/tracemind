@@ -87,6 +87,10 @@ fn main() {
             let session_id = Uuid::new_v4();
             let result = pipeline.ingest(&text, session_id)
                 .expect("ingest failed");
+            // Persist the trace.
+            let trace_store = TraceStore::open(&trace_path)
+                .expect("failed to open trace store");
+            trace_store.append(&result.trace).expect("failed to write trace");
             println!(
                 "Stored {} entities, {} triples.",
                 result.entities.len(),
@@ -98,14 +102,37 @@ fn main() {
             let mut engine = RetrievalEngine::open(&db_path, &trace_path)
                 .expect("failed to open retrieval engine");
             let result = engine.query(&text).expect("query failed");
+
+            // Build a name lookup from the returned entities.
+            let name_of: std::collections::HashMap<uuid::Uuid, String> = result
+                .entities
+                .iter()
+                .map(|e| (e.id, e.name.clone()))
+                .collect();
+
             for entity in &result.entities {
                 println!("  [{}] {}", entity.entity_type, entity.name);
             }
             for triple in &result.triples {
-                println!(
-                    "  {} -> {} -> {}",
-                    triple.subject_id, triple.predicate, triple.object_id
-                );
+                // Only print if both endpoints are in the result set.
+                if let (Some(subj), Some(obj)) = (
+                    name_of.get(&triple.subject_id),
+                    name_of.get(&triple.object_id),
+                ) {
+                    println!("  {} -> {} -> {}", subj, triple.predicate, obj);
+                }
+            }
+
+            // Persist bandit stats so `status` reflects real usage.
+            let stats = engine.bandit_stats();
+            let total_pulls: u64 = stats.iter().map(|(c, _)| c).sum();
+            let state = BanditState {
+                counts: [stats[0].0, stats[1].0, stats[2].0, stats[3].0],
+                rewards: [stats[0].1, stats[1].1, stats[2].1, stats[3].1],
+                total_pulls,
+            };
+            if let Ok(json) = serde_json::to_string_pretty(&state) {
+                let _ = fs::write(&bandit_path, json);
             }
         }
 

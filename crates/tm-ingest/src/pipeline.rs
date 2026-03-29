@@ -15,7 +15,7 @@ pub struct IngestPipeline {
 
 #[derive(Debug)]
 pub struct IngestResult {
-    pub trace_id: Uuid,
+    pub trace: Trace,
     pub entities: Vec<Entity>,
     pub triples: Vec<Triple>,
     pub content_hash: String,
@@ -79,7 +79,7 @@ impl IngestPipeline {
         trace.triples_extracted = triples.iter().map(|t| t.id).collect();
 
         Ok(IngestResult {
-            trace_id: trace.id,
+            trace,
             entities,
             triples,
             content_hash,
