@@ -1,600 +1,289 @@
-# AgentMem v2 — Self-Improving Agent Memory & Decision System
+# TraceMind
 
-*Design Document | Version 2.0 | February 2026*
+**Local-only memory OS for humans and AI agents.**
 
----
-
-## 1. Introduction
-
-Modern AI agents fail under scale not because their reasoning is wrong, but because their memory is wrong. When memory is an unstructured vector blob, there is no causal chain between what was retrieved and what was decided. When there is no causal chain, there is no learning. When there is no learning, every decision is made cold — regardless of how many prior decisions were made correctly or incorrectly on the same subject.
-
-This document describes **AgentMem v2**: a hybrid, self-improving agent memory system that separates memory *representation* (deterministic, structured) from memory *control* (learned, policy-driven). The system combines an entity-centric knowledge graph, soft semantic clustering, and a lightweight reinforcement-style controller — the **AgentMem Controller** — that decides at runtime how much to retrieve, what to store, and what to forget.
-
-The design is production-extendable and weekend-feasible. All components are independently replaceable.
+TraceMind gives every context window a persistent, structured, privacy-first memory — running entirely on your machine. No cloud, no RAM bloat, no telemetry.
 
 ---
 
-## 2. Tenets
+## What it does
 
-*In priority order. When they conflict, higher-order tenets win.*
+When you (or a Claude Code session) ingest text, TraceMind:
 
-1. **Auditability above convenience.** Every decision must be reproducible from its trace. A system that cannot explain itself cannot be trusted.
-2. **Structure controls learning; learning controls memory.** The knowledge graph is never mutated by gradient descent. Only heuristics and human feedback write to it.
-3. **Graceful degradation.** Every advanced subsystem (clustering, bandit) must have a working fallback so the system runs correctly from day one, without any trained components.
-4. **Human corrections are first-class memory.** A human correction is not a log entry — it is a new fact that immediately updates the graph and closes the reward loop.
+1. **Filters** it through a PII/governance gate (email, phone, SSN, credit card — stdlib regex, no external deps)
+2. **Extracts** entities (Person, Org, File, URL, Concept…) and typed relationships via heuristic NER
+3. **Embeds** entity names into a 384-dim vector space
+4. **Stores** entities + triples in a SQLite entity graph and vectors in a SQLite vector store
+5. **Logs** a provenance trace to an append-only JSONL file
 
----
+When you query:
 
-## 3. Problem Statement
-
-### 3.1 What Fails Today
-
-| Failure Mode | Root Cause | Consequence |
-|---|---|---|
-| Stale facts influence decisions | No confidence decay or TTL | Agent acts on outdated knowledge |
-| Retrieval noise poisons context | Fixed-depth traversal, no policy | Irrelevant facts crowd out relevant ones |
-| No learning from outcomes | Trace logs exist but are never read | Same mistakes repeated indefinitely |
-| Human corrections are ignored | Correction is logged, not ingested | Memory permanently wrong |
-
-### 3.2 What Success Looks Like
-
-- A query on a topic with rich history retrieves *more* relevant context than a query on a novel topic — automatically, without manual tuning.
-- After 50 decisions, the system's retrieval policy has measurably converged toward configurations that produced better outcomes.
-- A human who types a correction sees that correction reflected in graph memory within seconds, not the next training cycle.
-- Every decision can be replayed from its context trace, including which memory IDs were retrieved and in what order.
+1. A **UCB1 bandit** picks one of 4 retrieval strategies (narrow / medium / wide / deep)
+2. **Phase 1** — vector search for seed entities
+3. **Phase 2** — k-hop graph traversal from seeds
+4. **Phase 3** — episodic trace scan (if arm = deep)
+5. The bandit learns from the result and adjusts future arm selection
 
 ---
 
-## 4. Architecture
+## Workspace layout
 
-### 4.1 High-Level Data Flow (DFD Level 1)
-
-```mermaid
-graph TD
-    subgraph Input ["Input Layer"]
-        U["User Query"] --> I["Ingestor\n(src.processing.ingest)"]
-    end
-
-    subgraph Controller ["Control Layer (Policy)"]
-        I -->|"Facts"| HC["AgentMemController\n(should_store?)"]
-        P["Bandit Policy\n(UCB)"] -->|"retrieval_params\n(depth, breadth)"| R
-    end
-
-    subgraph Storage ["Storage Layer"]
-        HC -->|"STORE"| GS["Graph Store\n(Neo4j)"]
-        HC -->|"DEFER"| SINK["Discard"]
-        GS --- CS["Cluster Store\n(SQLite + HDBSCAN)"]
-        I -->|"Vectors"| VS["Vector Store\n(ChromaDB)"]
-        I -->|"Kinetic / HowTo"| PROC["Procedural Memory\n(:Procedure nodes)"]
-        PROC -->|"HAS_PROCEDURE"| GS
-        PROC -->|"description vector"| VS
-    end
-
-    subgraph Governance ["Governance Layer"]
-        GOV["GovernancePolicy\n(ACL + AuditLog)"] -->|"can_access?"| R
-        GOV -->|"can_execute?"| EXEC
-        GOV -->|"validate_type"| I
-    end
-
-    subgraph Retrieval ["Recall Layer"]
-        R["Retriever\n(src.processing.retrieval)"] --> VS
-        R --> GS
-        R --> CS
-        R -->|"procedural_context"| PROC
-    end
-
-    subgraph Execution ["Execution Layer"]
-        R --> MS["Memory Specialist"]
-        MS --> AG["AutoGen GroupChat"]
-        AG --> D["Decision + Trace"]
-        PROC -->|"execute"| EXEC["ProcedureExecutor\n(dry_run / live)"]
-        EXEC -->|"ExecutionResult"| D
-    end
-
-    subgraph Feedback ["Closing the Loop"]
-        D --> ES["Episodic Store\n(JSONL)"]
-        ES -->|"reward_signal"| P
-        ES -->|"procedure_reward"| HC
-        GS -->|"TTL expiry"| FORGET["Forgetting Logic"]
-        HC -->|"deprecate / revise"| PROC
-    end
-
-    subgraph Passive ["MacOS Interaction Monitor"]
-        M1["Window Observer"] --> I
-        M2["Clipboard Monitor"] --> I
-    end
 ```
-
-### 4.2 Application UML Diagram (Simplified)
-
-```mermaid
-classDiagram
-    class AutoGenWorkflow {
-        +Retriever retriever
-        +AgentMemController controller
-        +EpisodicStore episodic_store
-        +run(query) Dict
-    }
-    class AgentMemController {
-        +List[BanditArm] arms
-        +should_store(confidence) bool
-        +get_retrieval_params() Dict
-        +register_reward(reward, arm_name)
-    }
-    class Retriever {
-        +GraphStore graph_store
-        +VectorStore vector_store
-        +ClusterStore cluster_store
-        +retrieve(query) Dict
-    }
-    class ClusterStore {
-        +SQLiteClusterPersistence persistence
-        +fit() int
-        +expand_query(embedding) List
-    }
-    class GraphStore {
-        +add_triplet(triplet)
-        +search_nodes(query)
-    }
-    class EpisodicStore {
-        +log_trace(trace)
-        +update_outcome(trace_id, reward)
-    }
-
-    AutoGenWorkflow --> Retriever
-    AutoGenWorkflow --> AgentMemController
-    AutoGenWorkflow --> EpisodicStore
-    Retriever --> GraphStore
-    Retriever --> ClusterStore
-    ClusterStore --> SQLiteClusterPersistence
-```
-
-### 4.3 Memory Subsystem Detail
-
-```mermaid
-flowchart LR
-    subgraph Graph ["Entity Graph (Neo4j)"]
-        E1["Entity Node\nname: Tesla\ntype: Company\nconfidence: 0.82\nupdated: 2026-02-22"]
-        E2["Entity Node\nname: Earnings"]
-        E3["Entity Node\nname: Rally"]
-        E1 -->|"catalyst\nts: 2026-02-22\nconf: 0.9"| E2
-        E1 -->|"expected_movement\nts: 2026-02-22\nconf: 0.42"| E3
-    end
-
-    subgraph Vector ["Vector Store (ChromaDB)"]
-        V1["Chunk ID: abc123\n'Tesla stock will rally...\nembedding: [...]"]
-    end
-
-    subgraph Cluster ["Cluster Index (HDBSCAN)"]
-        C0["Cluster 0\n[Tesla, AMZN, AAPL]\n(Tech-Growth)"]
-        C1["Cluster 1\n[Earnings, Revenue, Q4]\n(Financial Events)"]
-        CN["Noise\n(outlier entities)"]
-    end
-
-    E1 -.->|"embedding"| C0
-    E2 -.->|"embedding"| C1
-    V1 -.->|"source_id link"| E1
-```
-
-### 4.4 Memory State Relationships (The Cognitive Pipeline)
-
-Memory in AgentMem is a multi-layered system where each state serves a specific cognitive function. We call this the **Cognitive Pipeline**.
-
-| State | Technology | Role | Analogy |
-|---|---|---|---|
-| **Semantic** | ChromaDB (Vector) | Recalls "anything similar" using text embeddings. | **Intuition**: I've heard something like this before. |
-| **Structured** | Neo4j (Graph) | Connects facts via explicit relationships (Triplets). | **Knowledge**: I know X is related to Y because of Z. |
-| **Clustered** | HDBSCAN (SQLite) | Groups entities into higher-level themes. | **Concepts**: This relates to "Finance" or "Tech". |
-| **Episodic** | JSONL (Log) | Records every interaction, decision, and outcome. | **Experience**: Last time I retrieved the graph, it worked well. |
-| **Procedural** | Neo4j + ChromaDB | Stores "how-to" sequences (Verbs) linked to entities. | **Skill**: I know how to restart a server. |
-
-#### The Cognitive Pipeline Flow
-```mermaid
-graph TD
-    subgraph Ingestion ["1. Ingestion (Creation)"]
-        Raw["Raw Activity / Text"] --> VS["Semantic Chunk\n(Vector Store)"]
-        Raw --> GS["Entities & Triplets\n(Graph Store)"]
-        GS -.-> CS["Cluster Membership\n(Cluster Store)"]
-        HowTo["How-To / Procedure"] --> PVEC["Procedure Description\n(Vector Store)"]
-        HowTo --> PGRAPH["Procedure+Steps\n(Graph Store :Procedure)"]
-    end
-
-    subgraph Retrieval ["2. Retrieval (Recall)"]
-        Q["User Query"] --> VS_S["Vector Search"]
-        VS_S -->|"Initial Anchors"| GS_T["Graph Traversal"]
-        GS_T -->|"Broaden"| CS_E["Cluster Expansion"]
-        GS_T -->|"Kinetic Recall"| PR["Procedural Recall\n(HAS_PROCEDURE)"]
-    end
-
-    subgraph Learning ["3. Learning (Feedback)"]
-        Outcome["Decision Outcome"] --> ES["Episodic Trace\n(JSONL)"]
-        ES -->|"Reinforce"| CTRL["Controller Policy"]
-        ES -->|"Refine"| GS_D["Graph Confidence Decay"]
-    end
-
-    Ingestion --> Retrieval
-    Retrieval --> Learning
-    Learning --> Ingestion
-```
-
-**Memory Stage Responsibilities:**
-1.  **Semantic Memory** provides the "seed" entities.
-2.  **Structured Memory** provides context (relationships/triplets) around those seeds.
-3.  **Clustered Memory** ensures theme-level coverage even without direct graph edges.
-4.  **Episodic Memory** validates if the combination was useful, training the controller.
-5.  **Procedural Memory** recalls *how to act* on what is known — the "Verbs" of the ontology.
-
-### 4.5 AgentMem Controller State Machine
-
-```mermaid
-stateDiagram-v2
-    [*] --> Idle
-
-    Idle --> Evaluating : Query arrives
-
-    Evaluating --> Retrieve : always
-    Retrieve --> BanditSelect : UCB arm selection
-    BanditSelect --> NarrowRetrieve : Arm narrow depth 1
-    BanditSelect --> MediumRetrieve : Arm medium depth 1
-    BanditSelect --> WideRetrieve   : Arm wide depth 2
-    BanditSelect --> DeepRetrieve   : Arm deep depth 3
-
-    NarrowRetrieve --> Decide
-    MediumRetrieve --> Decide
-    WideRetrieve   --> Decide
-    DeepRetrieve   --> Decide
-
-    Decide --> StoreCheck : New facts extracted
-    StoreCheck --> Store  : confidence ≥ 0.4
-    StoreCheck --> Defer  : confidence < 0.4
-
-    Store  --> LogTrace
-    Defer  --> LogTrace
-    LogTrace --> Idle
-
-    Idle --> Decay : TTL timer fires (every 5 min)
-    Decay --> Idle
-```
-
-### 4.6 TITANS & MIRAS Correspondence (Google DeepMind)
-
-AgentMem draws architectural inspiration from **TITANS** (Learning to Memorize at Test Time) and the **MIRAS** framework.
-
-| Concept | TITANS / MIRAS Equivalent | AgentMem Implementation |
-|---|---|---|
-| **Short-Term Memory** | Sliding Window Attention | AutoGen `GroupChat` context window. |
-| **Long-Term Memory** | Neural Memory Module (MLP) | Hybrid Graph + Vector + Cluster stores. |
-| **Kinetic Memory** | Action Policy Head | **Procedural Memory** — `:Procedure` nodes with steps. |
-| **Memory Algorithm** | Online Gradient Descent | Missing: AgentMem uses discrete updates, not neural gradients. |
-| **Updating Logic** | "Surprise" Metric (Loss Gradient) | Confidence gating (conf ≥ 0.4). |
-| **Retention Policy** | Retention Gate / Regularizer | TTL Forgetting & Confidence Decay. |
-
-#### Palantir Ontology Alignment
-
-AgentMem directly mirrors the Palantir Ontology model — the foundation of Palantir AIP:
-
-| Palantir Concept | AgentMem Equivalent |
-|---|---|
-| **Objects** (Nouns) | `Entity` nodes in the Graph Store |
-| **Links** (Relationships) | `Triplet` edges (`RELATED_TO`) |
-| **Properties** | Node/edge properties (`confidence`, `timestamp`, `version`) |
-| **Actions / Verbs** (Kinetic) | `Procedure` nodes → `ProcedureExecutor` (dry-run/live) |
-| **AIP Logic** (Ingestion) | `Ingestor.ingest()` / `ingest_procedure()` / `revise_procedure()` |
-| **Security Model** (Governance) | `GovernancePolicy` (ACL + Visibility + AuditLog) |
-| **Schema Enforcement** | `GovernancePolicy.ALLOWED_ENTITY_TYPES` |
-| **Audit Trail** | `ContextTrace` + `GovernancePolicy.audit_log` |
-| **Object Versioning** | `Procedure.version` + `deprecated` flag |
-
-#### Procedure Learning Lifecycle
-
-```mermaid
-stateDiagram-v2
-    [*] --> Active : ingest_procedure()
-    Active --> Reinforced : reward > 0
-    Active --> Degraded : reward < 0
-    Reinforced --> Active : next query
-    Degraded --> Deprecated : conf < 0.1
-    Degraded --> Revised : revise_procedure()
-    Deprecated --> [*]
-    Revised --> Active : v(n+1) created
-```
-
-#### Remaining Missing Pieces
-
-1. **Differentiable Memory Update**: TITANS updates long-term memory via gradient descent. AgentMem is currently symbolic.
-2. **Surprise-based Ingestion**: Prioritizing novel facts over high-confidence ones.
-3. **Cross-Modal Associative Memory**: Multimodal ingestion (image → entity) is on the roadmap.
-
----
-
-### 4.7 Self-Improvement Learning Loop
-
-```mermaid
-sequenceDiagram
-    participant U as User
-    participant W as Workflow
-    participant C as AgentMemController
-    participant E as EpisodicStore
-    participant L as LearningLoop
-
-    U->>W: "What is Tesla's outlook?"
-    W->>C: get_retrieval_params()
-    C-->>W: {depth: 1, breadth: 5}  [UCB selects 'medium']
-    W->>E: log_trace(trace_id, outcome="unknown")
-    W-->>U: Decision + Trace ID: abc-123
-
-    Note over U,L: ...time passes...
-
-    U->>W: feedback --trace-id abc-123 --score 0.9
-    W->>E: update_outcome(abc-123, "success", reward=0.9)
-    
-    loop Every 5 minutes
-        L->>E: get_traces_for_learning()
-        E-->>L: [ContextTrace(reward=0.9, retrieval_arm='medium')]
-        L->>C: register_reward(0.9, arm_name='medium')
-        C-->>L: Q('medium') updated → 0.9
-        L->>GraphStore: apply_confidence_decay(factor=0.9)
-    end
-
-    Note over C: Next query — UCB prefers 'medium' arm
-```
-
-### 4.8 Multi-Agent GroupChat
-
-```mermaid
-flowchart TD
-    U["User Query"] --> UP["UserProxy"]
-
-    UP --> GC
-
-    subgraph GC ["GroupChat (GroupChatManager — GPT-4o)"]
-        direction TB
-        PL["🗂  Planner\nBreaks query into subtasks\nCan hire new agents"]
-        MS["🧠  Memory Specialist\nretrieve_memory · graph_editor"]
-        RE["🔍  Researcher\nweb_search"]
-        AN["📊  Analyst\ncalculator · final synthesis"]
-
-        PL -- "delegates" --> MS
-        PL -- "delegates" --> RE
-        PL -- "delegates" --> AN
-        PL -- "hire_agent()" --> DYN
-        DYN["⚡ Dynamic Agent\n(spawned at runtime)"]
-    end
-
-    AN --> UP
-    UP --> U
+crates/
+├── tm-types        # All domain types: Entity, Triple, Trace, Trajectory, Procedure
+├── tm-graph        # SQLite entity + triple store, k-hop BFS traversal
+├── tm-vector       # 384-dim embedder + cosine search over SQLite
+├── tm-episodic     # Append-only JSONL: traces and trajectories
+├── tm-governance   # PII filter + confidence gate (stdlib only, no regex crate)
+├── tm-controller   # UCB1 bandit: 4 retrieval arms, register_reward, arm_stats
+├── tm-ingest       # Heuristic NER → graph + vector upsert pipeline
+├── tm-retrieval    # 3-phase recall engine, bandit-guided
+├── tm-mcp          # MCP server: JSON-RPC 2.0 over stdin/stdout for Claude Code
+└── tm-cli          # `tracemind` CLI binary
 ```
 
 ---
 
-## 5. Component Reference
-
-| Component | File | Responsibility |
-|---|---|---|
-| Ingestor | `src/processing/ingest.py` | Canonicalize text → entities + triplets |
-| GraphStore | `src/memory/graph_store.py` | Neo4j driver; typed, timestamped edges |
-| VectorStore | `src/memory/vector_store.py` | ChromaDB client; semantic embedding search |
-| ClusterStore | `src/memory/cluster_store.py` | HDBSCAN cluster index; soft expansion |
-| EpisodicStore | `src/memory/episodic_store.py` | Append-only trace log with outcome support |
-| Retriever | `src/processing/retrieval.py` | 3-phase recall: vector + graph + cluster |
-| AgentMemController | `src/agent/agentmem_controller.py` | UCB bandit policy over memory ops |
-| LearningLoop | `src/agent/learning_loop.py` | Background TTL decay + reward updates |
-| FeedbackManager | `src/agent/feedback.py` | Human corrections → graph write-back |
-| MacOSMonitor | `src/processing/macos_monitor.py` | Passive window and clipboard observation |
-| AutoGenWorkflow | `src/agent/workflow_autogen.py` | GroupChat orchestration + Provenance tracking |
-
----
-
-## 6. Data Schemas
-
-### ContextTrace (Full Provenance Record)
-```python
-class ContextTrace(BaseModel):
-    trace_id:            str           # UUID
-    task_id:             str
-    input_query:         str
-    retrieved_memory_ids: List[str]    # IDs of all memory objects retrieved
-    retrieved_memories:   List[Dict]    # Full content of retrieved items
-    graph_paths:         List[List[str]]
-    retrieval_arm:       Optional[str] # The strategy used (narrow, wide, etc.)
-    reasoning_steps:     List[str]
-    final_decision:      str
-    confidence:          float
-    outcome:             Literal["success", "failure", "unknown"]
-    reward_signal:       float         # [-1.0, 1.0]  ← drives bandit
-    timestamp:           datetime
-    feedback:            Optional[Feedback]
-```
-
-### Triplet (Knowledge Graph Edge)
-```python
-class Triplet(BaseModel):
-    subject:    str     # "Tesla"
-    predicate:  str     # "expected_movement"
-    object:     str     # "rally"
-    timestamp:  str
-    confidence: float   # decays over time via LearningLoop
-    source_id:  str     # links back to VectorStore chunk
-```
-
----
-
-## 7. Operational Guide
-
-### Quick Start (Local AI — Ollama)
-
-1. **Install Ollama**: [ollama.com](https://ollama.com)
-2. **Pull Models**:
-   ```bash
-   ollama pull llama3.2
-   ollama pull nomic-embed-text
-   ```
-3. **Configure .env**:
-   ```bash
-   LLM_MODEL=ollama/llama3.2
-   EMBEDDING_MODEL=ollama/nomic-embed-text
-   ```
-4. **Run**:
-   ```bash
-   ENABLE_MACOS_MONITOR=true python3 start_agent.py
-   ```
-
-### Quick Start (Docker — Traditional)
-
-### CLI Reference
+## Quick start
 
 ```bash
-# Interactive real-time mode (with monitors + learning loop)
-ENABLE_MACOS_MONITOR=true python3 start_agent.py
+# Build
+cargo build --release
 
-# One-off ingestion
-python run_agent.py ingest --text "Apple Q4 revenue was $120B"
+# Ingest something
+tracemind ingest "Alice is the lead engineer on the TraceMind Rust project"
 
-# One-off query
-python run_agent.py query "What is Apple's financial outlook?"
+# Query
+tracemind query "who is working on TraceMind"
 
-# Submit feedback on a past decision
-python run_agent.py feedback --trace-id <uuid> --score 0.9 \
-    --correction "Apple is actually in a strong position due to services growth"
+# See recent traces
+tracemind trace --limit 5
 
-# Inspect bandit arm Q-values (in start_agent.py interactive mode)
-> bandit
+# UCB bandit statistics
+tracemind status
 ```
 
-### Environment Variables
-
-| Variable | Default | Description |
-|---|---|---|
-| `OPENAI_API_KEY` | — | Required for LLM calls |
-| `NEO4J_URI` | `bolt://localhost:7687` | Graph DB connection |
-| `NEO4J_USER` | `neo4j` | Graph DB username |
-| `NEO4J_PASSWORD` | `password` | Graph DB password |
-| `CHROMA_HOST` | `localhost` | Vector DB host |
-| `CHROMA_PORT` | `8000` | Vector DB port |
+Data is stored under `~/.tracemind/` by default. Override with `TM_DATA_DIR`.
 
 ---
 
-## 8. Self-Improvement Mechanics
+## MCP integration (Claude Code)
 
-### Phase 1 — Heuristics (Active)
+Add to your Claude Code MCP config (`~/.claude/mcp.json` or workspace `.mcp.json`):
 
-The simplest improvement mechanism: old facts decay, high-confidence facts persist.
-
-```
-confidence(t) = confidence(t₀) × 0.9ⁿ
-```
-where *n* = number of decay cycles since last reinforcement. Facts below 0.05 confidence are candidates for deletion.
-
-### Phase 2 — Bandit Learning (Active)
-
-The `AgentMemController` maintains four retrieval arms:
-
-| Arm | Graph Depth | Entity Breadth | Use Case |
-|---|---|---|---|
-| narrow | 1 | 3 | Simple factual queries |
-| medium | 1 | 5 | Standard queries |
-| wide | 2 | 10 | Relational queries |
-| deep | 3 | 15 | Complex multi-hop queries |
-
-UCB selection formula:
-```
-arm* = argmax_a [ Q(a) + √(2 ln(N) / n(a)) ]
-```
-where `Q(a)` is the average reward for arm `a`, `N` is total pulls, `n(a)` is pulls for arm `a`.
-
-### Phase 3 — GRPO / RLVR (Planned)
-
-Offline optimization over episodic trace batches. Reward shaping from outcomes + human feedback. No end-to-end gradient through the memory store.
-
----
-
-## 9. Complexity Analysis
-
-| Operation | Complexity | Notes |
-|---|---|---|
-| Entity write | O(log N) | Neo4j B-tree index on name |
-| Vector search | O(log N) | ChromaDB HNSW index |
-| Graph traversal | O(k·d) | k neighbors per hop, d hops |
-| Cluster expansion | O(K) | K = cluster size, bounded |
-| TTL decay | O(N) | Full graph scan, runs offline |
-| Bandit arm select | O(A) | A = 4 arms, effectively O(1) |
-
----
-
-## 10. Failure Modes & Mitigations
-
-| Risk | Likelihood | Mitigation |
-|---|---|---|
-| Memory bloat from ingestion spam | Medium | AgentMem confidence gate (DEFER < 0.4) + TTL decay |
-| Retrieval noise corrupts reasoning | Medium | Cluster expansion budget cap (top 5 entities) |
-| Bandit feedback loop collapse | Low | Epsilon-greedy exploration (ε = 0.15); offline-only updates |
-| Neo4j unavailable at boot | Medium | `depends_on: healthcheck` in `docker-compose.yml` |
-| Graph edge proliferation | Low | Relationship deduplication via MERGE in Neo4j Cypher |
-| Human feedback poisons memory | Low | FeedbackManager re-canonicalizes correction through same pipeline as ingest |
-
----
-
-## 11. Testing
----
-
-## 5. Advanced Architectural Roadmap
-
-The following concepts represent the frontier of AgentMem's development, moving from symbolic memory toward unified latent intelligence.
-
-### 5.1 World Models (Predictive Simulation)
-A World Model is an internal simulation of the environment. Instead of just recalling facts, the agent can simulate the outcomes of its actions before executing them.
-- **Role**: Predictive layer inside `ProcedureExecutor`.
-- **Implementation**: Trains on the `EpisodicStore` (state, action, result) tuples to predict `expected_outcome` and `reward` for proposed procedures.
-
-### 5.2 JEPA (Joint Embedding Predictive Architecture)
-Inspired by Yann LeCun’s vision, JEPA replaces exact matching with **latent prediction**.
-- **Role**: Abstract semantic retrieval.
-- **Implementation**: Instead of finding "similar text," the system predicts what a *good answer embedding* looks like in latent space, then retrieves memories (entities/procedures) that match that predicted latent target. This ignores irrelevant noise and focuses on abstract structure.
-
-### 5.3 SSMs (State Space Models for Temporal Memory)
-SSMs (like Mamba) solve the scaling problem of append-only episodic logs by compressing temporal history into a **fixed-size hidden state**.
-- **Role**: Constant-time temporal memory compression.
-- **Implementation**: Replaces linear scans of the `EpisodicStore`. The hidden state implicitly learns retrieval success patterns, potentially replacing the symbolic UCB bandit with a learned temporal policy.
-
-### The Unified Vision
-
-```mermaid
-graph TD
-    Q["Query"] --> JEPA["JEPA Encoder<br/>(latent prediction)"]
-    JEPA --> R["Retriever<br/>(searches in latent space)"]
-    R --> WM["World Model<br/>(simulate before acting)"]
-    WM -->|"safe?"| EXEC["ProcedureExecutor"]
-    WM -->|"risky?"| PLAN["Re-plan / Ask human"]
-    
-    EXEC --> TRACE["ContextTrace"]
-    TRACE --> SSM["SSM Temporal Memory<br/>(compress episode)"]
-    SSM -->|"update latent space"| JEPA
-    SSM -->|"update world model"| WM
+```json
+{
+  "mcpServers": {
+    "tracemind": {
+      "command": "/path/to/tm-mcp",
+      "env": {
+        "TM_DATA_DIR": "/Users/you/.tracemind"
+      }
+    }
+  }
+}
 ```
 
-```bash
-# Run all v2 tests
-python -m unittest tests/test_agentmem_v2.py -v
+The MCP server exposes 4 tools:
 
-# Run full suite
-python -m unittest discover tests/ -v
-```
-
-| Test Class | Coverage |
+| Tool | Description |
 |---|---|
-| `TestClusterPersistence`| SQLite save/load, entity recovery |
-| `TestRetrievalV2` | Semantic query embedding flow |
-| `TestAgentMemController` | store gate, UCB selection, thread-safe reward update |
-| `TestLearningLoop` | reward propagation with explicit arm tracking |
-| `TestAutoGenSystem` | workflow trace & provenance capture |
-| `TestDynamicAgents` | hire_agent creates + adds to GroupChat |
+| `memory_store` | Ingest text into TraceMind memory |
+| `memory_query` | Query memory with natural language |
+| `get_trace` | Retrieve recent provenance traces |
+| `list_procedures` | List stored procedural memories (Phase 2) |
 
 ---
 
-## 12. Roadmap
+## Architecture
 
-- **v2.1** — [DONE] Persistent ClusterStore (SQLite sidecar for cluster memberships)
-- **v2.2** — [DONE] Semantic Cluster Expansion (True query string embeddings)
-- **v2.3** — [DONE] MacOS Interaction Monitor (Passive window/clipboard tracking)
-- **v3.0** — Phase 3 offline GRPO update over episodic trace batches
-- **v4.0** — Multimodal ingestion (image → entity attributes, chart → structured signals)
+### Cognitive pipeline
+
+| Layer | Role | Storage |
+|---|---|---|
+| **Semantic** | Recall anything similar via embeddings | SQLite vector table |
+| **Structured** | Connect facts via typed relationships | SQLite entity/triple tables |
+| **Episodic** | Record every ingest, query, and outcome | Append-only JSONL |
+| **Procedural** | Store versioned how-to sequences linked to entities | Graph + vector hybrid (Phase 2) |
+
+### UCB1 bandit arms
+
+| Arm | top_k | hops | episodic |
+|---|---|---|---|
+| 0 — narrow | 5 | 0 | no |
+| 1 — medium | 10 | 1 | no |
+| 2 — wide | 15 | 2 | no |
+| 3 — deep | 20 | 2 | yes |
+
+Selection formula: `arm* = argmax_a [ Q(a) + √(2 ln(N) / n(a)) ]`
+
+### Controller FSM
+
+```
+Idle → Evaluating → VectorSearch → BanditSelect → [GraphHop?] → [EpisodicScan?]
+     → ComputeReward → RegisterReward → LogTrace → Idle
+```
+
+---
+
+## Design tenets
+
+1. **Local-only.** No API calls, no telemetry. Your memory never leaves your machine.
+2. **Auditability.** Every ingest and query produces a `Trace` with full provenance. Every decision is replayable.
+3. **No RAM bloat.** Target: <200MB idle, <500MB active. SQLite + JSONL, no JVM, no Electron.
+4. **Graceful degradation.** The bandit starts with UCB1 (day 1). JEPA/World Model training (Phase 3) is opt-in and runs on CPU during idle.
+5. **Structure controls learning.** The knowledge graph is never mutated by gradient descent. Only heuristics and human feedback write to it.
+
+---
+
+## Tech stack
+
+| Component | Choice | Why |
+|---|---|---|
+| Language | Rust | Memory safety, zero-cost abstractions, tiny binaries |
+| Graph store | SQLite (rusqlite bundled) | No JVM, no daemon, embedded |
+| Vector store | SQLite cosine scan | Brute-force is fine at <100K vectors; swap to LanceDB in Phase 2 |
+| Embedder | Hash-based stub (384-dim) | Deterministic, no model download for MVP; swap to ONNX + all-MiniLM-L6-v2 in Phase 2 |
+| Episodic store | Append-only JSONL | Simplest durable log; Parquet in Phase 3 |
+| MCP server | JSON-RPC 2.0 over stdin/stdout | Claude Code native protocol |
+| CLI | clap derive | Standard Rust CLI |
+
+---
+
+## Data schemas
+
+### Entity
+```rust
+pub struct Entity {
+    pub id: Uuid,
+    pub name: String,
+    pub entity_type: EntityType,   // Person | Org | Project | File | Url | Concept | ...
+    pub confidence: f64,           // [0.0, 1.0], decays over time
+    pub source_id: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+```
+
+### Triple
+```rust
+pub struct Triple {
+    pub id: Uuid,
+    pub subject_id: Uuid,
+    pub predicate: Predicate,      // RelatedTo | WorksAt | DependsOn | HasProcedure | ...
+    pub object_id: Uuid,
+    pub confidence: f64,
+    pub source_id: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+```
+
+### Trajectory (JEPA/WM-ready from day 1)
+```rust
+pub struct Trajectory {
+    pub arm_chosen: u8,
+    pub reward: f64,
+    pub context_embedding: Vec<f32>,         // 384-dim
+    pub memory_snapshot_hash: String,
+    pub predicted_outcome: Option<Vec<f32>>, // Phase 3: JEPA prediction
+    pub actual_outcome_embedding: Option<Vec<f32>>,
+    pub surprise_score: Option<f32>,         // Phase 3: ||predicted - actual||
+    // ...
+}
+```
+
+---
+
+## Test coverage
+
+```
+cargo test --workspace
+```
+
+```
+tm-types        8 tests   Entity/Triple/Trajectory/Procedure lifecycle
+tm-graph        5 tests   Insert, upsert, name lookup, k-hop BFS (1-hop, 2-hop)
+tm-vector       6 tests   Embed length/norm, determinism, cosine top-1, top_k cap
+tm-episodic     2 tests   Trace recent(N), trajectory pending_training filter
+tm-governance   6 tests   Email/SSN/phone PII, confidence gate pass/fail
+tm-controller   7 tests   UCB exploration order, high-reward arm selection, clamping
+tm-ingest       3 tests   URL entity, File entity, PII rejection
+tm-retrieval    1 test    Query → Ok, bandit pull recorded
+─────────────────────────────
+Total          42 tests   0 failures
+```
+
+---
+
+## Roadmap
+
+### Phase 1 — MVP (current)
+- [x] 10-crate Rust workspace
+- [x] Heuristic NER ingest pipeline
+- [x] SQLite graph + vector stores
+- [x] UCB1 bandit retrieval controller
+- [x] Append-only trace + trajectory stores
+- [x] PII governance filter
+- [x] MCP server for Claude Code
+- [x] `tracemind` CLI
+
+### Phase 2 — Real embeddings + Tauri app
+- [ ] Swap hash embedder → ONNX + all-MiniLM-L6-v2 (80MB, CPU inference)
+- [ ] Swap SQLite cosine scan → LanceDB (Rust-native, ANN index)
+- [ ] Swap SQLite graph → Kuzu (embedded graph DB, Cypher)
+- [ ] Procedural memory: versioned step sequences, dry-run / live execution
+- [ ] Persistent bandit state across CLI invocations
+- [ ] Tauri desktop app (macOS/Windows/Linux)
+- [ ] Confidence decay background loop
+
+### Phase 3 — Latent intelligence (JEPA / World Model)
+- [ ] JEPA encoder (~5M params MLP, VICReg loss) — predicts latent target instead of cosine similarity
+- [ ] World Model (~2–5M params MLP) — predicts retrieval outcomes, powers intent recommendation
+- [ ] Surprise-based ingestion — replace static confidence gate with `||predicted - actual||`
+- [ ] SSM/Mamba (~1–3M params) — compress episodic history to fixed-size hidden state
+- [ ] All models train on CPU during idle, no GPU required
+
+### Phase 4 — Enterprise / Docker
+- [ ] Docker Compose deployment
+- [ ] Multi-user governance (ACL, audit log)
+- [ ] REST API layer
+
+---
+
+## Palantir Ontology alignment
+
+| Palantir | TraceMind |
+|---|---|
+| Objects (Nouns) | `Entity` nodes |
+| Links (Relationships) | `Triple` edges |
+| Properties | `confidence`, `source_id`, timestamps |
+| Actions / Verbs | `Procedure` + `ProcedureStep` (Phase 2) |
+| Security | `GovernanceFilter` (PII + confidence gate) |
+| Audit Trail | `Trace` + JSONL episodic store |
+| Object Versioning | `Procedure.version` + `parent_id` |
+
+---
+
+## TITANS / MIRAS correspondence
+
+| Concept | TITANS | TraceMind |
+|---|---|---|
+| Short-term memory | Sliding window attention | MCP context window |
+| Long-term memory | Neural memory module | Graph + vector + episodic |
+| Kinetic memory | Action policy head | Procedural memory (Phase 2) |
+| Surprise metric | Loss gradient | `surprise_score` in Trajectory (Phase 3) |
+| Retention policy | Retention gate | Confidence decay + TTL forgetting |
+
+---
+
+## Binary sizes (release)
+
+```
+target/release/tracemind   2.6 MB
+target/release/tm-mcp      3.1 MB
+```
+
+---
+
+*Legacy Python prototype (AgentMem v2) is preserved in `legacy/` for reference.*
