@@ -1,0 +1,14 @@
+[package]
+name = "tm-graph"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+tm-types = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+rusqlite = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
