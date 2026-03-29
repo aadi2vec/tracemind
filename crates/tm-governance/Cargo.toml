@@ -1,0 +1,11 @@
+[package]
+name = "tm-governance"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+tm-types = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }

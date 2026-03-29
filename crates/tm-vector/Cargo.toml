@@ -1,0 +1,14 @@
+[package]
+name = "tm-vector"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+tm-types = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+rusqlite = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+seahash = { workspace = true }

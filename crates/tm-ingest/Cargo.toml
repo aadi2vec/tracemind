@@ -1,0 +1,17 @@
+[package]
+name = "tm-ingest"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+tm-types = { workspace = true }
+tm-graph = { workspace = true }
+tm-vector = { workspace = true }
+tm-governance = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+seahash = { workspace = true }

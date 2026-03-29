@@ -1,45 +1,6 @@
-# Python
-__pycache__/
-*.py[cod]
-*$py.class
-*.so
-.Python
-env/
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
-*.egg-info/
-.installed.cfg
-*.egg
-
-# Virtual Environment
-venv/
-.venv/
-ENV/
-
-# Databases & Storage
+/target
 *.db
+*.db-shm
+*.db-wal
+*.vec
 *.jsonl
-chroma/
-neo4j_data/
-.chroma/
-
-# Environment
-.env
-
-# MacOS
-.DS_Store
-
-# Artifacts
-.gemini/
-.agent/
-brain/

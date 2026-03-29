@@ -1,0 +1,22 @@
+[package]
+name = "tm-mcp"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "tm-mcp"
+path = "src/main.rs"
+
+[dependencies]
+tm-types = { workspace = true }
+tm-ingest = { workspace = true }
+tm-retrieval = { workspace = true }
+tm-episodic = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+tokio = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }

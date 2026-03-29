@@ -1,0 +1,68 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/tm-types",
+    "crates/tm-graph",
+    "crates/tm-vector",
+    "crates/tm-episodic",
+    "crates/tm-governance",
+    "crates/tm-controller",
+    "crates/tm-ingest",
+    "crates/tm-retrieval",
+    "crates/tm-mcp",
+    "crates/tm-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["Aaditya Srivathsan"]
+license = "MIT"
+repository = "https://github.com/aadi2vec/tracemind"
+
+[workspace.dependencies]
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Async
+tokio = { version = "1", features = ["full"] }
+
+# Error handling
+anyhow = "1"
+thiserror = "1"
+
+# IDs
+uuid = { version = "1", features = ["v4", "serde"] }
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Database
+rusqlite = { version = "0.31", features = ["bundled"] }
+
+# Hashing
+seahash = "4"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Workspace crates
+tm-types = { path = "crates/tm-types" }
+tm-graph = { path = "crates/tm-graph" }
+tm-vector = { path = "crates/tm-vector" }
+tm-episodic = { path = "crates/tm-episodic" }
+tm-governance = { path = "crates/tm-governance" }
+tm-controller = { path = "crates/tm-controller" }
+tm-ingest = { path = "crates/tm-ingest" }
+tm-retrieval = { path = "crates/tm-retrieval" }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
