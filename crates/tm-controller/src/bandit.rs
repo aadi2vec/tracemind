@@ -1,4 +1,12 @@
 use std::f64;
+use std::path::Path;
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct BanditState {
+    counts: [u64; 4],
+    rewards: [f64; 4],
+    total_pulls: u64,
+}
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct RetrievalParams {
@@ -63,6 +71,38 @@ impl UcbBandit {
             (self.counts[2], self.rewards[2]),
             (self.counts[3], self.rewards[3]),
         ]
+    }
+
+    /// Load bandit state from a JSON file, or return a fresh bandit if missing/corrupt.
+    pub fn load(path: &Path) -> Self {
+        if let Ok(raw) = std::fs::read_to_string(path) {
+            if let Ok(state) = serde_json::from_str::<BanditState>(&raw) {
+                let mut b = Self::new();
+                for arm_idx in 0u8..4 {
+                    let pulls = state.counts[arm_idx as usize];
+                    let avg = state.rewards[arm_idx as usize];
+                    for _ in 0..pulls {
+                        b.register_reward(arm_idx, avg);
+                    }
+                }
+                return b;
+            }
+        }
+        Self::new()
+    }
+
+    /// Save bandit state to a JSON file.
+    pub fn save(&self, path: &Path) {
+        let stats = self.arm_stats();
+        let total_pulls: u64 = stats.iter().map(|(c, _)| c).sum();
+        let state = BanditState {
+            counts: [stats[0].0, stats[1].0, stats[2].0, stats[3].0],
+            rewards: [stats[0].1, stats[1].1, stats[2].1, stats[3].1],
+            total_pulls,
+        };
+        if let Ok(json) = serde_json::to_string_pretty(&state) {
+            let _ = std::fs::write(path, json);
+        }
     }
 
     fn params_for_arm(arm: u8) -> RetrievalParams {

@@ -3,21 +3,12 @@ use std::path::PathBuf;
 
 use clap::Parser;
 use tm_controller::UcbBandit;
-use tm_episodic::TraceStore;
+use tm_episodic::{ProcedureStore, TraceStore, dry_run};
+use tm_graph::GraphStore;
 use tm_ingest::IngestPipeline;
 use tm_retrieval::RetrievalEngine;
+use tm_types::{Procedure, ProcedureStep};
 use uuid::Uuid;
-
-// ---------------------------------------------------------------------------
-// Bandit persistence struct
-// ---------------------------------------------------------------------------
-
-#[derive(serde::Serialize, serde::Deserialize)]
-struct BanditState {
-    counts: [u64; 4],
-    rewards: [f64; 4],
-    total_pulls: u64,
-}
 
 // ---------------------------------------------------------------------------
 // CLI definition
@@ -26,6 +17,10 @@ struct BanditState {
 #[derive(clap::Parser)]
 #[command(name = "tracemind", about = "TraceMind local memory OS")]
 struct Cli {
+    /// Use deterministic hash embedder instead of ONNX model (offline/test mode)
+    #[arg(long, global = true)]
+    hash_embed: bool,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -43,8 +38,42 @@ enum Commands {
         #[arg(long, default_value = "10")]
         limit: usize,
     },
+    /// Decay all entity/triple confidence by a factor
+    Decay {
+        #[arg(long, default_value = "0.95")]
+        factor: f64,
+        #[arg(long, default_value = "0.05")]
+        threshold: f64,
+    },
+    /// Manage procedures (learnable action sequences)
+    Proc {
+        #[command(subcommand)]
+        action: ProcAction,
+    },
     /// Show bandit arm statistics
     Status,
+}
+
+#[derive(clap::Subcommand)]
+enum ProcAction {
+    /// Add a new procedure (steps as "action1;action2;action3")
+    Add {
+        name: String,
+        #[arg(long, default_value = "")]
+        desc: String,
+        /// Semicolon-separated steps
+        steps: String,
+    },
+    /// List all active procedures
+    List,
+    /// Dry-run a procedure by name
+    Run { name: String },
+    /// Record success/failure for a procedure
+    Feedback {
+        name: String,
+        #[arg(long)]
+        success: bool,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -82,7 +111,7 @@ fn main() {
 
     match cli.command {
         Commands::Ingest { text } => {
-            let pipeline = IngestPipeline::open(&db_path)
+            let pipeline = IngestPipeline::open(&db_path, cli.hash_embed)
                 .expect("failed to open ingest pipeline");
             let session_id = Uuid::new_v4();
             let result = pipeline.ingest(&text, session_id)
@@ -99,7 +128,7 @@ fn main() {
         }
 
         Commands::Query { text } => {
-            let mut engine = RetrievalEngine::open(&db_path, &trace_path)
+            let mut engine = RetrievalEngine::open(&db_path, &trace_path, cli.hash_embed)
                 .expect("failed to open retrieval engine");
             let result = engine.query(&text).expect("query failed");
 
@@ -123,62 +152,22 @@ fn main() {
                 }
             }
 
-            // Persist bandit stats so `status` reflects real usage.
-            let stats = engine.bandit_stats();
-            let total_pulls: u64 = stats.iter().map(|(c, _)| c).sum();
-            let state = BanditState {
-                counts: [stats[0].0, stats[1].0, stats[2].0, stats[3].0],
-                rewards: [stats[0].1, stats[1].1, stats[2].1, stats[3].1],
-                total_pulls,
-            };
-            if let Ok(json) = serde_json::to_string_pretty(&state) {
-                let _ = fs::write(&bandit_path, json);
-            }
+            // Bandit stats are auto-saved by RetrievalEngine after each query.
         }
 
         Commands::Feedback { arm, reward } => {
-            // v1 limitation: bandit state is not persisted between CLI calls.
-            // Load existing state if available, register reward, save back.
-            let mut bandit = UcbBandit::new();
-
-            // Attempt to load existing state and replay counts/rewards into a
-            // fresh bandit so the running average is preserved.
-            if bandit_path.exists() {
-                if let Ok(raw) = fs::read_to_string(&bandit_path) {
-                    if let Ok(state) = serde_json::from_str::<BanditState>(&raw) {
-                        // Reconstruct by replaying synthetic single-pull events
-                        // that reproduce the stored running averages.
-                        // Since UcbBandit doesn't expose direct field mutation,
-                        // we approximate by registering the stored average reward
-                        // for each recorded pull.
-                        let mut b = UcbBandit::new();
-                        for arm_idx in 0u8..4 {
-                            let pulls = state.counts[arm_idx as usize];
-                            let avg = state.rewards[arm_idx as usize];
-                            for _ in 0..pulls {
-                                b.register_reward(arm_idx, avg);
-                            }
-                        }
-                        bandit = b;
-                    }
-                }
-            }
-
+            let mut bandit = UcbBandit::load(&bandit_path);
             bandit.register_reward(arm, reward);
-
-            // Persist updated state.
-            let stats = bandit.arm_stats();
-            let total_pulls: u64 = stats.iter().map(|(c, _)| c).sum();
-            let state = BanditState {
-                counts: [stats[0].0, stats[1].0, stats[2].0, stats[3].0],
-                rewards: [stats[0].1, stats[1].1, stats[2].1, stats[3].1],
-                total_pulls,
-            };
-            let json = serde_json::to_string_pretty(&state)
-                .expect("failed to serialize bandit state");
-            fs::write(&bandit_path, json).expect("failed to write bandit state");
-
+            bandit.save(&bandit_path);
             println!("Reward registered.");
+        }
+
+        Commands::Decay { factor, threshold } => {
+            let graph = GraphStore::open(&db_path)
+                .expect("failed to open graph store");
+            let below = graph.decay_all(factor, threshold)
+                .expect("decay failed");
+            println!("Decay applied (factor={factor}). {below} entities below {threshold} threshold.");
         }
 
         Commands::Trace { limit } => {
@@ -193,30 +182,73 @@ fn main() {
             }
         }
 
-        Commands::Status => {
-            // Load bandit state from file if available; otherwise fresh bandit.
-            let bandit = if bandit_path.exists() {
-                if let Ok(raw) = fs::read_to_string(&bandit_path) {
-                    if let Ok(state) = serde_json::from_str::<BanditState>(&raw) {
-                        let mut b = UcbBandit::new();
-                        for arm_idx in 0u8..4 {
-                            let pulls = state.counts[arm_idx as usize];
-                            let avg = state.rewards[arm_idx as usize];
-                            for _ in 0..pulls {
-                                b.register_reward(arm_idx, avg);
-                            }
-                        }
-                        b
-                    } else {
-                        UcbBandit::new()
-                    }
-                } else {
-                    UcbBandit::new()
-                }
-            } else {
-                UcbBandit::new()
-            };
+        Commands::Proc { action } => {
+            let proc_path = dir.join("procedures.jsonl").to_str().unwrap().to_string();
+            let store = ProcedureStore::open(&proc_path)
+                .expect("failed to open procedure store");
 
+            match action {
+                ProcAction::Add { name, desc, steps } => {
+                    let steps: Vec<ProcedureStep> = steps
+                        .split(';')
+                        .enumerate()
+                        .map(|(i, s)| ProcedureStep::new(i as u32 + 1, s.trim()))
+                        .collect();
+                    let proc = Procedure::new(&name, &desc, steps);
+                    store.save(&proc).expect("failed to save procedure");
+                    println!("Procedure '{}' created ({} steps, id={}).", name, proc.steps.len(), proc.id);
+                }
+                ProcAction::List => {
+                    let procs = store.list_active().expect("failed to list procedures");
+                    if procs.is_empty() {
+                        println!("No active procedures.");
+                    }
+                    for p in &procs {
+                        println!(
+                            "  [{}] {} v{} ({:?}, {:.0}% confidence, {} steps)",
+                            p.id, p.name, p.version, p.status,
+                            p.confidence * 100.0, p.steps.len()
+                        );
+                    }
+                }
+                ProcAction::Run { name } => {
+                    let proc = store
+                        .get_by_name(&name)
+                        .expect("failed to read procedures")
+                        .unwrap_or_else(|| {
+                            eprintln!("Procedure '{}' not found.", name);
+                            std::process::exit(1);
+                        });
+                    for line in dry_run(&proc) {
+                        println!("{line}");
+                    }
+                }
+                ProcAction::Feedback { name, success } => {
+                    let mut proc = store
+                        .get_by_name(&name)
+                        .expect("failed to read procedures")
+                        .unwrap_or_else(|| {
+                            eprintln!("Procedure '{}' not found.", name);
+                            std::process::exit(1);
+                        });
+                    if success {
+                        proc.record_success();
+                    } else {
+                        proc.record_failure();
+                    }
+                    store.save(&proc).expect("failed to save procedure");
+                    println!(
+                        "Procedure '{}': {:?} (confidence={:.0}%, {} ok / {} fail)",
+                        proc.name, proc.status,
+                        proc.confidence * 100.0,
+                        proc.success_count, proc.failure_count
+                    );
+                }
+            }
+        }
+
+        Commands::Status => {
+            let bandit = UcbBandit::load(&bandit_path);
             let stats = bandit.arm_stats();
             for (i, (pulls, avg_reward)) in stats.iter().enumerate() {
                 println!("  Arm {}: pulls={}, avg_reward={:.2}", i, pulls, avg_reward);

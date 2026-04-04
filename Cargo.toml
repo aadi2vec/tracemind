@@ -45,7 +45,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Database
 rusqlite = { version = "0.31", features = ["bundled"] }
-kuzu = "0.11"
 
 # Vector / Embeddings
 lancedb = "0.27"

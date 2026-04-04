@@ -9,6 +9,7 @@ path = "src/main.rs"
 
 [dependencies]
 tm-types = { workspace = true }
+tm-graph = { workspace = true }
 tm-ingest = { workspace = true }
 tm-retrieval = { workspace = true }
 tm-episodic = { workspace = true }

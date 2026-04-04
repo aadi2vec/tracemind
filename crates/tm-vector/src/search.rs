@@ -14,7 +14,7 @@ use lancedb::query::{ExecutableQuery, QueryBase};
 use lancedb::Connection;
 use tokio::runtime::Runtime;
 use tm_types::{Result, TraceMindError};
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 use uuid::Uuid;
 
 const TABLE_NAME: &str = "vectors";

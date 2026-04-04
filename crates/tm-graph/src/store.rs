@@ -1,260 +1,315 @@
-//! Kuzu-backed graph store for TraceMind (Phase 2).
-//!
-//! Replaces the rusqlite implementation with Kuzu embedded graph DB.
-//! Same public API: open, upsert_entity, get_entity, find_entity_by_name,
-//! upsert_triple, get_triples_for_entity, k_hop_neighbors.
-
-use kuzu::{Connection, Database, LogicalType, SystemConfig, Value};
-use tm_types::{Entity, EntityType, Predicate, Result, TraceMindError, Triple};
+use rusqlite::{Connection, params};
+use tm_types::{Entity, EntityType, Triple, Predicate, TraceMindError, Result};
 use uuid::Uuid;
 use chrono::{DateTime, Utc};
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use tracing::{debug, info};
 
 pub struct GraphStore {
-    db: Database,
+    conn: Connection,
 }
 
 impl GraphStore {
-    /// Open or create a Kuzu graph store.
-    /// Pass `:memory:` for an in-memory database (tests).
     pub fn open(path: &str) -> Result<Self> {
-        info!("[graph] opening Kuzu store at {path}");
+        info!("[graph] opening SQLite store at {path}");
 
-        let db = if path == ":memory:" {
-            Database::in_memory(SystemConfig::default())
-        } else {
-            Database::new(path, SystemConfig::default())
-        }
-        .map_err(|e| TraceMindError::Storage(format!("kuzu open: {e}")))?;
+        let conn = Connection::open(path)
+            .map_err(|e| TraceMindError::Storage(e.to_string()))?;
 
-        let store = Self { db };
-        store.init_schema()?;
-        Ok(store)
-    }
+        conn.execute_batch("
+            CREATE TABLE IF NOT EXISTS entities (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                entity_type TEXT NOT NULL,
+                confidence REAL NOT NULL,
+                source_id TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_entities_name ON entities(name);
 
-    fn conn(&self) -> Result<Connection<'_>> {
-        Connection::new(&self.db)
-            .map_err(|e| TraceMindError::Storage(format!("kuzu connection: {e}")))
-    }
-
-    fn init_schema(&self) -> Result<()> {
-        let conn = self.conn()?;
-
-        conn.query(
-            "CREATE NODE TABLE IF NOT EXISTS Entity(
-                id STRING,
-                name STRING,
-                entity_type STRING,
-                confidence DOUBLE,
-                source_id STRING,
-                created_at STRING,
-                updated_at STRING,
-                PRIMARY KEY(id)
-            )"
-        ).map_err(|e| TraceMindError::Storage(format!("create Entity table: {e}")))?;
-
-        conn.query(
-            "CREATE REL TABLE IF NOT EXISTS Triple(
-                FROM Entity TO Entity,
-                id STRING,
-                predicate STRING,
-                confidence DOUBLE,
-                source_id STRING,
-                created_at STRING,
-                updated_at STRING
-            )"
-        ).map_err(|e| TraceMindError::Storage(format!("create Triple table: {e}")))?;
+            CREATE TABLE IF NOT EXISTS triples (
+                id TEXT PRIMARY KEY,
+                subject_id TEXT NOT NULL,
+                predicate TEXT NOT NULL,
+                object_id TEXT NOT NULL,
+                confidence REAL NOT NULL,
+                source_id TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_triples_subject ON triples(subject_id);
+            CREATE INDEX IF NOT EXISTS idx_triples_object ON triples(object_id);
+        ").map_err(|e| TraceMindError::Storage(e.to_string()))?;
 
         debug!("[graph] schema initialized");
-        Ok(())
+        Ok(Self { conn })
     }
 
     pub fn upsert_entity(&self, entity: &Entity) -> Result<()> {
-        let conn = self.conn()?;
-
         let entity_type_json = serde_json::to_string(&entity.entity_type)
             .map_err(|e| TraceMindError::Storage(e.to_string()))?;
 
-        let source_id_val = match &entity.source_id {
-            Some(s) => Value::String(s.clone()),
-            None => Value::Null(LogicalType::String),
-        };
-
-        let mut stmt = conn.prepare(
-            "MERGE (e:Entity {id: $id})
-             SET e.name = $name,
-                 e.entity_type = $etype,
-                 e.confidence = $conf,
-                 e.source_id = $src,
-                 e.created_at = $cat,
-                 e.updated_at = $uat"
-        ).map_err(|e| TraceMindError::Storage(format!("prepare upsert_entity: {e}")))?;
-
-        conn.execute(
-            &mut stmt,
-            vec![
-                ("id", Value::String(entity.id.to_string())),
-                ("name", Value::String(entity.name.clone())),
-                ("etype", Value::String(entity_type_json)),
-                ("conf", Value::Double(entity.confidence)),
-                ("src", source_id_val),
-                ("cat", Value::String(entity.created_at.to_rfc3339())),
-                ("uat", Value::String(entity.updated_at.to_rfc3339())),
+        self.conn.execute(
+            "INSERT INTO entities (id, name, entity_type, confidence, source_id, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(id) DO UPDATE SET
+                name = excluded.name,
+                entity_type = excluded.entity_type,
+                confidence = excluded.confidence,
+                source_id = excluded.source_id,
+                updated_at = excluded.updated_at",
+            params![
+                entity.id.to_string(),
+                entity.name,
+                entity_type_json,
+                entity.confidence,
+                entity.source_id,
+                entity.created_at.to_rfc3339(),
+                entity.updated_at.to_rfc3339(),
             ],
-        ).map_err(|e| TraceMindError::Storage(format!("execute upsert_entity: {e}")))?;
+        ).map_err(|e| TraceMindError::Storage(e.to_string()))?;
 
         debug!("[graph] upserted entity id={} name={}", entity.id, entity.name);
         Ok(())
     }
 
     pub fn get_entity(&self, id: Uuid) -> Result<Entity> {
-        let conn = self.conn()?;
+        let mut stmt = self.conn.prepare(
+            "SELECT id, name, entity_type, confidence, source_id, created_at, updated_at
+             FROM entities WHERE id = ?1"
+        ).map_err(|e| TraceMindError::Storage(e.to_string()))?;
 
-        let mut stmt = conn.prepare(
-            "MATCH (e:Entity {id: $id})
-             RETURN e.id, e.name, e.entity_type, e.confidence, e.source_id, e.created_at, e.updated_at"
-        ).map_err(|e| TraceMindError::Storage(format!("prepare get_entity: {e}")))?;
+        let entity = stmt.query_row(params![id.to_string()], |row| {
+            let id_str: String = row.get(0)?;
+            let name: String = row.get(1)?;
+            let entity_type_str: String = row.get(2)?;
+            let confidence: f64 = row.get(3)?;
+            let source_id: Option<String> = row.get(4)?;
+            let created_at_str: String = row.get(5)?;
+            let updated_at_str: String = row.get(6)?;
 
-        let result = conn.execute(
-            &mut stmt,
-            vec![("id", Value::String(id.to_string()))],
-        ).map_err(|e| TraceMindError::Storage(format!("execute get_entity: {e}")))?;
+            Ok((id_str, name, entity_type_str, confidence, source_id, created_at_str, updated_at_str))
+        }).map_err(|e| TraceMindError::Storage(e.to_string()))?;
 
-        let row = result.into_iter().next()
-            .ok_or_else(|| TraceMindError::Storage(format!("no rows for entity {id}")))?;
+        let (id_str, name, entity_type_str, confidence, source_id, created_at_str, updated_at_str) = entity;
 
-        parse_entity_row(&row)
+        let id: Uuid = id_str.parse()
+            .map_err(|e: uuid::Error| TraceMindError::Storage(e.to_string()))?;
+        let entity_type: EntityType = serde_json::from_str(&entity_type_str)
+            .map_err(|e| TraceMindError::Storage(e.to_string()))?;
+        let created_at: DateTime<Utc> = created_at_str.parse()
+            .map_err(|e: chrono::ParseError| TraceMindError::Storage(e.to_string()))?;
+        let updated_at: DateTime<Utc> = updated_at_str.parse()
+            .map_err(|e: chrono::ParseError| TraceMindError::Storage(e.to_string()))?;
+
+        Ok(Entity {
+            id,
+            name,
+            entity_type,
+            confidence,
+            source_id,
+            created_at,
+            updated_at,
+        })
     }
 
     pub fn find_entity_by_name(&self, name: &str) -> Result<Option<Entity>> {
-        let conn = self.conn()?;
+        let mut stmt = self.conn.prepare(
+            "SELECT id, name, entity_type, confidence, source_id, created_at, updated_at
+             FROM entities WHERE name = ?1 LIMIT 1"
+        ).map_err(|e| TraceMindError::Storage(e.to_string()))?;
 
-        let mut stmt = conn.prepare(
-            "MATCH (e:Entity)
-             WHERE e.name = $name
-             RETURN e.id, e.name, e.entity_type, e.confidence, e.source_id, e.created_at, e.updated_at
-             LIMIT 1"
-        ).map_err(|e| TraceMindError::Storage(format!("prepare find_entity_by_name: {e}")))?;
+        let result = stmt.query_row(params![name], |row| {
+            let id_str: String = row.get(0)?;
+            let name: String = row.get(1)?;
+            let entity_type_str: String = row.get(2)?;
+            let confidence: f64 = row.get(3)?;
+            let source_id: Option<String> = row.get(4)?;
+            let created_at_str: String = row.get(5)?;
+            let updated_at_str: String = row.get(6)?;
 
-        let result = conn.execute(
-            &mut stmt,
-            vec![("name", Value::String(name.to_string()))],
-        ).map_err(|e| TraceMindError::Storage(format!("execute find_entity_by_name: {e}")))?;
+            Ok((id_str, name, entity_type_str, confidence, source_id, created_at_str, updated_at_str))
+        });
 
-        match result.into_iter().next() {
-            Some(row) => Ok(Some(parse_entity_row(&row)?)),
-            None => Ok(None),
+        match result {
+            Ok((id_str, name, entity_type_str, confidence, source_id, created_at_str, updated_at_str)) => {
+                let id: Uuid = id_str.parse()
+                    .map_err(|e: uuid::Error| TraceMindError::Storage(e.to_string()))?;
+                let entity_type: EntityType = serde_json::from_str(&entity_type_str)
+                    .map_err(|e| TraceMindError::Storage(e.to_string()))?;
+                let created_at: DateTime<Utc> = created_at_str.parse()
+                    .map_err(|e: chrono::ParseError| TraceMindError::Storage(e.to_string()))?;
+                let updated_at: DateTime<Utc> = updated_at_str.parse()
+                    .map_err(|e: chrono::ParseError| TraceMindError::Storage(e.to_string()))?;
+
+                Ok(Some(Entity {
+                    id,
+                    name,
+                    entity_type,
+                    confidence,
+                    source_id,
+                    created_at,
+                    updated_at,
+                }))
+            }
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(TraceMindError::Storage(e.to_string())),
         }
     }
 
     pub fn upsert_triple(&self, triple: &Triple) -> Result<()> {
-        let conn = self.conn()?;
-
         let predicate_json = serde_json::to_string(&triple.predicate)
             .map_err(|e| TraceMindError::Storage(e.to_string()))?;
 
-        let source_id_val = match &triple.source_id {
-            Some(s) => Value::String(s.clone()),
-            None => Value::Null(LogicalType::String),
-        };
-
-        // Delete existing triple with same id (if any)
-        let mut del_stmt = conn.prepare(
-            "MATCH (s:Entity)-[r:Triple]->(o:Entity) WHERE r.id = $id DELETE r"
-        ).map_err(|e| TraceMindError::Storage(format!("prepare delete triple: {e}")))?;
-
-        conn.execute(
-            &mut del_stmt,
-            vec![("id", Value::String(triple.id.to_string()))],
-        ).map_err(|e| TraceMindError::Storage(format!("execute delete triple: {e}")))?;
-
-        // Create new relationship
-        let mut ins_stmt = conn.prepare(
-            "MATCH (s:Entity {id: $sid}), (o:Entity {id: $oid})
-             CREATE (s)-[r:Triple {
-                 id: $id,
-                 predicate: $pred,
-                 confidence: $conf,
-                 source_id: $src,
-                 created_at: $cat,
-                 updated_at: $uat
-             }]->(o)"
-        ).map_err(|e| TraceMindError::Storage(format!("prepare insert triple: {e}")))?;
-
-        conn.execute(
-            &mut ins_stmt,
-            vec![
-                ("sid", Value::String(triple.subject_id.to_string())),
-                ("oid", Value::String(triple.object_id.to_string())),
-                ("id", Value::String(triple.id.to_string())),
-                ("pred", Value::String(predicate_json)),
-                ("conf", Value::Double(triple.confidence)),
-                ("src", source_id_val),
-                ("cat", Value::String(triple.created_at.to_rfc3339())),
-                ("uat", Value::String(triple.updated_at.to_rfc3339())),
+        self.conn.execute(
+            "INSERT INTO triples (id, subject_id, predicate, object_id, confidence, source_id, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT(id) DO UPDATE SET
+                subject_id = excluded.subject_id,
+                predicate = excluded.predicate,
+                object_id = excluded.object_id,
+                confidence = excluded.confidence,
+                source_id = excluded.source_id,
+                updated_at = excluded.updated_at",
+            params![
+                triple.id.to_string(),
+                triple.subject_id.to_string(),
+                predicate_json,
+                triple.object_id.to_string(),
+                triple.confidence,
+                triple.source_id,
+                triple.created_at.to_rfc3339(),
+                triple.updated_at.to_rfc3339(),
             ],
-        ).map_err(|e| TraceMindError::Storage(format!("execute insert triple: {e}")))?;
+        ).map_err(|e| TraceMindError::Storage(e.to_string()))?;
 
         debug!("[graph] upserted triple id={} ({} -> {})", triple.id, triple.subject_id, triple.object_id);
         Ok(())
     }
 
     pub fn get_triples_for_entity(&self, entity_id: Uuid) -> Result<Vec<Triple>> {
-        let conn = self.conn()?;
+        let entity_id_str = entity_id.to_string();
 
-        let eid = entity_id.to_string();
+        let mut stmt = self.conn.prepare(
+            "SELECT id, subject_id, predicate, object_id, confidence, source_id, created_at, updated_at
+             FROM triples WHERE subject_id = ?1 OR object_id = ?1"
+        ).map_err(|e| TraceMindError::Storage(e.to_string()))?;
 
-        let mut stmt = conn.prepare(
-            "MATCH (s:Entity)-[r:Triple]->(o:Entity)
-             WHERE s.id = $eid OR o.id = $eid
-             RETURN r.id, s.id, r.predicate, o.id, r.confidence, r.source_id, r.created_at, r.updated_at"
-        ).map_err(|e| TraceMindError::Storage(format!("prepare get_triples: {e}")))?;
+        let rows = stmt.query_map(params![entity_id_str], |row| {
+            let id_str: String = row.get(0)?;
+            let subject_id_str: String = row.get(1)?;
+            let predicate_str: String = row.get(2)?;
+            let object_id_str: String = row.get(3)?;
+            let confidence: f64 = row.get(4)?;
+            let source_id: Option<String> = row.get(5)?;
+            let created_at_str: String = row.get(6)?;
+            let updated_at_str: String = row.get(7)?;
 
-        let result = conn.execute(
-            &mut stmt,
-            vec![("eid", Value::String(eid))],
-        ).map_err(|e| TraceMindError::Storage(format!("execute get_triples: {e}")))?;
+            Ok((id_str, subject_id_str, predicate_str, object_id_str, confidence, source_id, created_at_str, updated_at_str))
+        }).map_err(|e| TraceMindError::Storage(e.to_string()))?;
 
         let mut triples = Vec::new();
-        for row in result {
-            triples.push(parse_triple_row(&row)?);
+        for row in rows {
+            let (id_str, subject_id_str, predicate_str, object_id_str, confidence, source_id, created_at_str, updated_at_str) =
+                row.map_err(|e| TraceMindError::Storage(e.to_string()))?;
+
+            let id: Uuid = id_str.parse()
+                .map_err(|e: uuid::Error| TraceMindError::Storage(e.to_string()))?;
+            let subject_id: Uuid = subject_id_str.parse()
+                .map_err(|e: uuid::Error| TraceMindError::Storage(e.to_string()))?;
+            let predicate: Predicate = serde_json::from_str(&predicate_str)
+                .map_err(|e| TraceMindError::Storage(e.to_string()))?;
+            let object_id: Uuid = object_id_str.parse()
+                .map_err(|e: uuid::Error| TraceMindError::Storage(e.to_string()))?;
+            let created_at: DateTime<Utc> = created_at_str.parse()
+                .map_err(|e: chrono::ParseError| TraceMindError::Storage(e.to_string()))?;
+            let updated_at: DateTime<Utc> = updated_at_str.parse()
+                .map_err(|e: chrono::ParseError| TraceMindError::Storage(e.to_string()))?;
+
+            triples.push(Triple {
+                id,
+                subject_id,
+                predicate,
+                object_id,
+                confidence,
+                source_id,
+                created_at,
+                updated_at,
+            });
         }
 
         debug!("[graph] found {} triples for entity {entity_id}", triples.len());
         Ok(triples)
     }
 
-    /// Return entities reachable within `hops` hops via Cypher variable-length paths.
+    /// Multiply all entity and triple confidence values by `factor` (e.g. 0.95).
+    /// Returns the number of entities whose confidence dropped below `threshold`.
+    pub fn decay_all(&self, factor: f64, threshold: f64) -> Result<usize> {
+        info!("[graph] decaying all confidence by {factor}, threshold={threshold}");
+
+        self.conn.execute(
+            "UPDATE entities SET confidence = confidence * ?1, updated_at = ?2",
+            params![factor, Utc::now().to_rfc3339()],
+        ).map_err(|e| TraceMindError::Storage(e.to_string()))?;
+
+        self.conn.execute(
+            "UPDATE triples SET confidence = confidence * ?1, updated_at = ?2",
+            params![factor, Utc::now().to_rfc3339()],
+        ).map_err(|e| TraceMindError::Storage(e.to_string()))?;
+
+        let count: usize = self.conn.query_row(
+            "SELECT COUNT(*) FROM entities WHERE confidence < ?1",
+            params![threshold],
+            |row| row.get(0),
+        ).map_err(|e| TraceMindError::Storage(e.to_string()))?;
+
+        info!("[graph] decay complete: {count} entities below threshold");
+        Ok(count)
+    }
+
     pub fn k_hop_neighbors(&self, entity_id: Uuid, hops: u32) -> Result<Vec<Entity>> {
         if hops == 0 {
             return Ok(vec![]);
         }
 
-        let conn = self.conn()?;
+        let mut visited: HashSet<Uuid> = HashSet::new();
+        let mut queue: VecDeque<(Uuid, u32)> = VecDeque::new();
+        let mut neighbor_ids: Vec<Uuid> = Vec::new();
 
-        // Kuzu variable-length path syntax; hops is embedded as literal (not parameterizable)
-        let query = format!(
-            "MATCH (e:Entity {{id: $id}})-[*1..{}]-(n:Entity)
-             WHERE n.id <> $id
-             RETURN DISTINCT n.id, n.name, n.entity_type, n.confidence, n.source_id, n.created_at, n.updated_at",
-            hops
-        );
+        visited.insert(entity_id);
+        queue.push_back((entity_id, 0));
 
-        let mut stmt = conn.prepare(&query)
-            .map_err(|e| TraceMindError::Storage(format!("prepare k_hop: {e}")))?;
+        while let Some((current_id, depth)) = queue.pop_front() {
+            if depth >= hops {
+                continue;
+            }
 
-        let result = conn.execute(
-            &mut stmt,
-            vec![("id", Value::String(entity_id.to_string()))],
-        ).map_err(|e| TraceMindError::Storage(format!("execute k_hop: {e}")))?;
+            let triples = self.get_triples_for_entity(current_id)?;
+
+            for triple in triples {
+                let next_id = if triple.subject_id == current_id {
+                    triple.object_id
+                } else {
+                    triple.subject_id
+                };
+
+                if !visited.contains(&next_id) {
+                    visited.insert(next_id);
+                    neighbor_ids.push(next_id);
+                    queue.push_back((next_id, depth + 1));
+                }
+            }
+        }
 
         let mut entities = Vec::new();
-        let mut seen = HashSet::new();
-        for row in result {
-            let entity = parse_entity_row(&row)?;
-            if seen.insert(entity.id) {
-                entities.push(entity);
+        for id in neighbor_ids {
+            match self.get_entity(id) {
+                Ok(entity) => entities.push(entity),
+                Err(TraceMindError::Storage(ref msg)) if msg.contains("no rows") => {
+                    // Entity referenced in a triple but not in entities table; skip
+                }
+                Err(e) => return Err(e),
             }
         }
 
@@ -262,97 +317,6 @@ impl GraphStore {
         Ok(entities)
     }
 }
-
-// ---------------------------------------------------------------------------
-// Value extraction helpers
-// ---------------------------------------------------------------------------
-
-fn extract_string(val: &Value) -> Result<String> {
-    match val {
-        Value::String(s) => Ok(s.clone()),
-        _ => Err(TraceMindError::Storage(format!("expected String, got {:?}", val))),
-    }
-}
-
-fn extract_f64(val: &Value) -> Result<f64> {
-    match val {
-        Value::Double(d) => Ok(*d),
-        Value::Float(f) => Ok(*f as f64),
-        _ => Err(TraceMindError::Storage(format!("expected Double, got {:?}", val))),
-    }
-}
-
-fn extract_opt_string(val: &Value) -> Result<Option<String>> {
-    match val {
-        Value::String(s) => Ok(Some(s.clone())),
-        Value::Null(_) => Ok(None),
-        _ => Err(TraceMindError::Storage(format!("expected String|Null, got {:?}", val))),
-    }
-}
-
-fn parse_entity_row(row: &[Value]) -> Result<Entity> {
-    let id: Uuid = extract_string(&row[0])?
-        .parse()
-        .map_err(|e: uuid::Error| TraceMindError::Storage(e.to_string()))?;
-    let name = extract_string(&row[1])?;
-    let entity_type: EntityType = serde_json::from_str(&extract_string(&row[2])?)
-        .map_err(|e| TraceMindError::Storage(e.to_string()))?;
-    let confidence = extract_f64(&row[3])?;
-    let source_id = extract_opt_string(&row[4])?;
-    let created_at: DateTime<Utc> = extract_string(&row[5])?
-        .parse()
-        .map_err(|e: chrono::ParseError| TraceMindError::Storage(e.to_string()))?;
-    let updated_at: DateTime<Utc> = extract_string(&row[6])?
-        .parse()
-        .map_err(|e: chrono::ParseError| TraceMindError::Storage(e.to_string()))?;
-
-    Ok(Entity {
-        id,
-        name,
-        entity_type,
-        confidence,
-        source_id,
-        created_at,
-        updated_at,
-    })
-}
-
-fn parse_triple_row(row: &[Value]) -> Result<Triple> {
-    let id: Uuid = extract_string(&row[0])?
-        .parse()
-        .map_err(|e: uuid::Error| TraceMindError::Storage(e.to_string()))?;
-    let subject_id: Uuid = extract_string(&row[1])?
-        .parse()
-        .map_err(|e: uuid::Error| TraceMindError::Storage(e.to_string()))?;
-    let predicate: Predicate = serde_json::from_str(&extract_string(&row[2])?)
-        .map_err(|e| TraceMindError::Storage(e.to_string()))?;
-    let object_id: Uuid = extract_string(&row[3])?
-        .parse()
-        .map_err(|e: uuid::Error| TraceMindError::Storage(e.to_string()))?;
-    let confidence = extract_f64(&row[4])?;
-    let source_id = extract_opt_string(&row[5])?;
-    let created_at: DateTime<Utc> = extract_string(&row[6])?
-        .parse()
-        .map_err(|e: chrono::ParseError| TraceMindError::Storage(e.to_string()))?;
-    let updated_at: DateTime<Utc> = extract_string(&row[7])?
-        .parse()
-        .map_err(|e: chrono::ParseError| TraceMindError::Storage(e.to_string()))?;
-
-    Ok(Triple {
-        id,
-        subject_id,
-        predicate,
-        object_id,
-        confidence,
-        source_id,
-        created_at,
-        updated_at,
-    })
-}
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -495,5 +459,28 @@ mod tests {
         let ids: HashSet<Uuid> = two_hop.iter().map(|e| e.id).collect();
         assert!(ids.contains(&bob.id));
         assert!(ids.contains(&carol.id));
+    }
+
+    #[test]
+    fn test_decay_all_reduces_confidence() {
+        let store = GraphStore::open(":memory:").expect("open in-memory db");
+
+        for name in &["A", "B", "C", "D", "E"] {
+            let mut e = make_entity(name, EntityType::Concept);
+            e.confidence = 0.5;
+            store.upsert_entity(&e).expect("upsert");
+        }
+
+        // Decay by 0.1× so all go from 0.5 to 0.05 (at threshold)
+        let below = store.decay_all(0.1, 0.05).expect("decay");
+        assert_eq!(below, 0); // 0.5 * 0.1 = 0.05, not below
+
+        // Decay again → 0.005, all below 0.05
+        let below = store.decay_all(0.1, 0.05).expect("decay");
+        assert_eq!(below, 5);
+
+        // Verify actual values
+        let e = store.find_entity_by_name("A").expect("find").expect("exists");
+        assert!(e.confidence < 0.05, "confidence={}", e.confidence);
     }
 }
