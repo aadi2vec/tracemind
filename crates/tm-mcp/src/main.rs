@@ -296,12 +296,13 @@ async fn main() -> Result<()> {
     let db_path = dir.join("memory.db").to_str().unwrap().to_string();
     let trace_path = dir.join("traces.jsonl").to_str().unwrap().to_string();
 
-    // Open stores.
+    // Open stores. Use TM_HASH_EMBED=1 to skip model download.
+    let hash_embed = std::env::var("TM_HASH_EMBED").map(|v| v == "1").unwrap_or(false);
     let ingest = Arc::new(Mutex::new(
-        IngestPipeline::open(&db_path).map_err(|e| anyhow::anyhow!(e.to_string()))?,
+        IngestPipeline::open(&db_path, hash_embed).map_err(|e| anyhow::anyhow!(e.to_string()))?,
     ));
     let retrieval = Arc::new(Mutex::new(
-        RetrievalEngine::open(&db_path, &trace_path)
+        RetrievalEngine::open(&db_path, &trace_path, hash_embed)
             .map_err(|e| anyhow::anyhow!(e.to_string()))?,
     ));
     let traces = Arc::new(Mutex::new(

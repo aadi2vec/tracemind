@@ -3,6 +3,7 @@ use tm_types::{Entity, EntityType, Triple, Predicate, TraceMindError, Result};
 use uuid::Uuid;
 use chrono::{DateTime, Utc};
 use std::collections::{HashSet, VecDeque};
+use tracing::{debug, info};
 
 pub struct GraphStore {
     conn: Connection,
@@ -10,6 +11,8 @@ pub struct GraphStore {
 
 impl GraphStore {
     pub fn open(path: &str) -> Result<Self> {
+        info!("[graph] opening SQLite store at {path}");
+
         let conn = Connection::open(path)
             .map_err(|e| TraceMindError::Storage(e.to_string()))?;
 
@@ -39,6 +42,7 @@ impl GraphStore {
             CREATE INDEX IF NOT EXISTS idx_triples_object ON triples(object_id);
         ").map_err(|e| TraceMindError::Storage(e.to_string()))?;
 
+        debug!("[graph] schema initialized");
         Ok(Self { conn })
     }
 
@@ -66,6 +70,7 @@ impl GraphStore {
             ],
         ).map_err(|e| TraceMindError::Storage(e.to_string()))?;
 
+        debug!("[graph] upserted entity id={} name={}", entity.id, entity.name);
         Ok(())
     }
 
@@ -179,6 +184,7 @@ impl GraphStore {
             ],
         ).map_err(|e| TraceMindError::Storage(e.to_string()))?;
 
+        debug!("[graph] upserted triple id={} ({} -> {})", triple.id, triple.subject_id, triple.object_id);
         Ok(())
     }
 
@@ -233,7 +239,33 @@ impl GraphStore {
             });
         }
 
+        debug!("[graph] found {} triples for entity {entity_id}", triples.len());
         Ok(triples)
+    }
+
+    /// Multiply all entity and triple confidence values by `factor` (e.g. 0.95).
+    /// Returns the number of entities whose confidence dropped below `threshold`.
+    pub fn decay_all(&self, factor: f64, threshold: f64) -> Result<usize> {
+        info!("[graph] decaying all confidence by {factor}, threshold={threshold}");
+
+        self.conn.execute(
+            "UPDATE entities SET confidence = confidence * ?1, updated_at = ?2",
+            params![factor, Utc::now().to_rfc3339()],
+        ).map_err(|e| TraceMindError::Storage(e.to_string()))?;
+
+        self.conn.execute(
+            "UPDATE triples SET confidence = confidence * ?1, updated_at = ?2",
+            params![factor, Utc::now().to_rfc3339()],
+        ).map_err(|e| TraceMindError::Storage(e.to_string()))?;
+
+        let count: usize = self.conn.query_row(
+            "SELECT COUNT(*) FROM entities WHERE confidence < ?1",
+            params![threshold],
+            |row| row.get(0),
+        ).map_err(|e| TraceMindError::Storage(e.to_string()))?;
+
+        info!("[graph] decay complete: {count} entities below threshold");
+        Ok(count)
     }
 
     pub fn k_hop_neighbors(&self, entity_id: Uuid, hops: u32) -> Result<Vec<Entity>> {
@@ -281,6 +313,7 @@ impl GraphStore {
             }
         }
 
+        info!("[graph] k_hop({hops}) from {entity_id}: {} neighbors", entities.len());
         Ok(entities)
     }
 }
@@ -426,5 +459,28 @@ mod tests {
         let ids: HashSet<Uuid> = two_hop.iter().map(|e| e.id).collect();
         assert!(ids.contains(&bob.id));
         assert!(ids.contains(&carol.id));
+    }
+
+    #[test]
+    fn test_decay_all_reduces_confidence() {
+        let store = GraphStore::open(":memory:").expect("open in-memory db");
+
+        for name in &["A", "B", "C", "D", "E"] {
+            let mut e = make_entity(name, EntityType::Concept);
+            e.confidence = 0.5;
+            store.upsert_entity(&e).expect("upsert");
+        }
+
+        // Decay by 0.1× so all go from 0.5 to 0.05 (at threshold)
+        let below = store.decay_all(0.1, 0.05).expect("decay");
+        assert_eq!(below, 0); // 0.5 * 0.1 = 0.05, not below
+
+        // Decay again → 0.005, all below 0.05
+        let below = store.decay_all(0.1, 0.05).expect("decay");
+        assert_eq!(below, 5);
+
+        // Verify actual values
+        let e = store.find_entity_by_name("A").expect("find").expect("exists");
+        assert!(e.confidence < 0.05, "confidence={}", e.confidence);
     }
 }

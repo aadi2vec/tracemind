@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::path::PathBuf;
 use std::time::Instant;
 
 use tm_controller::bandit::RetrievalParams;
@@ -15,6 +16,7 @@ pub struct RetrievalEngine {
     trace_store: TraceStore,
     embedder: Embedder,
     bandit: UcbBandit,
+    bandit_path: PathBuf,
 }
 
 #[derive(Debug)]
@@ -32,14 +34,24 @@ impl RetrievalEngine {
     /// - Graph store  → `db_path`
     /// - Vector store → `db_path` + `".vec"`
     /// - Trace store  → `trace_path`
-    pub fn open(db_path: &str, trace_path: &str) -> Result<Self> {
+    pub fn open(db_path: &str, trace_path: &str, hash_embed: bool) -> Result<Self> {
         let vec_path = format!("{}.vec", db_path);
+
+        // Derive bandit path as sibling of db_path
+        let bandit_path = PathBuf::from(db_path)
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .join("bandit.json");
 
         let graph = GraphStore::open(db_path)?;
         let vector = VectorStore::open(&vec_path)?;
         let trace_store = TraceStore::open(trace_path)?;
-        let embedder = Embedder::new();
-        let bandit = UcbBandit::new();
+        let embedder = if hash_embed {
+            Embedder::new_hash()
+        } else {
+            Embedder::new()?
+        };
+        let bandit = UcbBandit::load(&bandit_path);
 
         Ok(Self {
             graph,
@@ -47,6 +59,7 @@ impl RetrievalEngine {
             trace_store,
             embedder,
             bandit,
+            bandit_path,
         })
     }
 
@@ -130,6 +143,7 @@ impl RetrievalEngine {
         // Compute reward: non-zero result → 1.0, empty → 0.3.
         let reward = if !entities.is_empty() { 1.0_f64 } else { 0.3_f64 };
         self.bandit.register_reward(arm, reward);
+        self.bandit.save(&self.bandit_path);
 
         Ok(RetrievalResult {
             arm,
@@ -156,11 +170,24 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let db = dir.join("test.db").to_str().unwrap().to_string();
         let traces = dir.join("traces.jsonl").to_str().unwrap().to_string();
-        let mut engine = RetrievalEngine::open(&db, &traces).unwrap();
+
+        // Build engine manually with hash embedder (avoids model download in tests)
+        let vec_path = format!("{}.vec", db);
+        let bandit_path = dir.join("bandit.json");
+        let mut engine = RetrievalEngine {
+            graph: GraphStore::open(&db).unwrap(),
+            vector: VectorStore::open(&vec_path).unwrap(),
+            trace_store: TraceStore::open(&traces).unwrap(),
+            embedder: Embedder::new_hash(),
+            bandit: UcbBandit::new(),
+            bandit_path: bandit_path.clone(),
+        };
+
         let result = engine.query("hello world").unwrap();
         assert!(result.latency_ms < 5000);
         let stats = engine.bandit_stats();
         let total: u64 = stats.iter().map(|(c, _)| c).sum();
         assert_eq!(total, 1);
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
