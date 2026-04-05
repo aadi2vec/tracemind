@@ -104,18 +104,9 @@ async fn handle_memory_store(
         .ingest(text, session_id)
         .map_err(|e| e.to_string())?;
 
-    // Build a Trace and persist it.
-    let mut trace = tm_types::Trace::new(
-        session_id,
-        tm_types::TraceEventType::Ingest,
-        &result.content_hash,
-    );
-    trace.entities_extracted = result.entities.iter().map(|e| e.id).collect();
-    trace.triples_extracted = result.triples.iter().map(|t| t.id).collect();
-
+    // Persist the trace from the pipeline result (already has raw_text + entity/triple IDs).
     let trace_store = traces.lock().await;
-    // Best-effort: ignore append errors so a disk issue doesn't kill the MCP loop.
-    let _ = trace_store.append(&trace);
+    let _ = trace_store.append(&result.trace);
 
     Ok(json!({
         "stored": true,
@@ -185,6 +176,11 @@ async fn handle_get_trace(
             json!({
                 "id": t.id.to_string(),
                 "event_type": format!("{:?}", t.event_type).to_lowercase(),
+                "raw_text": t.raw_text.as_deref().unwrap_or(""),
+                "entities_count": t.entities_extracted.len(),
+                "triples_count": t.triples_extracted.len(),
+                "retrieval_arm": t.retrieval_arm,
+                "retrieval_latency_ms": t.retrieval_latency_ms,
                 "created_at": t.created_at.to_rfc3339()
             })
         })

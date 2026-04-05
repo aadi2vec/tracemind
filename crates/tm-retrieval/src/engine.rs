@@ -6,7 +6,7 @@ use tm_controller::bandit::RetrievalParams;
 use tm_controller::UcbBandit;
 use tm_episodic::TraceStore;
 use tm_graph::GraphStore;
-use tm_types::{Entity, Result, Trace, TraceMindError, Triple};
+use tm_types::{Entity, Result, Trace, TraceEventType, TraceMindError, Triple};
 use tm_vector::{Embedder, VectorStore};
 use uuid::Uuid;
 
@@ -117,6 +117,7 @@ impl RetrievalEngine {
         }
 
         // Phase 4: collect triples for every entity, deduplicated by triple id.
+        //          Prefer typed predicates over generic RelatedTo; sort by confidence.
         let mut seen_triple_ids: HashSet<Uuid> = HashSet::new();
         let mut triples: Vec<Triple> = Vec::new();
 
@@ -129,6 +130,17 @@ impl RetrievalEngine {
                 }
             }
         }
+
+        // Sort: typed predicates first (higher confidence), then by confidence descending.
+        triples.sort_by(|a, b| {
+            let a_typed = !matches!(a.predicate, tm_types::Predicate::RelatedTo);
+            let b_typed = !matches!(b.predicate, tm_types::Predicate::RelatedTo);
+            b_typed.cmp(&a_typed).then(b.confidence.partial_cmp(&a.confidence).unwrap_or(std::cmp::Ordering::Equal))
+        });
+
+        // Cap triples to avoid noise — keep all typed + up to 20 RelatedTo
+        let typed_count = triples.iter().filter(|t| !matches!(t.predicate, tm_types::Predicate::RelatedTo)).count();
+        triples.truncate(typed_count + 20);
 
         // Phase 5: optional episodic traces.
         let traces: Vec<Trace> = if params.include_episodic {
@@ -144,6 +156,15 @@ impl RetrievalEngine {
         let reward = if !entities.is_empty() { 1.0_f64 } else { 0.3_f64 };
         self.bandit.register_reward(arm, reward);
         self.bandit.save(&self.bandit_path);
+
+        // Persist a retrieval trace for the audit trail.
+        let mut trace = Trace::new(Uuid::new_v4(), TraceEventType::Retrieve, "");
+        trace.raw_text = Some(text.to_string());
+        trace.entities_extracted = entities.iter().map(|e| e.id).collect();
+        trace.triples_extracted = triples.iter().map(|t| t.id).collect();
+        trace.retrieval_arm = Some(arm);
+        trace.retrieval_latency_ms = Some(latency_ms);
+        let _ = self.trace_store.append(&trace);
 
         Ok(RetrievalResult {
             arm,

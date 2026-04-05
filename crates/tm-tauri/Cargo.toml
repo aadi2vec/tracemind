@@ -1,0 +1,32 @@
+[package]
+name = "tm-tauri"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "tracemind-app"
+path = "src/main.rs"
+
+[dependencies]
+tm-types = { workspace = true }
+tm-graph = { workspace = true }
+tm-ingest = { workspace = true }
+tm-retrieval = { workspace = true }
+tm-episodic = { workspace = true }
+tm-controller = { workspace = true }
+tm-vector = { workspace = true }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+
+tauri = { version = "2", features = ["devtools"] }
+tauri-build = { version = "2", features = [] }
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
