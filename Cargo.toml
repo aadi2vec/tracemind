@@ -11,6 +11,8 @@ members = [
     "crates/tm-retrieval",
     "crates/tm-mcp",
     "crates/tm-cli",
+    "crates/tm-tauri",
+    "crates/tm-capture",
 ]
 
 [workspace.package]

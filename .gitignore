@@ -4,3 +4,14 @@
 *.db-wal
 *.vec
 *.jsonl
+
+# Model cache
+.fastembed_cache/
+
+# Frontend
+node_modules/
+crates/tm-tauri/ui/dist/
+crates/tm-tauri/ui/bun.lock
+
+# Tauri build
+crates/tm-tauri/gen/

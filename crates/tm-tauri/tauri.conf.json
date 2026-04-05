@@ -1,0 +1,35 @@
+{
+  "$schema": "https://raw.githubusercontent.com/nicerapp/tauri/dev/core/tauri-config-schema/schema.json",
+  "productName": "TraceMind",
+  "version": "0.1.0",
+  "identifier": "com.tracemind.app",
+  "build": {
+    "frontendDist": "./ui/dist",
+    "devUrl": "http://localhost:3000",
+    "beforeDevCommand": "cd crates/tm-tauri/ui && bun run dev",
+    "beforeBuildCommand": "cd crates/tm-tauri/ui && bun run build"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "TraceMind",
+        "width": 1200,
+        "height": 800,
+        "minWidth": 900,
+        "minHeight": 600,
+        "decorations": true,
+        "resizable": true
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": [
+      "icons/icon.png"
+    ]
+  }
+}

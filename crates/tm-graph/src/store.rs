@@ -245,6 +245,16 @@ impl GraphStore {
 
     /// Multiply all entity and triple confidence values by `factor` (e.g. 0.95).
     /// Returns the number of entities whose confidence dropped below `threshold`.
+    pub fn entity_count(&self) -> Result<usize> {
+        self.conn.query_row("SELECT COUNT(*) FROM entities", [], |row| row.get(0))
+            .map_err(|e| TraceMindError::Storage(e.to_string()))
+    }
+
+    pub fn triple_count(&self) -> Result<usize> {
+        self.conn.query_row("SELECT COUNT(*) FROM triples", [], |row| row.get(0))
+            .map_err(|e| TraceMindError::Storage(e.to_string()))
+    }
+
     pub fn decay_all(&self, factor: f64, threshold: f64) -> Result<usize> {
         info!("[graph] decaying all confidence by {factor}, threshold={threshold}");
 
