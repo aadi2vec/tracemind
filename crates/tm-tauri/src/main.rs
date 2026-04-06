@@ -1,6 +1,7 @@
 // Prevents additional console window on Windows in release
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
@@ -32,15 +33,7 @@ struct AppState {
 // IPC response types
 // ---------------------------------------------------------------------------
 
-#[derive(Serialize)]
-struct IngestResponse {
-    trace_id: String,
-    entities: Vec<EntityInfo>,
-    typed_triples: Vec<TripleInfo>,
-    co_occurrence_count: usize,
-}
-
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 struct EntityInfo {
     id: String,
     name: String,
@@ -48,12 +41,20 @@ struct EntityInfo {
     confidence: f64,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 struct TripleInfo {
     subject: String,
     predicate: String,
     object: String,
     confidence: f64,
+}
+
+#[derive(Serialize)]
+struct IngestResponse {
+    trace_id: String,
+    entities: Vec<EntityInfo>,
+    typed_triples: Vec<TripleInfo>,
+    co_occurrence_count: usize,
 }
 
 #[derive(Serialize)]
@@ -95,6 +96,35 @@ struct BanditArmInfo {
     avg_reward: f64,
 }
 
+#[derive(Serialize)]
+struct GraphNode {
+    id: String,
+    name: String,
+    entity_type: String,
+    confidence: f64,
+}
+
+#[derive(Serialize)]
+struct GraphEdge {
+    source: String,
+    target: String,
+    predicate: String,
+    confidence: f64,
+}
+
+#[derive(Serialize)]
+struct GraphData {
+    nodes: Vec<GraphNode>,
+    edges: Vec<GraphEdge>,
+}
+
+#[derive(Serialize)]
+struct DemoResult {
+    texts_ingested: usize,
+    total_entities: usize,
+    total_triples: usize,
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -120,7 +150,7 @@ fn cmd_ingest(text: String, state: State<AppState>) -> Result<IngestResponse, St
     let _ = trace_store.append(&result.trace);
 
     // Build name lookup
-    let name_of: std::collections::HashMap<Uuid, &str> = result.entities.iter()
+    let name_of: HashMap<Uuid, &str> = result.entities.iter()
         .map(|e| (e.id, e.name.as_str())).collect();
 
     let entities: Vec<EntityInfo> = result.entities.iter().map(|e| EntityInfo {
@@ -158,7 +188,7 @@ fn cmd_query(text: String, state: State<AppState>) -> Result<QueryResponse, Stri
     let mut engine = state.retrieval.lock().map_err(|e| e.to_string())?;
     let result = engine.query(&text).map_err(|e| e.to_string())?;
 
-    let name_of: std::collections::HashMap<Uuid, &str> = result.entities.iter()
+    let name_of: HashMap<Uuid, &str> = result.entities.iter()
         .map(|e| (e.id, e.name.as_str())).collect();
 
     let entities: Vec<EntityInfo> = result.entities.iter().map(|e| EntityInfo {
@@ -256,6 +286,136 @@ fn cmd_decay(factor: f64, threshold: f64, state: State<AppState>) -> Result<Stri
     Ok(format!("Decay applied (factor={factor}). {below} entities below {threshold} threshold."))
 }
 
+/// Return the full knowledge graph for mind-map visualization.
+#[tauri::command]
+fn cmd_graph(state: State<AppState>) -> Result<GraphData, String> {
+    let graph = GraphStore::open(&state.db_path).map_err(|e| e.to_string())?;
+
+    // Get all entities via skg
+    let skg_entities = graph.inner().list_entities(None, None)
+        .map_err(|e| format!("list entities: {e}"))?;
+
+    let mut nodes = Vec::new();
+    let mut uuid_to_name: HashMap<String, String> = HashMap::new();
+
+    for ent in &skg_entities {
+        let uuid_str = ent.get_property("uuid")
+            .and_then(|v| v.as_str().map(|s| s.to_string()))
+            .unwrap_or_default();
+        let confidence = ent.get_property("confidence")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.5);
+        // Parse the entity_type JSON string back to display format
+        let etype = serde_json::from_str::<tm_types::EntityType>(&ent.entity_type)
+            .map(|t| format!("{}", t))
+            .unwrap_or_else(|_| ent.entity_type.clone());
+
+        uuid_to_name.insert(uuid_str.clone(), ent.name.clone());
+
+        nodes.push(GraphNode {
+            id: uuid_str,
+            name: ent.name.clone(),
+            entity_type: etype,
+            confidence,
+        });
+    }
+
+    // Get all relations via raw SQL
+    let conn = graph.inner().connection();
+    let mut stmt = conn.prepare(
+        "SELECT source_id, target_id, rel_type, weight, properties FROM kg_relations"
+    ).map_err(|e| format!("prepare: {e}"))?;
+
+    // Build skg_id → uuid map
+    let mut skg_to_uuid: HashMap<i64, String> = HashMap::new();
+    for ent in &skg_entities {
+        if let Some(skg_id) = ent.id {
+            let uuid_str = ent.get_property("uuid")
+                .and_then(|v| v.as_str().map(|s| s.to_string()))
+                .unwrap_or_default();
+            skg_to_uuid.insert(skg_id, uuid_str);
+        }
+    }
+
+    let mut edges = Vec::new();
+    let rows = stmt.query_map([], |row| {
+        let source_id: i64 = row.get(0)?;
+        let target_id: i64 = row.get(1)?;
+        let rel_type: String = row.get(2)?;
+        let weight: f64 = row.get(3)?;
+        Ok((source_id, target_id, rel_type, weight))
+    }).map_err(|e| format!("query: {e}"))?;
+
+    for row in rows {
+        let (src, tgt, rel_type, weight) = row.map_err(|e| format!("row: {e}"))?;
+        let source_uuid = skg_to_uuid.get(&src).cloned().unwrap_or_default();
+        let target_uuid = skg_to_uuid.get(&tgt).cloned().unwrap_or_default();
+        if source_uuid.is_empty() || target_uuid.is_empty() {
+            continue;
+        }
+        let predicate = serde_json::from_str::<tm_types::Predicate>(&rel_type)
+            .map(|p| format!("{}", p))
+            .unwrap_or(rel_type);
+        edges.push(GraphEdge {
+            source: source_uuid,
+            target: target_uuid,
+            predicate,
+            confidence: weight,
+        });
+    }
+
+    Ok(GraphData { nodes, edges })
+}
+
+/// Batch-ingest curated demo data to populate the knowledge graph.
+#[tauri::command]
+fn cmd_demo_ingest(state: State<AppState>) -> Result<DemoResult, String> {
+    let demo_texts = [
+        "Aaditya Srivathsan is the founder of TraceMind, a local-only memory OS for AI agents built entirely in Rust.",
+        "TraceMind uses Rust for its core data plane because of memory safety, zero-cost abstractions, and tiny binary sizes.",
+        "The TraceMind desktop app is built with Tauri, which provides native performance without Electron overhead.",
+        "TraceMind stores everything in a single SQLite file using the sqlite-knowledge-graph crate for entities, relations, and vector embeddings.",
+        "Claude Code integrates with TraceMind through an MCP server that exposes memory_store and memory_query tools over JSON-RPC.",
+        "The retrieval engine uses a UCB1 bandit algorithm to select between four strategies: vector-only, graph-heavy, hybrid, and episodic.",
+        "Aaditya works at the intersection of systems programming and machine learning, with deep expertise in Python, Rust, and PyTorch.",
+        "TraceMind's NER pipeline extracts entities like Person, Organization, Technology, and Concept using a two-pass heuristic approach.",
+        "The capture daemon monitors clipboard changes and shell history, automatically ingesting relevant content into TraceMind memory.",
+        "Privacy is a core design tenet of TraceMind: no API calls, no telemetry, no cloud storage. Everything runs locally on the user's machine.",
+        "The knowledge graph supports PageRank for entity importance scoring and Louvain community detection for topic clustering.",
+        "TraceMind's procedural memory stores versioned how-to sequences with a lifecycle FSM: Active, Reinforced, Degraded, Deprecated.",
+        "React and Tailwind CSS power the TraceMind frontend, with a dark theme featuring purple accents and real-time dashboard updates.",
+        "Anthropic's Claude is the primary AI assistant that benefits from TraceMind's persistent memory across conversation sessions.",
+        "The embedding model is all-MiniLM-L6-v2 running via ONNX on CPU, producing 384-dimensional vectors for semantic search.",
+        "Kubernetes and Docker are planned for Phase 4 enterprise deployment, enabling multi-user governance with ACL and audit logs.",
+    ];
+
+    let pipeline = state.ingest.lock().map_err(|e| e.to_string())?;
+    let trace_store = state.trace_store.lock().map_err(|e| e.to_string())?;
+
+    let mut total_entities = 0;
+    let mut total_triples = 0;
+    let mut texts_ingested = 0;
+
+    for text in &demo_texts {
+        let session_id = Uuid::new_v4();
+        match pipeline.ingest(text, session_id) {
+            Ok(result) => {
+                total_entities += result.entities.len();
+                total_triples += result.triples.len();
+                let _ = trace_store.append(&result.trace);
+                texts_ingested += 1;
+            }
+            Err(_) => continue, // skip PII or other failures
+        }
+    }
+
+    Ok(DemoResult {
+        texts_ingested,
+        total_entities,
+        total_triples,
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
@@ -297,6 +457,8 @@ fn main() {
             cmd_dashboard,
             cmd_traces,
             cmd_decay,
+            cmd_graph,
+            cmd_demo_ingest,
         ])
         .run(tauri::generate_context!())
         .expect("error while running TraceMind");
