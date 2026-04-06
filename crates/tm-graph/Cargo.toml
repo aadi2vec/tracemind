@@ -10,5 +10,6 @@ serde_json = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
 rusqlite = { workspace = true }
+sqlite-knowledge-graph = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }

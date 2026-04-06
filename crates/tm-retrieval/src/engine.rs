@@ -6,17 +6,19 @@ use tm_controller::bandit::RetrievalParams;
 use tm_controller::UcbBandit;
 use tm_episodic::TraceStore;
 use tm_graph::GraphStore;
+use tm_rerank::{ColbertReranker, RerankCandidate};
 use tm_types::{Entity, Result, Trace, TraceEventType, TraceMindError, Triple};
-use tm_vector::{Embedder, VectorStore};
+use tm_vector::Embedder;
+use tracing::info;
 use uuid::Uuid;
 
 pub struct RetrievalEngine {
     graph: GraphStore,
-    vector: VectorStore,
     trace_store: TraceStore,
     embedder: Embedder,
     bandit: UcbBandit,
     bandit_path: PathBuf,
+    reranker: Option<ColbertReranker>,
 }
 
 #[derive(Debug)]
@@ -32,11 +34,8 @@ impl RetrievalEngine {
     /// Open a `RetrievalEngine` rooted at `db_path`.
     ///
     /// - Graph store  → `db_path`
-    /// - Vector store → `db_path` + `".vec"`
     /// - Trace store  → `trace_path`
     pub fn open(db_path: &str, trace_path: &str, hash_embed: bool) -> Result<Self> {
-        let vec_path = format!("{}.vec", db_path);
-
         // Derive bandit path as sibling of db_path
         let bandit_path = PathBuf::from(db_path)
             .parent()
@@ -44,7 +43,6 @@ impl RetrievalEngine {
             .join("bandit.json");
 
         let graph = GraphStore::open(db_path)?;
-        let vector = VectorStore::open(&vec_path)?;
         let trace_store = TraceStore::open(trace_path)?;
         let embedder = if hash_embed {
             Embedder::new_hash()
@@ -55,12 +53,23 @@ impl RetrievalEngine {
 
         Ok(Self {
             graph,
-            vector,
             trace_store,
             embedder,
             bandit,
             bandit_path,
+            reranker: None,
         })
+    }
+
+    /// Attach a ColBERT reranker for higher-quality retrieval.
+    ///
+    /// When set, vector search returns a wider candidate set (3x top_k),
+    /// which is then reranked with ColBERT MaxSim before entity loading.
+    pub fn with_reranker(mut self, model_path: &str, tokenizer_path: &str, alpha: f32) -> Result<Self> {
+        let reranker = ColbertReranker::new(model_path, tokenizer_path, alpha)?;
+        self.reranker = Some(reranker);
+        info!("[retrieval] ColBERT reranker attached (alpha={alpha})");
+        Ok(self)
     }
 
     /// Run the 3-phase UCB-guided retrieval pipeline against `text`.
@@ -73,8 +82,51 @@ impl RetrievalEngine {
 
         // Phase 2: embed query, vector-search for candidate entity UUIDs,
         //          then load entities from the graph store.
+        //          If reranker is available, fetch wider set and rerank.
         let embedding = self.embedder.embed(text);
-        let candidates = self.vector.search(&embedding, params.top_k)?;
+        let search_k = if self.reranker.is_some() {
+            params.top_k * 3 // wider pool for reranking
+        } else {
+            params.top_k
+        };
+        let mut candidates = self.graph.search_vectors(&embedding, search_k)?;
+
+        // Phase 2.5: Optional ColBERT reranking
+        if let Some(ref reranker) = self.reranker {
+            // Build rerank candidates with entity names as text
+            let mut rerank_inputs: Vec<(Uuid, RerankCandidate)> = Vec::new();
+            for (id, score) in &candidates {
+                if let Ok(entity) = self.graph.get_entity(*id) {
+                    rerank_inputs.push((*id, RerankCandidate {
+                        id: id.to_string(),
+                        initial_score: *score,
+                        text: entity.name.clone(),
+                    }));
+                }
+            }
+
+            if !rerank_inputs.is_empty() {
+                let rerank_candidates: Vec<RerankCandidate> =
+                    rerank_inputs.iter().map(|(_, c)| c.clone()).collect();
+
+                match reranker.rerank(text, rerank_candidates) {
+                    Ok(reranked) => {
+                        // Replace candidates with reranked order, capped to top_k
+                        candidates = reranked
+                            .into_iter()
+                            .take(params.top_k)
+                            .filter_map(|r| {
+                                Uuid::parse_str(&r.id).ok().map(|id| (id, r.combined_score))
+                            })
+                            .collect();
+                    }
+                    Err(e) => {
+                        info!("[retrieval] reranker failed, using vector order: {e}");
+                        candidates.truncate(params.top_k);
+                    }
+                }
+            }
+        }
 
         let mut seen_entity_ids: HashSet<Uuid> = HashSet::new();
         let mut entities: Vec<Entity> = Vec::new();
@@ -193,15 +245,14 @@ mod tests {
         let traces = dir.join("traces.jsonl").to_str().unwrap().to_string();
 
         // Build engine manually with hash embedder (avoids model download in tests)
-        let vec_path = format!("{}.vec", db);
         let bandit_path = dir.join("bandit.json");
         let mut engine = RetrievalEngine {
             graph: GraphStore::open(&db).unwrap(),
-            vector: VectorStore::open(&vec_path).unwrap(),
             trace_store: TraceStore::open(&traces).unwrap(),
             embedder: Embedder::new_hash(),
             bandit: UcbBandit::new(),
             bandit_path: bandit_path.clone(),
+            reranker: None,
         };
 
         let result = engine.query("hello world").unwrap();

@@ -15,8 +15,6 @@ tm-ingest = { workspace = true }
 tm-retrieval = { workspace = true }
 tm-episodic = { workspace = true }
 tm-controller = { workspace = true }
-tm-vector = { workspace = true }
-
 serde = { workspace = true }
 serde_json = { workspace = true }
 uuid = { workspace = true }
