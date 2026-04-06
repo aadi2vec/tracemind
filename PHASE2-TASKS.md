@@ -68,8 +68,8 @@ Status: `TODO` | `IN_PROGRESS` | `DONE` | `BLOCKED`
 ---
 
 ## TM-P2-008 — Tauri desktop app scaffold + IPC
-**Status:** TODO
-**Branch:** `p2/tauri-scaffold`
+**Status:** DONE
+**Branch:** `claude/crazy-spence`
 **Deps:** TM-P2-003
 **What:** `cargo tauri init` in workspace. Tauri commands wrapping: ingest, query, trace, status, decay. React + TypeScript frontend shell with sidebar nav. No UI content yet — just the plumbing.
 **Accept:** `cargo tauri dev` opens a window. Calling ingest from JS IPC returns entity count.
@@ -77,8 +77,8 @@ Status: `TODO` | `IN_PROGRESS` | `DONE` | `BLOCKED`
 ---
 
 ## TM-P2-009 — Tauri UI: query + dashboard
-**Status:** TODO
-**Branch:** `p2/tauri-ui`
+**Status:** DONE
+**Branch:** `claude/crazy-spence`
 **Deps:** TM-P2-008
 **What:** Dashboard: entity count, triple count, trace count, bandit arm stats. Query view: text input, entity cards, triple list with names. Tailwind CSS.
 **Accept:** Can ingest text and query it through the UI.
@@ -86,7 +86,7 @@ Status: `TODO` | `IN_PROGRESS` | `DONE` | `BLOCKED`
 ---
 
 ## TM-P2-010 — Tauri UI: memory timeline + entity graph
-**Status:** TODO
+**Status:** TODO (graph viz not yet implemented)
 **Branch:** `p2/tauri-graph`
 **Deps:** TM-P2-009
 **What:** Timeline view: chronological trace log. Entity explorer: browse entities, show connections. Graph visualization (D3 or Cytoscape.js) for entity neighborhood.
@@ -104,7 +104,7 @@ P2-001 (graph+tracing) ✅
       → P2-007 (bandit persist) ✅
     → P2-005 (procedural) ✅
     → P2-006 (decay) ✅
-  → P2-008 (tauri scaffold)
-    → P2-009 (tauri query UI)
-      → P2-010 (tauri graph UI)
+  → P2-008 (tauri scaffold) ✅
+    → P2-009 (tauri query UI) ✅
+      → P2-010 (tauri graph viz) — TODO
 ```

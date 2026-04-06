@@ -3,12 +3,11 @@ use uuid::Uuid;
 
 use tm_types::{Entity, EntityType, Predicate, Result, Trace, TraceEventType, Triple};
 use tm_graph::GraphStore;
-use tm_vector::{Embedder, VectorStore};
+use tm_vector::Embedder;
 use tm_governance::GovernanceFilter;
 
 pub struct IngestPipeline {
     graph: GraphStore,
-    vector: VectorStore,
     embedder: Embedder,
     governance: GovernanceFilter,
 }
@@ -28,8 +27,6 @@ impl IngestPipeline {
     /// If `hash_embed` is true, uses the deterministic hash embedder (no model download).
     pub fn open(db_path: &str, hash_embed: bool) -> Result<Self> {
         let graph = GraphStore::open(db_path)?;
-        let vec_path = format!("{}.vec", db_path);
-        let vector = VectorStore::open(&vec_path)?;
         let embedder = if hash_embed {
             Embedder::new_hash()
         } else {
@@ -39,7 +36,6 @@ impl IngestPipeline {
 
         Ok(Self {
             graph,
-            vector,
             embedder,
             governance,
         })
@@ -71,7 +67,7 @@ impl IngestPipeline {
             self.graph.upsert_entity(entity)?;
             let embed_text = format!("{}: {}", entity.name, text);
             let embedding = self.embedder.embed(&embed_text);
-            self.vector.upsert(entity.id, &embedding)?;
+            self.graph.upsert_vector(entity.id, &embedding)?;
         }
 
         // 5. Extract typed triples via pattern matching, then fill with co-occurrence.
@@ -456,23 +452,19 @@ mod tests {
     use super::*;
     use tm_types::TraceMindError;
 
-    /// Open a pipeline backed by in-memory graph + temp-dir vector store.
-    fn in_memory_pipeline() -> (IngestPipeline, std::path::PathBuf) {
-        let dir = std::env::temp_dir().join(format!("tm_ingest_{}", Uuid::new_v4()));
+    /// Open a pipeline backed by in-memory graph (vectors stored in same SQLite).
+    fn in_memory_pipeline() -> IngestPipeline {
         let graph = GraphStore::open(":memory:").unwrap();
-        let vector = VectorStore::open(dir.to_str().unwrap()).unwrap();
-        let pipeline = IngestPipeline {
+        IngestPipeline {
             graph,
-            vector,
             embedder: Embedder::new_hash(),
             governance: GovernanceFilter::default(),
-        };
-        (pipeline, dir)
+        }
     }
 
     #[test]
     fn test_url_and_file_entities_extracted() {
-        let (pipeline, dir) = in_memory_pipeline();
+        let pipeline = in_memory_pipeline();
         let session_id = Uuid::new_v4();
 
         let result = pipeline
@@ -490,12 +482,11 @@ mod tests {
 
         assert!(has_url, "expected a Url entity; got: {:?}", result.entities);
         assert!(has_file, "expected a File entity; got: {:?}", result.entities);
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn test_pii_email_rejected() {
-        let (pipeline, dir) = in_memory_pipeline();
+        let pipeline = in_memory_pipeline();
         let session_id = Uuid::new_v4();
 
         let result = pipeline.ingest("email: foo@bar.com", session_id);
@@ -505,12 +496,11 @@ mod tests {
             "expected PiiDetected, got: {:?}",
             result
         );
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn test_concept_entities_extracted() {
-        let (pipeline, dir) = in_memory_pipeline();
+        let pipeline = in_memory_pipeline();
         let session_id = Uuid::new_v4();
 
         let text = "memory systems enable agents to recall information across sessions \
@@ -522,7 +512,6 @@ mod tests {
             !result.entities.is_empty(),
             "expected at least one entity from conceptual text"
         );
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

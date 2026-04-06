@@ -13,6 +13,7 @@ members = [
     "crates/tm-cli",
     "crates/tm-tauri",
     "crates/tm-capture",
+    "crates/tm-rerank",
 ]
 
 [workspace.package]
@@ -46,13 +47,11 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Database
-rusqlite = { version = "0.31", features = ["bundled"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+sqlite-knowledge-graph = { version = "0.11.0", features = ["bundled"] }
 
-# Vector / Embeddings
-lancedb = "0.27"
+# Embeddings
 fastembed = "5"
-arrow-array = "57"
-arrow-schema = "57"
 
 # Hashing
 seahash = "4"
