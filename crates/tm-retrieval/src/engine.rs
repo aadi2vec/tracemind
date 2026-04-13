@@ -4,11 +4,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tm_controller::bandit::RetrievalParams;
 use tm_controller::{UcbBandit, LinUcbBandit, QueryPlanner, QueryPlan, PlanAction};
-use tm_episodic::TraceStore;
+use tm_episodic::{ProcedureStore, TraceStore};
 use tm_graph::GraphStore;
 use tm_reason::CausalTrace;
 use tm_rerank::{ColbertReranker, RerankCandidate};
-use tm_types::{Entity, Result, Trace, TraceEventType, TraceMindError, Triple};
+use tm_types::{Entity, Procedure, Result, Trace, TraceEventType, TraceMindError, Triple};
 use tm_vector::Embedder;
 use tracing::info;
 use uuid::Uuid;
@@ -86,6 +86,7 @@ pub struct RetrievalEngine {
     query_cache: RecentQueryCache,
     pending_reward: Option<PendingReward>,
     planner: QueryPlanner,
+    procedure_store: Option<ProcedureStore>,
 }
 
 #[derive(Debug)]
@@ -98,6 +99,12 @@ pub struct RetrievalResult {
     pub causal_trace: CausalTrace,
     /// The plan that was executed for this query.
     pub plan: Option<QueryPlan>,
+    /// When true, the system is not confident in these results.
+    pub low_confidence: bool,
+    /// Suggested follow-up queries when confidence is low.
+    pub suggested_queries: Vec<String>,
+    /// Procedures matching the query (Phase 6: procedural memory).
+    pub procedures: Vec<Procedure>,
 }
 
 impl RetrievalEngine {
@@ -124,6 +131,10 @@ impl RetrievalEngine {
         let bandit = UcbBandit::load(&bandit_path);
         let linucb = LinUcbBandit::load(&linucb_path);
 
+        // Try to auto-open procedure store from sibling file
+        let proc_path = parent.join("procedures.jsonl");
+        let procedure_store = ProcedureStore::open(&proc_path).ok();
+
         Ok(Self {
             graph,
             trace_store,
@@ -136,7 +147,15 @@ impl RetrievalEngine {
             query_cache: RecentQueryCache::new(10),
             pending_reward: None,
             planner: QueryPlanner::new(),
+            procedure_store,
         })
+    }
+
+    /// Attach a ProcedureStore for procedural memory matching.
+    pub fn with_procedures(mut self, path: &str) -> Result<Self> {
+        let store = ProcedureStore::open(path)?;
+        self.procedure_store = Some(store);
+        Ok(self)
     }
 
     /// Attach a ColBERT reranker for higher-quality retrieval.
@@ -148,6 +167,113 @@ impl RetrievalEngine {
         self.reranker = Some(reranker);
         info!("[retrieval] ColBERT reranker attached (alpha={alpha})");
         Ok(self)
+    }
+
+    /// Match stored procedures against a query string.
+    ///
+    /// Scoring:
+    /// - Exact name substring match → 1.0
+    /// - Word overlap (Jaccard) between query words and procedure name words
+    /// - 0.5 * Jaccard of query words vs procedure step action texts
+    ///
+    /// Returns procedures scoring > 0.2, sorted descending, limited to top 3.
+    fn match_procedures(&self, query: &str) -> Vec<Procedure> {
+        let store = match &self.procedure_store {
+            Some(s) => s,
+            None => return vec![],
+        };
+        let active = match store.list_active() {
+            Ok(procs) => procs,
+            Err(_) => return vec![],
+        };
+
+        let query_lower = query.to_lowercase();
+        let query_words: HashSet<&str> = query_lower.split_whitespace().collect();
+
+        let mut scored: Vec<(f64, Procedure)> = Vec::new();
+        for proc in active {
+            let name_lower = proc.name.to_lowercase();
+
+            // (a) exact substring match
+            if query_lower.contains(&name_lower) || name_lower.contains(&query_lower) {
+                scored.push((1.0, proc));
+                continue;
+            }
+
+            // (b) Jaccard of query words vs name words
+            let name_words: HashSet<&str> = name_lower.split_whitespace().collect();
+            let name_jaccard = if query_words.is_empty() && name_words.is_empty() {
+                0.0
+            } else {
+                let intersection = query_words.intersection(&name_words).count() as f64;
+                let union = query_words.union(&name_words).count() as f64;
+                if union > 0.0 { intersection / union } else { 0.0 }
+            };
+
+            // (c) Jaccard of query words vs step action words
+            let step_text: String = proc.steps.iter()
+                .map(|s| s.action.to_lowercase())
+                .collect::<Vec<_>>()
+                .join(" ");
+            let step_words: HashSet<&str> = step_text.split_whitespace().collect();
+            let step_jaccard = if query_words.is_empty() && step_words.is_empty() {
+                0.0
+            } else {
+                let intersection = query_words.intersection(&step_words).count() as f64;
+                let union = query_words.union(&step_words).count() as f64;
+                if union > 0.0 { intersection / union } else { 0.0 }
+            };
+
+            let score = name_jaccard + 0.5 * step_jaccard;
+            if score > 0.2 {
+                scored.push((score, proc));
+            }
+        }
+
+        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        scored.into_iter().take(3).map(|(_, p)| p).collect()
+    }
+
+    /// Generate follow-up query suggestions when confidence is low.
+    fn generate_suggestions(&self, query: &str, plan: &QueryPlan, entities: &[Entity]) -> Vec<String> {
+        let mut suggestions: Vec<String> = Vec::new();
+
+        // If entities were found, suggest learning more about the top one
+        if let Some(top) = entities.first() {
+            suggestions.push(format!("Tell me more about {}", top.name));
+        }
+
+        // If BanditRetrieval and results were sparse, suggest narrowing
+        if matches!(plan.action, PlanAction::BanditRetrieval) && entities.len() < 3 {
+            let first_word = query.split_whitespace()
+                .find(|w| w.len() > 2)
+                .unwrap_or(query);
+            suggestions.push(format!("What do you know about {}?", first_word));
+        }
+
+        // If the query had entity hints, suggest a relationship query
+        if plan.entity_hints.len() >= 2 {
+            suggestions.push(format!(
+                "How does {} relate to {}?",
+                plan.entity_hints[0], plan.entity_hints[1]
+            ));
+        }
+
+        // Always add an analogy suggestion based on the main topic
+        let main_topic = plan.entity_hints.first()
+            .map(|s| s.as_str())
+            .unwrap_or_else(|| {
+                query.split_whitespace()
+                    .find(|w| w.len() > 3)
+                    .unwrap_or(query)
+            });
+        suggestions.push(format!("What's similar to {}?", main_topic));
+
+        // Deduplicate and cap at 3
+        let mut seen = HashSet::new();
+        suggestions.retain(|s| seen.insert(s.clone()));
+        suggestions.truncate(3);
+        suggestions
     }
 
     /// Run the MIA-inspired retrieval pipeline against `text`.
@@ -452,6 +578,19 @@ impl RetrievalEngine {
         causal.total_triples = triples.len();
         causal.latency_ms = latency_ms as u64;
 
+        // Confidence assessment: low when plan confidence is weak and few entities, or no entities at all
+        let low_confidence = entities.is_empty()
+            || (plan.confidence < 0.5 && entities.len() < 2);
+
+        let suggested_queries = if low_confidence {
+            self.generate_suggestions(text, &plan, &entities)
+        } else {
+            vec![]
+        };
+
+        // Phase 6: procedural memory matching
+        let procedures = self.match_procedures(text);
+
         Ok(RetrievalResult {
             arm,
             entities,
@@ -460,6 +599,9 @@ impl RetrievalEngine {
             latency_ms,
             causal_trace: causal,
             plan: Some(plan),
+            low_confidence,
+            suggested_queries,
+            procedures,
         })
     }
 
@@ -578,6 +720,9 @@ impl RetrievalEngine {
             latency_ms,
             causal_trace: causal,
             plan: Some(plan.clone()),
+            low_confidence: false,
+            suggested_queries: vec![],
+            procedures: vec![],
         })
     }
 
@@ -931,6 +1076,7 @@ mod tests {
             query_cache: RecentQueryCache::new(10),
             pending_reward: None,
             planner: QueryPlanner::new(),
+            procedure_store: None,
         };
 
         let result = engine.query("hello world").unwrap();

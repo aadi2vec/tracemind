@@ -225,6 +225,14 @@ async fn handle_memory_query(
         }
     });
 
+    // Add confidence information when results are uncertain
+    if result.low_confidence {
+        response["confidence"] = json!({
+            "low": true,
+            "suggestions": result.suggested_queries
+        });
+    }
+
     // Auto-enrich with reasoning chains when planner detects relationship queries
     if let Some(ref plan) = result.plan {
         match &plan.action {
