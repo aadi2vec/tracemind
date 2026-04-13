@@ -1,22 +1,14 @@
 [package]
-name = "tm-retrieval"
+name = "tm-reason"
 version.workspace = true
 edition.workspace = true
-
-[features]
-default = []
-colbert = ["tm-rerank/colbert"]
 
 [dependencies]
 tm-types = { workspace = true }
 tm-graph = { workspace = true }
-tm-vector = { workspace = true }  # for Embedder only
-tm-episodic = { workspace = true }
-tm-controller = { workspace = true }
-tm-rerank = { path = "../tm-rerank" }
-tm-reason = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 uuid = { workspace = true }
+chrono = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }

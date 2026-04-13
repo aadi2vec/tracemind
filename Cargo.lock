@@ -5718,13 +5718,30 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 1.0.69",
+ "tm-controller",
  "tm-episodic",
+ "tm-graph",
  "tm-ingest",
+ "tm-reason",
  "tm-retrieval",
  "tm-types",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
+name = "tm-reason"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tm-graph",
+ "tm-types",
+ "tracing",
  "uuid",
 ]
 
@@ -5752,6 +5769,7 @@ dependencies = [
  "tm-controller",
  "tm-episodic",
  "tm-graph",
+ "tm-reason",
  "tm-rerank",
  "tm-types",
  "tm-vector",
@@ -5764,6 +5782,7 @@ name = "tm-tauri"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "seahash",
  "serde",
  "serde_json",
  "tauri",
@@ -5772,6 +5791,7 @@ dependencies = [
  "tm-episodic",
  "tm-graph",
  "tm-ingest",
+ "tm-reason",
  "tm-retrieval",
  "tm-types",
  "tokio",

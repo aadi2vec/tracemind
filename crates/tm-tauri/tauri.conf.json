@@ -6,8 +6,8 @@
   "build": {
     "frontendDist": "./ui/dist",
     "devUrl": "http://localhost:3000",
-    "beforeDevCommand": "cd crates/tm-tauri/ui && bun run dev",
-    "beforeBuildCommand": "cd crates/tm-tauri/ui && bun run build"
+    "beforeDevCommand": "",
+    "beforeBuildCommand": ""
   },
   "app": {
     "windows": [

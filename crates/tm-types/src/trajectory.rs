@@ -2,6 +2,20 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+/// Contrastive outcome tag for MIA-inspired trajectory storage.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub enum TrajectoryOutcome {
+    Unknown,
+    Success,
+    Failure,
+}
+
+impl Default for TrajectoryOutcome {
+    fn default() -> Self {
+        Self::Unknown
+    }
+}
+
 /// RL training record: captures context, decision, outcome, and JEPA/WM surprise signal.
 /// Schema is stable from day-1 so Phase-3 model training requires no migration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -19,6 +33,14 @@ pub struct Trajectory {
     // Embeddings (384-dim all-MiniLM-L6-v2). Stored as flat Vec<f32>.
     pub context_embedding: Vec<f32>,
     pub memory_snapshot_hash: String,
+
+    // MIA contrastive trajectory fields
+    /// Whether this trajectory was a success (positive feedback) or failure.
+    #[serde(default)]
+    pub outcome: TrajectoryOutcome,
+    /// Query class/category for grouping contrastive pairs.
+    #[serde(default)]
+    pub query_class: Option<String>,
 
     // JEPA / World Model training fields (Phase 3). None until models are trained.
     pub predicted_outcome: Option<Vec<f32>>,
@@ -49,6 +71,8 @@ impl Trajectory {
             latency_ms,
             context_embedding,
             memory_snapshot_hash: memory_snapshot_hash.into(),
+            outcome: TrajectoryOutcome::Unknown,
+            query_class: None,
             predicted_outcome: None,
             actual_outcome_embedding: None,
             surprise_score: None,

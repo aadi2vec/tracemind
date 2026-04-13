@@ -12,6 +12,9 @@ tm-types = { workspace = true }
 tm-ingest = { workspace = true }
 tm-retrieval = { workspace = true }
 tm-episodic = { workspace = true }
+tm-graph = { workspace = true }
+tm-reason = { workspace = true }
+tm-controller = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 uuid = { workspace = true }

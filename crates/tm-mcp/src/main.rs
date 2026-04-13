@@ -7,7 +7,9 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use tm_episodic::TraceStore;
+use tm_graph::GraphStore;
 use tm_ingest::IngestPipeline;
+use tm_reason::{AnalogySolver, ChainBuilder, Consolidator};
 use tm_retrieval::RetrievalEngine;
 
 // ---------------------------------------------------------------------------
@@ -79,6 +81,56 @@ fn tools_list() -> Value {
                     "type": "object",
                     "properties": {}
                 }
+            },
+            {
+                "name": "memory_reason",
+                "description": "Explore reasoning paths from an entity. Returns multi-hop chains through the knowledge graph showing how entities connect.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "entity": {
+                            "type": "string",
+                            "description": "Entity name to reason from."
+                        },
+                        "target": {
+                            "type": "string",
+                            "description": "Optional target entity. If provided, finds paths between source and target."
+                        },
+                        "max_results": {
+                            "type": "integer",
+                            "description": "Max number of reasoning chains (default 5).",
+                            "default": 5
+                        }
+                    },
+                    "required": ["entity"]
+                }
+            },
+            {
+                "name": "memory_analogies",
+                "description": "Find entities structurally similar to the given entity, based on their relationship patterns in the knowledge graph.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "entity": {
+                            "type": "string",
+                            "description": "Entity name to find analogies for."
+                        },
+                        "max_results": {
+                            "type": "integer",
+                            "description": "Max analogies (default 5).",
+                            "default": 5
+                        }
+                    },
+                    "required": ["entity"]
+                }
+            },
+            {
+                "name": "memory_consolidate",
+                "description": "Run memory consolidation: strengthen frequently-accessed memories, decay old ones, prune weak entities, merge duplicates.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {}
+                }
             }
         ]
     })
@@ -118,6 +170,7 @@ async fn handle_memory_store(
 async fn handle_memory_query(
     params: &Value,
     retrieval: &Arc<Mutex<RetrievalEngine>>,
+    db_path: &str,
 ) -> Result<Value, String> {
     let text = params
         .get("text")
@@ -126,6 +179,12 @@ async fn handle_memory_query(
 
     let mut engine = retrieval.lock().await;
     let result = engine.query(text).map_err(|e| e.to_string())?;
+
+    // Extract the plan action for auto-routing supplemental data
+    let plan_action = result.plan.as_ref().map(|p| format!("{:?}", p.action))
+        .unwrap_or_else(|| "BanditRetrieval".to_string());
+    let plan_complexity = result.plan.as_ref().map(|p| p.complexity.clone())
+        .unwrap_or_else(|| "Unknown".to_string());
 
     let entities: Vec<Value> = result
         .entities
@@ -151,11 +210,87 @@ async fn handle_memory_query(
         })
         .collect();
 
-    Ok(json!({
+    let explanation = result.causal_trace.explain();
+
+    // Auto-routing: if the planner detected a reasoning/analogy query,
+    // enrich the response with supplemental reasoning data.
+    let mut response = json!({
         "entities": entities,
         "triples": triples,
-        "arm": result.arm
-    }))
+        "arm": result.arm,
+        "explanation": explanation,
+        "plan": {
+            "action": plan_action,
+            "complexity": plan_complexity
+        }
+    });
+
+    // Auto-enrich with reasoning chains when planner detects relationship queries
+    if let Some(ref plan) = result.plan {
+        match &plan.action {
+            tm_controller::PlanAction::ReasoningChain { source_hint, target_hint } => {
+                if let (Some(src), Some(tgt)) = (source_hint, target_hint) {
+                    // Auto-run reasoning chain between the detected entities
+                    if let Ok(chains) = auto_reason_chain(db_path, src, tgt) {
+                        response["reasoning_chains"] = chains;
+                    }
+                }
+            }
+            tm_controller::PlanAction::AnalogySearch { entity_hint } => {
+                if let Ok(analogies) = auto_find_analogies(db_path, entity_hint) {
+                    response["analogies"] = analogies;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    Ok(response)
+}
+
+/// Auto-route: run reasoning chain between two entities (triggered by planner).
+fn auto_reason_chain(db_path: &str, source: &str, target: &str) -> Result<Value, String> {
+    let graph = GraphStore::open(db_path).map_err(|e| e.to_string())?;
+    let src = graph.find_entity_by_name_icase(source)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("Entity '{}' not found", source))?;
+    let tgt = graph.find_entity_by_name_icase(target)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("Entity '{}' not found", target))?;
+
+    let builder = ChainBuilder::with_defaults(&graph);
+    let chains = builder.find_chains(src.id, tgt.id);
+
+    let chain_json: Vec<Value> = chains.iter().take(3).map(|c| {
+        json!({
+            "path": c.steps.iter().map(|s| format!("{} --[{}]--> {}", s.entity_name, s.predicate, s.entity_type)).collect::<Vec<_>>(),
+            "score": c.score,
+            "hops": c.steps.len()
+        })
+    }).collect();
+
+    Ok(json!(chain_json))
+}
+
+/// Auto-route: find analogies for an entity (triggered by planner).
+fn auto_find_analogies(db_path: &str, entity_name: &str) -> Result<Value, String> {
+    let graph = GraphStore::open(db_path).map_err(|e| e.to_string())?;
+    let entity = graph.find_entity_by_name_icase(entity_name)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("Entity '{}' not found", entity_name))?;
+
+    let solver = AnalogySolver::new(&graph);
+    let results = solver.find_analogies(entity.id, 3);
+
+    let analogies: Vec<Value> = results.iter().map(|r| {
+        json!({
+            "target": r.target_name,
+            "similarity": r.similarity,
+            "explanation": r.explanation
+        })
+    }).collect();
+
+    Ok(json!(analogies))
 }
 
 async fn handle_get_trace(
@@ -193,6 +328,93 @@ fn handle_list_procedures() -> Value {
     json!({ "procedures": [] })
 }
 
+fn handle_memory_reason(params: &Value, db_path: &str) -> Result<Value, String> {
+    let entity_name = params
+        .get("entity")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "missing required parameter: entity".to_string())?;
+
+    let target_name = params.get("target").and_then(|v| v.as_str());
+    let max_results = params.get("max_results").and_then(|v| v.as_u64()).unwrap_or(5) as usize;
+
+    let graph = GraphStore::open(db_path).map_err(|e| e.to_string())?;
+    let source = graph.find_entity_by_name_icase(entity_name)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("Entity '{}' not found", entity_name))?;
+
+    let builder = ChainBuilder::with_defaults(&graph);
+
+    if let Some(target) = target_name {
+        let target_entity = graph.find_entity_by_name_icase(target)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("Entity '{}' not found", target))?;
+
+        let chains = builder.find_chains(source.id, target_entity.id);
+        let chain_json: Vec<Value> = chains.iter().take(max_results).map(|c| {
+            json!({
+                "path": c.steps.iter().map(|s| format!("{} --[{}]--> {}", s.entity_name, s.predicate, s.entity_type)).collect::<Vec<_>>(),
+                "score": c.score,
+                "hops": c.steps.len()
+            })
+        }).collect();
+
+        Ok(json!({ "chains": chain_json, "source": entity_name, "target": target }))
+    } else {
+        let chains = builder.explore(&[source.id], max_results);
+        let chain_json: Vec<Value> = chains.iter().map(|c| {
+            json!({
+                "path": c.steps.iter().map(|s| format!("{} ({}) via {}", s.entity_name, s.entity_type, s.predicate)).collect::<Vec<_>>(),
+                "score": c.score,
+                "destination": c.steps.last().map(|s| s.entity_name.clone()).unwrap_or_default()
+            })
+        }).collect();
+
+        Ok(json!({ "chains": chain_json, "source": entity_name }))
+    }
+}
+
+fn handle_memory_analogies(params: &Value, db_path: &str) -> Result<Value, String> {
+    let entity_name = params
+        .get("entity")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "missing required parameter: entity".to_string())?;
+
+    let max_results = params.get("max_results").and_then(|v| v.as_u64()).unwrap_or(5) as usize;
+
+    let graph = GraphStore::open(db_path).map_err(|e| e.to_string())?;
+    let entity = graph.find_entity_by_name_icase(entity_name)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("Entity '{}' not found", entity_name))?;
+
+    let solver = AnalogySolver::new(&graph);
+    let results = solver.find_analogies(entity.id, max_results);
+
+    let analogies: Vec<Value> = results.iter().map(|r| {
+        json!({
+            "target": r.target_name,
+            "similarity": r.similarity,
+            "explanation": r.explanation,
+            "shared_patterns": r.shared_patterns
+        })
+    }).collect();
+
+    Ok(json!({ "source": entity_name, "analogies": analogies }))
+}
+
+fn handle_memory_consolidate(db_path: &str) -> Result<Value, String> {
+    let graph = GraphStore::open(db_path).map_err(|e| e.to_string())?;
+    let consolidator = Consolidator::with_defaults(&graph);
+    let report = consolidator.consolidate();
+
+    Ok(json!({
+        "entities_strengthened": report.entities_strengthened,
+        "entities_decayed": report.entities_decayed,
+        "entities_pruned": report.entities_pruned,
+        "entities_merged": report.entities_merged,
+        "triples_pruned": report.triples_pruned
+    }))
+}
+
 // ---------------------------------------------------------------------------
 // Request dispatcher
 // ---------------------------------------------------------------------------
@@ -204,6 +426,7 @@ async fn handle_request(
     retrieval: &Arc<Mutex<RetrievalEngine>>,
     traces: &Arc<Mutex<TraceStore>>,
     session_id: Uuid,
+    db_path: &str,
 ) -> Result<Value, anyhow::Error> {
     match method {
         "initialize" => {
@@ -236,7 +459,7 @@ async fn handle_request(
                         .map_err(|e| anyhow::anyhow!(e))?
                 }
                 "memory_query" => {
-                    handle_memory_query(&args, retrieval)
+                    handle_memory_query(&args, retrieval, db_path)
                         .await
                         .map_err(|e| anyhow::anyhow!(e))?
                 }
@@ -246,6 +469,18 @@ async fn handle_request(
                         .map_err(|e| anyhow::anyhow!(e))?
                 }
                 "list_procedures" => handle_list_procedures(),
+                "memory_reason" => {
+                    handle_memory_reason(&args, db_path)
+                        .map_err(|e| anyhow::anyhow!(e))?
+                }
+                "memory_analogies" => {
+                    handle_memory_analogies(&args, db_path)
+                        .map_err(|e| anyhow::anyhow!(e))?
+                }
+                "memory_consolidate" => {
+                    handle_memory_consolidate(db_path)
+                        .map_err(|e| anyhow::anyhow!(e))?
+                }
                 unknown => {
                     return Err(anyhow::anyhow!("unknown tool: {}", unknown));
                 }
@@ -350,7 +585,7 @@ async fn main() -> Result<()> {
             .to_string();
 
         let response =
-            handle_request(&method, &request, &ingest, &retrieval, &traces, session_id).await;
+            handle_request(&method, &request, &ingest, &retrieval, &traces, session_id, &db_path).await;
 
         let resp_json = match response {
             Ok(result) => json!({

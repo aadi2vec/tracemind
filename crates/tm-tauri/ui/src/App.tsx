@@ -3,13 +3,17 @@ import Dashboard from "./views/Dashboard";
 import QueryView from "./views/QueryView";
 import TracesView from "./views/TracesView";
 import IngestView from "./views/IngestView";
+import GraphView from "./views/GraphView";
+import ReasonView from "./views/ReasonView";
 
-type View = "dashboard" | "query" | "ingest" | "traces";
+type View = "dashboard" | "query" | "ingest" | "traces" | "graph" | "reason";
 
 const NAV_ITEMS: { id: View; label: string; icon: string }[] = [
   { id: "dashboard", label: "Dashboard", icon: "grid" },
   { id: "query", label: "Query", icon: "search" },
   { id: "ingest", label: "Ingest", icon: "plus" },
+  { id: "graph", label: "Graph", icon: "graph" },
+  { id: "reason", label: "Reason", icon: "reason" },
   { id: "traces", label: "Traces", icon: "list" },
 ];
 
@@ -31,6 +35,21 @@ function NavIcon({ type }: { type: string }) {
       return (
         <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
           <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4v16m8-8H4" />
+        </svg>
+      );
+    case "graph":
+      return (
+        <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <circle cx="6" cy="6" r="2" strokeWidth={2} />
+          <circle cx="18" cy="6" r="2" strokeWidth={2} />
+          <circle cx="12" cy="18" r="2" strokeWidth={2} />
+          <path strokeLinecap="round" strokeWidth={2} d="M8 7l4 9M16 7l-4 9M7.5 5.5h9" />
+        </svg>
+      );
+    case "reason":
+      return (
+        <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 10V3L4 14h7v7l9-11h-7z" />
         </svg>
       );
     case "list":
@@ -86,6 +105,8 @@ export default function App() {
         {view === "dashboard" && <Dashboard />}
         {view === "query" && <QueryView />}
         {view === "ingest" && <IngestView />}
+        {view === "graph" && <GraphView />}
+        {view === "reason" && <ReasonView />}
         {view === "traces" && <TracesView />}
       </main>
     </div>

@@ -1,2 +1,4 @@
 pub mod bandit;
-pub use bandit::UcbBandit;
+pub mod planner;
+pub use bandit::{UcbBandit, LinUcbBandit};
+pub use planner::{QueryPlanner, QueryPlan, PlanAction};

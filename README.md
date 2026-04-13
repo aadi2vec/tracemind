@@ -97,7 +97,7 @@ cargo tauri dev
 cargo tauri build
 ```
 
-Four views: **Dashboard** (stats + bandit visualization + activity feed), **Query** (semantic search), **Ingest** (text extraction preview), **Traces** (audit trail with drill-down).
+Five views: **Dashboard** (stats + bandit visualization + live capture feed + recommendations), **Query** (semantic search + inline recommendations), **Ingest** (text extraction preview), **Graph** (force-directed knowledge graph with type filtering), **Traces** (audit trail with drill-down).
 
 ---
 

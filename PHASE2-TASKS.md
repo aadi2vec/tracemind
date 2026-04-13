@@ -86,11 +86,58 @@ Status: `TODO` | `IN_PROGRESS` | `DONE` | `BLOCKED`
 ---
 
 ## TM-P2-010 — Tauri UI: memory timeline + entity graph
-**Status:** TODO (graph viz not yet implemented)
-**Branch:** `p2/tauri-graph`
+**Status:** DONE
+**Branch:** `claude/brave-herschel`
 **Deps:** TM-P2-009
-**What:** Timeline view: chronological trace log. Entity explorer: browse entities, show connections. Graph visualization (D3 or Cytoscape.js) for entity neighborhood.
-**Accept:** Can click an entity and see its neighborhood rendered as a graph.
+**What:** Force-directed graph visualization on HTML5 canvas. Responsive sizing (ResizeObserver + devicePixelRatio). Type filter dropdown, label toggle, degree-based node sizing. Adaptive physics for large graphs (300+ nodes) with spatial cutoff. Color-coded entity types with legend. Drag-to-reposition nodes. Hover info panel showing connections.
+**Accept:** Can see full knowledge graph rendered with entity types color-coded. Can filter by type, toggle labels, drag nodes. ✅
+
+---
+
+## TM-2.6 — Demo Polish Sprint
+**Status:** DONE
+**Branch:** `claude/brave-herschel`
+**Deps:** TM-P2-010
+
+### TM-2.6-001 — Entity deduplication
+**Status:** DONE
+**What:** Case-insensitive name matching during ingest. Reuses existing entity UUIDs, reinforces confidence (+0.05). Within-batch dedup by lowercase name.
+**Accept:** Ingesting "Rust" twice doesn't create duplicates. ✅
+
+### TM-2.6-002 — Explicit feedback (thumbs up/down)
+**Status:** DONE
+**What:** `explicit_feedback(score)` on RetrievalEngine registers reward on current bandit arm. Frontend +/- buttons in QueryView meta bar.
+**Accept:** Clicking +/- updates bandit state. ✅
+
+### TM-2.6-003 — PageRank-weighted recommendations
+**Status:** DONE
+**What:** Recommendations scoring formula: 0.4*relevance + 0.2*recency + 0.2*novelty + 0.2*pagerank. Cold-start: 0.3*recency + 0.2*novelty + 0.2*confidence + 0.3*pagerank.
+**Accept:** High-PageRank entities surface in recommendations. ✅
+
+### TM-2.6-004 — Community coloring (Louvain)
+**Status:** DONE
+**What:** GraphStore wraps `sqlite-knowledge-graph` Louvain. `cmd_graph` populates community per node. Frontend toggle between type/community coloring with 12-color palette.
+**Accept:** Graph view shows community clusters with distinct colors. ✅
+
+### TM-2.6-005 — "Surprising entities today" widget
+**Status:** DONE
+**What:** `cmd_surprising` returns high-novelty recently captured entities. Dashboard shows "Most Surprising Today" widget with novelty/recency percentages.
+**Accept:** Dashboard shows surprising entities. ✅
+
+### TM-2.6-006 — Batch SQL scoring
+**Status:** DONE
+**What:** Replaced N+1 `recency_score()`/`novelty_score()` calls with `batch_recency_scores()`/`batch_novelty_scores()` single-query batch fetches.
+**Accept:** No performance regression; same results. ✅
+
+### TM-2.6-007 — Entity trend sparklines
+**Status:** DONE
+**What:** `cmd_entity_trends` returns entities created per day over last 7 days. Dashboard shows bar chart sparkline of entity growth.
+**Accept:** Dashboard shows 7-day trend. ✅
+
+### TM-2.6-008 — Entity delete from graph
+**Status:** DONE
+**What:** `cmd_delete_entity` deletes entity + relations + vectors + access logs. Right-click context menu on graph nodes with "Delete Entity" option.
+**Accept:** Right-click delete removes entity and refreshes graph. ✅
 
 ---
 
@@ -106,5 +153,168 @@ P2-001 (graph+tracing) ✅
     → P2-006 (decay) ✅
   → P2-008 (tauri scaffold) ✅
     → P2-009 (tauri query UI) ✅
-      → P2-010 (tauri graph viz) — TODO
+      → P2-010 (tauri graph viz) ✅
+        → TM-2.6 (demo polish) ✅
+          → TM-3.0 (local reasoning) ✅
+            → TM-3.1 (MIA retrieval intelligence) ✅
+              → TM-3.2 (R1-inspired architecture) ✅
+              → TM-3.3 (LinUCB + attenuation + reward) ✅
+                → TM-3.4-001 (query decomposition) ✅
 ```
+
+---
+
+## Phase 3.0 — Local Reasoning Engine
+
+### TM-3.0-001 — Graph-of-Thought reasoning chains
+**Status:** DONE
+**What:** New `tm-reason` crate with `ChainBuilder`. Multi-hop BFS traversal that builds scored reasoning paths between entities. Excludes noisy RelatedTo edges. Hop decay factor (0.85^n) prefers shorter paths. `explore()` method for open-ended reasoning from seed entities. 3 tests.
+**Accept:** `cargo test -p tm-reason` passes. `cmd_reason_chain` and `cmd_reason_explore` IPC commands work. Frontend "Reason" view with Explore/Chain/Analogy modes. ✅
+
+### TM-3.0-002 — Causal tracing / attribution
+**Status:** DONE
+**What:** `CausalTrace` struct records how each entity was discovered: vector match, graph hop, episodic trace, or reasoning chain. `explain()` generates human-readable attribution. `top_attributions(n)` returns highest-weight evidence. 2 tests.
+**Accept:** Causal traces can be built and explained. ✅
+
+### TM-3.0-003 — Analogical reasoning (WL kernel)
+**Status:** DONE
+**What:** `AnalogySolver` computes entity neighborhood fingerprints using 1-hop and 2-hop predicate patterns (simplified Weisfeiler-Leman). Jaccard similarity between fingerprints. Same-type bonus. `cmd_find_analogies` IPC command. 1 test.
+**Accept:** "What's like Rust?" finds Python (both Technologies with DependsOn→Project pattern). ✅
+
+### TM-3.0-004 — Memory consolidation ("sleep")
+**Status:** DONE
+**What:** `Consolidator` runs Ebbinghaus forgetting curves: strengthens frequently-accessed entities, decays old ones, prunes below threshold, merges near-duplicate names. `cmd_consolidate` IPC. Dashboard "Sleep" button. 3 tests.
+**Accept:** Consolidation merges duplicates, prunes weak entities. ✅
+
+### TM-3.0-005 — find_entity_by_id
+**Status:** DONE
+**What:** Added `GraphStore::find_entity_by_id(Uuid)` for direct ID lookup (used by reasoning engine).
+**Accept:** Reasoning chains resolve entity names during traversal. ✅
+
+### TM-3.0-006 — Causal tracing integration into retrieval pipeline
+**Status:** DONE
+**What:** `CausalTrace` is now threaded through `RetrievalEngine::query()`. Every vector match, graph hop, and episodic trace adds attribution. `RetrievalResult` includes `causal_trace` field. MCP `memory_query` returns `explanation`. Tauri `QueryView` shows "Why these results?" collapsible panel.
+**Accept:** Every query produces causal attribution data. ✅
+
+### TM-3.0-007 — MCP reasoning tools
+**Status:** DONE
+**What:** Added `memory_reason`, `memory_analogies`, `memory_consolidate` to MCP JSON-RPC server. `memory_reason` supports both directed (source→target) and exploratory modes. All tools dispatch to tm-reason crate.
+**Accept:** MCP clients can call all 3 reasoning tools. ✅
+
+---
+
+## Phase 3.1 — MIA-Inspired Retrieval Intelligence
+
+### TM-3.1-001 — Composite retrieval scoring (MIA)
+**Status:** DONE
+**What:** Score(m) = 0.7*Sim + 0.15*Value + 0.15*Frequency. Value = successes/(usage+1), Frequency = 1/(usage+1). Added `retrieval_feedback` table to GraphStore with `record_retrieval()`, `record_success()`, `batch_value_scores()`, `batch_frequency_scores()`. Results re-ranked by composite score after vector search.
+**Accept:** Entities that historically led to good outcomes rank higher. ✅
+
+### TM-3.1-002 — Session context blending (MIA)
+**Status:** DONE
+**What:** Sim = 0.8*sim(query, memory) + 0.2*sim(session_context, memory). `blend_with_context()` computes centroid of recent query embeddings and blends 80/20 with current query. Prevents tunnel vision on exact query match.
+**Accept:** Ambiguous queries get better results when session context exists. ✅
+
+### TM-3.1-003 — Fallback cascade (MIA reflection)
+**Status:** DONE
+**What:** When max similarity < 0.3 and results are sparse, automatically try next bandit arm's parameters (wider top_k). Made `UcbBandit::params_for_arm()` public. Prevents returning poor results without trying harder.
+**Accept:** Weak queries trigger automatic retry with wider strategy. ✅
+
+### TM-3.1-004 — Entity success/failure credit assignment
+**Status:** DONE
+**What:** `explicit_feedback()` credits entities via `graph.record_success()` when reward > 0.5. Each `query()` calls `record_retrieval()` for usage tracking. Builds value scores over time.
+**Accept:** Entities accumulate success/usage stats for composite scoring. ✅
+
+### TM-3.1-005 — Contrastive trajectory storage (MIA)
+**Status:** DONE
+**What:** Added `TrajectoryOutcome` enum (Unknown/Success/Failure) and `query_class` to Trajectory type. `TrajectoryStore::tag_outcome()` tags trajectories. `consolidate_contrastive()` keeps shortest success + one failure per query class, preserves untagged. MIA principle: learn from both positive and negative exemplars.
+**Accept:** `cargo test --workspace` passes. Contrastive consolidation prunes redundant trajectories. ✅
+
+---
+
+## Phase 3.2 — R1-Inspired Architecture Upgrades
+
+### TM-3.2-001 — Memory-R1 CRUD operations
+**Status:** DONE
+**What:** Added `MemoryOp` enum (Add/Update/Noop/Delete) to `tm-types`. `IngestPipeline::decide_memory_op()` uses vector similarity to decide: >0.90 same type = Noop (duplicate), >0.90 diff type = Update, 0.75-0.90 = Update (merge + average embeddings), <0.75 = Add. IngestResult now includes `memory_ops` field tracking all decisions. Noop lightly reinforces (+0.02), Update merges embeddings and reinforces (+0.1).
+**Accept:** `cargo test --workspace` passes. Graph doesn't grow unboundedly with duplicates. ✅
+
+### TM-3.2-002 — Reciprocal Rank Aggregation (Graph-R1)
+**Status:** DONE
+**What:** Replaced MIA's fixed linear weights (0.7/0.15/0.15) with parameter-free Reciprocal Rank Aggregation. `rra_fuse()` computes `RRA(id) = Σ 1/(k + rank + 1)` over 3 ranked lists (similarity, value, frequency). k=60 smoothing constant. Immune to score scale differences — no weight tuning needed. 2 new tests.
+**Accept:** RRA fusion ranks entities correctly. No arbitrary weights to tune. ✅
+
+### TM-3.2-003 — KG-R1 schema-agnostic graph actions
+**Status:** DONE
+**What:** Added `GraphAction` enum (GetOutgoingPredicates, GetIncomingPredicates, FollowPredicate, ReverseFollow) to `tm-graph`. These 4 actions are provably sufficient to traverse any reasoning path in a directed KG (KG-R1, arXiv:2509.26383). `GraphAction::execute()` dispatches to GraphStore methods. Foundation for future learned traversal policies.
+**Accept:** All 4 actions implemented and callable. ✅
+
+### TM-3.2-004 — QueryPlanner (prefrontal cortex)
+**Status:** DONE
+**What:** New `QueryPlanner` in `tm-controller` with 6 plan actions: DirectLookup, BanditRetrieval, ReasoningChain, AnalogySearch, Decompose, Consolidate. Assesses query complexity (Simple/Moderate/Complex/Compound) from linguistic features. Extracts entity hints from capitalized words. `replan()` escalates strategy when results are poor (Graph-R1 "rethink" step). 8 tests.
+**Accept:** Planner classifies queries correctly. Relationship queries → ReasoningChain, analogy → AnalogySearch, etc. ✅
+
+### TM-3.2-005 — Planner-driven retrieval pipeline
+**Status:** DONE
+**What:** `RetrievalEngine` now runs planner as Phase 0 ("think" step) before retrieval. DirectLookup forces narrow arm (speed), ReasoningChain forces hybrid arm (graph hops), others let bandit decide. MCP `memory_query` auto-enriches responses: relationship queries get reasoning chains, analogy queries get structural matches — zero extra user interaction needed.
+**Accept:** Queries auto-route to the right pipeline. MCP responses include plan metadata. ✅
+
+---
+
+## What's Next — Priority Roadmap
+
+### Phase 3.3 — Contextual Bandit + Progressive Attenuation (HIGH IMPACT)
+
+#### TM-3.3-001 — LinUCB contextual bandit
+**Status:** DONE
+**What:** Added `LinUcbBandit` alongside `UcbBandit`. Diagonal approximation of LinUCB — O(d) storage per arm (~3KB vs 1.2MB for full). Context = 384-dim query embedding. Learns "for ML queries use wide arm, for lookups use narrow arm." Retrieval engine now uses LinUCB for all bandit-decided queries, with dual reward updates (both UCB1 and LinUCB). Persistent via `linucb.json`. 6 new tests including context-arm association learning.
+**Accept:** `cargo test -p tm-controller` passes (21 tests). LinUCB learns distinct arm preferences for different context vectors. ✅
+
+#### TM-3.3-002 — Progressive fallback attenuation (GraphRAG-R1)
+**Status:** DONE
+**What:** Replace binary fallback gate (sim < 0.3) with attenuated cascade. Each cascade step multiplied by decay factor 0.6. Prevents over-retrieval while still catching bad arms. Track cascade depth in trajectory for analysis. Attenuated score must pass 0.15 threshold to be included.
+**Accept:** Fallback cascade applies 0.6× decay per step. `cargo test --workspace` passes. ✅
+
+#### TM-3.3-003 — Simplified reward signal
+**Status:** DONE
+**What:** Replace composite reward with outcome-only signals: click=0.7 (positive engagement), rapid_requery=0.1 (results were bad), dwell>10s=0.5 (probably useful), else=0.3 (ambiguous). R1 papers consistently show simpler outcome-aligned rewards outperform complex proxies.
+**Accept:** Reward signal is 4 clean cases. `cargo test --workspace` passes. ✅
+
+### Phase 3.4 — Planner Decomposition + Procedural Execution
+
+#### TM-3.4-001 — Query decomposition execution
+**Status:** DONE
+**What:** When planner returns `Decompose { sub_queries }`, `query_decomposed()` executes each sub-query independently with medium arm + 1-hop graph expansion, merges entities/triples with deduplication, and builds unified CausalTrace. Phase 0.5 intercept in `query()` routes Decompose plans automatically.
+**Accept:** Compound queries split and merge correctly. `cargo test --workspace` passes. ✅
+
+#### TM-3.4-002 — Procedural memory execution in query flow
+**Status:** TODO
+**What:** Wire `ProcedureStore` into retrieval. When a query matches a stored procedure (by name similarity), surface it alongside entity results. Currently procedures exist but are disconnected from query flow.
+**Effort:** 1-2 days
+
+#### TM-3.4-003 — Uncertainty-driven routing
+**Status:** TODO
+**What:** When planner confidence < 0.5 and results are poor, surface "I'm not confident — here's what I found" with suggested follow-up queries. Graph-R1 "rethink" step but for the user.
+**Effort:** Half day
+
+### Phase 4.0 — Production Polish
+
+#### TM-4.0-001 — ONNX embeddings everywhere
+**Status:** TODO
+**What:** Ship real all-MiniLM-L6-v2 via fastembed. Auto-download on first run. Hash embedder only for tests. Required for real-world precision.
+**Effort:** 1 day (mostly testing model download paths)
+
+#### TM-4.0-002 — Tauri desktop app packaging
+**Status:** TODO
+**What:** `cargo tauri build` for macOS .dmg. Menu bar integration. Auto-start option. System tray icon.
+**Effort:** 2-3 days
+
+#### TM-4.0-003 — Capture daemon integration
+**Status:** TODO
+**What:** Wire tm-capture into Tauri app. Background thread monitors clipboard/screen. Relevance gating via `is_relevant_for_ingestion()`. User notification on auto-ingest.
+**Effort:** 2 days
+
+#### TM-4.0-004 — Performance benchmarking
+**Status:** TODO
+**What:** Measure: ingest latency, query latency, memory usage (target <200MB idle, <500MB active), SQLite file size growth rate. Optimize hot paths.
+**Effort:** 1 day
