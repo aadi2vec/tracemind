@@ -96,6 +96,50 @@ impl GraphStore {
             triple_map.len()
         );
 
+        // Create access_log and captured_signals tables for dynamic ingestion/recommendations.
+        let conn = kg.connection();
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS access_log (
+                id         INTEGER PRIMARY KEY,
+                entity_id  TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                context    TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_access_entity ON access_log(entity_id, created_at);
+
+            CREATE TABLE IF NOT EXISTS captured_signals (
+                id              INTEGER PRIMARY KEY,
+                source          TEXT NOT NULL,
+                raw_text        TEXT NOT NULL,
+                content_hash    INTEGER NOT NULL,
+                relevance_score REAL,
+                ingested        INTEGER DEFAULT 0,
+                created_at      TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_signals_hash ON captured_signals(content_hash);
+
+            CREATE TABLE IF NOT EXISTS retrieval_feedback (
+                id           INTEGER PRIMARY KEY,
+                entity_id    TEXT NOT NULL,
+                retrieved    INTEGER NOT NULL DEFAULT 0,
+                succeeded    INTEGER NOT NULL DEFAULT 0,
+                UNIQUE(entity_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_feedback_entity ON retrieval_feedback(entity_id);
+
+            CREATE TABLE IF NOT EXISTS recommendations (
+                id          INTEGER PRIMARY KEY,
+                entity_id   TEXT NOT NULL,
+                score       REAL NOT NULL,
+                reason      TEXT NOT NULL,
+                clicked     INTEGER DEFAULT 0,
+                query_id    TEXT,
+                created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+            );"
+        )
+        .map_err(|e| TraceMindError::Storage(format!("create tables: {e}")))?;
+
         Ok(Self {
             kg,
             entity_map: RefCell::new(entity_map),
@@ -158,6 +202,38 @@ impl GraphStore {
         skg_entity_to_tm(&skg_ent)
     }
 
+    pub fn find_entity_by_id(&self, id: Uuid) -> Result<Option<Entity>> {
+        let map = self.entity_map.borrow();
+        let skg_id = match map.get(&id) {
+            Some(&sid) => sid,
+            None => return Ok(None),
+        };
+        drop(map);
+
+        let conn = self.kg.connection();
+        let result = conn.query_row(
+            "SELECT entity_type, name, properties FROM kg_entities WHERE id = ?1",
+            params![skg_id],
+            |row| {
+                let entity_type: String = row.get(0)?;
+                let name: String = row.get(1)?;
+                let props_str: String = row.get(2)?;
+                Ok((entity_type, name, props_str))
+            },
+        );
+
+        match result {
+            Ok((etype_str, name, props_str)) => {
+                let props: HashMap<String, serde_json::Value> =
+                    serde_json::from_str(&props_str).unwrap_or_default();
+                let entity = props_to_tm_entity(&etype_str, &name, &props)?;
+                Ok(Some(entity))
+            }
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(TraceMindError::Storage(e.to_string())),
+        }
+    }
+
     pub fn find_entity_by_name(&self, name: &str) -> Result<Option<Entity>> {
         let conn = self.kg.connection();
         let result = conn.query_row(
@@ -182,6 +258,62 @@ impl GraphStore {
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(TraceMindError::Storage(e.to_string())),
         }
+    }
+
+    /// Case-insensitive entity lookup. Returns the first match.
+    pub fn find_entity_by_name_icase(&self, name: &str) -> Result<Option<Entity>> {
+        let conn = self.kg.connection();
+        let result = conn.query_row(
+            "SELECT id, entity_type, name, properties FROM kg_entities WHERE name = ?1 COLLATE NOCASE LIMIT 1",
+            params![name],
+            |row| {
+                let _id: i64 = row.get(0)?;
+                let entity_type: String = row.get(1)?;
+                let name: String = row.get(2)?;
+                let props_str: String = row.get(3)?;
+                Ok((entity_type, name, props_str))
+            },
+        );
+
+        match result {
+            Ok((etype_str, name, props_str)) => {
+                let props: HashMap<String, serde_json::Value> =
+                    serde_json::from_str(&props_str).unwrap_or_default();
+                let entity = props_to_tm_entity(&etype_str, &name, &props)?;
+                Ok(Some(entity))
+            }
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(TraceMindError::Storage(e.to_string())),
+        }
+    }
+
+    /// Reinforce an existing entity's confidence and update its timestamp.
+    pub fn reinforce_entity(&self, id: Uuid, amount: f64) -> Result<()> {
+        let map = self.entity_map.borrow();
+        let &skg_id = map.get(&id).ok_or_else(|| {
+            TraceMindError::Storage(format!("entity {id} not in id map"))
+        })?;
+        drop(map);
+
+        let mut skg_ent = self
+            .kg
+            .get_entity(skg_id)
+            .map_err(|e| TraceMindError::Storage(format!("skg get_entity: {e}")))?;
+
+        let cur = skg_ent
+            .get_property("confidence")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.5);
+        let new_conf = (cur + amount).min(1.0);
+        skg_ent.set_property("confidence", json!(new_conf));
+        skg_ent.set_property("updated_at", json!(Utc::now().to_rfc3339()));
+
+        self.kg
+            .update_entity(&skg_ent)
+            .map_err(|e| TraceMindError::Storage(format!("skg update_entity: {e}")))?;
+
+        debug!("[graph] reinforced entity {id}: {cur:.3} → {new_conf:.3}");
+        Ok(())
     }
 
     // ─── Triple (Relation) CRUD ─────────────────────────────────────────
@@ -449,6 +581,202 @@ impl GraphStore {
         Ok(out)
     }
 
+    // ─── Get vector for an entity ───────────────────────────────────────
+
+    /// Retrieve the embedding vector for a single entity, if it exists.
+    pub fn get_vector(&self, entity_id: Uuid) -> Result<Option<Vec<f32>>> {
+        let entity_map = self.entity_map.borrow();
+        let &skg_id = match entity_map.get(&entity_id) {
+            Some(id) => id,
+            None => return Ok(None),
+        };
+        drop(entity_map);
+
+        let conn = self.kg.connection();
+        let result: std::result::Result<Vec<u8>, _> = conn.query_row(
+            "SELECT vector FROM kg_vectors WHERE entity_id = ?1",
+            params![skg_id],
+            |row| row.get(0),
+        );
+
+        match result {
+            Ok(blob) => {
+                // skg stores vectors as f32 little-endian bytes
+                let floats: Vec<f32> = blob
+                    .chunks_exact(4)
+                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .collect();
+                Ok(Some(floats))
+            }
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(TraceMindError::Storage(format!("get_vector: {e}"))),
+        }
+    }
+
+    // ─── Access log (for recommendations) ────────────────────────────────
+
+    /// Log an entity access event (query_result, clicked, recommended, ingested).
+    pub fn log_access(&self, entity_id: Uuid, event_type: &str, context: Option<&str>) -> Result<()> {
+        let conn = self.kg.connection();
+        conn.execute(
+            "INSERT INTO access_log (entity_id, event_type, context) VALUES (?1, ?2, ?3)",
+            params![entity_id.to_string(), event_type, context],
+        )
+        .map_err(|e| TraceMindError::Storage(format!("log_access: {e}")))?;
+        Ok(())
+    }
+
+    // ─── Retrieval feedback (MIA-style value scoring) ──────────────────
+
+    /// Record that an entity was returned in a retrieval result set.
+    pub fn record_retrieval(&self, entity_id: Uuid) -> Result<()> {
+        let conn = self.kg.connection();
+        conn.execute(
+            "INSERT INTO retrieval_feedback (entity_id, retrieved, succeeded) VALUES (?1, 1, 0)
+             ON CONFLICT(entity_id) DO UPDATE SET retrieved = retrieved + 1",
+            params![entity_id.to_string()],
+        ).map_err(|e| TraceMindError::Storage(format!("record_retrieval: {e}")))?;
+        Ok(())
+    }
+
+    /// Record positive feedback for entities in a result set.
+    pub fn record_success(&self, entity_ids: &[Uuid]) -> Result<()> {
+        let conn = self.kg.connection();
+        for id in entity_ids {
+            conn.execute(
+                "UPDATE retrieval_feedback SET succeeded = succeeded + 1 WHERE entity_id = ?1",
+                params![id.to_string()],
+            ).map_err(|e| TraceMindError::Storage(format!("record_success: {e}")))?;
+        }
+        Ok(())
+    }
+
+    /// Batch fetch value scores: succeeded / (retrieved + 1) for each entity.
+    pub fn batch_value_scores(&self, entity_ids: &[Uuid]) -> HashMap<Uuid, f64> {
+        let mut result = HashMap::new();
+        if entity_ids.is_empty() {
+            return result;
+        }
+
+        let conn = self.kg.connection();
+        let id_strs: Vec<String> = entity_ids.iter().map(|id| format!("'{}'", id)).collect();
+        let sql = format!(
+            "SELECT entity_id, CAST(succeeded AS REAL) / (retrieved + 1) AS value_score \
+             FROM retrieval_feedback WHERE entity_id IN ({})",
+            id_strs.join(",")
+        );
+        if let Ok(mut stmt) = conn.prepare(&sql) {
+            if let Ok(rows) = stmt.query_map([], |row| {
+                let id_str: String = row.get(0)?;
+                let score: f64 = row.get(1)?;
+                Ok((id_str, score))
+            }) {
+                for row in rows.flatten() {
+                    if let Ok(id) = Uuid::parse_str(&row.0) {
+                        result.insert(id, row.1);
+                    }
+                }
+            }
+        }
+        result
+    }
+
+    /// Batch fetch frequency scores: 1.0 / (retrieved + 1) for each entity.
+    pub fn batch_frequency_scores(&self, entity_ids: &[Uuid]) -> HashMap<Uuid, f64> {
+        let mut result = HashMap::new();
+        if entity_ids.is_empty() {
+            return result;
+        }
+
+        let conn = self.kg.connection();
+        let id_strs: Vec<String> = entity_ids.iter().map(|id| format!("'{}'", id)).collect();
+        let sql = format!(
+            "SELECT entity_id, 1.0 / (retrieved + 1) AS freq_score \
+             FROM retrieval_feedback WHERE entity_id IN ({})",
+            id_strs.join(",")
+        );
+        if let Ok(mut stmt) = conn.prepare(&sql) {
+            if let Ok(rows) = stmt.query_map([], |row| {
+                let id_str: String = row.get(0)?;
+                let score: f64 = row.get(1)?;
+                Ok((id_str, score))
+            }) {
+                for row in rows.flatten() {
+                    if let Ok(id) = Uuid::parse_str(&row.0) {
+                        result.insert(id, row.1);
+                    }
+                }
+            }
+        }
+        result
+    }
+
+    /// Recency score: exp(-lambda * hours_since_last_access). Half-life ~14h.
+    pub fn recency_score(&self, entity_id: Uuid) -> f64 {
+        let conn = self.kg.connection();
+        let result: std::result::Result<String, _> = conn.query_row(
+            "SELECT MAX(created_at) FROM access_log WHERE entity_id = ?1",
+            params![entity_id.to_string()],
+            |row| row.get(0),
+        );
+        match result {
+            Ok(ts) => {
+                if let Ok(dt) = ts.parse::<DateTime<Utc>>() {
+                    let hours = (Utc::now() - dt).num_minutes() as f64 / 60.0;
+                    (-0.05 * hours).exp()
+                } else {
+                    0.0
+                }
+            }
+            Err(_) => 0.0,
+        }
+    }
+
+    /// Novelty score: 1.0 / (1.0 + ln(1 + access_count)). Less seen = more novel.
+    pub fn novelty_score(&self, entity_id: Uuid) -> f64 {
+        let conn = self.kg.connection();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM access_log WHERE entity_id = ?1",
+                params![entity_id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+        1.0 / (1.0 + (1.0 + count as f64).ln())
+    }
+
+    // ─── Captured signals ────────────────────────────────────────────────
+
+    /// Log a captured signal (clipboard, query, shell, etc.) with its ingestion status.
+    pub fn log_signal(
+        &self,
+        source: &str,
+        raw_text: &str,
+        content_hash: u64,
+        relevance_score: Option<f64>,
+        ingested: bool,
+    ) -> Result<()> {
+        let conn = self.kg.connection();
+        conn.execute(
+            "INSERT INTO captured_signals (source, raw_text, content_hash, relevance_score, ingested) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![source, raw_text, content_hash as i64, relevance_score, ingested as i32],
+        )
+        .map_err(|e| TraceMindError::Storage(format!("log_signal: {e}")))?;
+        Ok(())
+    }
+
+    /// Check if a signal with the given content hash was already seen.
+    pub fn signal_exists(&self, content_hash: u64) -> bool {
+        let conn = self.kg.connection();
+        conn.query_row(
+            "SELECT 1 FROM captured_signals WHERE content_hash = ?1 LIMIT 1",
+            params![content_hash as i64],
+            |_| Ok(()),
+        )
+        .is_ok()
+    }
+
     // ─── Graph algorithms (new capabilities) ────────────────────────────
 
     /// Run PageRank on the knowledge graph. Returns entity UUID → score.
@@ -470,10 +798,225 @@ impl GraphStore {
         Ok(result)
     }
 
+    /// Run Louvain community detection. Returns entity UUID → community ID.
+    pub fn louvain(&self) -> Result<HashMap<Uuid, i32>> {
+        let result = self
+            .kg
+            .kg_louvain()
+            .map_err(|e| TraceMindError::Storage(format!("louvain: {e}")))?;
+
+        let entity_map = self.entity_map.borrow();
+        let reverse: HashMap<i64, Uuid> =
+            entity_map.iter().map(|(&uuid, &sid)| (sid, uuid)).collect();
+
+        let mut communities = HashMap::new();
+        for (skg_id, community_id) in result.memberships {
+            if let Some(&uuid) = reverse.get(&skg_id) {
+                communities.insert(uuid, community_id);
+            }
+        }
+        info!(
+            "[graph] louvain: {} communities, modularity={:.4}",
+            result.num_communities, result.modularity
+        );
+        Ok(communities)
+    }
+
+    /// Batch recency scores for multiple entities in a single query.
+    pub fn batch_recency_scores(&self, entity_ids: &[Uuid]) -> HashMap<Uuid, f64> {
+        let mut scores = HashMap::new();
+        if entity_ids.is_empty() {
+            return scores;
+        }
+        let conn = self.kg.connection();
+        // Use a single query to get max access time for all entities
+        let placeholders: Vec<String> = entity_ids.iter().map(|id| format!("'{}'", id)).collect();
+        let sql = format!(
+            "SELECT entity_id, MAX(created_at) FROM access_log WHERE entity_id IN ({}) GROUP BY entity_id",
+            placeholders.join(",")
+        );
+        if let Ok(mut stmt) = conn.prepare(&sql) {
+            if let Ok(rows) = stmt.query_map([], |row| {
+                let id_str: String = row.get(0)?;
+                let ts: String = row.get(1)?;
+                Ok((id_str, ts))
+            }) {
+                for row in rows.flatten() {
+                    if let Ok(uuid) = Uuid::parse_str(&row.0) {
+                        if let Ok(dt) = row.1.parse::<DateTime<Utc>>() {
+                            let hours = (Utc::now() - dt).num_minutes() as f64 / 60.0;
+                            scores.insert(uuid, (-0.05 * hours).exp());
+                        }
+                    }
+                }
+            }
+        }
+        // Fill missing with 0.0
+        for id in entity_ids {
+            scores.entry(*id).or_insert(0.0);
+        }
+        scores
+    }
+
+    /// Batch novelty scores for multiple entities in a single query.
+    pub fn batch_novelty_scores(&self, entity_ids: &[Uuid]) -> HashMap<Uuid, f64> {
+        let mut scores = HashMap::new();
+        if entity_ids.is_empty() {
+            return scores;
+        }
+        let conn = self.kg.connection();
+        let placeholders: Vec<String> = entity_ids.iter().map(|id| format!("'{}'", id)).collect();
+        let sql = format!(
+            "SELECT entity_id, COUNT(*) FROM access_log WHERE entity_id IN ({}) GROUP BY entity_id",
+            placeholders.join(",")
+        );
+        if let Ok(mut stmt) = conn.prepare(&sql) {
+            if let Ok(rows) = stmt.query_map([], |row| {
+                let id_str: String = row.get(0)?;
+                let count: i64 = row.get(1)?;
+                Ok((id_str, count))
+            }) {
+                for row in rows.flatten() {
+                    if let Ok(uuid) = Uuid::parse_str(&row.0) {
+                        scores.insert(uuid, 1.0 / (1.0 + (1.0 + row.1 as f64).ln()));
+                    }
+                }
+            }
+        }
+        // Fill missing with max novelty (1.0 / (1.0 + ln(1)) = 1.0)
+        for id in entity_ids {
+            scores.entry(*id).or_insert(1.0 / (1.0 + 1.0f64.ln()));
+        }
+        scores
+    }
+
+    /// Delete an entity and all its associated relations and vectors.
+    pub fn delete_entity(&self, entity_id: Uuid) -> Result<()> {
+        let mut map = self.entity_map.borrow_mut();
+        let &skg_id = map.get(&entity_id).ok_or_else(|| {
+            TraceMindError::Storage(format!("entity {entity_id} not in id map"))
+        })?;
+
+        let conn = self.kg.connection();
+
+        // Delete relations involving this entity
+        conn.execute(
+            "DELETE FROM kg_relations WHERE source_id = ?1 OR target_id = ?1",
+            params![skg_id],
+        )
+        .map_err(|e| TraceMindError::Storage(format!("delete relations: {e}")))?;
+
+        // Delete vectors for this entity
+        conn.execute(
+            "DELETE FROM kg_vectors WHERE entity_id = ?1",
+            params![skg_id],
+        )
+        .map_err(|e| TraceMindError::Storage(format!("delete vectors: {e}")))?;
+
+        // Delete the entity itself
+        conn.execute(
+            "DELETE FROM kg_entities WHERE id = ?1",
+            params![skg_id],
+        )
+        .map_err(|e| TraceMindError::Storage(format!("delete entity: {e}")))?;
+
+        // Clean up access log
+        conn.execute(
+            "DELETE FROM access_log WHERE entity_id = ?1",
+            params![entity_id.to_string()],
+        )
+        .map_err(|e| TraceMindError::Storage(format!("delete access_log: {e}")))?;
+
+        // Remove from maps
+        map.remove(&entity_id);
+
+        // Remove triple map entries that reference this entity's relations
+        let mut tmap = self.triple_map.borrow_mut();
+        tmap.retain(|_, _| true); // We can't easily filter by entity, but the DB rows are gone
+
+        info!("[graph] deleted entity {entity_id} and all associated data");
+        Ok(())
+    }
+
+    /// List all entities (for graph visualization, export, etc.).
+    pub fn list_all_entities(&self) -> Result<Vec<Entity>> {
+        let entities = self
+            .kg
+            .list_entities(None, None)
+            .map_err(|e| TraceMindError::Storage(format!("list entities: {e}")))?;
+
+        let mut result = Vec::new();
+        for ent in &entities {
+            if let Ok(entity) = skg_entity_to_tm(ent) {
+                result.push(entity);
+            }
+        }
+        Ok(result)
+    }
+
     /// Access the underlying `KnowledgeGraph` for advanced operations
-    /// (Louvain communities, BFS/DFS traversal, export, etc.).
+    /// (BFS/DFS traversal, export, etc.).
     pub fn inner(&self) -> &KnowledgeGraph {
         &self.kg
+    }
+
+    // ─── KG-R1 Schema-Agnostic Graph Actions ───────────────────────────
+    //
+    // Minimal 4-action API inspired by KG-R1 (arXiv:2509.26383).
+    // These 4 operations are provably sufficient to traverse any path in
+    // a directed knowledge graph, and constrain the action space for
+    // future learned traversal policies.
+
+    /// KG-R1 Action 1: Get all outgoing predicates from an entity.
+    /// Returns `Vec<(Predicate, Uuid)>` — the predicate and target entity ID.
+    pub fn outgoing_predicates(&self, entity_id: Uuid) -> Result<Vec<(Predicate, Uuid)>> {
+        let triples = self.get_triples_for_entity(entity_id)?;
+        Ok(triples
+            .into_iter()
+            .filter(|t| t.subject_id == entity_id)
+            .map(|t| (t.predicate, t.object_id))
+            .collect())
+    }
+
+    /// KG-R1 Action 2: Get all incoming predicates pointing to an entity.
+    /// Returns `Vec<(Predicate, Uuid)>` — the predicate and source entity ID.
+    pub fn incoming_predicates(&self, entity_id: Uuid) -> Result<Vec<(Predicate, Uuid)>> {
+        let triples = self.get_triples_for_entity(entity_id)?;
+        Ok(triples
+            .into_iter()
+            .filter(|t| t.object_id == entity_id)
+            .map(|t| (t.predicate, t.subject_id))
+            .collect())
+    }
+
+    /// KG-R1 Action 3: Follow a specific predicate forward from an entity.
+    /// Returns all target entities reachable via `predicate` from `entity_id`.
+    pub fn follow_predicate(&self, entity_id: Uuid, predicate: &Predicate) -> Result<Vec<Entity>> {
+        let outgoing = self.outgoing_predicates(entity_id)?;
+        let mut results = Vec::new();
+        for (pred, target_id) in outgoing {
+            if &pred == predicate {
+                if let Ok(entity) = self.get_entity(target_id) {
+                    results.push(entity);
+                }
+            }
+        }
+        Ok(results)
+    }
+
+    /// KG-R1 Action 4: Reverse-follow a predicate — find entities that point
+    /// to `entity_id` via `predicate`.
+    pub fn reverse_follow(&self, entity_id: Uuid, predicate: &Predicate) -> Result<Vec<Entity>> {
+        let incoming = self.incoming_predicates(entity_id)?;
+        let mut results = Vec::new();
+        for (pred, source_id) in incoming {
+            if &pred == predicate {
+                if let Ok(entity) = self.get_entity(source_id) {
+                    results.push(entity);
+                }
+            }
+        }
+        Ok(results)
     }
 }
 

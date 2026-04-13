@@ -1,6 +1,7 @@
+use std::collections::HashMap;
 use std::io::Write;
 use std::path::PathBuf;
-use tm_types::{Result, Trajectory, TraceMindError};
+use tm_types::{Result, Trajectory, TrajectoryOutcome, TraceMindError};
 
 pub struct TrajectoryStore {
     path: PathBuf,
@@ -48,6 +49,110 @@ impl TrajectoryStore {
             .collect::<Result<Vec<_>>>()?;
         let start = trajectories.len().saturating_sub(limit);
         Ok(trajectories[start..].to_vec())
+    }
+
+    /// Tag a trajectory's outcome (success/failure) for contrastive storage.
+    pub fn tag_outcome(&self, trajectory_id: uuid::Uuid, outcome: TrajectoryOutcome, query_class: Option<&str>) -> Result<()> {
+        let raw = std::fs::read_to_string(&self.path)
+            .map_err(|e| TraceMindError::Storage(e.to_string()))?;
+        let mut trajectories: Vec<Trajectory> = raw
+            .split('\n')
+            .filter(|line| !line.is_empty())
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect();
+
+        for t in &mut trajectories {
+            if t.id == trajectory_id {
+                t.outcome = outcome;
+                if let Some(qc) = query_class {
+                    t.query_class = Some(qc.to_string());
+                }
+            }
+        }
+
+        // Rewrite the file
+        let mut file = std::fs::File::create(&self.path)
+            .map_err(|e| TraceMindError::Storage(e.to_string()))?;
+        for t in &trajectories {
+            let mut line = serde_json::to_string(t)?;
+            line.push('\n');
+            file.write_all(line.as_bytes())
+                .map_err(|e| TraceMindError::Storage(e.to_string()))?;
+        }
+        Ok(())
+    }
+
+    /// MIA-inspired contrastive consolidation: for each query class, keep only
+    /// the shortest successful trajectory + one random failed trajectory.
+    /// Returns (kept, pruned) counts.
+    pub fn consolidate_contrastive(&self) -> Result<(usize, usize)> {
+        let raw = std::fs::read_to_string(&self.path)
+            .map_err(|e| TraceMindError::Storage(e.to_string()))?;
+        let trajectories: Vec<Trajectory> = raw
+            .split('\n')
+            .filter(|line| !line.is_empty())
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect();
+
+        let total = trajectories.len();
+
+        // Group by query_class
+        let mut by_class: HashMap<String, Vec<Trajectory>> = HashMap::new();
+        let mut unclassed: Vec<Trajectory> = Vec::new();
+
+        for t in trajectories {
+            if let Some(ref qc) = t.query_class {
+                by_class.entry(qc.clone()).or_default().push(t);
+            } else {
+                unclassed.push(t);
+            }
+        }
+
+        let mut kept: Vec<Trajectory> = Vec::new();
+
+        // For each class: shortest success + random failure
+        for (_class, class_trajectories) in &by_class {
+            let successes: Vec<&Trajectory> = class_trajectories.iter()
+                .filter(|t| t.outcome == TrajectoryOutcome::Success)
+                .collect();
+            let failures: Vec<&Trajectory> = class_trajectories.iter()
+                .filter(|t| t.outcome == TrajectoryOutcome::Failure)
+                .collect();
+
+            // Keep shortest success (by n_results as proxy for path length)
+            if let Some(best) = successes.iter().min_by_key(|t| t.n_results) {
+                kept.push((*best).clone());
+            }
+
+            // Keep one failure (most recent as "random" sample)
+            if let Some(fail) = failures.last() {
+                kept.push((*fail).clone());
+            }
+
+            // Keep all Unknown (not yet tagged)
+            for t in class_trajectories {
+                if t.outcome == TrajectoryOutcome::Unknown {
+                    kept.push(t.clone());
+                }
+            }
+        }
+
+        // Keep all unclassed trajectories
+        kept.extend(unclassed);
+
+        let pruned = total.saturating_sub(kept.len());
+
+        // Rewrite
+        let mut file = std::fs::File::create(&self.path)
+            .map_err(|e| TraceMindError::Storage(e.to_string()))?;
+        for t in &kept {
+            let mut line = serde_json::to_string(t)?;
+            line.push('\n');
+            file.write_all(line.as_bytes())
+                .map_err(|e| TraceMindError::Storage(e.to_string()))?;
+        }
+
+        Ok((kept.len(), pruned))
     }
 
     /// Read the whole file and return the last `limit` trajectories where

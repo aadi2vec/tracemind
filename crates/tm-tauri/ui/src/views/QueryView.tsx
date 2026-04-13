@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { queryMemory, type QueryResponse } from "../api";
+import { queryMemory, entityClick, sendFeedback, type QueryResponse, type AttributionInfo } from "../api";
 
 const TYPE_COLORS: Record<string, string> = {
   Person: "bg-blue-500/20 text-blue-400",
@@ -22,11 +22,14 @@ export default function QueryView() {
   const [result, setResult] = useState<QueryResponse | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
+  const [feedbackGiven, setFeedbackGiven] = useState<"up" | "down" | null>(null);
+  const [showAttribution, setShowAttribution] = useState(false);
 
   const handleQuery = async () => {
     if (!query.trim()) return;
     setLoading(true);
     setError("");
+    setFeedbackGiven(null);
     try {
       const res = await queryMemory(query.trim());
       setResult(res);
@@ -75,13 +78,77 @@ export default function QueryView() {
 
       {result && (
         <div className="space-y-5">
-          {/* Meta bar */}
+          {/* Meta bar with feedback */}
           <div className="flex items-center gap-4 text-xs text-tm-muted">
             <span>Strategy: <span className="text-tm-accent">{result.arm_name}</span></span>
             <span>Latency: <span className="text-tm-text">{result.latency_ms}ms</span></span>
             <span>Entities: <span className="text-tm-text">{uniqueEntities.length}</span></span>
             <span>Triples: <span className="text-tm-text">{result.triples.length}</span></span>
+            <div className="ml-auto flex items-center gap-2">
+              <span className="text-tm-muted">Was this helpful?</span>
+              <button
+                onClick={() => { sendFeedback(1.0); setFeedbackGiven("up"); }}
+                disabled={feedbackGiven !== null}
+                className={`px-2 py-1 rounded text-sm transition-colors ${
+                  feedbackGiven === "up"
+                    ? "bg-emerald-500/30 text-emerald-400"
+                    : "hover:bg-emerald-500/20 hover:text-emerald-400"
+                } ${feedbackGiven !== null && feedbackGiven !== "up" ? "opacity-30" : ""}`}
+              >
+                +
+              </button>
+              <button
+                onClick={() => { sendFeedback(0.0); setFeedbackGiven("down"); }}
+                disabled={feedbackGiven !== null}
+                className={`px-2 py-1 rounded text-sm transition-colors ${
+                  feedbackGiven === "down"
+                    ? "bg-red-500/30 text-red-400"
+                    : "hover:bg-red-500/20 hover:text-red-400"
+                } ${feedbackGiven !== null && feedbackGiven !== "down" ? "opacity-30" : ""}`}
+              >
+                -
+              </button>
+              {feedbackGiven && (
+                <span className="text-xs text-tm-muted">Thanks!</span>
+              )}
+            </div>
           </div>
+
+          {/* Causal attribution — why these results */}
+          {result.attributions && result.attributions.length > 0 && (
+            <div className="bg-tm-surface border border-tm-border rounded-lg overflow-hidden">
+              <button
+                onClick={() => setShowAttribution(!showAttribution)}
+                className="w-full px-5 py-3 flex items-center justify-between text-left hover:bg-white/5 transition-colors"
+              >
+                <span className="text-sm font-medium text-tm-muted">
+                  Why these results? <span className="text-xs opacity-60">({result.attributions.length} evidence paths)</span>
+                </span>
+                <span className="text-xs text-tm-muted">{showAttribution ? "▲" : "▼"}</span>
+              </button>
+              {showAttribution && (
+                <div className="px-5 pb-4 space-y-2 border-t border-tm-border pt-3">
+                  {result.attributions.map((a: AttributionInfo, i: number) => {
+                    const maxWeight = Math.max(...result.attributions.map((x: AttributionInfo) => x.weight));
+                    const pct = maxWeight > 0 ? (a.weight / maxWeight) * 100 : 0;
+                    return (
+                      <div key={i} className="flex items-center gap-3">
+                        <div className="w-24 h-1.5 bg-tm-border rounded-full overflow-hidden flex-shrink-0">
+                          <div
+                            className="h-full bg-tm-accent rounded-full transition-all"
+                            style={{ width: `${pct}%` }}
+                          />
+                        </div>
+                        <span className="text-sm font-medium w-32 truncate">{a.entity_name}</span>
+                        <span className="text-xs text-tm-muted flex-1">{a.source}</span>
+                        <span className="text-xs text-tm-accent font-mono">{(a.weight * 100).toFixed(0)}%</span>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+          )}
 
           {/* Typed triples — the important relationships */}
           {typedTriples.length > 0 && (
@@ -106,20 +173,21 @@ export default function QueryView() {
             </div>
           )}
 
-          {/* Entity cards */}
+          {/* Entity cards — clickable for implicit feedback */}
           <div className="bg-tm-surface border border-tm-border rounded-lg p-5">
             <h3 className="text-sm font-medium text-tm-muted uppercase tracking-wider mb-3">
               Entities
             </h3>
             <div className="flex flex-wrap gap-2">
               {uniqueEntities.map((e) => (
-                <div
+                <button
                   key={e.id}
-                  className={`px-3 py-1.5 rounded-full text-xs font-medium ${typeColor(e.entity_type)}`}
+                  onClick={() => entityClick(e.id)}
+                  className={`px-3 py-1.5 rounded-full text-xs font-medium cursor-pointer hover:ring-2 hover:ring-tm-accent/50 transition-all ${typeColor(e.entity_type)}`}
                 >
                   {e.name}
                   <span className="ml-1 opacity-60">{e.entity_type}</span>
-                </div>
+                </button>
               ))}
             </div>
           </div>
@@ -135,6 +203,36 @@ export default function QueryView() {
                   <span key={i}>
                     {t.subject} <span className="text-tm-border">---</span> {t.object}
                   </span>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* Recommendations */}
+          {result.recommendations.length > 0 && (
+            <div className="bg-tm-surface border border-tm-accent/20 rounded-lg p-5">
+              <h3 className="text-sm font-medium text-tm-accent uppercase tracking-wider mb-3">
+                Recommended for You
+              </h3>
+              <div className="space-y-2">
+                {result.recommendations.map((rec) => (
+                  <button
+                    key={rec.entity_id}
+                    onClick={() => {
+                      entityClick(rec.entity_id);
+                      setQuery(rec.entity_name);
+                    }}
+                    className="w-full flex items-center gap-3 p-3 rounded bg-tm-bg border border-tm-border hover:border-tm-accent/40 transition-colors text-left"
+                  >
+                    <div className="flex-1">
+                      <span className="text-sm font-medium">{rec.entity_name}</span>
+                      <span className="text-xs text-tm-muted ml-2">{rec.entity_type}</span>
+                    </div>
+                    <span className="text-xs text-tm-muted">{rec.reason}</span>
+                    <span className="text-xs text-tm-accent font-mono">
+                      {(rec.score * 100).toFixed(0)}%
+                    </span>
+                  </button>
                 ))}
               </div>
             </div>

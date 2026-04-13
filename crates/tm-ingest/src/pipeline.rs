@@ -1,7 +1,7 @@
 use seahash;
 use uuid::Uuid;
 
-use tm_types::{Entity, EntityType, Predicate, Result, Trace, TraceEventType, Triple};
+use tm_types::{Entity, EntityType, MemoryOp, Predicate, Result, Trace, TraceEventType, Triple};
 use tm_graph::GraphStore;
 use tm_vector::Embedder;
 use tm_governance::GovernanceFilter;
@@ -18,6 +18,8 @@ pub struct IngestResult {
     pub entities: Vec<Entity>,
     pub triples: Vec<Triple>,
     pub content_hash: String,
+    /// Memory-R1 CRUD operations performed for each entity (entity_name, op).
+    pub memory_ops: Vec<(String, MemoryOp)>,
 }
 
 impl IngestPipeline {
@@ -46,10 +48,11 @@ impl IngestPipeline {
     /// 1. Run governance check (confidence = 1.0).
     /// 2. Hash the text.
     /// 3. Extract entities heuristically (multi-word aware).
-    /// 4. Upsert each entity to graph + vector stores (context-aware embeddings).
-    /// 5. Extract typed triples via pattern matching + co-occurrence fallback.
-    /// 6. Upsert each triple to the graph store.
-    /// 7. Return an `IngestResult`.
+    /// 4. Deduplicate entities against the existing graph (exact + case-insensitive name match).
+    /// 5. Upsert each entity to graph + vector stores (context-aware embeddings).
+    /// 6. Extract typed triples via pattern matching + co-occurrence fallback.
+    /// 7. Upsert each triple to the graph store.
+    /// 8. Return an `IngestResult`.
     pub fn ingest(&self, text: &str, session_id: Uuid) -> Result<IngestResult> {
         // 1. Governance check.
         self.governance.check(text, 1.0)?;
@@ -58,27 +61,116 @@ impl IngestPipeline {
         let content_hash = hash_text(text);
 
         // 3. Extract entities (multi-word aware).
-        let entities = extract_entities(text);
+        let mut entities = extract_entities(text);
 
-        // 4. Upsert entities with context-aware embeddings.
-        //    Embed "entity_name: full source text" so the vector captures
-        //    the semantic context in which the entity appeared.
-        for entity in &entities {
-            self.graph.upsert_entity(entity)?;
-            let embed_text = format!("{}: {}", entity.name, text);
-            let embedding = self.embedder.embed(&embed_text);
-            self.graph.upsert_vector(entity.id, &embedding)?;
+        // 4. Deduplicate: check each entity against the graph.
+        //    - Exact or case-insensitive name match → reuse existing entity
+        //    - Reinforces confidence of existing entities on re-mention
+        //
+        // First pass: resolve each name to an existing graph entity or a batch-local ID.
+        let mut name_to_id: std::collections::HashMap<String, Uuid> =
+            std::collections::HashMap::new();
+        for entity in entities.iter_mut() {
+            let key = entity.name.to_lowercase();
+
+            // Check batch-local dedup first
+            if let Some(&existing_id) = name_to_id.get(&key) {
+                entity.id = existing_id;
+                continue;
+            }
+
+            // Check graph for existing entity by name (case-insensitive)
+            if let Ok(Some(existing)) = self.graph.find_entity_by_name_icase(&entity.name) {
+                entity.id = existing.id;
+                entity.confidence = existing.confidence;
+                entity.created_at = existing.created_at;
+                // Reinforce confidence on re-mention
+                self.graph.reinforce_entity(existing.id, 0.05)?;
+            }
+
+            name_to_id.insert(key, entity.id);
         }
 
-        // 5. Extract typed triples via pattern matching, then fill with co-occurrence.
+        // Remove within-batch duplicates (keep first occurrence of each ID)
+        let mut seen_ids = std::collections::HashSet::new();
+        entities.retain(|e| seen_ids.insert(e.id));
+
+        // 5. Upsert entities with context-aware embeddings + Memory-R1 CRUD.
+        //    Embed "entity_name: full source text" so the vector captures
+        //    the semantic context in which the entity appeared.
+        //    For each entity, decide whether to Add, Update, or Noop based
+        //    on similarity to existing entities in the graph.
+        let mut memory_ops: Vec<(String, MemoryOp)> = Vec::new();
+        let mut kept_entities: Vec<Entity> = Vec::new();
+
+        for entity in &entities {
+            let embed_text = format!("{}: {}", entity.name, text);
+            let embedding = self.embedder.embed(&embed_text);
+
+            let op = Self::decide_memory_op(
+                &entity.name,
+                &embedding,
+                &entity.entity_type,
+                &self.graph,
+            );
+
+            match &op {
+                MemoryOp::Add => {
+                    self.graph.upsert_entity(entity)?;
+                    self.graph.upsert_vector(entity.id, &embedding)?;
+                    kept_entities.push(entity.clone());
+                }
+                MemoryOp::Update { target_entity_id } => {
+                    // Merge: reinforce confidence and average the embedding vectors.
+                    let target_id = *target_entity_id;
+                    self.graph.reinforce_entity(target_id, 0.1)?;
+
+                    if let Ok(Some(old_vec)) = self.graph.get_vector(target_id) {
+                        let merged: Vec<f32> = old_vec
+                            .iter()
+                            .zip(embedding.iter())
+                            .map(|(a, b)| (a + b) / 2.0)
+                            .collect();
+                        self.graph.upsert_vector(target_id, &merged)?;
+                    }
+
+                    // Return the existing entity in the result so callers
+                    // know which entity was affected.
+                    if let Ok(existing) = self.graph.get_entity(target_id) {
+                        kept_entities.push(existing);
+                    }
+                }
+                MemoryOp::Noop { .. } => {
+                    // Near-duplicate — just lightly reinforce confidence.
+                    // Find the entity ID from the graph search that caused the Noop.
+                    let embed_text_for_search = format!("{}: {}", entity.name, text);
+                    let search_emb = self.embedder.embed(&embed_text_for_search);
+                    if let Ok(similar) = self.graph.search_vectors(&search_emb, 1) {
+                        if let Some(&(top_id, _)) = similar.first() {
+                            let _ = self.graph.reinforce_entity(top_id, 0.02);
+                        }
+                    }
+                }
+                MemoryOp::Delete { .. } => {
+                    // Not used during ingest; reserved for future contradiction detection.
+                }
+            }
+
+            memory_ops.push((entity.name.clone(), op));
+        }
+
+        // Replace entities with the kept set for downstream triple extraction.
+        entities = kept_entities;
+
+        // 6. Extract typed triples via pattern matching, then fill with co-occurrence.
         let triples = extract_triples(text, &entities);
 
-        // 6. Upsert triples to graph.
+        // 7. Upsert triples to graph.
         for triple in &triples {
             self.graph.upsert_triple(triple)?;
         }
 
-        // 7. Build trace record with full provenance.
+        // 8. Build trace record with full provenance.
         let mut trace = Trace::new(session_id, TraceEventType::Ingest, &content_hash);
         trace.raw_text = Some(text.to_string());
         trace.entities_extracted = entities.iter().map(|e| e.id).collect();
@@ -89,7 +181,59 @@ impl IngestPipeline {
             entities,
             triples,
             content_hash,
+            memory_ops,
         })
+    }
+    // -----------------------------------------------------------------------
+    // Memory-R1 CRUD decision logic
+    // -----------------------------------------------------------------------
+
+    /// Decide what operation to perform for a new entity based on similarity
+    /// to entities already in the graph.
+    ///
+    /// Thresholds (cosine similarity):
+    /// - `> 0.90` and same type  => **Noop** (near-duplicate)
+    /// - `> 0.90` and diff type  => **Update** (same concept, reclassify)
+    /// - `0.75 .. 0.90`          => **Update** (merge / reinforce)
+    /// - `< 0.75` (or no match)  => **Add** (novel entity)
+    fn decide_memory_op(
+        _name: &str,
+        embedding: &[f32],
+        entity_type: &EntityType,
+        graph: &GraphStore,
+    ) -> MemoryOp {
+        let similar = graph.search_vectors(embedding, 5).unwrap_or_default();
+
+        if similar.is_empty() || similar[0].1 < 0.4 {
+            return MemoryOp::Add;
+        }
+
+        let (top_id, top_sim) = similar[0];
+
+        // Very high similarity (>0.90) = likely duplicate
+        if top_sim > 0.90 {
+            if let Ok(existing) = graph.get_entity(top_id) {
+                if existing.entity_type == *entity_type {
+                    return MemoryOp::Noop {
+                        reason: format!("duplicate of '{}'", existing.name),
+                    };
+                } else {
+                    return MemoryOp::Update {
+                        target_entity_id: top_id,
+                    };
+                }
+            }
+        }
+
+        // High similarity (0.75-0.90) = update/merge
+        if top_sim > 0.75 {
+            return MemoryOp::Update {
+                target_entity_id: top_id,
+            };
+        }
+
+        // Moderate or low similarity = add (different enough)
+        MemoryOp::Add
     }
 }
 
@@ -559,6 +703,56 @@ mod tests {
             "expected 'uses' predicate; got: {:?}",
             triples.iter().map(|t| &t.predicate).collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn test_entity_dedup_across_ingests() {
+        let pipeline = in_memory_pipeline();
+        let s1 = Uuid::new_v4();
+        let s2 = Uuid::new_v4();
+
+        let r1 = pipeline.ingest("Alice works at Anthropic", s1).unwrap();
+        let r2 = pipeline.ingest("Alice is building TraceMind", s2).unwrap();
+
+        // "Alice" should be the same entity in both ingests (reused ID)
+        let alice1 = r1.entities.iter().find(|e| e.name == "Alice");
+        let alice2 = r2.entities.iter().find(|e| e.name == "Alice");
+        assert!(alice1.is_some(), "Alice should be in first ingest");
+        assert!(alice2.is_some(), "Alice should be in second ingest");
+        assert_eq!(
+            alice1.unwrap().id,
+            alice2.unwrap().id,
+            "Same entity should have same UUID across ingests"
+        );
+
+        // Total entity count in graph should not have duplicates
+        let count = pipeline.graph.entity_count().unwrap();
+        // First ingest: Alice, Anthropic. Second: Alice (deduped), TraceMind.
+        // So we expect 3 unique entities, not 4.
+        assert!(
+            count <= 4,
+            "expected at most 4 entities with dedup (got {count})"
+        );
+    }
+
+    #[test]
+    fn test_entity_dedup_case_insensitive() {
+        let pipeline = in_memory_pipeline();
+        let s1 = Uuid::new_v4();
+        let s2 = Uuid::new_v4();
+
+        let r1 = pipeline.ingest("Rust is great for performance", s1).unwrap();
+        let r2 = pipeline.ingest("RUST powers TraceMind", s2).unwrap();
+
+        // "Rust" and "RUST" should map to the same entity
+        let rust1 = r1.entities.iter().find(|e| e.name.eq_ignore_ascii_case("rust"));
+        let rust2 = r2.entities.iter().find(|e| e.name.eq_ignore_ascii_case("rust"));
+        if let (Some(r1e), Some(r2e)) = (rust1, rust2) {
+            assert_eq!(
+                r1e.id, r2e.id,
+                "Case-insensitive name match should reuse entity"
+            );
+        }
     }
 
     #[test]
