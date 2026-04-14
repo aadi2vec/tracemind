@@ -4,12 +4,12 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tm_controller::bandit::RetrievalParams;
 use tm_controller::{UcbBandit, LinUcbBandit, QueryPlanner, QueryPlan, PlanAction};
-use tm_episodic::{ProcedureStore, TraceStore};
+use tm_episodic::{ProcedureStore, TraceStore, TrajectoryStore};
 use tm_graph::GraphStore;
 use tm_reason::CausalTrace;
 use tm_rerank::{ColbertReranker, RerankCandidate};
 use tm_types::{Entity, Procedure, Result, Trace, TraceEventType, TraceMindError, Triple};
-use tm_vector::Embedder;
+use tm_vector::{Embedder, EmbedModel};
 use tracing::info;
 use uuid::Uuid;
 
@@ -87,6 +87,7 @@ pub struct RetrievalEngine {
     pending_reward: Option<PendingReward>,
     planner: QueryPlanner,
     procedure_store: Option<ProcedureStore>,
+    trajectory_store: Option<TrajectoryStore>,
 }
 
 #[derive(Debug)]
@@ -125,15 +126,21 @@ impl RetrievalEngine {
         let trace_store = TraceStore::open(trace_path)?;
         let embedder = if hash_embed {
             Embedder::new_hash()
+        } else if let Some(model) = std::env::var("TM_EMBED_MODEL").ok()
+            .and_then(|s| EmbedModel::from_str_loose(&s))
+        {
+            Embedder::with_model(model)?
         } else {
             Embedder::new()?
         };
         let bandit = UcbBandit::load(&bandit_path);
         let linucb = LinUcbBandit::load(&linucb_path);
 
-        // Try to auto-open procedure store from sibling file
+        // Try to auto-open procedure and trajectory stores from sibling files
         let proc_path = parent.join("procedures.jsonl");
         let procedure_store = ProcedureStore::open(&proc_path).ok();
+        let traj_path = parent.join("trajectories.jsonl");
+        let trajectory_store = TrajectoryStore::open(&traj_path).ok();
 
         Ok(Self {
             graph,
@@ -148,6 +155,7 @@ impl RetrievalEngine {
             pending_reward: None,
             planner: QueryPlanner::new(),
             procedure_store,
+            trajectory_store,
         })
     }
 
@@ -316,7 +324,11 @@ impl RetrievalEngine {
             }
             _ => {
                 // BanditRetrieval, Analogy, Consolidate → LinUCB with context
-                self.linucb.select(&query_embedding)
+                // + trajectory nearest-neighbor hint for non-parametric prior
+                let hint = self.trajectory_store.as_ref()
+                    .and_then(|ts| ts.nearest_successful_arm(&query_embedding, 0.7))
+                    .map(|(arm, _sim)| arm);
+                self.linucb.select_with_hint(&query_embedding, hint)
             }
         };
         let arm = params.arm;
@@ -472,6 +484,11 @@ impl RetrievalEngine {
                 break;
             }
         }
+
+        // Phase 2.9: Diversity penalty (MMR-style greedy reranking).
+        // Prevents returning 3 near-identical entities when coverage matters.
+        // λ=0.3 is mild — preserves relevance ordering but breaks ties toward diversity.
+        diversify_entities(&mut entities, &self.graph, 0.3);
 
         // Phase 3: k-hop graph expansion (only when params.hops > 0).
         if params.hops > 0 {
@@ -1039,6 +1056,64 @@ fn rra_fuse(ranked_lists: &[Vec<(Uuid, f64)>], k: f64) -> Vec<(Uuid, f64)> {
     results
 }
 
+/// Apply diversity penalty to a ranked list of entities.
+///
+/// After initial ranking, penalize each entity by its maximum similarity
+/// to any already-selected entity: `score -= λ * max_sim_to_selected`.
+/// This is Maximal Marginal Relevance (MMR) without the full O(n²) reranking —
+/// just a single pass greedy selection.
+///
+/// Returns reordered entity list with improved coverage / less redundancy.
+fn diversify_entities(entities: &mut Vec<Entity>, graph: &GraphStore, lambda: f64) {
+    if entities.len() < 3 || lambda <= 0.0 {
+        return;
+    }
+
+    // Collect embeddings for all entities
+    let embeddings: Vec<Option<Vec<f32>>> = entities.iter()
+        .map(|e| graph.get_vector(e.id).ok().flatten())
+        .collect();
+
+    let mut selected: Vec<usize> = vec![0]; // always keep the top-ranked entity
+    let mut remaining: Vec<usize> = (1..entities.len()).collect();
+
+    while !remaining.is_empty() && selected.len() < entities.len() {
+        let mut best_idx = 0;
+        let mut best_score = f64::NEG_INFINITY;
+
+        for (ri, &cand) in remaining.iter().enumerate() {
+            // Max similarity to any already-selected entity
+            let max_sim = selected.iter()
+                .filter_map(|&si| {
+                    match (&embeddings[cand], &embeddings[si]) {
+                        (Some(a), Some(b)) => Some(cosine_sim(a, b) as f64),
+                        _ => None,
+                    }
+                })
+                .fold(0.0f64, f64::max);
+
+            // Original rank score (higher = earlier in original ordering)
+            let rank_score = 1.0 / (cand as f64 + 1.0);
+
+            // MMR: relevance - λ * redundancy
+            let mmr = rank_score - lambda * max_sim;
+
+            if mmr > best_score {
+                best_score = mmr;
+                best_idx = ri;
+            }
+        }
+
+        selected.push(remaining.remove(best_idx));
+    }
+
+    // Reorder entities according to selected order
+    let reordered: Vec<Entity> = selected.into_iter()
+        .map(|i| entities[i].clone())
+        .collect();
+    *entities = reordered;
+}
+
 fn cosine_sim(a: &[f32], b: &[f32]) -> f32 {
     let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
     let norm_a: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
@@ -1077,6 +1152,7 @@ mod tests {
             pending_reward: None,
             planner: QueryPlanner::new(),
             procedure_store: None,
+            trajectory_store: None,
         };
 
         let result = engine.query("hello world").unwrap();

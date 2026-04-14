@@ -3,7 +3,7 @@ use uuid::Uuid;
 
 use tm_types::{Entity, EntityType, MemoryOp, Predicate, Result, Trace, TraceEventType, Triple};
 use tm_graph::GraphStore;
-use tm_vector::Embedder;
+use tm_vector::{Embedder, EmbedModel};
 use tm_governance::GovernanceFilter;
 
 pub struct IngestPipeline {
@@ -31,6 +31,10 @@ impl IngestPipeline {
         let graph = GraphStore::open(db_path)?;
         let embedder = if hash_embed {
             Embedder::new_hash()
+        } else if let Some(model) = std::env::var("TM_EMBED_MODEL").ok()
+            .and_then(|s| EmbedModel::from_str_loose(&s))
+        {
+            Embedder::with_model(model)?
         } else {
             Embedder::new()?
         };

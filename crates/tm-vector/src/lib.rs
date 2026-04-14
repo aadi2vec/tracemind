@@ -1,2 +1,2 @@
 pub mod embed;
-pub use embed::Embedder;
+pub use embed::{Embedder, EmbedModel};

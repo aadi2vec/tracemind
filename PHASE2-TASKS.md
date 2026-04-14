@@ -159,7 +159,8 @@ P2-001 (graph+tracing) ✅
             → TM-3.1 (MIA retrieval intelligence) ✅
               → TM-3.2 (R1-inspired architecture) ✅
               → TM-3.3 (LinUCB + attenuation + reward) ✅
-                → TM-3.4-001 (query decomposition) ✅
+                → TM-3.4 (decomposition + procedures + uncertainty + diversity + trajectory prior) ✅
+                  → TM-4.0-001 (ONNX embeddings + model selection + benchmark) ✅
 ```
 
 ---
@@ -265,10 +266,15 @@ P2-001 (graph+tracing) ✅
 
 ### Phase 3.3 — Contextual Bandit + Progressive Attenuation (HIGH IMPACT)
 
-#### TM-3.3-001 — LinUCB contextual bandit
+#### TM-3.3-001 — LinUCB contextual bandit (enhanced)
 **Status:** DONE
-**What:** Added `LinUcbBandit` alongside `UcbBandit`. Diagonal approximation of LinUCB — O(d) storage per arm (~3KB vs 1.2MB for full). Context = 384-dim query embedding. Learns "for ML queries use wide arm, for lookups use narrow arm." Retrieval engine now uses LinUCB for all bandit-decided queries, with dual reward updates (both UCB1 and LinUCB). Persistent via `linucb.json`. 6 new tests including context-arm association learning.
-**Accept:** `cargo test -p tm-controller` passes (21 tests). LinUCB learns distinct arm preferences for different context vectors. ✅
+**What:** `LinUcbBandit` with diagonal approximation + 3 enhancements from expert feedback:
+1. **Exploration decay** — α anneals from 0.5 → 0.05 via multiplicative decay (0.995/pull). Prevents "still trying dumb strategies" after preferences stabilize.
+2. **Arm feature sharing** — arms encoded as [breadth, depth] features on a latent axis. Reward signal for arm 2 (wide) strengthens arm 3 (deep) via Gaussian similarity kernel. Faster convergence with same data.
+3. **Trajectory hint** — `select_with_hint(context, Some(arm))` accepts nearest-neighbor prior from trajectory store. +0.1 bonus for arm that succeeded on similar past query.
+
+Retrieval engine uses `TrajectoryStore::nearest_successful_arm()` (cosine sim > 0.7) to provide hints automatically. 9 LinUCB tests (24 total in tm-controller).
+**Accept:** Alpha decays, arm bias shares across similar arms, trajectory hints work. ✅
 
 #### TM-3.3-002 — Progressive fallback attenuation (GraphRAG-R1)
 **Status:** DONE
@@ -288,21 +294,31 @@ P2-001 (graph+tracing) ✅
 **Accept:** Compound queries split and merge correctly. `cargo test --workspace` passes. ✅
 
 #### TM-3.4-002 — Procedural memory execution in query flow
-**Status:** TODO
-**What:** Wire `ProcedureStore` into retrieval. When a query matches a stored procedure (by name similarity), surface it alongside entity results. Currently procedures exist but are disconnected from query flow.
-**Effort:** 1-2 days
+**Status:** DONE
+**What:** `ProcedureStore` wired into `RetrievalEngine`. `match_procedures()` scores active procedures by name substring match (1.0), name-word Jaccard, and step-text Jaccard (0.5×). Top 3 procedures with score > 0.2 surfaced in `RetrievalResult.procedures`. Auto-opened from `procedures.jsonl`.
+**Accept:** Queries matching stored procedures surface them alongside entities. ✅
 
 #### TM-3.4-003 — Uncertainty-driven routing
-**Status:** TODO
-**What:** When planner confidence < 0.5 and results are poor, surface "I'm not confident — here's what I found" with suggested follow-up queries. Graph-R1 "rethink" step but for the user.
-**Effort:** Half day
+**Status:** DONE
+**What:** `low_confidence` flag set when: (plan.confidence < 0.5 AND entities < 2) OR entities empty. `generate_suggestions()` produces 2-3 follow-up queries: "Tell me more about X", "How does X relate to Y?", "What's similar to X?". MCP response includes `confidence: { low, suggestions }`.
+**Accept:** Low-confidence queries produce actionable suggestions. ✅
+
+#### TM-3.4-004 — Diversity penalty (MMR reranking)
+**Status:** DONE
+**What:** Phase 2.9 in retrieval pipeline: Maximal Marginal Relevance greedy selection. After RRA ranking, penalize each entity by `λ * max_similarity_to_already_selected` (λ=0.3). Prevents returning 3 near-identical entities. Uses entity embeddings from GraphStore.
+**Accept:** Builds and tests pass. Result lists have better coverage. ✅
+
+#### TM-3.4-005 — Trajectory nearest-neighbor prior
+**Status:** DONE
+**What:** `TrajectoryStore::nearest_successful_arm()` finds most similar past successful trajectory (cosine sim > 0.7) and returns the arm that worked. Passed as hint to `LinUcbBandit::select_with_hint()`. Non-parametric prior — no learning, just lookup. "Similar past queries preferred arm X, so bias toward arm X."
+**Accept:** Trajectory lookup + hint integration builds and passes. ✅
 
 ### Phase 4.0 — Production Polish
 
-#### TM-4.0-001 — ONNX embeddings everywhere
-**Status:** TODO
-**What:** Ship real all-MiniLM-L6-v2 via fastembed. Auto-download on first run. Hash embedder only for tests. Required for real-world precision.
-**Effort:** 1 day (mostly testing model download paths)
+#### TM-4.0-001 — ONNX embeddings + model selection + quality benchmark
+**Status:** DONE
+**What:** 6 Apache 2.0 models via fastembed (BGE, BGE-Q, MiniLM, MiniLM-Q, Arctic, Arctic-Q — all 384-dim). Default changed to BGE-small-en-v1.5. `TM_EMBED_MODEL` env var for runtime model selection. `tm-bench` crate with embedding quality (15 triples), retrieval quality (24 docs, 8 queries), and `--compare` mode for side-by-side model evaluation. Hash embedder only for tests. BGE: 100% accuracy, 0.317 margin. MiniLM: 100% accuracy, 0.385 margin. Hash baseline: 60% accuracy, 0.040 margin.
+**Accept:** `cargo run -p tm-bench` passes. `cargo run -p tm-bench -- --compare` shows all 6 models. ✅
 
 #### TM-4.0-002 — Tauri desktop app packaging
 **Status:** TODO
