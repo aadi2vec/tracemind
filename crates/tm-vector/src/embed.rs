@@ -1,14 +1,105 @@
-//! Text embedder for TraceMind (Phase 2).
+//! Text embedder for TraceMind.
 //!
-//! Two backends:
-//! * **Model** – `all-MiniLM-L6-v2` via fastembed (~80 MB, cached).  [`Embedder::new`]
-//! * **Hash** – deterministic seahash-seeded; for unit tests.  [`Embedder::new_hash`]
+//! Three backends:
+//! * **Model** – ONNX model via fastembed (cached on first download). [`Embedder::new`]
+//! * **Hash** – deterministic seahash-seeded; for unit tests. [`Embedder::new_hash`]
+//!
+//! Supported models (all Apache 2.0, all 384-dim):
+//!
+//! | Model | Variant | Size | Quality | Speed |
+//! |-------|---------|------|---------|-------|
+//! | BGE-small-en-v1.5 | `Bge` | ~130 MB | Best | Fast |
+//! | BGE-small-en-v1.5-Q | `BgeQ` | ~33 MB | Good | Fastest |
+//! | all-MiniLM-L6-v2 | `MiniLM` | ~80 MB | Good | Fast |
+//! | all-MiniLM-L6-v2-Q | `MiniLMQ` | ~22 MB | Decent | Fastest |
+//! | snowflake-arctic-embed-xs | `Arctic` | ~90 MB | Good | Fast |
+//! | snowflake-arctic-embed-xs-Q | `ArcticQ` | ~23 MB | Decent | Fastest |
 
+use std::fmt;
 use std::sync::Mutex;
 
 use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
 use tm_types::{Result, TraceMindError};
 use tracing::{debug, info, warn};
+
+// ---------------------------------------------------------------------------
+// Model selection
+// ---------------------------------------------------------------------------
+
+/// Supported embedding models. All produce 384-dimensional vectors.
+/// All are Apache 2.0 licensed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EmbedModel {
+    /// BGE-small-en-v1.5 — fastembed's default, best quality/speed ratio.
+    Bge,
+    /// BGE-small-en-v1.5 quantized — smallest BGE variant.
+    BgeQ,
+    /// all-MiniLM-L6-v2 — well-established Sentence Transformers model.
+    MiniLM,
+    /// all-MiniLM-L6-v2 quantized — smallest MiniLM variant.
+    MiniLMQ,
+    /// snowflake-arctic-embed-xs — extra-small, good for constrained envs.
+    Arctic,
+    /// snowflake-arctic-embed-xs quantized — tiniest model available.
+    ArcticQ,
+}
+
+impl EmbedModel {
+    fn to_fastembed(self) -> EmbeddingModel {
+        match self {
+            EmbedModel::Bge => EmbeddingModel::BGESmallENV15,
+            EmbedModel::BgeQ => EmbeddingModel::BGESmallENV15Q,
+            EmbedModel::MiniLM => EmbeddingModel::AllMiniLML6V2,
+            EmbedModel::MiniLMQ => EmbeddingModel::AllMiniLML6V2Q,
+            EmbedModel::Arctic => EmbeddingModel::SnowflakeArcticEmbedXS,
+            EmbedModel::ArcticQ => EmbeddingModel::SnowflakeArcticEmbedXSQ,
+        }
+    }
+
+    /// Parse from string (CLI/env var). Case-insensitive.
+    pub fn from_str_loose(s: &str) -> Option<Self> {
+        match s.to_lowercase().as_str() {
+            "bge" | "bge-small" | "bge-small-en-v1.5" => Some(EmbedModel::Bge),
+            "bge-q" | "bge-quantized" => Some(EmbedModel::BgeQ),
+            "minilm" | "all-minilm-l6-v2" | "minilm-l6" => Some(EmbedModel::MiniLM),
+            "minilm-q" | "minilm-quantized" => Some(EmbedModel::MiniLMQ),
+            "arctic" | "snowflake-arctic" | "arctic-xs" => Some(EmbedModel::Arctic),
+            "arctic-q" | "arctic-quantized" => Some(EmbedModel::ArcticQ),
+            _ => None,
+        }
+    }
+
+    /// All available models for benchmarking.
+    pub fn all() -> &'static [EmbedModel] {
+        &[
+            EmbedModel::Bge,
+            EmbedModel::BgeQ,
+            EmbedModel::MiniLM,
+            EmbedModel::MiniLMQ,
+            EmbedModel::Arctic,
+            EmbedModel::ArcticQ,
+        ]
+    }
+}
+
+impl Default for EmbedModel {
+    fn default() -> Self {
+        EmbedModel::Bge
+    }
+}
+
+impl fmt::Display for EmbedModel {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            EmbedModel::Bge => write!(f, "BGE-small-en-v1.5"),
+            EmbedModel::BgeQ => write!(f, "BGE-small-en-v1.5-Q"),
+            EmbedModel::MiniLM => write!(f, "all-MiniLM-L6-v2"),
+            EmbedModel::MiniLMQ => write!(f, "all-MiniLM-L6-v2-Q"),
+            EmbedModel::Arctic => write!(f, "snowflake-arctic-embed-xs"),
+            EmbedModel::ArcticQ => write!(f, "snowflake-arctic-embed-xs-Q"),
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Backend
@@ -27,23 +118,31 @@ enum EmbedBackend {
 pub struct Embedder {
     backend: EmbedBackend,
     dim: usize,
+    model_name: String,
 }
 
 impl Embedder {
-    /// Load the real `all-MiniLM-L6-v2` ONNX model via fastembed.
+    /// Load the default ONNX model (BGE-small-en-v1.5) via fastembed.
     ///
-    /// Downloads ~80 MB on first call; subsequent calls use the local cache.
+    /// Downloads on first call; subsequent calls use the local cache.
     pub fn new() -> Result<Self> {
-        info!("[embed] loading all-MiniLM-L6-v2 model via fastembed...");
-        let model = TextEmbedding::try_new(InitOptions::new(EmbeddingModel::AllMiniLML6V2))
+        Self::with_model(EmbedModel::default())
+    }
+
+    /// Load a specific ONNX model via fastembed.
+    pub fn with_model(model: EmbedModel) -> Result<Self> {
+        let model_name = model.to_string();
+        info!("[embed] loading {model_name} model via fastembed...");
+        let te = TextEmbedding::try_new(InitOptions::new(model.to_fastembed()))
             .map_err(|e| {
-                warn!("[embed] failed to load model: {e}");
+                warn!("[embed] failed to load {model_name}: {e}");
                 TraceMindError::Embedding(e.to_string())
             })?;
-        info!("[embed] model loaded successfully (384-dim)");
+        info!("[embed] {model_name} loaded successfully (384-dim)");
         Ok(Self {
-            backend: EmbedBackend::Model(Mutex::new(model)),
+            backend: EmbedBackend::Model(Mutex::new(te)),
             dim: 384,
+            model_name,
         })
     }
 
@@ -53,6 +152,7 @@ impl Embedder {
         Self {
             backend: EmbedBackend::Hash,
             dim: 384,
+            model_name: "hash".to_string(),
         }
     }
 
@@ -77,8 +177,30 @@ impl Embedder {
         }
     }
 
+    /// Embed a batch of texts (more efficient than repeated single calls).
+    pub fn embed_batch(&self, texts: &[&str]) -> Vec<Vec<f32>> {
+        match &self.backend {
+            EmbedBackend::Model(model) => {
+                let owned: Vec<String> = texts.iter().map(|t| t.to_string()).collect();
+                let mut guard = model.lock().expect("embedder mutex poisoned");
+                guard
+                    .embed(owned, None)
+                    .unwrap_or_else(|e| {
+                        warn!("[embed] batch inference failed ({e}), falling back to hash");
+                        texts.iter().map(|t| hash_embed(t, self.dim)).collect()
+                    })
+            }
+            EmbedBackend::Hash => texts.iter().map(|t| hash_embed(t, self.dim)).collect(),
+        }
+    }
+
     pub fn dim(&self) -> usize {
         self.dim
+    }
+
+    /// Name of the active model (for benchmarking / display).
+    pub fn model_name(&self) -> &str {
+        &self.model_name
     }
 }
 
@@ -132,5 +254,35 @@ mod tests {
     fn embed_different_texts_differ() {
         let embedder = Embedder::new_hash();
         assert_ne!(embedder.embed("hello"), embedder.embed("world"));
+    }
+
+    #[test]
+    fn embed_batch_matches_singles() {
+        let embedder = Embedder::new_hash();
+        let texts = &["hello", "world", "foo"];
+        let batch = embedder.embed_batch(texts);
+        for (i, text) in texts.iter().enumerate() {
+            assert_eq!(batch[i], embedder.embed(text));
+        }
+    }
+
+    #[test]
+    fn embed_model_name_hash() {
+        let embedder = Embedder::new_hash();
+        assert_eq!(embedder.model_name(), "hash");
+    }
+
+    #[test]
+    fn embed_model_from_str_loose() {
+        assert_eq!(EmbedModel::from_str_loose("bge"), Some(EmbedModel::Bge));
+        assert_eq!(EmbedModel::from_str_loose("BGE"), Some(EmbedModel::Bge));
+        assert_eq!(EmbedModel::from_str_loose("minilm"), Some(EmbedModel::MiniLM));
+        assert_eq!(EmbedModel::from_str_loose("arctic-q"), Some(EmbedModel::ArcticQ));
+        assert_eq!(EmbedModel::from_str_loose("unknown"), None);
+    }
+
+    #[test]
+    fn embed_model_default_is_bge() {
+        assert_eq!(EmbedModel::default(), EmbedModel::Bge);
     }
 }

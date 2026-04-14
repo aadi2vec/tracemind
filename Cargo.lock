@@ -5605,6 +5605,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "tm-bench"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tm-graph",
+ "tm-ingest",
+ "tm-retrieval",
+ "tm-types",
+ "tm-vector",
+ "uuid",
+]
+
+[[package]]
 name = "tm-capture"
 version = "0.1.0"
 dependencies = [

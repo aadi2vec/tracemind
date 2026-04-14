@@ -155,6 +155,37 @@ impl TrajectoryStore {
         Ok((kept.len(), pruned))
     }
 
+    /// Find the nearest successful trajectory by cosine similarity to `query_embedding`.
+    ///
+    /// Returns `Some((best_arm, similarity))` if a successful trajectory with
+    /// similarity > `threshold` exists. This is a non-parametric prior for LinUCB:
+    /// "similar past queries succeeded with arm X, so bias toward arm X."
+    ///
+    /// Only considers trajectories tagged as `Success` with reward > 0.5.
+    pub fn nearest_successful_arm(&self, query_embedding: &[f32], threshold: f32) -> Option<(u8, f32)> {
+        let raw = std::fs::read_to_string(&self.path).ok()?;
+        let mut best_sim = threshold;
+        let mut best_arm: Option<u8> = None;
+
+        for line in raw.split('\n').filter(|l| !l.is_empty()) {
+            if let Ok(t) = serde_json::from_str::<Trajectory>(line) {
+                if t.outcome != TrajectoryOutcome::Success || t.reward <= 0.5 {
+                    continue;
+                }
+                if t.context_embedding.len() != query_embedding.len() {
+                    continue;
+                }
+                let sim = cosine_sim_f32(query_embedding, &t.context_embedding);
+                if sim > best_sim {
+                    best_sim = sim;
+                    best_arm = Some(t.arm_chosen);
+                }
+            }
+        }
+
+        best_arm.map(|arm| (arm, best_sim))
+    }
+
     /// Read the whole file and return the last `limit` trajectories where
     /// `is_training_ready()` is true (i.e. `actual_outcome_embedding` is Some).
     pub fn pending_training(&self, limit: usize) -> Result<Vec<Trajectory>> {
@@ -172,6 +203,13 @@ impl TrajectoryStore {
         let start = ready.len().saturating_sub(limit);
         Ok(ready[start..].to_vec())
     }
+}
+
+fn cosine_sim_f32(a: &[f32], b: &[f32]) -> f32 {
+    let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
+    let norm_a: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+    let norm_b: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if norm_a == 0.0 || norm_b == 0.0 { 0.0 } else { dot / (norm_a * norm_b) }
 }
 
 #[cfg(test)]

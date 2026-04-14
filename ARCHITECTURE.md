@@ -1,6 +1,6 @@
 # TraceMind Architecture
 
-**~10,500 lines of Rust | 14 crates | 97 tests | 4 binaries**
+**~11,000 lines of Rust | 14 crates | 100 tests | 4 binaries**
 
 Local-only memory OS. All data lives in `~/.tracemind/`. No cloud, no telemetry.
 
@@ -149,20 +149,23 @@ graph.batch_frequency_scores(&ids) // MIA exploration bonus
 | 2 | wide | 15 | 2 | no |
 | 3 | deep | 20 | 2 | yes |
 
-### tm-retrieval (Pipeline — ~900 lines, 3 tests)
+### tm-retrieval (Pipeline — ~1,100 lines, 3 tests)
 
-The query pipeline has 10 phases:
+The query pipeline has 13 phases:
 ```
 Phase 0:   Planner assesses query → selects strategy (think step)
 Phase 0.5: Decompose intercept → split compound queries, merge results
-Phase 1:   Bandit selects arm (or planner overrides: DirectLookup→arm 0, ReasoningChain→arm 2)
-Phase 2:   Embed query + session context blend (80/20)
+Phase 1:   Embed query (needed for LinUCB context)
+Phase 1.5: LinUCB selects arm with trajectory hint (or planner overrides)
+Phase 2:   Session context blend (80/20)
 Phase 2.5: Optional ColBERT reranking
 Phase 2.7: RRA fusion — parameter-free rank aggregation over sim/value/freq lists
-Phase 2.8: Progressive fallback cascade — 0.6× attenuation per cascade step, min score 0.15
+Phase 2.8: Progressive fallback cascade — 0.6× attenuation per cascade step
+Phase 2.9: MMR diversity penalty — greedy reranking (λ=0.3) for coverage
 Phase 3:   K-hop graph expansion
 Phase 4:   Triple collection + dedup
-Phase 5:   Optional episodic traces + causal attribution + auto-enrich (chains/analogies)
+Phase 5:   Episodic traces + causal attribution + auto-enrich (chains/analogies)
+Phase 6:   Procedural memory matching + confidence assessment + suggestions
 ```
 
 ### tm-ingest (Extraction — 780 lines, 10 tests)
@@ -274,7 +277,7 @@ All in `$TM_DATA_DIR` (default `~/.tracemind/`):
 
 ```bash
 cargo build --release          # Build all 14 crates
-cargo test --workspace         # Run all 97 tests
+cargo test --workspace         # Run all 100 tests
 cargo test -p tm-controller    # Test single crate (15 tests)
 
 # Run CLI
@@ -300,12 +303,16 @@ R1-inspired intelligence layer is fully operational:
 - **Graph-R1 RRA** — parameter-free rank fusion replaces hand-tuned weights
 - **KG-R1 actions** — 4-action schema-agnostic graph API
 - **GraphRAG-R1 attenuation** — 0.6× decay per cascade step
-- **LinUCB contextual bandit** — diagonal approximation, per-query-type arm selection
+- **LinUCB contextual bandit** — diagonal approx + α decay + arm feature sharing + trajectory hint
 - **QueryPlanner** — 6-action prefrontal cortex with replan escalation
 - **Query decomposition** — compound queries split, executed, merged
 - **Simplified rewards** — outcome-only signals (click/dwell/requery)
 - **MIA session blending** — 80/20 query-context mix
 - **Contrastive trajectories** — shortest-success + random-failure per query class
+- **MMR diversity penalty** — greedy reranking prevents redundant results
+- **Trajectory nearest-neighbor** — non-parametric prior biases arm selection
+- **Procedural memory** — procedures surface alongside entity results
+- **Uncertainty routing** — low-confidence flag + suggested follow-up queries
 
 ### Phase 4 — Procedures & Production
 
