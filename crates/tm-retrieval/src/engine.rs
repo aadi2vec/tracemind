@@ -64,6 +64,60 @@ fn epoch_ms_now() -> u64 {
         .as_millis() as u64
 }
 
+/// Record of what a single pipeline phase did — enables downstream phases
+/// to condition on upstream decisions (BIGMAS execution history ℋ).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PhaseRecord {
+    pub phase: &'static str,
+    pub duration_us: u64,           // microseconds
+    pub candidates_in: usize,
+    pub candidates_out: usize,
+    pub decision: String,           // human-readable description of what happened
+}
+
+/// Global Workspace Theory-inspired state container for query execution.
+/// All phases read from and write to this workspace, enabling downstream
+/// phases to condition on everything that happened upstream.
+#[derive(Debug)]
+pub struct QueryWorkspace {
+    // ── ctx: read-only query context ──
+    pub query_text: String,
+    pub query_embedding: Vec<f32>,
+    pub blended_embedding: Vec<f32>,
+    pub plan: QueryPlan,
+
+    // ── work: read-write intermediate results ──
+    pub candidates: Vec<(Uuid, f32)>,     // (entity_id, score) from vector search
+    pub entities: Vec<Entity>,
+    pub triples: Vec<Triple>,
+    pub traces: Vec<Trace>,
+    pub seen_entity_ids: HashSet<Uuid>,
+    pub seen_triple_ids: HashSet<Uuid>,
+    pub causal_trace: CausalTrace,
+
+    // ── sys: execution metadata ──
+    pub arm: u8,
+    pub cascade_depth: u8,
+    pub phases: Vec<PhaseRecord>,         // execution history
+
+    // ── ans: final answer assembly ──
+    pub low_confidence: bool,
+    pub suggested_queries: Vec<String>,
+    pub procedures: Vec<Procedure>,
+}
+
+impl QueryWorkspace {
+    fn record_phase(&mut self, phase: &'static str, candidates_before: usize, decision: String, start: Instant) {
+        self.phases.push(PhaseRecord {
+            phase,
+            duration_us: start.elapsed().as_micros() as u64,
+            candidates_in: candidates_before,
+            candidates_out: self.entities.len(),
+            decision,
+        });
+    }
+}
+
 /// A proactive recommendation with reason.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct Recommendation {
@@ -106,6 +160,8 @@ pub struct RetrievalResult {
     pub suggested_queries: Vec<String>,
     /// Procedures matching the query (Phase 6: procedural memory).
     pub procedures: Vec<Procedure>,
+    /// Execution history: what each pipeline phase did (GWT/BIGMAS).
+    pub phases: Vec<PhaseRecord>,
 }
 
 impl RetrievalEngine {
@@ -293,7 +349,8 @@ impl RetrievalEngine {
     pub fn query(&mut self, text: &str) -> Result<RetrievalResult> {
         let start = Instant::now();
 
-        // Phase 0: Planner assesses query and selects strategy (Graph-R1 "think" step).
+        // ── Phase: plan ──
+        let phase_start = Instant::now();
         let plan = self.planner.plan(text);
         info!(
             "[retrieval] plan: {:?} (complexity={}, confidence={:.2}, hints={:?})",
@@ -307,24 +364,21 @@ impl RetrievalEngine {
             }
         }
 
-        // Phase 1: embed query first (needed for LinUCB context)
+        // ── Phase: embed ──
+        let embed_start = Instant::now();
         let query_embedding = self.embedder.embed(text);
+        let blended_embedding = self.blend_with_context(&query_embedding);
 
-        // Phase 1.5: select retrieval parameters based on plan.
-        // Uses LinUCB (contextual bandit) when the bandit decides — learns
-        // "for ML queries use wide arm, for lookups use narrow arm."
+        // ── Phase: arm_select ──
+        let arm_start = Instant::now();
         let params: RetrievalParams = match &plan.action {
             PlanAction::DirectLookup => {
-                // Simple query → force narrow arm for speed
                 UcbBandit::params_for_arm(0)
             }
             PlanAction::ReasoningChain { .. } => {
-                // Reasoning needs graph hops → force hybrid or deep arm
                 UcbBandit::params_for_arm(2)
             }
             _ => {
-                // BanditRetrieval, Analogy, Consolidate → LinUCB with context
-                // + trajectory nearest-neighbor hint for non-parametric prior
                 let hint = self.trajectory_store.as_ref()
                     .and_then(|ts| ts.nearest_successful_arm(&query_embedding, 0.7))
                     .map(|(arm, _sim)| arm);
@@ -332,19 +386,76 @@ impl RetrievalEngine {
             }
         };
         let arm = params.arm;
-        let embedding = self.blend_with_context(&query_embedding);
+
+        // Build the arm selection reason for the phase record
+        let arm_reason = match &plan.action {
+            PlanAction::DirectLookup => format!("arm={} (DirectLookup override)", arm),
+            PlanAction::ReasoningChain { .. } => format!("arm={} (ReasoningChain override)", arm),
+            _ => {
+                let hint = self.trajectory_store.as_ref()
+                    .and_then(|ts| ts.nearest_successful_arm(&query_embedding, 0.7))
+                    .map(|(a, _)| a);
+                format!("arm={} (LinUCB, trajectory_hint={:?})", arm, hint)
+            }
+        };
+
+        // Initialize causal trace for attribution tracking
+        let arm_names = ["vector-only", "graph-heavy", "hybrid", "episodic"];
+        let causal = CausalTrace::new(text, arm as usize, arm_names.get(arm as usize).unwrap_or(&"unknown"));
+
+        // ── Create QueryWorkspace ──
+        let mut ws = QueryWorkspace {
+            query_text: text.to_string(),
+            query_embedding: query_embedding.clone(),
+            blended_embedding: blended_embedding.clone(),
+            plan: plan.clone(),
+            candidates: Vec::new(),
+            entities: Vec::new(),
+            triples: Vec::new(),
+            traces: Vec::new(),
+            seen_entity_ids: HashSet::new(),
+            seen_triple_ids: HashSet::new(),
+            causal_trace: causal,
+            arm,
+            cascade_depth: 0,
+            phases: Vec::new(),
+            low_confidence: false,
+            suggested_queries: Vec::new(),
+            procedures: Vec::new(),
+        };
+
+        // Record the plan phase
+        ws.record_phase("plan", 0,
+            format!("action={:?}, complexity={}, confidence={:.2}", plan.action, plan.complexity, plan.confidence),
+            phase_start);
+
+        // Record the embed phase
+        ws.record_phase("embed", 0,
+            format!("dim={}", query_embedding.len()),
+            embed_start);
+
+        // Record the arm_select phase
+        ws.record_phase("arm_select", 0, arm_reason, arm_start);
+
+        // ── Phase: vector_search ──
+        let vs_start = Instant::now();
         let search_k = if self.reranker.is_some() {
-            params.top_k * 3 // wider pool for reranking
+            params.top_k * 3
         } else {
             params.top_k
         };
-        let mut candidates = self.graph.search_vectors(&embedding, search_k)?;
+        ws.candidates = self.graph.search_vectors(&blended_embedding, search_k)?;
+        let vs_count = ws.candidates.len();
+        ws.record_phase("vector_search", 0,
+            format!("search_k={}, found={}", search_k, vs_count),
+            vs_start);
 
-        // Phase 2.5: Optional ColBERT reranking
+        // ── Phase: rerank (optional ColBERT) ──
+        let rerank_start = Instant::now();
+        let mut reranked_used = false;
         if let Some(ref reranker) = self.reranker {
-            // Build rerank candidates with entity names as text
             let mut rerank_inputs: Vec<(Uuid, RerankCandidate)> = Vec::new();
-            for (id, score) in &candidates {
+            for (id, score) in &ws.candidates {
                 if let Ok(entity) = self.graph.get_entity(*id) {
                     rerank_inputs.push((*id, RerankCandidate {
                         id: id.to_string(),
@@ -360,39 +471,36 @@ impl RetrievalEngine {
 
                 match reranker.rerank(text, rerank_candidates) {
                     Ok(reranked) => {
-                        // Replace candidates with reranked order, capped to top_k
-                        candidates = reranked
+                        ws.candidates = reranked
                             .into_iter()
                             .take(params.top_k)
                             .filter_map(|r| {
                                 Uuid::parse_str(&r.id).ok().map(|id| (id, r.combined_score))
                             })
                             .collect();
+                        reranked_used = true;
                     }
                     Err(e) => {
                         info!("[retrieval] reranker failed, using vector order: {e}");
-                        candidates.truncate(params.top_k);
+                        ws.candidates.truncate(params.top_k);
                     }
                 }
             }
         }
+        ws.record_phase("rerank", vs_count,
+            format!("colbert={}, candidates_after={}", reranked_used, ws.candidates.len()),
+            rerank_start);
 
-        // Initialize causal trace for attribution tracking
-        let arm_names = ["vector-only", "graph-heavy", "hybrid", "episodic"];
-        let mut causal = CausalTrace::new(text, arm as usize, arm_names.get(arm as usize).unwrap_or(&"unknown"));
-
-        let mut seen_entity_ids: HashSet<Uuid> = HashSet::new();
-        let mut entities: Vec<Entity> = Vec::new();
-
-        for (rank, (id, score)) in candidates.iter().enumerate() {
-            if seen_entity_ids.contains(id) {
+        // Load entities from candidates
+        for (rank, (id, score)) in ws.candidates.iter().enumerate() {
+            if ws.seen_entity_ids.contains(id) {
                 continue;
             }
             match self.graph.get_entity(*id) {
                 Ok(entity) => {
-                    causal.add_vector_match(*id, &entity.name, *score as f64, rank);
-                    seen_entity_ids.insert(*id);
-                    entities.push(entity);
+                    ws.causal_trace.add_vector_match(*id, &entity.name, *score as f64, rank);
+                    ws.seen_entity_ids.insert(*id);
+                    ws.entities.push(entity);
                 }
                 Err(TraceMindError::EntityNotFound(_)) => {}
                 Err(TraceMindError::Storage(ref msg)) if msg.contains("no rows") => {}
@@ -400,156 +508,193 @@ impl RetrievalEngine {
             }
         }
 
-        // Phase 2.7: Reciprocal Rank Aggregation (Graph-R1) — parameter-free rank fusion
-        //            RRA_score(id) = Σ_lists 1/(k + rank(id) + 1), k=60
-        // Legacy MIA linear: 0.7*Sim + 0.15*Value + 0.15*Freq
-        if !entities.is_empty() {
-            let entity_ids: Vec<Uuid> = entities.iter().map(|e| e.id).collect();
+        // ── Phase: rra_fusion ──
+        let rra_start = Instant::now();
+        let entities_before_rra = ws.entities.len();
+        if !ws.entities.is_empty() {
+            let entity_ids: Vec<Uuid> = ws.entities.iter().map(|e| e.id).collect();
             let value_scores = self.graph.batch_value_scores(&entity_ids);
             let freq_scores = self.graph.batch_frequency_scores(&entity_ids);
+            let recency_scores = self.graph.batch_recency_scores(&entity_ids);
 
-            // Build 3 ranked lists for RRA fusion
-            // List 1: entities ranked by similarity score (descending)
-            let mut sim_list: Vec<(Uuid, f64)> = candidates.iter()
-                .filter(|(id, _)| seen_entity_ids.contains(id))
+            let mut sim_list: Vec<(Uuid, f64)> = ws.candidates.iter()
+                .filter(|(id, _)| ws.seen_entity_ids.contains(id))
                 .map(|(id, score)| (*id, *score as f64))
                 .collect();
             sim_list.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
-            // List 2: entities ranked by value score (descending)
             let mut value_list: Vec<(Uuid, f64)> = entity_ids.iter()
                 .map(|id| (*id, value_scores.get(id).copied().unwrap_or(0.5)))
                 .collect();
             value_list.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
-            // List 3: entities ranked by frequency score (descending)
             let mut freq_list: Vec<(Uuid, f64)> = entity_ids.iter()
                 .map(|id| (*id, freq_scores.get(id).copied().unwrap_or(1.0)))
                 .collect();
             freq_list.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
-            let fused = rra_fuse(&[sim_list, value_list, freq_list], 60.0);
+            let mut recency_list: Vec<(Uuid, f64)> = entity_ids.iter()
+                .map(|id| (*id, recency_scores.get(id).copied().unwrap_or(0.0)))
+                .collect();
+            recency_list.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
-            // Reorder entities by fused ranking
+            let fused = rra_fuse(&[sim_list, value_list, freq_list, recency_list], 60.0);
+
             let rank_map: HashMap<Uuid, usize> = fused.iter()
                 .enumerate()
                 .map(|(rank, (id, _))| (*id, rank))
                 .collect();
-            entities.sort_by_key(|e| rank_map.get(&e.id).copied().unwrap_or(usize::MAX));
+            ws.entities.sort_by_key(|e| rank_map.get(&e.id).copied().unwrap_or(usize::MAX));
 
-            // Record retrieval for value tracking
             for id in &entity_ids {
                 let _ = self.graph.record_retrieval(*id);
             }
         }
+        ws.record_phase("rra_fusion", entities_before_rra,
+            format!("entities_after={}", ws.entities.len()),
+            rra_start);
 
-        // Phase 2.8: Progressive fallback attenuation (GraphRAG-R1)
-        // Each cascade step is worth 60% of the previous — prevents over-retrieval
-        let max_sim = candidates.iter().map(|(_, s)| *s).fold(0.0f32, f32::max);
-        let mut cascade_depth: u8 = 0;
+        // ── Phase: fallback_cascade ──
+        let cascade_start = Instant::now();
+        let max_sim = ws.candidates.iter().map(|(_, s)| *s).fold(0.0f32, f32::max);
         let mut current_arm = arm;
         let mut attenuation = 1.0f64;
 
-        while max_sim < 0.3 && entities.len() < 3 && current_arm < 3 {
+        while max_sim < 0.3 && ws.entities.len() < 3 && current_arm < 3 {
             current_arm += 1;
-            cascade_depth += 1;
+            ws.cascade_depth += 1;
             attenuation *= 0.6;
 
             info!("[retrieval] fallback cascade depth {}: arm {} → {}, attenuation={:.2}",
-                  cascade_depth, arm, current_arm, attenuation);
+                  ws.cascade_depth, arm, current_arm, attenuation);
 
             let fallback_params = UcbBandit::params_for_arm(current_arm);
-            if let Ok(fallback_candidates) = self.graph.search_vectors(&embedding, fallback_params.top_k) {
+            if let Ok(fallback_candidates) = self.graph.search_vectors(&blended_embedding, fallback_params.top_k) {
                 for (id, score) in fallback_candidates {
-                    // Only accept if attenuated score passes threshold
                     if (score as f64 * attenuation) < 0.15 {
                         continue;
                     }
-                    if seen_entity_ids.contains(&id) {
+                    if ws.seen_entity_ids.contains(&id) {
                         continue;
                     }
                     match self.graph.get_entity(id) {
                         Ok(entity) => {
-                            causal.add_vector_match(id, &entity.name, score as f64 * attenuation, entities.len());
-                            seen_entity_ids.insert(id);
-                            entities.push(entity);
+                            ws.causal_trace.add_vector_match(id, &entity.name, score as f64 * attenuation, ws.entities.len());
+                            ws.seen_entity_ids.insert(id);
+                            ws.entities.push(entity);
                         }
                         _ => {}
                     }
                 }
             }
 
-            // Re-check: if we got some results, stop cascading
-            if !entities.is_empty() {
+            if !ws.entities.is_empty() {
                 break;
             }
         }
+        ws.record_phase("fallback_cascade", entities_before_rra,
+            format!("cascade_depth={}, attenuation={:.2}", ws.cascade_depth, attenuation),
+            cascade_start);
 
-        // Phase 2.9: Diversity penalty (MMR-style greedy reranking).
-        // Prevents returning 3 near-identical entities when coverage matters.
-        // λ=0.3 is mild — preserves relevance ordering but breaks ties toward diversity.
-        diversify_entities(&mut entities, &self.graph, 0.3);
+        // ── Phase: mmr_diversity ──
+        let mmr_start = Instant::now();
+        let entities_before_mmr = ws.entities.len();
+        diversify_entities(&mut ws.entities, &self.graph, 0.3);
+        ws.record_phase("mmr_diversity", entities_before_mmr,
+            format!("entities_before={}, entities_after={}", entities_before_mmr, ws.entities.len()),
+            mmr_start);
 
-        // Phase 3: k-hop graph expansion (only when params.hops > 0).
+        // ── Phase: graph_expand ──
+        let graph_start = Instant::now();
+        let entities_before_graph = ws.entities.len();
         if params.hops > 0 {
-            // Snapshot the IDs of the seed entities so we can iterate over them
-            // without borrowing `entities` mutably at the same time.
-            let seed_ids: Vec<Uuid> = entities.iter().map(|e| e.id).collect();
+            let seed_ids: Vec<Uuid> = ws.entities.iter().map(|e| e.id).collect();
 
             for seed_id in seed_ids {
                 let neighbors = self.graph.k_hop_neighbors(seed_id, params.hops)?;
                 for neighbor in neighbors {
-                    if !seen_entity_ids.contains(&neighbor.id) {
-                        causal.add_graph_hop(neighbor.id, &neighbor.name, seed_id, "k_hop", params.hops as usize);
-                        seen_entity_ids.insert(neighbor.id);
-                        entities.push(neighbor);
+                    if !ws.seen_entity_ids.contains(&neighbor.id) {
+                        ws.causal_trace.add_graph_hop(neighbor.id, &neighbor.name, seed_id, "k_hop", params.hops as usize);
+                        ws.seen_entity_ids.insert(neighbor.id);
+                        ws.entities.push(neighbor);
                     }
                 }
             }
         }
+        let new_from_graph = ws.entities.len() - entities_before_graph;
+        ws.record_phase("graph_expand", entities_before_graph,
+            format!("hops={}, new_entities={}", params.hops, new_from_graph),
+            graph_start);
 
-        // Phase 4: collect triples for every entity, deduplicated by triple id.
-        //          Prefer typed predicates over generic RelatedTo; sort by confidence.
-        let mut seen_triple_ids: HashSet<Uuid> = HashSet::new();
-        let mut triples: Vec<Triple> = Vec::new();
-
-        for entity in &entities {
+        // ── Phase: triples ──
+        let triples_start = Instant::now();
+        for entity in &ws.entities {
             let entity_triples = self.graph.get_triples_for_entity(entity.id)?;
             for triple in entity_triples {
-                if !seen_triple_ids.contains(&triple.id) {
-                    seen_triple_ids.insert(triple.id);
-                    triples.push(triple);
+                if !ws.seen_triple_ids.contains(&triple.id) {
+                    ws.seen_triple_ids.insert(triple.id);
+                    ws.triples.push(triple);
                 }
             }
         }
 
-        // Sort: typed predicates first (higher confidence), then by confidence descending.
-        triples.sort_by(|a, b| {
+        ws.triples.sort_by(|a, b| {
             let a_typed = !matches!(a.predicate, tm_types::Predicate::RelatedTo);
             let b_typed = !matches!(b.predicate, tm_types::Predicate::RelatedTo);
             b_typed.cmp(&a_typed).then(b.confidence.partial_cmp(&a.confidence).unwrap_or(std::cmp::Ordering::Equal))
         });
 
-        // Cap triples to avoid noise — keep all typed + up to 20 RelatedTo
-        let typed_count = triples.iter().filter(|t| !matches!(t.predicate, tm_types::Predicate::RelatedTo)).count();
-        triples.truncate(typed_count + 20);
+        let typed_count = ws.triples.iter().filter(|t| !matches!(t.predicate, tm_types::Predicate::RelatedTo)).count();
+        let generic_count = ws.triples.len() - typed_count;
+        ws.triples.truncate(typed_count + 20);
+        ws.record_phase("triples", ws.entities.len(),
+            format!("typed={}, generic={}", typed_count, generic_count),
+            triples_start);
 
-        // Phase 5: optional episodic traces.
-        let traces: Vec<Trace> = if params.include_episodic {
+        // ── Phase: episodic ──
+        let episodic_start = Instant::now();
+        if params.include_episodic {
             let recent = self.trace_store.recent(50)?;
+            let scanned = recent.len();
             for trace in &recent {
                 for eid in &trace.entities_extracted {
-                    if !seen_entity_ids.contains(eid) {
+                    if !ws.seen_entity_ids.contains(eid) {
                         if let Ok(e) = self.graph.get_entity(*eid) {
-                            causal.add_episodic(*eid, &e.name, &trace.id.to_string());
+                            ws.causal_trace.add_episodic(*eid, &e.name, &trace.id.to_string());
                         }
                     }
                 }
             }
-            recent
+            ws.traces = recent;
+            ws.record_phase("episodic", ws.entities.len(),
+                format!("traces_scanned={}", scanned),
+                episodic_start);
+        } else {
+            ws.record_phase("episodic", ws.entities.len(),
+                "skipped (arm does not include episodic)".to_string(),
+                episodic_start);
+        }
+
+        // ── Phase: procedures ──
+        let proc_start = Instant::now();
+        ws.procedures = self.match_procedures(text);
+        ws.record_phase("procedures", ws.entities.len(),
+            format!("matched={}", ws.procedures.len()),
+            proc_start);
+
+        // ── Phase: confidence ──
+        let conf_start = Instant::now();
+        ws.low_confidence = ws.entities.is_empty()
+            || (plan.confidence < 0.5 && ws.entities.len() < 2);
+
+        ws.suggested_queries = if ws.low_confidence {
+            self.generate_suggestions(text, &plan, &ws.entities)
         } else {
             vec![]
         };
+        ws.record_phase("confidence", ws.entities.len(),
+            format!("low_confidence={}, suggestions={}", ws.low_confidence, ws.suggested_queries.len()),
+            conf_start);
 
         // Measure elapsed time.
         let latency_ms = start.elapsed().as_millis().min(u32::MAX as u128) as u32;
@@ -558,8 +703,8 @@ impl RetrievalEngine {
         self.finalize_pending_reward();
 
         // Create deferred reward — will be finalized on next query or explicit flush.
-        let base_score = if !entities.is_empty() {
-            (entities.len() as f64 / 5.0).min(1.0)
+        let base_score = if !ws.entities.is_empty() {
+            (ws.entities.len() as f64 / 5.0).min(1.0)
         } else {
             0.0
         };
@@ -574,51 +719,39 @@ impl RetrievalEngine {
         });
 
         // Log access for each result entity (for recommendation scoring).
-        for entity in &entities {
+        for entity in &ws.entities {
             let _ = self.graph.log_access(entity.id, "query_result", Some(text));
         }
 
         // Cache query embedding for recommendations + relevance gating.
-        self.query_cache.push(text.to_string(), embedding.clone());
+        self.query_cache.push(text.to_string(), blended_embedding);
 
         // Persist a retrieval trace for the audit trail.
         let mut trace = Trace::new(Uuid::new_v4(), TraceEventType::Retrieve, "");
         trace.raw_text = Some(text.to_string());
-        trace.entities_extracted = entities.iter().map(|e| e.id).collect();
-        trace.triples_extracted = triples.iter().map(|t| t.id).collect();
+        trace.entities_extracted = ws.entities.iter().map(|e| e.id).collect();
+        trace.triples_extracted = ws.triples.iter().map(|t| t.id).collect();
         trace.retrieval_arm = Some(arm);
         trace.retrieval_latency_ms = Some(latency_ms);
         let _ = self.trace_store.append(&trace);
 
         // Finalize causal trace
-        causal.total_entities = entities.len();
-        causal.total_triples = triples.len();
-        causal.latency_ms = latency_ms as u64;
-
-        // Confidence assessment: low when plan confidence is weak and few entities, or no entities at all
-        let low_confidence = entities.is_empty()
-            || (plan.confidence < 0.5 && entities.len() < 2);
-
-        let suggested_queries = if low_confidence {
-            self.generate_suggestions(text, &plan, &entities)
-        } else {
-            vec![]
-        };
-
-        // Phase 6: procedural memory matching
-        let procedures = self.match_procedures(text);
+        ws.causal_trace.total_entities = ws.entities.len();
+        ws.causal_trace.total_triples = ws.triples.len();
+        ws.causal_trace.latency_ms = latency_ms as u64;
 
         Ok(RetrievalResult {
-            arm,
-            entities,
-            triples,
-            traces,
+            arm: ws.arm,
+            entities: ws.entities,
+            triples: ws.triples,
+            traces: ws.traces,
             latency_ms,
-            causal_trace: causal,
-            plan: Some(plan),
-            low_confidence,
-            suggested_queries,
-            procedures,
+            causal_trace: ws.causal_trace,
+            plan: Some(ws.plan),
+            low_confidence: ws.low_confidence,
+            suggested_queries: ws.suggested_queries,
+            procedures: ws.procedures,
+            phases: ws.phases,
         })
     }
 
@@ -720,6 +853,8 @@ impl RetrievalEngine {
             let _ = self.graph.log_access(entity.id, "query_result", Some(original_text));
         }
 
+        let entity_count = all_entities.len();
+
         // Persist trace
         let mut trace = Trace::new(Uuid::new_v4(), TraceEventType::Retrieve, "");
         trace.raw_text = Some(original_text.to_string());
@@ -740,6 +875,13 @@ impl RetrievalEngine {
             low_confidence: false,
             suggested_queries: vec![],
             procedures: vec![],
+            phases: vec![PhaseRecord {
+                phase: "decomposed",
+                duration_us: start.elapsed().as_micros() as u64,
+                candidates_in: sub_queries.len(),
+                candidates_out: entity_count,
+                decision: format!("{} sub-queries merged", sub_queries.len()),
+            }],
         })
     }
 

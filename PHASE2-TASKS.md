@@ -160,7 +160,8 @@ P2-001 (graph+tracing) ✅
               → TM-3.2 (R1-inspired architecture) ✅
               → TM-3.3 (LinUCB + attenuation + reward) ✅
                 → TM-3.4 (decomposition + procedures + uncertainty + diversity + trajectory prior) ✅
-                  → TM-4.0-001 (ONNX embeddings + model selection + benchmark) ✅
+                  → TM-3.5 (BIGMAS workspace + MEM ingestion gate + temporal decay) ✅
+                    → TM-4.0-001 (ONNX embeddings + model selection + benchmark) ✅
 ```
 
 ---
@@ -312,6 +313,33 @@ Retrieval engine uses `TrajectoryStore::nearest_successful_arm()` (cosine sim > 
 **Status:** DONE
 **What:** `TrajectoryStore::nearest_successful_arm()` finds most similar past successful trajectory (cosine sim > 0.7) and returns the arm that worked. Passed as hint to `LinUcbBandit::select_with_hint()`. Non-parametric prior — no learning, just lookup. "Similar past queries preferred arm X, so bias toward arm X."
 **Accept:** Trajectory lookup + hint integration builds and passes. ✅
+
+### Phase 3.5 — Paper-Inspired Architecture (BIGMAS + MEM)
+
+#### TM-3.5-001 — QueryWorkspace (GWT shared state)
+**Status:** DONE
+**What:** `QueryWorkspace` struct with 4 GWT-inspired partitions (ctx/work/sys/ans). All 13 pipeline phases read/write to the workspace instead of passing state sequentially. Downstream phases can condition on upstream decisions. Inspired by BIGMAS (arXiv:2603.15371) centralized shared workspace from Global Workspace Theory.
+**Accept:** Build passes, 3 retrieval tests pass. ✅
+
+#### TM-3.5-002 — PhaseRecord execution history
+**Status:** DONE
+**What:** `PhaseRecord` struct logged by every pipeline phase: phase name, duration (μs), candidates in/out, human-readable decision string. Exposed via `RetrievalResult.phases`. Mirrors BIGMAS execution history ℋ^(t) — enables observability and smarter downstream decisions.
+**Accept:** Build passes, phases populated in query results. ✅
+
+#### TM-3.5-003 — Self-correction with error context
+**Status:** DONE
+**What:** `QueryPlanner::replan_with_context(plan, error_ctx)` uses failure description to select smarter retry strategy (BIGMAS self-correction loop). "0 entities" → escalate DirectLookup→BanditRetrieval→ReasoningChain. "Low similarity" → try AnalogySearch or Decompose. "Cascade exhausted" → confidence → 0.0. 4 tests.
+**Accept:** `cargo test -p tm-controller` — 28 tests pass. ✅
+
+#### TM-3.5-004 — Temporal decay weighting
+**Status:** DONE
+**What:** Added recency as 4th RRA fusion signal (alongside sim, value, frequency). Uses `batch_recency_scores()` — recently-updated entities rank higher. Inspired by MEM's temporal attention layers where recent observations get more weight.
+**Accept:** Build passes, RRA now fuses 4 lists. ✅
+
+#### TM-3.5-005 — Selective ingestion gate
+**Status:** DONE
+**What:** `IngestPipeline::should_ingest()` rejects noise before entity extraction (MEM "model decides what to remember"). Criteria: < 3 non-stopword tokens → skip, cosine sim > 0.95 to existing memory → skip. Skipped inputs logged to trace with reason. `IngestResult.skip_gate` flag. 3 tests.
+**Accept:** `cargo test -p tm-ingest` — 13 tests pass. ✅
 
 ### Phase 4.0 — Production Polish
 

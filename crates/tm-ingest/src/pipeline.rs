@@ -20,6 +20,8 @@ pub struct IngestResult {
     pub content_hash: String,
     /// Memory-R1 CRUD operations performed for each entity (entity_name, op).
     pub memory_ops: Vec<(String, MemoryOp)>,
+    /// True if the selective ingestion gate rejected this input.
+    pub skip_gate: bool,
 }
 
 impl IngestPipeline {
@@ -47,9 +49,56 @@ impl IngestPipeline {
         })
     }
 
+    // Stopwords for the selective ingestion gate (lowercase).
+    const GATE_STOPWORDS: &'static [&'static str] = &[
+        "the", "a", "an", "is", "are", "was", "were", "be", "been", "being",
+        "have", "has", "had", "do", "does", "did", "will", "would", "could",
+        "should", "may", "might", "shall", "can", "to", "of", "in", "for",
+        "on", "with", "at", "by", "from", "it", "its", "this", "that", "and",
+        "or", "but", "not", "no", "if", "then", "so", "as", "i", "me", "my",
+        "we", "you", "your", "he", "she", "they",
+    ];
+
+    /// Selective ingestion gate (MEM-inspired: model decides what to remember).
+    /// Returns `(should_ingest, reason)`.
+    ///
+    /// Rejection criteria:
+    /// - Too short (< 3 non-stopword tokens)
+    /// - All stopwords / no semantic content
+    /// - Near-exact duplicate of existing memory (cosine sim > 0.95)
+    fn should_ingest(&self, text: &str) -> (bool, &'static str) {
+        // 1. Length / semantic content check
+        let non_stopword_count = text
+            .split_whitespace()
+            .filter(|w| {
+                let lower = w.to_lowercase();
+                let trimmed = lower.trim_matches(|c: char| !c.is_alphanumeric());
+                !trimmed.is_empty()
+                    && !Self::GATE_STOPWORDS.contains(&trimmed)
+            })
+            .count();
+
+        if non_stopword_count < 3 {
+            return (false, "too short or no semantic content");
+        }
+
+        // 2. Near-duplicate check via vector similarity
+        let embedding = self.embedder.embed(text);
+        if let Ok(results) = self.graph.search_vectors(&embedding, 1) {
+            if let Some(&(_, sim)) = results.first() {
+                if sim > 0.95 {
+                    return (false, "near-duplicate of existing memory");
+                }
+            }
+        }
+
+        (true, "accepted")
+    }
+
     /// Ingest raw `text` from `session_id`:
     ///
     /// 1. Run governance check (confidence = 1.0).
+    /// 1.5. Selective ingestion gate (MEM-inspired).
     /// 2. Hash the text.
     /// 3. Extract entities heuristically (multi-word aware).
     /// 4. Deduplicate entities against the existing graph (exact + case-insensitive name match).
@@ -60,6 +109,22 @@ impl IngestPipeline {
     pub fn ingest(&self, text: &str, session_id: Uuid) -> Result<IngestResult> {
         // 1. Governance check.
         self.governance.check(text, 1.0)?;
+
+        // 1.5: Selective ingestion gate (MEM-inspired)
+        let (pass, reason) = self.should_ingest(text);
+        if !pass {
+            let content_hash = hash_text(text);
+            let mut trace = Trace::new(session_id, TraceEventType::Ingest, &content_hash);
+            trace.raw_text = Some(format!("[SKIPPED: {}] {}", reason, text));
+            return Ok(IngestResult {
+                trace,
+                entities: vec![],
+                triples: vec![],
+                content_hash,
+                memory_ops: vec![],
+                skip_gate: true,
+            });
+        }
 
         // 2. Hash.
         let content_hash = hash_text(text);
@@ -186,6 +251,7 @@ impl IngestPipeline {
             triples,
             content_hash,
             memory_ops,
+            skip_gate: false,
         })
     }
     // -----------------------------------------------------------------------
@@ -757,6 +823,29 @@ mod tests {
                 "Case-insensitive name match should reuse entity"
             );
         }
+    }
+
+    #[test]
+    fn test_should_ingest_too_short() {
+        let pipeline = in_memory_pipeline();
+        let (pass, reason) = pipeline.should_ingest("the a an");
+        assert!(!pass, "all-stopword text should be rejected");
+        assert_eq!(reason, "too short or no semantic content");
+    }
+
+    #[test]
+    fn test_should_ingest_normal() {
+        let pipeline = in_memory_pipeline();
+        let (pass, _reason) = pipeline.should_ingest("Rust is a systems programming language");
+        assert!(pass, "meaningful text should be accepted");
+    }
+
+    #[test]
+    fn test_should_ingest_empty() {
+        let pipeline = in_memory_pipeline();
+        let (pass, reason) = pipeline.should_ingest("");
+        assert!(!pass, "empty text should be rejected");
+        assert_eq!(reason, "too short or no semantic content");
     }
 
     #[test]
