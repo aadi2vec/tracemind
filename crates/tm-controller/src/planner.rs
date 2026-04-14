@@ -248,6 +248,100 @@ impl QueryPlanner {
         })
     }
 
+    /// Re-plan with error context from the failed execution.
+    /// Unlike blind `replan()`, this uses the error description to select
+    /// a more appropriate strategy (BIGMAS self-correction loop).
+    ///
+    /// Error context examples:
+    /// - "0 entities found" → try wider search or suggest ingestion
+    /// - "all results low similarity" → try reasoning chain or analogy
+    /// - "cascade exhausted" → topic likely not in memory
+    pub fn replan_with_context(&self, original: &QueryPlan, error_ctx: &str) -> QueryPlan {
+        let lower_err = error_ctx.to_lowercase();
+
+        // 1. No entities found — escalate search strategy
+        if lower_err.contains("0 entities") || lower_err.contains("no entities") {
+            return match &original.action {
+                PlanAction::DirectLookup => QueryPlan {
+                    action: PlanAction::BanditRetrieval,
+                    complexity: original.complexity.clone(),
+                    confidence: 0.6,
+                    allow_fallback: true,
+                    max_cascade: 2,
+                    entity_hints: original.entity_hints.clone(),
+                },
+                PlanAction::BanditRetrieval => QueryPlan {
+                    action: PlanAction::ReasoningChain {
+                        source_hint: original.entity_hints.first().cloned(),
+                        target_hint: original.entity_hints.get(1).cloned(),
+                    },
+                    complexity: original.complexity.clone(),
+                    confidence: 0.4,
+                    allow_fallback: true,
+                    max_cascade: 1,
+                    entity_hints: original.entity_hints.clone(),
+                },
+                _ => {
+                    // Give up — already tried advanced strategies
+                    let mut plan = original.clone();
+                    plan.confidence = 0.1;
+                    plan.allow_fallback = false;
+                    plan
+                }
+            };
+        }
+
+        // 2. Low similarity results — try analogy or decomposition
+        if lower_err.contains("low similarity") || lower_err.contains("max_sim") {
+            if let Some(entity) = original.entity_hints.first() {
+                return QueryPlan {
+                    action: PlanAction::AnalogySearch {
+                        entity_hint: entity.clone(),
+                    },
+                    complexity: original.complexity.clone(),
+                    confidence: 0.5,
+                    allow_fallback: true,
+                    max_cascade: 1,
+                    entity_hints: original.entity_hints.clone(),
+                };
+            }
+            // No entity hints — decompose the query into simpler parts
+            let sub_queries = original
+                .entity_hints
+                .iter()
+                .map(|e| e.clone())
+                .collect::<Vec<_>>();
+            if sub_queries.len() > 1 {
+                return QueryPlan {
+                    action: PlanAction::Decompose { sub_queries },
+                    complexity: original.complexity.clone(),
+                    confidence: 0.45,
+                    allow_fallback: false,
+                    max_cascade: 1,
+                    entity_hints: original.entity_hints.clone(),
+                };
+            }
+            // Fall through to default if no hints at all
+        }
+
+        // 3. Cascade exhausted — topic not in memory
+        if lower_err.contains("cascade") || lower_err.contains("exhausted") {
+            let mut plan = original.clone();
+            plan.confidence = 0.0;
+            return plan;
+        }
+
+        // 4. Default: fall back to existing replan() behavior
+        match self.replan(original, 0.0) {
+            Some(plan) => plan,
+            None => {
+                let mut plan = original.clone();
+                plan.confidence = (plan.confidence * 0.7).min(0.5);
+                plan
+            }
+        }
+    }
+
     /// Assess query complexity based on linguistic features.
     fn assess_complexity(&self, lower: &str, word_count: usize) -> QueryComplexity {
         // Count conjunctions (indicates compound query)
@@ -404,5 +498,61 @@ mod tests {
         let plan = planner.plan("How does Rust connect to TraceMind?");
         assert!(plan.entity_hints.contains(&"Rust".to_string()));
         assert!(plan.entity_hints.contains(&"TraceMind".to_string()));
+    }
+
+    #[test]
+    fn test_replan_with_context_no_entities() {
+        let planner = QueryPlanner::new();
+        let plan = planner.plan("What is Rust?");
+        assert_eq!(plan.action, PlanAction::DirectLookup);
+
+        // "0 entities found" should escalate DirectLookup → BanditRetrieval
+        let replanned = planner.replan_with_context(&plan, "0 entities found in graph");
+        assert_eq!(replanned.action, PlanAction::BanditRetrieval);
+        assert!(replanned.confidence <= 0.6);
+    }
+
+    #[test]
+    fn test_replan_with_context_low_similarity() {
+        let planner = QueryPlanner::new();
+        let plan = QueryPlan {
+            action: PlanAction::BanditRetrieval,
+            complexity: "Moderate".to_string(),
+            confidence: 0.85,
+            allow_fallback: true,
+            max_cascade: 2,
+            entity_hints: vec!["Rust".to_string()],
+        };
+
+        // "low similarity" with entity hints should try AnalogySearch
+        let replanned = planner.replan_with_context(&plan, "all results low similarity, max_sim=0.12");
+        assert!(matches!(replanned.action, PlanAction::AnalogySearch { .. }));
+        if let PlanAction::AnalogySearch { entity_hint } = &replanned.action {
+            assert_eq!(entity_hint, "Rust");
+        }
+    }
+
+    #[test]
+    fn test_replan_with_context_cascade_exhausted() {
+        let planner = QueryPlanner::new();
+        let plan = planner.plan("What is Rust?");
+
+        // "cascade exhausted" should drop confidence to 0.0
+        let replanned = planner.replan_with_context(&plan, "cascade exhausted after 3 attempts");
+        assert!((replanned.confidence - 0.0).abs() < f64::EPSILON);
+        // Action should remain unchanged
+        assert_eq!(replanned.action, plan.action);
+    }
+
+    #[test]
+    fn test_replan_with_context_default_fallback() {
+        let planner = QueryPlanner::new();
+        let plan = planner.plan("What is Rust?");
+        assert_eq!(plan.action, PlanAction::DirectLookup);
+
+        // Unknown error should fall back to standard replan() behavior
+        let replanned = planner.replan_with_context(&plan, "unexpected timeout error");
+        // Standard replan from DirectLookup escalates to BanditRetrieval
+        assert_eq!(replanned.action, PlanAction::BanditRetrieval);
     }
 }

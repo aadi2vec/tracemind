@@ -1,6 +1,6 @@
 # TraceMind Architecture
 
-**~11,000 lines of Rust | 14 crates | 100 tests | 4 binaries**
+**~11,500 lines of Rust | 14 crates | 101 tests | 4 binaries**
 
 Local-only memory OS. All data lives in `~/.tracemind/`. No cloud, no telemetry.
 
@@ -149,7 +149,15 @@ graph.batch_frequency_scores(&ids) // MIA exploration bonus
 | 2 | wide | 15 | 2 | no |
 | 3 | deep | 20 | 2 | yes |
 
-### tm-retrieval (Pipeline — ~1,100 lines, 3 tests)
+### tm-retrieval (Pipeline — ~1,300 lines, 3 tests)
+
+**QueryWorkspace** (GWT-inspired): All phases read/write a shared workspace struct with 4 partitions:
+- `ctx` — read-only query context (text, embeddings, plan)
+- `work` — read-write candidates, entities, triples, causal trace
+- `sys` — execution metadata: arm, cascade depth, `Vec<PhaseRecord>`
+- `ans` — final answer assembly (confidence, suggestions, procedures)
+
+**PhaseRecord** execution history: Every phase logs what it did (duration, candidates in/out, decision string). Downstream phases can condition on upstream decisions. Persisted in `RetrievalResult.phases`.
 
 The query pipeline has 13 phases:
 ```
@@ -159,8 +167,8 @@ Phase 1:   Embed query (needed for LinUCB context)
 Phase 1.5: LinUCB selects arm with trajectory hint (or planner overrides)
 Phase 2:   Session context blend (80/20)
 Phase 2.5: Optional ColBERT reranking
-Phase 2.7: RRA fusion — parameter-free rank aggregation over sim/value/freq lists
-Phase 2.8: Progressive fallback cascade — 0.6× attenuation per cascade step
+Phase 2.7: RRA fusion — 4-list rank aggregation (sim + value + freq + recency)
+Phase 2.8: Progressive fallback cascade — 0.6× attenuation, self-correction with error context
 Phase 2.9: MMR diversity penalty — greedy reranking (λ=0.3) for coverage
 Phase 3:   K-hop graph expansion
 Phase 4:   Triple collection + dedup
@@ -168,7 +176,12 @@ Phase 5:   Episodic traces + causal attribution + auto-enrich (chains/analogies)
 Phase 6:   Procedural memory matching + confidence assessment + suggestions
 ```
 
-### tm-ingest (Extraction — 780 lines, 10 tests)
+### tm-ingest (Extraction — 870 lines, 13 tests)
+
+**Selective ingestion gate** (MEM-inspired): Before entity extraction, rejects noise:
+- Too short / all stopwords (< 3 semantic tokens) → skip
+- Near-exact duplicate (cosine sim > 0.95) → skip
+- Skipped inputs logged to trace with reason
 
 Memory-R1 CRUD decision at ingest time:
 ```
@@ -232,6 +245,8 @@ user feedback → UcbBandit.register_reward() → graph.record_success()
 | **Graph-R1** (arXiv:2507.21892) | Reciprocal Rank Aggregation (parameter-free fusion) | tm-retrieval |
 | **KG-R1** (arXiv:2509.26383) | 4-action schema-agnostic graph API | tm-graph |
 | **GraphRAG-R1** (arXiv:2507.23581) | Progressive fallback attenuation | tm-retrieval |
+| **BIGMAS** (arXiv:2603.15371) | QueryWorkspace (GWT shared state), PhaseRecord execution history, self-correction with error context | tm-retrieval, tm-controller |
+| **Pi MEM** (Physical Intelligence) | Selective ingestion gate, temporal decay weighting in RRA fusion | tm-ingest, tm-retrieval |
 
 ---
 
@@ -313,6 +328,11 @@ R1-inspired intelligence layer is fully operational:
 - **Trajectory nearest-neighbor** — non-parametric prior biases arm selection
 - **Procedural memory** — procedures surface alongside entity results
 - **Uncertainty routing** — low-confidence flag + suggested follow-up queries
+- **QueryWorkspace (GWT)** — 4-partition shared state for all pipeline phases (BIGMAS-inspired)
+- **PhaseRecord history** — every phase logs duration, candidates, decisions (BIGMAS ℋ)
+- **Self-correction with error context** — replan uses failure reason, not blind escalation
+- **Temporal decay weighting** — recency as 4th RRA signal (MEM temporal attention)
+- **Selective ingestion gate** — rejects noise before entity extraction (MEM selective memory)
 
 ### Phase 4 — Procedures & Production
 
@@ -328,6 +348,8 @@ R1-inspired intelligence layer is fully operational:
 
 | Item | What | Impact |
 |------|------|--------|
+| Semantic memory summarization | Cluster related entities → create super-entities with merged descriptions (MEM abstract consolidation) | High — hierarchical memory |
+| Execution graph per query | QueryPlanner outputs multi-step DAG with Fork/Merge, not single action (BIGMAS GraphDesigner) | High — parallel sub-plans |
 | JEPA encoder | Joint Embedding Predictive Architecture — predict next entity state from partial observation | High — anticipatory memory |
 | World model | Internal simulation: "if I store X, what queries will it help?" | High — proactive memory management |
 | Surprise-based ingestion | Only ingest if information gain exceeds threshold (KL divergence from world model) | Medium — prevents memory bloat |
