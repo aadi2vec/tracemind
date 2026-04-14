@@ -160,6 +160,7 @@ P2-001 (graph+tracing) ✅
               → TM-3.2 (R1-inspired architecture) ✅
               → TM-3.3 (LinUCB + attenuation + reward) ✅
                 → TM-3.4 (decomposition + procedures + uncertainty + diversity + trajectory prior) ✅
+                  → TM-4.0-001 (ONNX embeddings + model selection + benchmark) ✅
 ```
 
 ---
@@ -314,10 +315,10 @@ Retrieval engine uses `TrajectoryStore::nearest_successful_arm()` (cosine sim > 
 
 ### Phase 4.0 — Production Polish
 
-#### TM-4.0-001 — ONNX embeddings everywhere
-**Status:** TODO
-**What:** Ship real all-MiniLM-L6-v2 via fastembed. Auto-download on first run. Hash embedder only for tests. Required for real-world precision.
-**Effort:** 1 day (mostly testing model download paths)
+#### TM-4.0-001 — ONNX embeddings + model selection + quality benchmark
+**Status:** DONE
+**What:** 6 Apache 2.0 models via fastembed (BGE, BGE-Q, MiniLM, MiniLM-Q, Arctic, Arctic-Q — all 384-dim). Default changed to BGE-small-en-v1.5. `TM_EMBED_MODEL` env var for runtime model selection. `tm-bench` crate with embedding quality (15 triples), retrieval quality (24 docs, 8 queries), and `--compare` mode for side-by-side model evaluation. Hash embedder only for tests. BGE: 100% accuracy, 0.317 margin. MiniLM: 100% accuracy, 0.385 margin. Hash baseline: 60% accuracy, 0.040 margin.
+**Accept:** `cargo run -p tm-bench` passes. `cargo run -p tm-bench -- --compare` shows all 6 models. ✅
 
 #### TM-4.0-002 — Tauri desktop app packaging
 **Status:** TODO
