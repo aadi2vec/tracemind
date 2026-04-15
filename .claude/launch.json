@@ -1,0 +1,20 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "tm-mcp (MCP Server)",
+      "runtimeExecutable": "bash",
+      "runtimeArgs": ["run-mcp.sh"]
+    },
+    {
+      "name": "tracemind-cli (CLI)",
+      "runtimeExecutable": "cargo",
+      "runtimeArgs": ["run", "-p", "tm-cli", "--release", "--", "status"]
+    },
+    {
+      "name": "tm-bench (Benchmark)",
+      "runtimeExecutable": "cargo",
+      "runtimeArgs": ["run", "-p", "tm-bench", "--release"]
+    }
+  ]
+}

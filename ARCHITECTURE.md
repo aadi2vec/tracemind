@@ -313,6 +313,10 @@ R1-inspired intelligence layer is fully operational:
 - **Trajectory nearest-neighbor** — non-parametric prior biases arm selection
 - **Procedural memory** — procedures surface alongside entity results
 - **Uncertainty routing** — low-confidence flag + suggested follow-up queries
+- **Unified reasoning narrative** — 3-layer Strategy/Process/Evidence explanation answering "WHY did TraceMind recommend this?"
+- **ColBERT token cache** — SQLite storage for per-token embeddings (foundation for multi-vector retrieval)
+- **File/directory bulk import** — `tracemind import <path>` with extension filtering and dry-run
+- **MCP procedures live** — list_procedures returns real stored procedures from ProcedureStore
 
 ### Phase 4 — Procedures & Production
 

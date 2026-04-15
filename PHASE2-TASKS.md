@@ -320,6 +320,28 @@ Retrieval engine uses `TrajectoryStore::nearest_successful_arm()` (cosine sim > 
 **What:** 6 Apache 2.0 models via fastembed (BGE, BGE-Q, MiniLM, MiniLM-Q, Arctic, Arctic-Q — all 384-dim). Default changed to BGE-small-en-v1.5. `TM_EMBED_MODEL` env var for runtime model selection. `tm-bench` crate with embedding quality (15 triples), retrieval quality (24 docs, 8 queries), and `--compare` mode for side-by-side model evaluation. Hash embedder only for tests. BGE: 100% accuracy, 0.317 margin. MiniLM: 100% accuracy, 0.385 margin. Hash baseline: 60% accuracy, 0.040 margin.
 **Accept:** `cargo run -p tm-bench` passes. `cargo run -p tm-bench -- --compare` shows all 6 models. ✅
 
+### Phase 4.1 — Tier 1: Reasoning + Retrieval Infrastructure
+
+#### TM-4.1-001 — Unified reasoning narrative
+**Status:** DONE
+**What:** 3-layer `reasoning_narrative()` method on CausalTrace combining Strategy (QueryPlan action/complexity/confidence), Process (PhaseRecord decisions, filtering mechanical phases), and Evidence (top-5 attributions with source descriptions). Wired into RetrievalResult and MCP memory_query JSON response. Human-readable answer to "WHY did TraceMind recommend this?"
+**Accept:** `cargo test -p tm-reason` passes. Narrative includes ## Strategy, ## Process, ## Evidence sections. ✅
+
+#### TM-4.1-002 — ColBERT token cache infrastructure
+**Status:** DONE
+**What:** New `colbert_tokens` table in GraphStore SQLite (entity_id PK, model_id, token_count, dim, embeddings BLOB as packed f32 LE). Three methods: `upsert_colbert_tokens()`, `get_colbert_tokens()`, `batch_colbert_tokens()`. Foundation for multi-vector retrieval (ColBERT late interaction / MUVERA FDE).
+**Accept:** `cargo test -p tm-graph test_colbert_token_cache` passes. Roundtrip, missing entity, and batch verified. ✅
+
+#### TM-4.1-003 — File/directory bulk import CLI
+**Status:** DONE
+**What:** `tracemind import <path>` command with `--ext` (default: md,txt,rs,py,js,ts,toml,yaml,yml,json), `--max-kb` (default: 100), `--dry-run` flags. Recursive directory walking, skips hidden files/node_modules/target/.git/__pycache__. Prepends `[File: relative/path]` context. Reports imported/skipped/errors/total KB.
+**Accept:** `cargo build -p tm-cli` succeeds. Command handles single files and directories. ✅
+
+#### TM-4.1-004 — MCP list_procedures fix
+**Status:** DONE
+**What:** `handle_list_procedures()` now loads real procedures from `ProcedureStore` via `procedures.jsonl` instead of returning empty stub array. Returns id, name, description, steps, status, confidence per procedure.
+**Accept:** `cargo build -p tm-mcp` succeeds. MCP returns actual stored procedures. ✅
+
 #### TM-4.0-002 — Tauri desktop app packaging
 **Status:** TODO
 **What:** `cargo tauri build` for macOS .dmg. Menu bar integration. Auto-start option. System tray icon.
