@@ -164,7 +164,7 @@ struct RecommendationInfo {
 // Helpers
 // ---------------------------------------------------------------------------
 
-const ARM_NAMES: [&str; 4] = ["vector-only", "graph-heavy", "hybrid", "episodic"];
+const ARM_NAMES: [&str; 5] = ["vector-only", "graph-heavy", "hybrid", "episodic", "colbert"];
 
 fn arm_name(arm: u8) -> String {
     ARM_NAMES.get(arm as usize).unwrap_or(&"unknown").to_string()

@@ -402,8 +402,7 @@ impl RetrievalEngine {
         };
 
         // Initialize causal trace for attribution tracking
-        let arm_names = ["vector-only", "graph-heavy", "hybrid", "episodic"];
-        let causal = CausalTrace::new(text, arm as usize, arm_names.get(arm as usize).unwrap_or(&"unknown"));
+        let causal = CausalTrace::new(text, arm as usize, UcbBandit::arm_name(arm));
 
         // ── Create QueryWorkspace ──
         let mut ws = QueryWorkspace {
@@ -492,6 +491,17 @@ impl RetrievalEngine {
         ws.record_phase("rerank", vs_count,
             format!("colbert={}, candidates_after={}", reranked_used, ws.candidates.len()),
             rerank_start);
+
+        // ── Phase: colbert_maxsim (arm 4 only) ──
+        let colbert_start = Instant::now();
+        let colbert_applied = if params.include_colbert && !ws.candidates.is_empty() {
+            self.apply_colbert_maxsim(&mut ws, text)
+        } else {
+            false
+        };
+        ws.record_phase("colbert_maxsim", ws.candidates.len(),
+            format!("applied={}, arm_colbert={}", colbert_applied, params.include_colbert),
+            colbert_start);
 
         // Load entities from candidates
         for (rank, (id, score)) in ws.candidates.iter().enumerate() {
@@ -914,12 +924,12 @@ impl RetrievalEngine {
     }
 
     /// Return per-arm `(pull_count, average_reward)` statistics from the bandit.
-    pub fn bandit_stats(&self) -> [(u64, f64); 4] {
+    pub fn bandit_stats(&self) -> [(u64, f64); tm_controller::NUM_ARMS] {
         self.bandit.arm_stats()
     }
 
     /// LinUCB contextual bandit statistics: (pulls, avg_weight_magnitude) per arm.
-    pub fn linucb_stats(&self) -> [(u64, f64); 4] {
+    pub fn linucb_stats(&self) -> [(u64, f64); tm_controller::NUM_ARMS] {
         self.linucb.arm_stats()
     }
 
@@ -1208,6 +1218,43 @@ impl RetrievalEngine {
     /// Access the underlying graph store (for IPC commands that need it).
     pub fn graph(&self) -> &GraphStore {
         &self.graph
+    }
+
+    /// Apply ColBERT MaxSim scoring using cached per-token embeddings.
+    fn apply_colbert_maxsim(&self, ws: &mut QueryWorkspace, _query_text: &str) -> bool {
+        let candidate_ids: Vec<Uuid> = ws.candidates.iter().map(|(id, _)| *id).collect();
+        let cached_tokens = self.graph.batch_colbert_tokens(&candidate_ids);
+
+        if cached_tokens.is_empty() {
+            return false;
+        }
+
+        #[cfg(feature = "colbert")]
+        {
+            let query_tokens_opt: Option<Vec<Vec<f32>>> = self.reranker.as_ref()
+                .and_then(|r| r.encode_query(_query_text).ok());
+
+            if let Some(query_tokens) = query_tokens_opt {
+                let mut scored: Vec<(Uuid, f32)> = Vec::new();
+                for (id, orig_score) in &ws.candidates {
+                    if let Some((flat_embs, token_count, dim)) = cached_tokens.get(id) {
+                        let doc_tokens: Vec<Vec<f32>> = (0..*token_count)
+                            .map(|t| flat_embs[t * dim..(t + 1) * dim].to_vec())
+                            .collect();
+                        let maxsim_score = tm_rerank::maxsim(&query_tokens, &doc_tokens);
+                        let blended = 0.6 * maxsim_score + 0.4 * orig_score;
+                        scored.push((*id, blended));
+                    } else {
+                        scored.push((*id, *orig_score));
+                    }
+                }
+                scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                ws.candidates = scored;
+                return true;
+            }
+        }
+
+        false
     }
 }
 

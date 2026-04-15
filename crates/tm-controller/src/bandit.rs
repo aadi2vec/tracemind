@@ -1,10 +1,12 @@
 use std::f64;
 use std::path::Path;
 
+pub const NUM_ARMS: usize = 5;
+
 #[derive(serde::Serialize, serde::Deserialize)]
 struct BanditState {
-    counts: [u64; 4],
-    rewards: [f64; 4],
+    counts: Vec<u64>,
+    rewards: Vec<f64>,
     total_pulls: u64,
 }
 
@@ -14,19 +16,21 @@ pub struct RetrievalParams {
     pub top_k: usize,
     pub hops: u32,
     pub include_episodic: bool,
+    #[serde(default)]
+    pub include_colbert: bool,
 }
 
 pub struct UcbBandit {
-    counts: [u64; 4],
-    rewards: [f64; 4],
+    counts: [u64; NUM_ARMS],
+    rewards: [f64; NUM_ARMS],
     total_pulls: u64,
 }
 
 impl UcbBandit {
     pub fn new() -> Self {
         Self {
-            counts: [0u64; 4],
-            rewards: [0.0f64; 4],
+            counts: [0u64; NUM_ARMS],
+            rewards: [0.0f64; NUM_ARMS],
             total_pulls: 0,
         }
     }
@@ -35,7 +39,7 @@ impl UcbBandit {
         let mut best_arm: u8 = 0;
         let mut best_score = f64::NEG_INFINITY;
 
-        for arm in 0u8..4 {
+        for arm in 0u8..NUM_ARMS as u8 {
             let score = if self.counts[arm as usize] == 0 {
                 f64::INFINITY
             } else {
@@ -64,13 +68,8 @@ impl UcbBandit {
             (self.rewards[arm_idx] * (n - 1.0) + reward) / n;
     }
 
-    pub fn arm_stats(&self) -> [(u64, f64); 4] {
-        [
-            (self.counts[0], self.rewards[0]),
-            (self.counts[1], self.rewards[1]),
-            (self.counts[2], self.rewards[2]),
-            (self.counts[3], self.rewards[3]),
-        ]
+    pub fn arm_stats(&self) -> [(u64, f64); NUM_ARMS] {
+        std::array::from_fn(|i| (self.counts[i], self.rewards[i]))
     }
 
     /// Load bandit state from a JSON file, or return a fresh bandit if missing/corrupt.
@@ -78,11 +77,12 @@ impl UcbBandit {
         if let Ok(raw) = std::fs::read_to_string(path) {
             if let Ok(state) = serde_json::from_str::<BanditState>(&raw) {
                 let mut b = Self::new();
-                for arm_idx in 0u8..4 {
-                    let pulls = state.counts[arm_idx as usize];
-                    let avg = state.rewards[arm_idx as usize];
+                let n = state.counts.len().min(NUM_ARMS);
+                for arm_idx in 0..n {
+                    let pulls = state.counts[arm_idx];
+                    let avg = state.rewards[arm_idx];
                     for _ in 0..pulls {
-                        b.register_reward(arm_idx, avg);
+                        b.register_reward(arm_idx as u8, avg);
                     }
                 }
                 return b;
@@ -96,8 +96,8 @@ impl UcbBandit {
         let stats = self.arm_stats();
         let total_pulls: u64 = stats.iter().map(|(c, _)| c).sum();
         let state = BanditState {
-            counts: [stats[0].0, stats[1].0, stats[2].0, stats[3].0],
-            rewards: [stats[0].1, stats[1].1, stats[2].1, stats[3].1],
+            counts: stats.iter().map(|(c, _)| *c).collect(),
+            rewards: stats.iter().map(|(_, r)| *r).collect(),
             total_pulls,
         };
         if let Ok(json) = serde_json::to_string_pretty(&state) {
@@ -107,36 +107,24 @@ impl UcbBandit {
 
     pub fn params_for_arm(arm: u8) -> RetrievalParams {
         match arm {
-            0 => RetrievalParams {
-                arm: 0,
-                top_k: 5,
-                hops: 0,
-                include_episodic: false,
-            },
-            1 => RetrievalParams {
-                arm: 1,
-                top_k: 10,
-                hops: 1,
-                include_episodic: false,
-            },
-            2 => RetrievalParams {
-                arm: 2,
-                top_k: 15,
-                hops: 2,
-                include_episodic: false,
-            },
-            3 => RetrievalParams {
-                arm: 3,
-                top_k: 20,
-                hops: 2,
-                include_episodic: true,
-            },
-            _ => RetrievalParams {
-                arm: 0,
-                top_k: 5,
-                hops: 0,
-                include_episodic: false,
-            },
+            0 => RetrievalParams { arm: 0, top_k: 5, hops: 0, include_episodic: false, include_colbert: false },
+            1 => RetrievalParams { arm: 1, top_k: 10, hops: 1, include_episodic: false, include_colbert: false },
+            2 => RetrievalParams { arm: 2, top_k: 15, hops: 2, include_episodic: false, include_colbert: false },
+            3 => RetrievalParams { arm: 3, top_k: 20, hops: 2, include_episodic: true, include_colbert: false },
+            4 => RetrievalParams { arm: 4, top_k: 10, hops: 1, include_episodic: false, include_colbert: true },
+            _ => RetrievalParams { arm: 0, top_k: 5, hops: 0, include_episodic: false, include_colbert: false },
+        }
+    }
+
+    /// Human-readable name for an arm index.
+    pub fn arm_name(arm: u8) -> &'static str {
+        match arm {
+            0 => "narrow",
+            1 => "medium",
+            2 => "wide",
+            3 => "deep",
+            4 => "colbert",
+            _ => "unknown",
         }
     }
 }
@@ -173,31 +161,30 @@ impl Default for UcbBandit {
 // ---------------------------------------------------------------------------
 
 const LINUCB_DIM: usize = 384;
-const LINUCB_ARMS: usize = 4;
-const LINUCB_ALPHA_INIT: f64 = 0.5;  // initial exploration coefficient
-const LINUCB_ALPHA_MIN: f64 = 0.05;  // floor — never stop exploring entirely
-const LINUCB_ALPHA_DECAY: f64 = 0.995; // per-pull multiplicative decay
-const LINUCB_LR: f64 = 0.01;         // weight update learning rate
+const LINUCB_ARMS: usize = NUM_ARMS;
+const LINUCB_ALPHA_INIT: f64 = 0.5;
+const LINUCB_ALPHA_MIN: f64 = 0.05;
+const LINUCB_ALPHA_DECAY: f64 = 0.995;
+const LINUCB_LR: f64 = 0.01;
 
-// Arm features: [breadth, depth] — enables statistical strength sharing
-// across arms that lie on the same breadth↔depth axis.
 const ARM_FEATURES: [[f64; 2]; LINUCB_ARMS] = [
-    [0.25, 0.0],  // narrow: low breadth, no depth
-    [0.50, 0.33], // medium: moderate breadth, 1-hop depth
-    [0.75, 0.67], // wide: high breadth, 2-hop depth
-    [1.00, 1.00], // deep: full breadth + depth + episodic
+    [0.25, 0.0],  // narrow
+    [0.50, 0.33], // medium
+    [0.75, 0.67], // wide
+    [1.00, 1.00], // deep
+    [0.50, 0.50], // colbert: medium breadth + depth, token-level scoring
 ];
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct LinUcbState {
-    weights: Vec<Vec<f64>>,      // [4][384] — learned arm preferences
-    variances: Vec<Vec<f64>>,    // [4][384] — accumulated x² per dim
-    counts: [u64; LINUCB_ARMS],
+    weights: Vec<Vec<f64>>,
+    variances: Vec<Vec<f64>>,
+    counts: Vec<u64>,
     total_pulls: u64,
     #[serde(default = "default_alpha")]
-    alpha: f64,                  // current exploration coefficient (annealed)
+    alpha: f64,
     #[serde(default)]
-    arm_bias: [f64; LINUCB_ARMS], // shared arm feature bias (learned)
+    arm_bias: Vec<f64>,
 }
 
 fn default_alpha() -> f64 { LINUCB_ALPHA_INIT }
@@ -360,19 +347,30 @@ impl LinUcbBandit {
     pub fn load(path: &Path) -> Self {
         if let Ok(raw) = std::fs::read_to_string(path) {
             if let Ok(state) = serde_json::from_str::<LinUcbState>(&raw) {
-                if state.weights.len() == LINUCB_ARMS
-                    && state.variances.len() == LINUCB_ARMS
+                let n = state.weights.len();
+                if n >= 4
+                    && state.variances.len() == n
                     && state.weights.iter().all(|w| w.len() == LINUCB_DIM)
                     && state.variances.iter().all(|v| v.len() == LINUCB_DIM)
                 {
-                    return Self {
-                        weights: std::array::from_fn(|i| state.weights[i].clone()),
-                        variances: std::array::from_fn(|i| state.variances[i].clone()),
-                        counts: state.counts,
-                        total_pulls: state.total_pulls,
-                        alpha: state.alpha,
-                        arm_bias: state.arm_bias,
-                    };
+                    let mut bandit = Self::new();
+                    for i in 0..n.min(LINUCB_ARMS) {
+                        bandit.weights[i] = state.weights[i].clone();
+                        bandit.variances[i] = state.variances[i].clone();
+                    }
+                    let mut counts = [0u64; LINUCB_ARMS];
+                    for i in 0..state.counts.len().min(LINUCB_ARMS) {
+                        counts[i] = state.counts[i];
+                    }
+                    bandit.counts = counts;
+                    bandit.total_pulls = state.total_pulls;
+                    bandit.alpha = state.alpha;
+                    let mut arm_bias = [0.0f64; LINUCB_ARMS];
+                    for i in 0..state.arm_bias.len().min(LINUCB_ARMS) {
+                        arm_bias[i] = state.arm_bias[i];
+                    }
+                    bandit.arm_bias = arm_bias;
+                    return bandit;
                 }
             }
         }
@@ -383,10 +381,10 @@ impl LinUcbBandit {
         let state = LinUcbState {
             weights: self.weights.iter().map(|w| w.clone()).collect(),
             variances: self.variances.iter().map(|v| v.clone()).collect(),
-            counts: self.counts,
+            counts: self.counts.to_vec(),
             total_pulls: self.total_pulls,
             alpha: self.alpha,
-            arm_bias: self.arm_bias,
+            arm_bias: self.arm_bias.to_vec(),
         };
         if let Ok(json) = serde_json::to_string(&state) {
             let _ = std::fs::write(path, json);
@@ -406,36 +404,17 @@ mod tests {
 
     #[test]
     fn test_fresh_bandit_explores_all_arms() {
-        let bandit = UcbBandit::new();
+        let mut b = UcbBandit::new();
+        let mut seen = [false; NUM_ARMS];
 
-        // Collect the first 4 arm selections — all should be distinct
-        // because unpulled arms have score = INFINITY and are picked in order 0..3
-        let mut seen = [false; 4];
-        for _ in 0..4 {
-            // We cannot mutate the bandit here (select is &self), so we simulate
-            // by manually checking that each arm appears in a sequence of selects
-            // on a fresh bandit (all arms still have INFINITY until pulled).
-            let _ = bandit.select();
+        for arm_idx in 0..NUM_ARMS {
+            seen[b.select().arm as usize] = true;
+            b.register_reward(arm_idx as u8, 0.5);
         }
 
-        // More precise: a fresh bandit always returns arm 0 first (first INFINITY wins),
-        // so we build up by registering rewards step by step.
-        let mut b = UcbBandit::new();
-        seen[b.select().arm as usize] = true;
-        b.register_reward(0, 0.5);
-
-        seen[b.select().arm as usize] = true;
-        b.register_reward(1, 0.5);
-
-        seen[b.select().arm as usize] = true;
-        b.register_reward(2, 0.5);
-
-        seen[b.select().arm as usize] = true;
-
-        assert!(seen[0], "arm 0 should be selected during exploration");
-        assert!(seen[1], "arm 1 should be selected during exploration");
-        assert!(seen[2], "arm 2 should be selected during exploration");
-        assert!(seen[3], "arm 3 should be selected during exploration");
+        for i in 0..NUM_ARMS {
+            assert!(seen[i], "arm {} should be selected during exploration", i);
+        }
     }
 
     #[test]
@@ -444,7 +423,7 @@ mod tests {
 
         // Give all arms equal baseline pulls to equalise exploration bonus
         for _ in 0..20 {
-            for arm in 0u8..4 {
+            for arm in 0u8..NUM_ARMS as u8 {
                 bandit.register_reward(arm, 0.5);
             }
         }
@@ -528,6 +507,17 @@ mod tests {
         assert_eq!(p.top_k, 20);
         assert_eq!(p.hops, 2);
         assert!(p.include_episodic);
+        assert!(!p.include_colbert);
+
+        // Arm 4 — ColBERT
+        let p = UcbBandit::params_for_arm(4);
+        assert_eq!(p.arm, 4);
+        assert_eq!(p.top_k, 10);
+        assert!(p.include_colbert);
+        assert!(!p.include_episodic);
+
+        assert_eq!(UcbBandit::arm_name(0), "narrow");
+        assert_eq!(UcbBandit::arm_name(4), "colbert");
 
         // Suppress unused variable warning
         let _ = b;
@@ -583,20 +573,13 @@ mod tests {
         let mut bandit = LinUcbBandit::new();
         let ctx = make_context(0);
 
-        // First 4 selects should cover all arms (unpulled → INFINITY)
-        let mut seen = [false; 4];
-        seen[bandit.select(&ctx).arm as usize] = true;
-        bandit.register_reward(0, 0.5, &ctx);
+        let mut seen = [false; LINUCB_ARMS];
+        for arm_idx in 0..LINUCB_ARMS {
+            seen[bandit.select(&ctx).arm as usize] = true;
+            bandit.register_reward(arm_idx as u8, 0.5, &ctx);
+        }
 
-        seen[bandit.select(&ctx).arm as usize] = true;
-        bandit.register_reward(1, 0.5, &ctx);
-
-        seen[bandit.select(&ctx).arm as usize] = true;
-        bandit.register_reward(2, 0.5, &ctx);
-
-        seen[bandit.select(&ctx).arm as usize] = true;
-
-        assert!(seen.iter().all(|&s| s), "should explore all 4 arms");
+        assert!(seen.iter().all(|&s| s), "should explore all {} arms", LINUCB_ARMS);
     }
 
     #[test]
@@ -607,7 +590,7 @@ mod tests {
         let ctx_b = make_context(50);  // "lookup queries" → arm 0
 
         // Explore phase: pull each arm once with each context
-        for arm in 0u8..4 {
+        for arm in 0u8..NUM_ARMS as u8 {
             bandit.register_reward(arm, 0.3, &ctx_a);
             bandit.register_reward(arm, 0.3, &ctx_b);
         }
@@ -637,7 +620,7 @@ mod tests {
         let short_ctx = vec![0.5f32; 10]; // wrong dimension
         let params = bandit.select(&short_ctx);
         // Should not panic, should return valid params
-        assert!(params.arm < 4);
+        assert!(params.arm < NUM_ARMS as u8);
     }
 
     #[test]
@@ -668,8 +651,8 @@ mod tests {
         assert_eq!(loaded.counts, bandit.counts);
         assert_eq!(loaded.total_pulls, bandit.total_pulls);
         // Weights should be identical
-        for arm in 0..4 {
-            for dim in 0..384 {
+        for arm in 0..LINUCB_ARMS {
+            for dim in 0..LINUCB_DIM {
                 assert!(
                     (loaded.weights[arm][dim] - bandit.weights[arm][dim]).abs() < 1e-10,
                     "weight mismatch at arm {} dim {}", arm, dim
@@ -703,8 +686,8 @@ mod tests {
         let initial_alpha = bandit.alpha();
 
         // After 100 pulls, alpha should have decayed significantly
-        for arm in 0u8..4 {
-            for _ in 0..25 {
+        for arm in 0u8..NUM_ARMS as u8 {
+            for _ in 0..20 {
                 bandit.register_reward(arm, 0.5, &ctx);
             }
         }
@@ -725,7 +708,7 @@ mod tests {
         let ctx = make_context(0);
 
         // Explore all arms first
-        for arm in 0u8..4 {
+        for arm in 0u8..NUM_ARMS as u8 {
             bandit.register_reward(arm, 0.3, &ctx);
         }
 
@@ -749,22 +732,16 @@ mod tests {
         let ctx = make_context(0);
 
         // Explore all arms, give equal rewards
-        for arm in 0u8..4 {
+        for arm in 0u8..NUM_ARMS as u8 {
             for _ in 0..10 {
                 bandit.register_reward(arm, 0.5, &ctx);
             }
         }
 
-        // Without hint, some arm is selected
         let no_hint = bandit.select_with_hint(&ctx, None);
-
-        // With hint for arm 3, arm 3 gets a +0.1 bonus
         let with_hint = bandit.select_with_hint(&ctx, Some(3));
 
-        // The hint should bias toward arm 3 (though not guaranteed if
-        // another arm has much higher weight — at equal weights it should win)
-        // At minimum, verify the hint doesn't crash and returns valid params
-        assert!(with_hint.arm < 4);
-        assert!(no_hint.arm < 4);
+        assert!(with_hint.arm < NUM_ARMS as u8);
+        assert!(no_hint.arm < NUM_ARMS as u8);
     }
 }
