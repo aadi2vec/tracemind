@@ -333,6 +333,10 @@ R1-inspired intelligence layer is fully operational:
 - **Self-correction with error context** — replan uses failure reason, not blind escalation
 - **Temporal decay weighting** — recency as 4th RRA signal (MEM temporal attention)
 - **Selective ingestion gate** — rejects noise before entity extraction (MEM selective memory)
+- **Unified reasoning narrative** — 3-layer Strategy/Process/Evidence explanation answering "WHY did TraceMind recommend this?"
+- **ColBERT token cache** — SQLite storage for per-token embeddings (foundation for multi-vector retrieval)
+- **File/directory bulk import** — `tracemind import <path>` with extension filtering and dry-run
+- **MCP procedures live** — list_procedures returns real stored procedures from ProcedureStore
 
 ### Phase 4 — Procedures & Production
 

@@ -140,6 +140,92 @@ impl CausalTrace {
     }
 }
 
+impl CausalTrace {
+    /// Generate a 3-layer narrative explanation combining strategy, process, and evidence.
+    /// This is the unified reasoning trace that answers "WHY did TraceMind recommend this?"
+    ///
+    /// Layer 1: Strategy -- what approach was chosen and why
+    /// Layer 2: Process -- what phases executed and key decisions
+    /// Layer 3: Evidence -- which entities from which sources
+    pub fn reasoning_narrative(
+        &self,
+        plan: Option<(&str, &str, f64)>,  // (action, complexity, confidence)
+        phases: &[(String, String)],       // [(phase_name, decision)]
+    ) -> String {
+        let mut out = String::new();
+
+        // Layer 1: Strategy
+        out.push_str("## Strategy\n");
+        if let Some((action, complexity, confidence)) = plan {
+            out.push_str(&format!(
+                "Interpreted as a {}-complexity query (confidence: {:.2}).\n",
+                complexity, confidence
+            ));
+            out.push_str(&format!(
+                "Selected {} strategy — letting the contextual bandit choose retrieval depth.\n",
+                action
+            ));
+        } else {
+            out.push_str(&format!(
+                "Used {} strategy (arm {}).\n",
+                self.arm_name, self.arm_index
+            ));
+        }
+
+        // Layer 2: Process
+        out.push('\n');
+        out.push_str("## Process\n");
+        // Filter to non-trivial phases (skip mechanical ones like "embed")
+        let mechanical = ["embed", "blend", "cache"];
+        let meaningful: Vec<&(String, String)> = phases
+            .iter()
+            .filter(|(name, _)| !mechanical.contains(&name.as_str()))
+            .collect();
+        if meaningful.is_empty() {
+            out.push_str("- (no phase decisions recorded)\n");
+        } else {
+            for (phase_name, decision) in &meaningful {
+                out.push_str(&format!("- {}: {}\n", phase_name, decision));
+            }
+        }
+
+        // Layer 3: Evidence
+        out.push('\n');
+        out.push_str("## Evidence\n");
+        if self.attributions.is_empty() {
+            out.push_str("No evidence paths recorded.\n");
+        } else {
+            out.push_str(&format!(
+                "Found {} entities via {} evidence paths:\n",
+                self.total_entities,
+                self.attributions.len()
+            ));
+            let top = self.top_attributions(5);
+            for attr in top {
+                let source_desc = match &attr.source {
+                    AttributionSource::VectorMatch { similarity, rank } =>
+                        format!("vector match (rank #{}, similarity {:.2})", rank + 1, similarity),
+                    AttributionSource::GraphHop { from_entity: _, predicate, hop } => {
+                        // Find the entity name of the source for readable output
+                        let from_name = self.attributions.iter()
+                            .find(|a| matches!(&a.source, AttributionSource::VectorMatch { .. }) || matches!(&a.source, AttributionSource::GraphHop { hop: h, .. } if *h < *hop))
+                            .map(|a| a.entity_name.as_str())
+                            .unwrap_or("?");
+                        format!("graph hop #{} via {} from {}", hop, predicate, from_name)
+                    }
+                    AttributionSource::EpisodicTrace { trace_id } =>
+                        format!("episodic trace {}", &trace_id[..trace_id.len().min(8)]),
+                    AttributionSource::ReasoningChain { chain_score, path_length } =>
+                        format!("reasoning chain (length {}, score {:.2})", path_length, chain_score),
+                };
+                out.push_str(&format!("- {} ({}): {}\n", attr.entity_name, attr.weight_pct(), source_desc));
+            }
+        }
+
+        out
+    }
+}
+
 impl Attribution {
     pub fn weight_pct(&self) -> String {
         format!("{:.0}%", self.weight * 100.0)
@@ -178,5 +264,29 @@ mod tests {
 
         let top = trace.top_attributions(1);
         assert_eq!(top[0].entity_name, "high");
+    }
+
+    #[test]
+    fn test_reasoning_narrative_full() {
+        let mut trace = CausalTrace::new("What is Rust?", 2, "wide");
+        trace.add_vector_match(Uuid::new_v4(), "Rust", 0.92, 0);
+        trace.add_graph_hop(Uuid::new_v4(), "TraceMind", Uuid::new_v4(), "Uses", 1);
+        trace.total_entities = 2;
+
+        let phases = vec![
+            ("arm_select".to_string(), "LinUCB selected arm 2 (wide)".to_string()),
+            ("vector_search".to_string(), "Found 12 candidates".to_string()),
+        ];
+
+        let narrative = trace.reasoning_narrative(
+            Some(("BanditRetrieval", "Moderate", 0.82)),
+            &phases,
+        );
+        assert!(narrative.contains("## Strategy"));
+        assert!(narrative.contains("## Process"));
+        assert!(narrative.contains("## Evidence"));
+        assert!(narrative.contains("Rust"));
+        assert!(narrative.contains("BanditRetrieval"));
+        assert!(narrative.contains("LinUCB"));
     }
 }
