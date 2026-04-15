@@ -335,9 +335,8 @@ fn main() {
         Commands::Status => {
             let bandit = UcbBandit::load(&bandit_path);
             let stats = bandit.arm_stats();
-            let arm_names = ["vector-only", "graph-heavy", "hybrid", "episodic"];
             for (i, (pulls, avg_reward)) in stats.iter().enumerate() {
-                let name = arm_names.get(i).unwrap_or(&"unknown");
+                let name = UcbBandit::arm_name(i as u8);
                 println!("  Arm {} ({}): pulls={}, avg_reward={:.2}", i, name, pulls, avg_reward);
             }
         }
@@ -523,8 +522,7 @@ fn print_trace_detail(trace: &tm_types::Trace, db_path: &str) {
     }
 
     if let Some(arm) = trace.retrieval_arm {
-        let arm_names = ["vector-only", "graph-heavy", "hybrid", "episodic"];
-        let name = arm_names.get(arm as usize).unwrap_or(&"unknown");
+        let name = UcbBandit::arm_name(arm);
         println!("  Retrieval strategy: arm {} ({})", arm, name);
         if let Some(ms) = trace.retrieval_latency_ms {
             println!("  Latency: {}ms", ms);
