@@ -54,6 +54,20 @@ enum Commands {
         #[command(subcommand)]
         action: ProcAction,
     },
+    /// Import files or directories into memory
+    Import {
+        /// Path to a file or directory to import
+        path: String,
+        /// File extensions to include (comma-separated, e.g. "md,txt,rs")
+        #[arg(long, default_value = "md,txt,rs,py,js,ts,toml,yaml,yml,json")]
+        ext: String,
+        /// Maximum file size in KB (skip larger files)
+        #[arg(long, default_value = "100")]
+        max_kb: u64,
+        /// Dry run — show what would be imported without actually importing
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Show bandit arm statistics
     Status,
 }
@@ -314,6 +328,10 @@ fn main() {
             }
         }
 
+        Commands::Import { path, ext, max_kb, dry_run } => {
+            cmd_import(&path, &ext, max_kb, dry_run, cli.hash_embed, &db_path);
+        }
+
         Commands::Status => {
             let bandit = UcbBandit::load(&bandit_path);
             let stats = bandit.arm_stats();
@@ -329,6 +347,143 @@ fn main() {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+fn cmd_import(path: &str, extensions: &str, max_kb: u64, dry_run: bool, hash_embed: bool, db_path: &str) {
+    let ext_set: std::collections::HashSet<String> = extensions
+        .split(',')
+        .map(|s| s.trim().to_lowercase())
+        .collect();
+
+    let skip_dirs: std::collections::HashSet<&str> = [
+        "node_modules", "target", ".git", "__pycache__", "dist",
+        "build", ".next", "vendor", ".venv", "venv",
+    ].into_iter().collect();
+
+    let root = std::path::Path::new(path);
+    if !root.exists() {
+        eprintln!("Error: path '{}' does not exist", path);
+        std::process::exit(1);
+    }
+
+    let files = collect_files(root, &ext_set, &skip_dirs, max_kb * 1024);
+
+    if dry_run {
+        println!("Dry run — would import {} files:", files.len());
+        for f in &files {
+            let size_kb = f.metadata().map(|m| m.len() / 1024).unwrap_or(0);
+            println!("  {} ({} KB)", f.display(), size_kb);
+        }
+        return;
+    }
+
+    println!("Importing {} files from {}", files.len(), path);
+
+    let pipeline = IngestPipeline::open(db_path, hash_embed)
+        .expect("failed to open ingest pipeline");
+    let session_id = Uuid::new_v4();
+
+    let mut imported = 0u32;
+    let mut skipped = 0u32;
+    let mut errors = 0u32;
+    let mut total_bytes = 0u64;
+
+    for file_path in &files {
+        let rel_path = file_path.strip_prefix(root).unwrap_or(file_path);
+
+        match std::fs::read_to_string(file_path) {
+            Ok(contents) => {
+                if contents.trim().is_empty() {
+                    skipped += 1;
+                    continue;
+                }
+                let text = format!("[File: {}]\n\n{}", rel_path.display(), contents);
+                total_bytes += text.len() as u64;
+
+                match pipeline.ingest(&text, session_id) {
+                    Ok(result) => {
+                        if result.skip_gate {
+                            skipped += 1;
+                        } else {
+                            imported += 1;
+                            println!("  {} ({} entities, {} triples)",
+                                rel_path.display(), result.entities.len(), result.triples.len());
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("  x {}: {}", rel_path.display(), e);
+                        errors += 1;
+                    }
+                }
+            }
+            Err(_) => {
+                skipped += 1; // not UTF-8
+            }
+        }
+    }
+
+    println!("\nImport complete:");
+    println!("  Imported: {}", imported);
+    println!("  Skipped:  {} (empty, non-UTF-8, or duplicate)", skipped);
+    println!("  Errors:   {}", errors);
+    println!("  Total:    {} KB processed", total_bytes / 1024);
+}
+
+fn collect_files(
+    root: &std::path::Path,
+    extensions: &std::collections::HashSet<String>,
+    skip_dirs: &std::collections::HashSet<&str>,
+    max_bytes: u64,
+) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    collect_files_recursive(root, extensions, skip_dirs, max_bytes, &mut files);
+    files.sort();
+    files
+}
+
+fn collect_files_recursive(
+    dir: &std::path::Path,
+    extensions: &std::collections::HashSet<String>,
+    skip_dirs: &std::collections::HashSet<&str>,
+    max_bytes: u64,
+    out: &mut Vec<PathBuf>,
+) {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().to_string();
+
+        if name.starts_with('.') {
+            continue;
+        }
+
+        if path.is_dir() {
+            if !skip_dirs.contains(name.as_str()) {
+                collect_files_recursive(&path, extensions, skip_dirs, max_bytes, out);
+            }
+            continue;
+        }
+
+        if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+            if !extensions.contains(&ext.to_lowercase()) {
+                continue;
+            }
+        } else {
+            continue;
+        }
+
+        if let Ok(meta) = entry.metadata() {
+            if meta.len() > max_bytes {
+                continue;
+            }
+        }
+
+        out.push(path);
+    }
+}
 
 fn truncate_str(s: &str, max: usize) -> String {
     let s = s.replace('\n', " ");

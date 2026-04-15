@@ -162,6 +162,8 @@ pub struct RetrievalResult {
     pub procedures: Vec<Procedure>,
     /// Execution history: what each pipeline phase did (GWT/BIGMAS).
     pub phases: Vec<PhaseRecord>,
+    /// Unified reasoning narrative: strategy + process + evidence (3-layer explanation).
+    pub reasoning_narrative: String,
 }
 
 impl RetrievalEngine {
@@ -740,6 +742,20 @@ impl RetrievalEngine {
         ws.causal_trace.total_triples = ws.triples.len();
         ws.causal_trace.latency_ms = latency_ms as u64;
 
+        // Build unified reasoning narrative (strategy + process + evidence)
+        let plan_tuple = (
+            format!("{:?}", ws.plan.action),
+            ws.plan.complexity.clone(),
+            ws.plan.confidence,
+        );
+        let phase_pairs: Vec<(String, String)> = ws.phases.iter()
+            .map(|p| (p.phase.to_string(), p.decision.clone()))
+            .collect();
+        let reasoning_narrative = ws.causal_trace.reasoning_narrative(
+            Some((plan_tuple.0.as_str(), plan_tuple.1.as_str(), plan_tuple.2)),
+            &phase_pairs,
+        );
+
         Ok(RetrievalResult {
             arm: ws.arm,
             entities: ws.entities,
@@ -752,6 +768,7 @@ impl RetrievalEngine {
             suggested_queries: ws.suggested_queries,
             procedures: ws.procedures,
             phases: ws.phases,
+            reasoning_narrative,
         })
     }
 
@@ -864,6 +881,16 @@ impl RetrievalEngine {
         trace.retrieval_latency_ms = Some(latency_ms);
         let _ = self.trace_store.append(&trace);
 
+        // Build narrative before moving causal
+        let decompose_phases = vec![
+            ("decomposed".to_string(), format!("{} sub-queries merged", sub_queries.len())),
+        ];
+        let action_str = format!("{:?}", plan.action);
+        let reasoning_narrative = causal.reasoning_narrative(
+            Some((action_str.as_str(), &plan.complexity, plan.confidence)),
+            &decompose_phases,
+        );
+
         Ok(RetrievalResult {
             arm: 0,
             entities: all_entities,
@@ -882,6 +909,7 @@ impl RetrievalEngine {
                 candidates_out: entity_count,
                 decision: format!("{} sub-queries merged", sub_queries.len()),
             }],
+            reasoning_narrative,
         })
     }
 

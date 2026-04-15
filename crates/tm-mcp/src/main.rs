@@ -219,6 +219,7 @@ async fn handle_memory_query(
         "triples": triples,
         "arm": result.arm,
         "explanation": explanation,
+        "reasoning": result.reasoning_narrative,
         "plan": {
             "action": plan_action,
             "complexity": plan_complexity
@@ -332,8 +333,33 @@ async fn handle_get_trace(
     Ok(json!({ "traces": trace_list }))
 }
 
-fn handle_list_procedures() -> Value {
-    json!({ "procedures": [] })
+fn handle_list_procedures(db_path: &str) -> Value {
+    // Derive procedures.jsonl path as sibling of db_path
+    let proc_path = std::path::Path::new(db_path)
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .join("procedures.jsonl");
+
+    let procs = match tm_episodic::ProcedureStore::open(proc_path.to_str().unwrap_or(".")) {
+        Ok(store) => store.list_active().unwrap_or_default(),
+        Err(_) => vec![],
+    };
+
+    let proc_json: Vec<Value> = procs.iter().map(|p| {
+        json!({
+            "id": p.id.to_string(),
+            "name": p.name,
+            "description": p.description,
+            "steps": p.steps.iter().map(|s| json!({
+                "ordinal": s.ordinal,
+                "action": s.action,
+            })).collect::<Vec<_>>(),
+            "status": format!("{:?}", p.status),
+            "confidence": p.confidence,
+        })
+    }).collect();
+
+    json!({ "procedures": proc_json })
 }
 
 fn handle_memory_reason(params: &Value, db_path: &str) -> Result<Value, String> {
@@ -476,7 +502,7 @@ async fn handle_request(
                         .await
                         .map_err(|e| anyhow::anyhow!(e))?
                 }
-                "list_procedures" => handle_list_procedures(),
+                "list_procedures" => handle_list_procedures(db_path),
                 "memory_reason" => {
                     handle_memory_reason(&args, db_path)
                         .map_err(|e| anyhow::anyhow!(e))?

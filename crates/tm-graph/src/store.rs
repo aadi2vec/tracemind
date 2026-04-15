@@ -136,6 +136,15 @@ impl GraphStore {
                 clicked     INTEGER DEFAULT 0,
                 query_id    TEXT,
                 created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+
+            CREATE TABLE IF NOT EXISTS colbert_tokens (
+                entity_id   TEXT PRIMARY KEY,
+                model_id    TEXT NOT NULL,
+                token_count INTEGER NOT NULL,
+                dim         INTEGER NOT NULL,
+                embeddings  BLOB NOT NULL,
+                created_at  TEXT NOT NULL DEFAULT (datetime('now'))
             );"
         )
         .map_err(|e| TraceMindError::Storage(format!("create tables: {e}")))?;
@@ -1115,6 +1124,73 @@ fn prop_string(val: Option<&serde_json::Value>) -> Option<String> {
     })
 }
 
+// ─── ColBERT token cache (added to GraphStore) ─────────────────────────────
+
+impl GraphStore {
+    /// Store pre-computed ColBERT per-token embeddings for an entity.
+    /// Embeddings stored as packed f32 LE bytes: token_count * dim * 4 bytes.
+    pub fn upsert_colbert_tokens(
+        &self,
+        entity_id: Uuid,
+        model_id: &str,
+        token_count: usize,
+        dim: usize,
+        embeddings: &[f32],
+    ) -> Result<()> {
+        let id_str = entity_id.to_string();
+        let bytes: Vec<u8> = embeddings.iter().flat_map(|f| f.to_le_bytes()).collect();
+        let conn = self.kg.connection();
+        conn.execute(
+            "INSERT OR REPLACE INTO colbert_tokens (entity_id, model_id, token_count, dim, embeddings)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![id_str, model_id, token_count as i64, dim as i64, bytes],
+        )
+        .map_err(|e| TraceMindError::Storage(format!("upsert colbert tokens: {e}")))?;
+        Ok(())
+    }
+
+    /// Load pre-computed ColBERT token embeddings for an entity.
+    /// Returns `(model_id, embeddings_flat, token_count, dim)`.
+    pub fn get_colbert_tokens(&self, entity_id: Uuid) -> Result<Option<(String, Vec<f32>, usize, usize)>> {
+        let id_str = entity_id.to_string();
+        let conn = self.kg.connection();
+        let mut stmt = conn
+            .prepare("SELECT model_id, token_count, dim, embeddings FROM colbert_tokens WHERE entity_id = ?1")
+            .map_err(|e| TraceMindError::Storage(format!("prepare colbert: {e}")))?;
+
+        let result = stmt.query_row(params![id_str], |row| {
+            let model_id: String = row.get(0)?;
+            let token_count: i64 = row.get(1)?;
+            let dim: i64 = row.get(2)?;
+            let bytes: Vec<u8> = row.get(3)?;
+            Ok((model_id, token_count as usize, dim as usize, bytes))
+        });
+
+        match result {
+            Ok((model_id, token_count, dim, bytes)) => {
+                let embeddings: Vec<f32> = bytes
+                    .chunks_exact(4)
+                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .collect();
+                Ok(Some((model_id, embeddings, token_count, dim)))
+            }
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(TraceMindError::Storage(format!("get colbert tokens: {e}"))),
+        }
+    }
+
+    /// Batch load ColBERT tokens for multiple entities.
+    pub fn batch_colbert_tokens(&self, entity_ids: &[Uuid]) -> HashMap<Uuid, (Vec<f32>, usize, usize)> {
+        let mut result = HashMap::new();
+        for id in entity_ids {
+            if let Ok(Some((_, embs, tc, dim))) = self.get_colbert_tokens(*id) {
+                result.insert(*id, (embs, tc, dim));
+            }
+        }
+        result
+    }
+}
+
 /// Extract a DateTime<Utc> from a JSON property value, defaulting to now.
 fn prop_datetime(val: Option<&serde_json::Value>) -> DateTime<Utc> {
     val.and_then(|v| v.as_str())
@@ -1338,5 +1414,35 @@ mod tests {
         assert_eq!(results.len(), 3);
         assert_eq!(results[0].0, a.id);
         assert_eq!(results[1].0, c.id);
+    }
+
+    #[test]
+    fn test_colbert_token_cache() {
+        let store = GraphStore::open(":memory:").unwrap();
+        let entity_id = Uuid::new_v4();
+
+        // Store 3 tokens of dim 4
+        let tokens: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0];
+        store.upsert_colbert_tokens(entity_id, "test-model", 3, 4, &tokens).unwrap();
+
+        // Load back
+        let loaded = store.get_colbert_tokens(entity_id).unwrap();
+        assert!(loaded.is_some());
+        let (model_id, embs, tc, dim) = loaded.unwrap();
+        assert_eq!(model_id, "test-model");
+        assert_eq!(tc, 3);
+        assert_eq!(dim, 4);
+        assert_eq!(embs.len(), 12);
+        assert_eq!(embs[0], 1.0);
+        assert_eq!(embs[11], 12.0);
+
+        // Not found
+        let missing = store.get_colbert_tokens(Uuid::new_v4()).unwrap();
+        assert!(missing.is_none());
+
+        // Batch
+        let batch = store.batch_colbert_tokens(&[entity_id, Uuid::new_v4()]);
+        assert_eq!(batch.len(), 1);
+        assert!(batch.contains_key(&entity_id));
     }
 }
