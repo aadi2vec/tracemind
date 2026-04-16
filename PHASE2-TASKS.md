@@ -162,6 +162,8 @@ P2-001 (graph+tracing) ✅
                 → TM-3.4 (decomposition + procedures + uncertainty + diversity + trajectory prior) ✅
                   → TM-3.5 (BIGMAS workspace + MEM ingestion gate + temporal decay) ✅
                     → TM-4.0-001 (ONNX embeddings + model selection + benchmark) ✅
+                      → TM-4.1-005 (ColBERT retrieval arm) ✅
+                        → TM-4.1-006 (Temporal queries) ✅
 ```
 
 ---
@@ -369,6 +371,16 @@ Retrieval engine uses `TrajectoryStore::nearest_successful_arm()` (cosine sim > 
 **Status:** DONE
 **What:** `handle_list_procedures()` now loads real procedures from `ProcedureStore` via `procedures.jsonl` instead of returning empty stub array. Returns id, name, description, steps, status, confidence per procedure.
 **Accept:** `cargo build -p tm-mcp` succeeds. MCP returns actual stored procedures. ✅
+
+#### TM-4.1-005 — ColBERT retrieval arm (5th bandit arm)
+**Status:** DONE
+**What:** Extended bandit from 4 to 5 arms. Arm 4 "colbert" (top_k=10, hops=1, include_colbert=true) uses MaxSim scoring via cached per-token embeddings. `BanditState` uses `Vec<u64>` for backward-compatible serialization — old 4-arm JSON files auto-extend. `ARM_FEATURES` places colbert at [0.50, 0.50] for LinUCB feature sharing. `apply_colbert_maxsim()` blends 60% MaxSim + 40% vector score. Feature-gated: gracefully degrades when ONNX model not available.
+**Accept:** `cargo test --workspace` passes. Old bandit.json files load without error. ✅
+
+#### TM-4.1-006 — Temporal queries
+**Status:** DONE
+**What:** "What was I working on last week?" NLP time expression parser in `tm-types/time_range.rs` (supports today/yesterday/last N days/weeks/months/recently/N ago/this week/this month). `PlanAction::TemporalQuery` variant added to planner (highest priority detection). `GraphStore::get_entities_by_time_range()` uses SQLite `json_extract` on `updated_at`. `GraphStore::get_accessed_entities_in_range()` queries `access_log`. `TraceStore::traces_in_range()` filters JSONL traces. `RetrievalEngine::query_temporal()` runs 6-phase temporal pipeline: entities + access log + traces → merge/dedup → rank by 60% vector sim + 40% recency. MCP response includes `temporal.label/start/end` metadata. 6 new tests (9 in time_range, 4 in planner, 2 in graph).
+**Accept:** `cargo test --workspace` passes (116 tests). Temporal queries correctly parsed and routed. ✅
 
 #### TM-4.0-002 — Tauri desktop app packaging
 **Status:** TODO
