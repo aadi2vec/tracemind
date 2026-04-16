@@ -49,6 +49,25 @@ impl TraceStore {
         let start = traces.len().saturating_sub(limit);
         Ok(traces[start..].to_vec())
     }
+
+    /// Return traces whose `created_at` falls within `[start, end)`.
+    /// Sorted by created_at descending (most recent first).
+    pub fn traces_in_range(
+        &self,
+        start: chrono::DateTime<chrono::Utc>,
+        end: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Vec<Trace>> {
+        let raw = std::fs::read_to_string(&self.path)
+            .map_err(|e| TraceMindError::Storage(e.to_string()))?;
+        let mut traces: Vec<Trace> = raw
+            .split('\n')
+            .filter(|line| !line.is_empty())
+            .filter_map(|line| serde_json::from_str::<Trace>(line).ok())
+            .filter(|t| t.created_at >= start && t.created_at < end)
+            .collect();
+        traces.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        Ok(traces)
+    }
 }
 
 #[cfg(test)]

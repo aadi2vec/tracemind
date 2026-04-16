@@ -359,7 +359,12 @@ impl RetrievalEngine {
             plan.action, plan.complexity, plan.confidence, plan.entity_hints
         );
 
-        // Phase 0.5: If planner returns Decompose, execute each sub-query and merge.
+        // Phase 0.5a: If planner returns TemporalQuery, execute temporal retrieval.
+        if let PlanAction::TemporalQuery { ref time_range } = plan.action {
+            return self.query_temporal(text, time_range, &plan, start);
+        }
+
+        // Phase 0.5b: If planner returns Decompose, execute each sub-query and merge.
         if let PlanAction::Decompose { ref sub_queries } = plan.action {
             if sub_queries.len() > 1 {
                 return self.query_decomposed(text, sub_queries, &plan, start);
@@ -919,6 +924,238 @@ impl RetrievalEngine {
                 candidates_out: entity_count,
                 decision: format!("{} sub-queries merged", sub_queries.len()),
             }],
+            reasoning_narrative,
+        })
+    }
+
+    /// Execute a temporal query: find entities and traces within a time range,
+    /// optionally combined with vector similarity for the query text.
+    ///
+    /// This is the execution path for the Planner's `TemporalQuery` action.
+    /// Example: "what was I working on last week?" → entities updated in last 7 days,
+    /// traces from last 7 days, optionally ranked by query-text similarity.
+    fn query_temporal(
+        &mut self,
+        original_text: &str,
+        time_range: &tm_types::TimeRange,
+        plan: &QueryPlan,
+        start: Instant,
+    ) -> Result<RetrievalResult> {
+        info!(
+            "[retrieval] temporal query: '{}' range=[{} → {}]",
+            time_range.label, time_range.start, time_range.end
+        );
+
+        let mut phases: Vec<PhaseRecord> = Vec::new();
+        let mut causal = CausalTrace::new(original_text, 0, "temporal");
+
+        // Record the plan phase
+        let plan_start = Instant::now();
+        phases.push(PhaseRecord {
+            phase: "plan",
+            duration_us: plan_start.elapsed().as_micros() as u64,
+            candidates_in: 0,
+            candidates_out: 0,
+            decision: format!(
+                "TemporalQuery: {} [{} → {}]",
+                time_range.label, time_range.start, time_range.end
+            ),
+        });
+
+        // ── Phase: temporal_entities ──
+        // Get entities created/updated in the time range
+        let te_start = Instant::now();
+        let temporal_entities = self.graph.get_entities_by_time_range(
+            time_range.start,
+            time_range.end,
+        )?;
+        let te_count = temporal_entities.len();
+        phases.push(PhaseRecord {
+            phase: "temporal_entities",
+            duration_us: te_start.elapsed().as_micros() as u64,
+            candidates_in: 0,
+            candidates_out: te_count,
+            decision: format!("found {} entities in time range", te_count),
+        });
+
+        // ── Phase: temporal_access ──
+        // Also get entities accessed (queried/clicked) in the time range
+        let ta_start = Instant::now();
+        let accessed_ids = self.graph.get_accessed_entities_in_range(
+            time_range.start,
+            time_range.end,
+        )?;
+        let ta_count = accessed_ids.len();
+        phases.push(PhaseRecord {
+            phase: "temporal_access",
+            duration_us: ta_start.elapsed().as_micros() as u64,
+            candidates_in: 0,
+            candidates_out: ta_count,
+            decision: format!("found {} accessed entities in time range", ta_count),
+        });
+
+        // ── Phase: temporal_traces ──
+        // Get traces from the time range
+        let tt_start = Instant::now();
+        let temporal_traces = self.trace_store.traces_in_range(
+            time_range.start,
+            time_range.end,
+        )?;
+        let tt_count = temporal_traces.len();
+        phases.push(PhaseRecord {
+            phase: "temporal_traces",
+            duration_us: tt_start.elapsed().as_micros() as u64,
+            candidates_in: 0,
+            candidates_out: tt_count,
+            decision: format!("found {} traces in time range", tt_count),
+        });
+
+        // ── Phase: merge + rank ──
+        // Merge temporal entities + accessed entities, deduplicate, rank by similarity
+        let merge_start = Instant::now();
+        let mut seen_ids: HashSet<Uuid> = HashSet::new();
+        let mut all_entities: Vec<Entity> = Vec::new();
+
+        // Add entities from time range
+        for entity in temporal_entities {
+            if seen_ids.insert(entity.id) {
+                causal.add_vector_match(entity.id, &entity.name, 1.0, all_entities.len());
+                all_entities.push(entity);
+            }
+        }
+
+        // Add accessed entities from time range (may overlap)
+        for id in &accessed_ids {
+            if seen_ids.insert(*id) {
+                if let Ok(entity) = self.graph.get_entity(*id) {
+                    causal.add_vector_match(*id, &entity.name, 0.8, all_entities.len());
+                    all_entities.push(entity);
+                }
+            }
+        }
+
+        // Add entity IDs referenced in traces
+        for trace in &temporal_traces {
+            for eid in &trace.entities_extracted {
+                if seen_ids.insert(*eid) {
+                    if let Ok(entity) = self.graph.get_entity(*eid) {
+                        causal.add_episodic(*eid, &entity.name, &trace.id.to_string());
+                        all_entities.push(entity);
+                    }
+                }
+            }
+        }
+
+        // If we have a meaningful query beyond temporal keywords, use vector similarity to rank
+        let query_emb = self.embedder.embed(original_text);
+        let mut scored_entities: Vec<(Entity, f64)> = Vec::new();
+        for entity in &all_entities {
+            let sim = if let Ok(Some(vec)) = self.graph.get_vector(entity.id) {
+                cosine_sim(&query_emb, &vec) as f64
+            } else {
+                0.5 // default score for entities without vectors
+            };
+            // Boost by recency within the time range
+            let recency_boost = self.graph.recency_score(entity.id);
+            let score = 0.6 * sim + 0.4 * recency_boost;
+            scored_entities.push((entity.clone(), score));
+        }
+        scored_entities.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+        let final_entities: Vec<Entity> = scored_entities.into_iter().map(|(e, _)| e).collect();
+
+        phases.push(PhaseRecord {
+            phase: "temporal_merge_rank",
+            duration_us: merge_start.elapsed().as_micros() as u64,
+            candidates_in: te_count + ta_count,
+            candidates_out: final_entities.len(),
+            decision: format!(
+                "merged {} unique entities from {} temporal + {} accessed + traces",
+                final_entities.len(), te_count, ta_count
+            ),
+        });
+
+        // ── Collect triples ──
+        let triples_start = Instant::now();
+        let mut all_triples: Vec<Triple> = Vec::new();
+        let mut seen_triple_ids: HashSet<Uuid> = HashSet::new();
+        for entity in &final_entities {
+            if let Ok(entity_triples) = self.graph.get_triples_for_entity(entity.id) {
+                for triple in entity_triples {
+                    if seen_triple_ids.insert(triple.id) {
+                        all_triples.push(triple);
+                    }
+                }
+            }
+        }
+        all_triples.sort_by(|a, b| {
+            let a_typed = !matches!(a.predicate, tm_types::Predicate::RelatedTo);
+            let b_typed = !matches!(b.predicate, tm_types::Predicate::RelatedTo);
+            b_typed.cmp(&a_typed).then(b.confidence.partial_cmp(&a.confidence).unwrap_or(std::cmp::Ordering::Equal))
+        });
+        let typed_count = all_triples.iter().filter(|t| !matches!(t.predicate, tm_types::Predicate::RelatedTo)).count();
+        all_triples.truncate(typed_count + 20);
+        phases.push(PhaseRecord {
+            phase: "triples",
+            duration_us: triples_start.elapsed().as_micros() as u64,
+            candidates_in: final_entities.len(),
+            candidates_out: all_triples.len(),
+            decision: format!("typed={}, total={}", typed_count, all_triples.len()),
+        });
+
+        let latency_ms = start.elapsed().as_millis().min(u32::MAX as u128) as u32;
+
+        // Finalize causal trace
+        causal.total_entities = final_entities.len();
+        causal.total_triples = all_triples.len();
+        causal.latency_ms = latency_ms as u64;
+
+        // Persist retrieval trace
+        let mut trace = Trace::new(Uuid::new_v4(), TraceEventType::Retrieve, "");
+        trace.raw_text = Some(original_text.to_string());
+        trace.entities_extracted = final_entities.iter().map(|e| e.id).collect();
+        trace.triples_extracted = all_triples.iter().map(|t| t.id).collect();
+        trace.retrieval_arm = Some(0);
+        trace.retrieval_latency_ms = Some(latency_ms);
+        let _ = self.trace_store.append(&trace);
+
+        // Log access
+        for entity in &final_entities {
+            let _ = self.graph.log_access(entity.id, "query_result", Some(original_text));
+        }
+
+        // Cache query embedding
+        self.query_cache.push(original_text.to_string(), query_emb);
+
+        let low_confidence = final_entities.is_empty();
+        let suggested_queries = if low_confidence {
+            self.generate_suggestions(original_text, plan, &final_entities)
+        } else {
+            vec![]
+        };
+
+        // Build narrative
+        let action_str = format!("{:?}", plan.action);
+        let phase_pairs: Vec<(String, String)> = phases.iter()
+            .map(|p| (p.phase.to_string(), p.decision.clone()))
+            .collect();
+        let reasoning_narrative = causal.reasoning_narrative(
+            Some((action_str.as_str(), &plan.complexity, plan.confidence)),
+            &phase_pairs,
+        );
+
+        Ok(RetrievalResult {
+            arm: 0,
+            entities: final_entities,
+            triples: all_triples,
+            traces: temporal_traces,
+            latency_ms,
+            causal_trace: causal,
+            plan: Some(plan.clone()),
+            low_confidence,
+            suggested_queries,
+            procedures: self.match_procedures(original_text),
+            phases,
             reasoning_narrative,
         })
     }

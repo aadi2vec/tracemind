@@ -9,6 +9,7 @@
 //! to perform in the first place.
 
 use std::collections::HashSet;
+use tm_types::TimeRange;
 
 /// The type of operation the Planner recommends.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -29,6 +30,11 @@ pub enum PlanAction {
     Decompose { sub_queries: Vec<String> },
     /// Consolidation — user wants to clean up / optimize memory.
     Consolidate,
+    /// Temporal query — "what was I working on last week?"
+    /// Filters entities/traces by time range before standard retrieval.
+    TemporalQuery {
+        time_range: TimeRange,
+    },
 }
 
 /// Complexity assessment for a query.
@@ -119,7 +125,21 @@ impl QueryPlanner {
         let complexity = self.assess_complexity(&lower, word_count);
         let entity_hints = self.extract_entity_hints(query);
 
-        // Check for consolidation requests first (highest priority)
+        // Check for temporal queries first (highest priority)
+        if tm_types::has_temporal_intent(&lower) {
+            if let Some(time_range) = tm_types::parse_time_expression_now(&lower) {
+                return QueryPlan {
+                    action: PlanAction::TemporalQuery { time_range },
+                    complexity: format!("{:?}", complexity),
+                    confidence: 0.90,
+                    allow_fallback: true,
+                    max_cascade: 1,
+                    entity_hints,
+                };
+            }
+        }
+
+        // Check for consolidation requests (second highest priority)
         if self.matches_any(&lower, CONSOLIDATION_WORDS) {
             return QueryPlan {
                 action: PlanAction::Consolidate,
@@ -235,7 +255,7 @@ impl QueryPlanner {
                     return None;
                 }
             }
-            _ => return None, // Can't escalate Consolidate, Analogy, Decompose
+            _ => return None, // Can't escalate Consolidate, Analogy, Decompose, TemporalQuery
         };
 
         Some(QueryPlan {
@@ -542,6 +562,40 @@ mod tests {
         assert!((replanned.confidence - 0.0).abs() < f64::EPSILON);
         // Action should remain unchanged
         assert_eq!(replanned.action, plan.action);
+    }
+
+    #[test]
+    fn temporal_query_detected_last_week() {
+        let planner = QueryPlanner::new();
+        let plan = planner.plan("what was I working on last week?");
+        assert!(matches!(plan.action, PlanAction::TemporalQuery { .. }), "got {:?}", plan.action);
+        if let PlanAction::TemporalQuery { time_range } = &plan.action {
+            assert_eq!(time_range.label, "last week");
+        }
+    }
+
+    #[test]
+    fn temporal_query_detected_yesterday() {
+        let planner = QueryPlanner::new();
+        let plan = planner.plan("show me what I did yesterday");
+        assert!(matches!(plan.action, PlanAction::TemporalQuery { .. }), "got {:?}", plan.action);
+        if let PlanAction::TemporalQuery { time_range } = &plan.action {
+            assert_eq!(time_range.label, "yesterday");
+        }
+    }
+
+    #[test]
+    fn temporal_query_detected_recently() {
+        let planner = QueryPlanner::new();
+        let plan = planner.plan("what have I been doing recently?");
+        assert!(matches!(plan.action, PlanAction::TemporalQuery { .. }), "got {:?}", plan.action);
+    }
+
+    #[test]
+    fn non_temporal_query_not_detected() {
+        let planner = QueryPlanner::new();
+        let plan = planner.plan("What is Rust?");
+        assert!(!matches!(plan.action, PlanAction::TemporalQuery { .. }));
     }
 
     #[test]

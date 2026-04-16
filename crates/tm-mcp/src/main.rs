@@ -250,6 +250,13 @@ async fn handle_memory_query(
                     response["analogies"] = analogies;
                 }
             }
+            tm_controller::PlanAction::TemporalQuery { time_range } => {
+                response["temporal"] = json!({
+                    "label": time_range.label,
+                    "start": time_range.start.to_rfc3339(),
+                    "end": time_range.end.to_rfc3339(),
+                });
+            }
             _ => {}
         }
     }

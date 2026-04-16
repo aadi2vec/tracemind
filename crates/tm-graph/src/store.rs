@@ -963,6 +963,101 @@ impl GraphStore {
         Ok(result)
     }
 
+    // ─── Temporal queries ─────────────────────────────────────────────────
+
+    /// Return entities created or updated within a time range.
+    ///
+    /// Scans entity JSON properties for `created_at`/`updated_at` timestamps
+    /// and returns those that fall within `[start, end)`.
+    /// Results sorted by `updated_at` descending (most recently active first).
+    pub fn get_entities_by_time_range(
+        &self,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+    ) -> Result<Vec<Entity>> {
+        let start_str = start.to_rfc3339();
+        let end_str = end.to_rfc3339();
+
+        let conn = self.kg.connection();
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, entity_type, name, properties FROM kg_entities \
+                 WHERE json_extract(properties, '$.updated_at') >= ?1 \
+                   AND json_extract(properties, '$.updated_at') < ?2 \
+                 ORDER BY json_extract(properties, '$.updated_at') DESC",
+            )
+            .map_err(|e| TraceMindError::Storage(format!("temporal query prepare: {e}")))?;
+
+        let rows = stmt
+            .query_map(params![start_str, end_str], |row| {
+                let _id: i64 = row.get(0)?;
+                let entity_type: String = row.get(1)?;
+                let name: String = row.get(2)?;
+                let props_str: String = row.get(3)?;
+                Ok((entity_type, name, props_str))
+            })
+            .map_err(|e| TraceMindError::Storage(format!("temporal query: {e}")))?;
+
+        let mut entities = Vec::new();
+        for row in rows {
+            let (etype_str, name, props_str) =
+                row.map_err(|e| TraceMindError::Storage(e.to_string()))?;
+            let props: HashMap<String, serde_json::Value> =
+                serde_json::from_str(&props_str).unwrap_or_default();
+            if let Ok(entity) = props_to_tm_entity(&etype_str, &name, &props) {
+                entities.push(entity);
+            }
+        }
+
+        info!(
+            "[graph] temporal query [{} → {}]: {} entities",
+            start_str, end_str, entities.len()
+        );
+        Ok(entities)
+    }
+
+    /// Return entities accessed within a time range (from access_log).
+    /// Complements `get_entities_by_time_range` by capturing entities that
+    /// were *queried* (not just created/updated) in the period.
+    pub fn get_accessed_entities_in_range(
+        &self,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+    ) -> Result<Vec<Uuid>> {
+        let start_str = start.to_rfc3339();
+        let end_str = end.to_rfc3339();
+
+        let conn = self.kg.connection();
+        let mut stmt = conn
+            .prepare(
+                "SELECT DISTINCT entity_id FROM access_log \
+                 WHERE created_at >= ?1 AND created_at < ?2 \
+                 ORDER BY created_at DESC",
+            )
+            .map_err(|e| TraceMindError::Storage(format!("access log range: {e}")))?;
+
+        let rows = stmt
+            .query_map(params![start_str, end_str], |row| {
+                let id_str: String = row.get(0)?;
+                Ok(id_str)
+            })
+            .map_err(|e| TraceMindError::Storage(format!("access log range query: {e}")))?;
+
+        let mut ids = Vec::new();
+        for row in rows {
+            let id_str = row.map_err(|e| TraceMindError::Storage(e.to_string()))?;
+            if let Ok(uuid) = Uuid::parse_str(&id_str) {
+                ids.push(uuid);
+            }
+        }
+
+        info!(
+            "[graph] accessed entities in range [{} → {}]: {} unique",
+            start_str, end_str, ids.len()
+        );
+        Ok(ids)
+    }
+
     /// Access the underlying `KnowledgeGraph` for advanced operations
     /// (BFS/DFS traversal, export, etc.).
     pub fn inner(&self) -> &KnowledgeGraph {
@@ -1414,6 +1509,52 @@ mod tests {
         assert_eq!(results.len(), 3);
         assert_eq!(results[0].0, a.id);
         assert_eq!(results[1].0, c.id);
+    }
+
+    #[test]
+    fn test_get_entities_by_time_range() {
+        let store = GraphStore::open(":memory:").unwrap();
+
+        // Create entities at different times
+        let now = Utc::now();
+        let mut e1 = make_entity("Recent", EntityType::Concept);
+        e1.updated_at = now;
+        e1.created_at = now;
+        store.upsert_entity(&e1).unwrap();
+
+        let mut e2 = make_entity("Old", EntityType::Concept);
+        e2.updated_at = now - chrono::Duration::days(30);
+        e2.created_at = now - chrono::Duration::days(30);
+        store.upsert_entity(&e2).unwrap();
+
+        // Query for entities updated in the last 7 days
+        let start = now - chrono::Duration::days(7);
+        let end = now + chrono::Duration::hours(1);
+        let results = store.get_entities_by_time_range(start, end).unwrap();
+
+        assert_eq!(results.len(), 1, "should only find recent entity");
+        assert_eq!(results[0].name, "Recent");
+
+        // Query for entities updated in the last 60 days — should find both
+        let start_wide = now - chrono::Duration::days(60);
+        let results_wide = store.get_entities_by_time_range(start_wide, end).unwrap();
+        assert_eq!(results_wide.len(), 2, "should find both entities");
+    }
+
+    #[test]
+    fn test_get_accessed_entities_in_range() {
+        let store = GraphStore::open(":memory:").unwrap();
+
+        let e1 = make_entity("Accessed", EntityType::Concept);
+        store.upsert_entity(&e1).unwrap();
+        store.log_access(e1.id, "query_result", None).unwrap();
+
+        let now = Utc::now();
+        let start = now - chrono::Duration::hours(1);
+        let end = now + chrono::Duration::hours(1);
+        let accessed = store.get_accessed_entities_in_range(start, end).unwrap();
+
+        assert!(accessed.contains(&e1.id), "should find the accessed entity");
     }
 
     #[test]
