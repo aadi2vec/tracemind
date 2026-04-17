@@ -2,7 +2,7 @@ use seahash;
 use uuid::Uuid;
 
 use tm_types::{Entity, EntityType, MemoryOp, Predicate, Result, Trace, TraceEventType, Triple};
-use tm_graph::GraphStore;
+use tm_graph::{CapturedSignal, GraphStore};
 use tm_vector::{Embedder, EmbedModel};
 use tm_governance::GovernanceFilter;
 
@@ -22,6 +22,27 @@ pub struct IngestResult {
     pub memory_ops: Vec<(String, MemoryOp)>,
     /// True if the selective ingestion gate rejected this input.
     pub skip_gate: bool,
+}
+
+/// Result of the fast-path ingestion (embed-first, extract-later).
+#[derive(Debug)]
+pub struct FastIngestResult {
+    /// Row ID of the stored signal (0 if skipped).
+    pub signal_id: i64,
+    pub content_hash: String,
+    /// Reason the signal was skipped, or None if it was stored.
+    pub skipped: Option<String>,
+}
+
+/// Statistics returned by a consolidation pass.
+#[derive(Debug, Default)]
+pub struct ConsolidateStats {
+    pub signals_scanned: usize,
+    pub clusters_formed: usize,
+    pub entities_promoted: usize,
+    pub triples_created: usize,
+    /// Signals in clusters below min_cluster_size (treated as noise).
+    pub noise_signals: usize,
 }
 
 impl IngestPipeline {
@@ -254,6 +275,148 @@ impl IngestPipeline {
             skip_gate: false,
         })
     }
+    // -----------------------------------------------------------------------
+    // Two-speed pipeline: fast path (embed-first) + slow path (consolidate)
+    // -----------------------------------------------------------------------
+
+    /// **Fast path** — governance + dedup + embed + store signal.
+    ///
+    /// Does NOT run NER or triple extraction. Designed for passive capture
+    /// (clipboard, shell history, browser) where latency matters and no LLM
+    /// is present. Stored signals are later promoted by `consolidate()`.
+    ///
+    /// Target: <10ms wall time (dominated by the embed call).
+    pub fn ingest_fast(
+        &self,
+        text: &str,
+        source: &str,
+        session_id: Uuid,
+    ) -> Result<FastIngestResult> {
+        // 1. Governance: reject PII before storing anything.
+        self.governance.check(text, 1.0)?;
+
+        // 2. Content hash + dedup.
+        let hash64 = seahash::hash(text.as_bytes());
+        let content_hash_str = format!("{:016x}", hash64);
+
+        if self.graph.signal_exists(hash64) {
+            return Ok(FastIngestResult {
+                signal_id: 0,
+                content_hash: content_hash_str,
+                skipped: Some("duplicate signal".to_string()),
+            });
+        }
+
+        // 3. Semantic gate: reject if too short / all stopwords.
+        let non_sw = text
+            .split_whitespace()
+            .filter(|w| {
+                let lower = w.to_lowercase();
+                let t = lower.trim_matches(|c: char| !c.is_alphanumeric());
+                !t.is_empty() && !Self::GATE_STOPWORDS.contains(&t)
+            })
+            .count();
+        if non_sw < 3 {
+            return Ok(FastIngestResult {
+                signal_id: 0,
+                content_hash: content_hash_str,
+                skipped: Some("too short or no semantic content".to_string()),
+            });
+        }
+
+        // 4. Embed.
+        let embedding = self.embedder.embed(text);
+
+        // 5. Store signal with embedding.
+        let signal_id = self.graph.insert_signal_with_embedding(
+            source,
+            text,
+            hash64,
+            session_id,
+            &embedding,
+            None,
+        )?;
+
+        Ok(FastIngestResult {
+            signal_id,
+            content_hash: content_hash_str,
+            skipped: None,
+        })
+    }
+
+    /// **Slow path** — cluster unconsolidated signals and promote dense clusters
+    /// to entities via the full `ingest()` pipeline.
+    ///
+    /// Call this periodically (e.g., every 5 minutes or on idle). It is safe to
+    /// call concurrently; signals are processed in insertion order.
+    ///
+    /// # Parameters
+    /// - `max_signals`: max signals to load per pass (bounds CPU time).
+    /// - `min_cluster_size`: clusters smaller than this are treated as noise.
+    /// - `sim_threshold`: cosine similarity threshold for joining a cluster (0.0–1.0).
+    pub fn consolidate(
+        &self,
+        max_signals: usize,
+        min_cluster_size: usize,
+        sim_threshold: f32,
+    ) -> Result<ConsolidateStats> {
+        let signals = self.graph.unconsolidated_signals(max_signals)?;
+        if signals.is_empty() {
+            return Ok(ConsolidateStats::default());
+        }
+
+        let mut stats = ConsolidateStats {
+            signals_scanned: signals.len(),
+            ..Default::default()
+        };
+
+        // Single-link agglomerative clustering by cosine similarity.
+        let clusters = cluster_by_similarity(&signals, sim_threshold);
+
+        for (cluster_idx, member_indices) in clusters.iter().enumerate() {
+            if member_indices.len() < min_cluster_size {
+                // Noise — mark so these signals aren't re-scanned.
+                stats.noise_signals += member_indices.len();
+                for &idx in member_indices {
+                    let _ = self.graph.mark_signal_clustered(signals[idx].id, -1, None);
+                }
+                continue;
+            }
+
+            stats.clusters_formed += 1;
+
+            // Pick representative: the signal with the most tokens.
+            let rep_idx = member_indices
+                .iter()
+                .copied()
+                .max_by_key(|&i| signals[i].raw_text.split_whitespace().count())
+                .unwrap();
+            let rep_text = &signals[rep_idx].raw_text;
+            let rep_session = signals[rep_idx].session_id.unwrap_or_else(Uuid::new_v4);
+
+            // Run full NER + triple extraction on the representative text.
+            let primary_entity_id = match self.ingest(rep_text, rep_session) {
+                Ok(result) => {
+                    stats.entities_promoted += result.entities.len();
+                    stats.triples_created += result.triples.len();
+                    result.entities.first().map(|e| e.id)
+                }
+                Err(_) => None,
+            };
+
+            // Mark all cluster members as consolidated.
+            for &idx in member_indices {
+                let _ = self.graph.mark_signal_clustered(
+                    signals[idx].id,
+                    cluster_idx as i64,
+                    primary_entity_id,
+                );
+            }
+        }
+
+        Ok(stats)
+    }
+
     // -----------------------------------------------------------------------
     // Memory-R1 CRUD decision logic
     // -----------------------------------------------------------------------
@@ -650,6 +813,63 @@ fn extract_triples(text: &str, entities: &[Entity]) -> Vec<Triple> {
 }
 
 // ---------------------------------------------------------------------------
+// Two-speed pipeline helpers
+// ---------------------------------------------------------------------------
+
+/// Single-link agglomerative clustering by cosine similarity.
+/// Returns a Vec of clusters, each cluster is a Vec of signal indices.
+fn cluster_by_similarity(signals: &[CapturedSignal], threshold: f32) -> Vec<Vec<usize>> {
+    let n = signals.len();
+    let mut parent: Vec<usize> = (0..n).collect();
+
+    fn find(parent: &mut Vec<usize>, mut i: usize) -> usize {
+        while parent[i] != i {
+            parent[i] = parent[parent[i]]; // path halving
+            i = parent[i];
+        }
+        i
+    }
+
+    for i in 0..n {
+        for j in (i + 1)..n {
+            if cosine_sim(&signals[i].embedding, &signals[j].embedding) >= threshold {
+                let ri = find(&mut parent, i);
+                let rj = find(&mut parent, j);
+                if ri != rj {
+                    parent[ri] = rj;
+                }
+            }
+        }
+    }
+
+    let mut clusters: std::collections::HashMap<usize, Vec<usize>> =
+        std::collections::HashMap::new();
+    for i in 0..n {
+        let root = find(&mut parent, i);
+        clusters.entry(root).or_default().push(i);
+    }
+    clusters.into_values().collect()
+}
+
+fn cosine_sim(a: &[f32], b: &[f32]) -> f32 {
+    if a.len() != b.len() || a.is_empty() {
+        return 0.0;
+    }
+    let mut dot = 0.0f32;
+    let mut na = 0.0f32;
+    let mut nb = 0.0f32;
+    for (x, y) in a.iter().zip(b.iter()) {
+        dot += x * y;
+        na += x * x;
+        nb += y * y;
+    }
+    if na == 0.0 || nb == 0.0 {
+        return 0.0;
+    }
+    dot / (na.sqrt() * nb.sqrt())
+}
+
+// ---------------------------------------------------------------------------
 // Content hash
 // ---------------------------------------------------------------------------
 
@@ -864,5 +1084,85 @@ mod tests {
             });
             assert!(!dup, "co-occurrence should not duplicate typed pairs");
         }
+    }
+
+    // ── Two-speed pipeline tests ──────────────────────────────────────────
+
+    #[test]
+    fn test_ingest_fast_stores_signal() {
+        let pipeline = in_memory_pipeline();
+        let session = Uuid::new_v4();
+        let result = pipeline
+            .ingest_fast("Rust powers the TraceMind memory system", "test", session)
+            .expect("ingest_fast should succeed");
+        assert!(result.skipped.is_none(), "expected signal stored, got: {:?}", result.skipped);
+        assert!(result.signal_id > 0, "expected non-zero signal_id");
+    }
+
+    #[test]
+    fn test_ingest_fast_deduplicates() {
+        let pipeline = in_memory_pipeline();
+        let text = "TraceMind uses SQLite for local storage";
+        let r1 = pipeline.ingest_fast(text, "test", Uuid::new_v4()).unwrap();
+        let r2 = pipeline.ingest_fast(text, "test", Uuid::new_v4()).unwrap();
+        assert!(r1.skipped.is_none(), "first ingest should store signal");
+        assert!(
+            r2.skipped.as_deref() == Some("duplicate signal"),
+            "second ingest should be skipped as duplicate"
+        );
+    }
+
+    #[test]
+    fn test_ingest_fast_rejects_pii() {
+        let pipeline = in_memory_pipeline();
+        let result = pipeline.ingest_fast("contact foo@bar.com for details", "test", Uuid::new_v4());
+        assert!(
+            matches!(result, Err(tm_types::TraceMindError::PiiDetected)),
+            "PII should be rejected by fast path"
+        );
+    }
+
+    #[test]
+    fn test_ingest_fast_rejects_short_text() {
+        let pipeline = in_memory_pipeline();
+        let result = pipeline
+            .ingest_fast("ok thanks", "test", Uuid::new_v4())
+            .unwrap();
+        assert!(
+            result.skipped.is_some(),
+            "short text should be skipped"
+        );
+    }
+
+    #[test]
+    fn test_consolidate_promotes_cluster_to_entities() {
+        let pipeline = in_memory_pipeline();
+        let s = "Rust is a systems programming language for memory safety";
+        // Store the same topic multiple times (similar embeddings with hash embedder).
+        for _ in 0..3 {
+            let _ = pipeline.ingest_fast(
+                &format!("{} — version {}", s, Uuid::new_v4()),
+                "test",
+                Uuid::new_v4(),
+            );
+        }
+        let stats = pipeline
+            .consolidate(50, 2, 0.0) // threshold=0.0 forces all signals into one cluster
+            .expect("consolidate should succeed");
+        assert!(stats.signals_scanned >= 3, "should have scanned stored signals");
+        assert!(stats.clusters_formed >= 1, "should have formed at least one cluster");
+    }
+
+    #[test]
+    fn test_cosine_sim_identical() {
+        let v = vec![1.0f32, 0.0, 0.0];
+        assert!((cosine_sim(&v, &v) - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_cosine_sim_orthogonal() {
+        let a = vec![1.0f32, 0.0];
+        let b = vec![0.0f32, 1.0];
+        assert!(cosine_sim(&a, &b).abs() < 1e-6);
     }
 }

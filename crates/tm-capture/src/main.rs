@@ -15,7 +15,6 @@ use tokio::time;
 use tracing::{info, warn, debug};
 use uuid::Uuid;
 
-use tm_episodic::TraceStore;
 use tm_ingest::IngestPipeline;
 
 // ---------------------------------------------------------------------------
@@ -24,9 +23,10 @@ use tm_ingest::IngestPipeline;
 
 struct CaptureConfig {
     db_path: String,
-    trace_path: String,
     clipboard_interval: Duration,
     history_interval: Duration,
+    /// How often to run the slow-path consolidation pass (seconds).
+    consolidation_interval: Duration,
     hash_embed: bool,
 }
 
@@ -42,7 +42,6 @@ impl CaptureConfig {
 
         Self {
             db_path: dir.join("memory.db").to_str().unwrap().to_string(),
-            trace_path: dir.join("traces.jsonl").to_str().unwrap().to_string(),
             clipboard_interval: Duration::from_millis(
                 std::env::var("TM_CLIP_INTERVAL_MS")
                     .ok()
@@ -54,6 +53,12 @@ impl CaptureConfig {
                     .ok()
                     .and_then(|v| v.parse().ok())
                     .unwrap_or(5),
+            ),
+            consolidation_interval: Duration::from_secs(
+                std::env::var("TM_CONSOLIDATE_INTERVAL_S")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(300), // default: every 5 minutes
             ),
             hash_embed: std::env::var("TM_HASH_EMBED")
                 .map(|v| v == "1")
@@ -106,13 +111,6 @@ async fn clipboard_loop(config: &CaptureConfig) {
             return;
         }
     };
-    let trace_store = match TraceStore::open(&config.trace_path) {
-        Ok(s) => s,
-        Err(e) => {
-            warn!("[clipboard] failed to open trace store: {e}");
-            return;
-        }
-    };
 
     let mut seen_hashes: HashSet<u64> = HashSet::new();
     let mut last_hash: u64 = 0;
@@ -139,18 +137,16 @@ async fn clipboard_loop(config: &CaptureConfig) {
             info!("[clipboard] captured: \"{}\"", truncate(&text, 60));
 
             let session = Uuid::new_v4();
-            match pipeline.ingest(&text, session) {
+            match pipeline.ingest_fast(&text, "clipboard", session) {
                 Ok(result) => {
-                    let _ = trace_store.append(&result.trace);
-                    info!(
-                        "[clipboard] ingested {} entities, {} triples (trace={})",
-                        result.entities.len(),
-                        result.triples.len(),
-                        &result.trace.id.to_string()[..8]
-                    );
+                    if let Some(reason) = result.skipped {
+                        debug!("[clipboard] signal skipped: {reason}");
+                    } else {
+                        info!("[clipboard] signal stored (id={})", result.signal_id);
+                    }
                 }
                 Err(e) => {
-                    debug!("[clipboard] ingest skipped: {e}");
+                    debug!("[clipboard] fast ingest skipped: {e}");
                 }
             }
         }
@@ -228,17 +224,10 @@ async fn history_loop(config: &CaptureConfig) {
             return;
         }
     };
-    let trace_store = match TraceStore::open(&config.trace_path) {
-        Ok(s) => s,
-        Err(e) => {
-            warn!("[history] failed to open trace store: {e}");
-            return;
-        }
-    };
 
     let mut seen_hashes: HashSet<u64> = HashSet::new();
 
-    // Seed with existing history to avoid re-ingesting
+    // Seed with existing history to avoid re-ingesting on startup.
     for line in read_last_lines(&hist_path, 100) {
         seen_hashes.insert(content_hash(&line));
     }
@@ -265,18 +254,58 @@ async fn history_loop(config: &CaptureConfig) {
 
             let prefixed = format!("shell command: {}", line);
             let session = Uuid::new_v4();
-            match pipeline.ingest(&prefixed, session) {
+            match pipeline.ingest_fast(&prefixed, "shell", session) {
                 Ok(result) => {
-                    let _ = trace_store.append(&result.trace);
-                    info!(
-                        "[history] ingested {} entities, {} triples",
-                        result.entities.len(),
-                        result.triples.len()
-                    );
+                    if let Some(reason) = result.skipped {
+                        debug!("[history] signal skipped: {reason}");
+                    } else {
+                        info!("[history] signal stored (id={})", result.signal_id);
+                    }
                 }
                 Err(e) => {
-                    debug!("[history] ingest skipped: {e}");
+                    debug!("[history] fast ingest skipped: {e}");
                 }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Slow-path consolidation loop
+// ---------------------------------------------------------------------------
+
+async fn consolidation_loop(config: &CaptureConfig) {
+    info!(
+        "[consolidate] starting (interval={}s)",
+        config.consolidation_interval.as_secs()
+    );
+
+    let pipeline = match IngestPipeline::open(&config.db_path, config.hash_embed) {
+        Ok(p) => p,
+        Err(e) => {
+            warn!("[consolidate] failed to open pipeline: {e}");
+            return;
+        }
+    };
+
+    loop {
+        time::sleep(config.consolidation_interval).await;
+
+        match pipeline.consolidate(200, 3, 0.75) {
+            Ok(stats) => {
+                if stats.signals_scanned > 0 {
+                    info!(
+                        "[consolidate] scanned={} clusters={} entities_promoted={} triples={} noise={}",
+                        stats.signals_scanned,
+                        stats.clusters_formed,
+                        stats.entities_promoted,
+                        stats.triples_created,
+                        stats.noise_signals,
+                    );
+                }
+            }
+            Err(e) => {
+                warn!("[consolidate] error: {e}");
             }
         }
     }
@@ -310,15 +339,17 @@ async fn main() {
 
     let config = CaptureConfig::from_env();
 
-    println!("TraceMind Capture Daemon");
+    println!("TraceMind Capture Daemon (two-speed pipeline)");
     println!("  Data dir: {}", config.db_path.rsplit('/').nth(1).unwrap_or("?"));
-    println!("  Clipboard polling: {}ms", config.clipboard_interval.as_millis());
-    println!("  History polling: {}s", config.history_interval.as_secs());
+    println!("  Clipboard polling:  {}ms", config.clipboard_interval.as_millis());
+    println!("  History polling:    {}s", config.history_interval.as_secs());
+    println!("  Consolidation:      every {}s", config.consolidation_interval.as_secs());
     println!("  Press Ctrl+C to stop\n");
 
-    // Run both monitors concurrently
+    // Run fast-path capture + slow-path consolidation concurrently.
     tokio::join!(
         clipboard_loop(&config),
         history_loop(&config),
+        consolidation_loop(&config),
     );
 }
