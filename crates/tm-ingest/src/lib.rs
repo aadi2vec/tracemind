@@ -1,2 +1,2 @@
 pub mod pipeline;
-pub use pipeline::IngestPipeline;
+pub use pipeline::{ConsolidateStats, FastIngestResult, IngestPipeline, IngestResult};

@@ -164,6 +164,13 @@ P2-001 (graph+tracing) ✅
                     → TM-4.0-001 (ONNX embeddings + model selection + benchmark) ✅
                       → TM-4.1-005 (ColBERT retrieval arm) ✅
                         → TM-4.1-006 (Temporal queries) ✅
+→ TM-4.0-002 (Tauri packaging)
+  → TM-4.0-005 (Global hotkey) [BLOCKED on TM-4.0-002]
+  → TM-5.0-003 (Browser extension) [BLOCKED on TM-4.0-002]
+→ TM-4.0-004 (Perf benchmarking)
+→ TM-5.0-001 (NL answers)
+→ TM-5.0-002 (Proactive surfacing)
+→ TM-5.0-004 (File import embeddings)
 ```
 
 ---
@@ -396,3 +403,37 @@ Retrieval engine uses `TrajectoryStore::nearest_successful_arm()` (cosine sim > 
 **Status:** TODO
 **What:** Measure: ingest latency, query latency, memory usage (target <200MB idle, <500MB active), SQLite file size growth rate. Optimize hot paths.
 **Effort:** 1 day
+
+#### TM-4.0-005 — Global hotkey quick-capture
+**Status:** BLOCKED
+**Deps:** TM-4.0-002 (Tauri desktop app)
+**What:** Cmd+Shift+M overlay for instant store/search. System-wide hotkey registration via Tauri global shortcut API. Floating overlay window for quick text capture and inline search results. Dismiss on Escape or focus loss.
+**Effort:** 2-3 days
+
+---
+
+## Phase 5.0 — Competitive Moat
+
+#### TM-5.0-001 — Natural language answers
+**Status:** TODO
+**Deps:** TM-4.1-006 (temporal queries)
+**What:** Synthesize a human-readable response from retrieved entities instead of returning raw entity lists. Template-based answer generation from entity/triple/reasoning data. Users want answers, not database rows.
+**Effort:** 2-3 days
+
+#### TM-5.0-002 — Proactive surfacing
+**Status:** TODO
+**Deps:** TM-3.5-005 (ingestion gate)
+**What:** Notify when new connections form between entities. On ingest, detect when a new triple bridges two previously unconnected entity clusters. Surface "TraceMind noticed X is connected to Y" via Tauri notification or MCP event. Makes memory feel alive.
+**Effort:** 2-3 days
+
+#### TM-5.0-003 — Browser extension / clipboard capture
+**Status:** TODO
+**Deps:** TM-4.0-002 (Tauri desktop app)
+**What:** Passive ingestion without manual ingest calls. Chrome/Firefox extension that captures highlighted text + page context. Clipboard monitoring daemon with relevance gating. Reduces friction to zero.
+**Effort:** 3-5 days
+
+#### TM-5.0-004 — File import real embedding integration
+**Status:** TODO
+**Deps:** TM-4.1-003 (file import CLI)
+**What:** Wire the import command through the real ONNX embedder so imported files get proper embeddings. Integration testing with large file sets. Verify embedding quality on code vs prose content.
+**Effort:** Half day

@@ -20,6 +20,20 @@ use tm_types::{Entity, EntityType, Predicate, Result, TraceMindError, Triple};
 use tracing::{debug, info};
 use uuid::Uuid;
 
+/// A raw captured signal from the fast-path ingestion pipeline.
+/// Signals are stored with their embedding but without NER/triple extraction.
+/// The slow-path consolidation pass clusters signals and promotes clusters to entities.
+#[derive(Debug, Clone)]
+pub struct CapturedSignal {
+    pub id: i64,
+    pub source: String,
+    pub raw_text: String,
+    pub content_hash: u64,
+    pub session_id: Option<Uuid>,
+    pub embedding: Vec<f32>,
+    pub created_at: DateTime<Utc>,
+}
+
 /// Knowledge-graph store backed by a single SQLite file (via sqlite-knowledge-graph).
 ///
 /// Provides entity/triple CRUD, k-hop traversal, vector search, PageRank, and
@@ -115,9 +129,14 @@ impl GraphStore {
                 content_hash    INTEGER NOT NULL,
                 relevance_score REAL,
                 ingested        INTEGER DEFAULT 0,
-                created_at      TEXT NOT NULL DEFAULT (datetime('now'))
+                created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+                session_id      TEXT,
+                embedding       BLOB,
+                cluster_id      INTEGER,
+                promoted_entity TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_signals_hash ON captured_signals(content_hash);
+            CREATE INDEX IF NOT EXISTS idx_signals_cluster ON captured_signals(cluster_id);
 
             CREATE TABLE IF NOT EXISTS retrieval_feedback (
                 id           INTEGER PRIMARY KEY,
@@ -148,6 +167,24 @@ impl GraphStore {
             );"
         )
         .map_err(|e| TraceMindError::Storage(format!("create tables: {e}")))?;
+
+        // Migrate existing DBs that lack the two-speed pipeline columns.
+        {
+            let conn = kg.connection();
+            for (col, ty) in &[
+                ("session_id", "TEXT"),
+                ("embedding", "BLOB"),
+                ("cluster_id", "INTEGER"),
+                ("promoted_entity", "TEXT"),
+            ] {
+                let sql = format!("ALTER TABLE captured_signals ADD COLUMN {col} {ty}");
+                let _ = conn.execute(&sql, []); // Ignore error if column already exists
+            }
+            let _ = conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_signals_cluster ON captured_signals(cluster_id)",
+                [],
+            );
+        }
 
         Ok(Self {
             kg,
@@ -784,6 +821,114 @@ impl GraphStore {
             |_| Ok(()),
         )
         .is_ok()
+    }
+
+    /// Insert a captured signal with its embedding (two-speed fast path).
+    /// Returns the row ID of the inserted signal.
+    pub fn insert_signal_with_embedding(
+        &self,
+        source: &str,
+        raw_text: &str,
+        content_hash: u64,
+        session_id: Uuid,
+        embedding: &[f32],
+        relevance_score: Option<f64>,
+    ) -> Result<i64> {
+        let blob: Vec<u8> = embedding.iter().flat_map(|f| f.to_le_bytes()).collect();
+        let conn = self.kg.connection();
+        conn.execute(
+            "INSERT INTO captured_signals \
+             (source, raw_text, content_hash, relevance_score, ingested, session_id, embedding) \
+             VALUES (?1, ?2, ?3, ?4, 0, ?5, ?6)",
+            params![
+                source,
+                raw_text,
+                content_hash as i64,
+                relevance_score,
+                session_id.to_string(),
+                blob
+            ],
+        )
+        .map_err(|e| TraceMindError::Storage(format!("insert_signal_with_embedding: {e}")))?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// Load unconsolidated signals (those with no cluster_id and a stored embedding).
+    /// Used by the slow-path consolidation pass.
+    pub fn unconsolidated_signals(&self, limit: usize) -> Result<Vec<CapturedSignal>> {
+        let conn = self.kg.connection();
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, source, raw_text, content_hash, session_id, embedding, created_at \
+                 FROM captured_signals \
+                 WHERE cluster_id IS NULL AND embedding IS NOT NULL \
+                 ORDER BY id ASC LIMIT ?1",
+            )
+            .map_err(|e| TraceMindError::Storage(format!("prep unconsolidated: {e}")))?;
+
+        let rows = stmt
+            .query_map(params![limit as i64], |row| {
+                let id: i64 = row.get(0)?;
+                let source: String = row.get(1)?;
+                let raw_text: String = row.get(2)?;
+                let hash_i64: i64 = row.get(3)?;
+                let session_str: Option<String> = row.get(4)?;
+                let blob: Vec<u8> = row.get(5)?;
+                let created_str: String = row.get(6)?;
+                Ok((id, source, raw_text, hash_i64, session_str, blob, created_str))
+            })
+            .map_err(|e| TraceMindError::Storage(format!("query unconsolidated: {e}")))?;
+
+        let mut signals = Vec::new();
+        for row in rows {
+            let (id, source, raw_text, hash_i64, session_str, blob, created_str) =
+                row.map_err(|e| TraceMindError::Storage(e.to_string()))?;
+
+            let embedding: Vec<f32> = blob
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
+
+            let session_id = session_str.and_then(|s| Uuid::parse_str(&s).ok());
+
+            let created_at = created_str
+                .parse::<DateTime<Utc>>()
+                .unwrap_or_else(|_| Utc::now());
+
+            signals.push(CapturedSignal {
+                id,
+                source,
+                raw_text,
+                content_hash: hash_i64 as u64,
+                session_id,
+                embedding,
+                created_at,
+            });
+        }
+        Ok(signals)
+    }
+
+    /// Mark a signal as belonging to a cluster (and optionally promoted to an entity).
+    /// cluster_id = -1 means the signal was too small to promote (noise).
+    pub fn mark_signal_clustered(
+        &self,
+        signal_id: i64,
+        cluster_id: i64,
+        promoted_entity: Option<Uuid>,
+    ) -> Result<()> {
+        let conn = self.kg.connection();
+        conn.execute(
+            "UPDATE captured_signals \
+             SET cluster_id = ?1, promoted_entity = ?2, ingested = 1 \
+             WHERE id = ?3",
+            params![
+                cluster_id,
+                promoted_entity.map(|u| u.to_string()),
+                signal_id
+            ],
+        )
+        .map_err(|e| TraceMindError::Storage(format!("mark_signal_clustered: {e}")))?;
+        Ok(())
     }
 
     // ─── Graph algorithms (new capabilities) ────────────────────────────

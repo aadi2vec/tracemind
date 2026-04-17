@@ -1,5 +1,5 @@
 pub mod store;
-pub use store::GraphStore;
+pub use store::{CapturedSignal, GraphStore};
 
 use tm_types::Predicate;
 use uuid::Uuid;
