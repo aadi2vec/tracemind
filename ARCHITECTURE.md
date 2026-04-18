@@ -23,7 +23,7 @@ Layer 1: Foundation        tm-types
 
 2. **`tm-graph/src/store.rs`** (~1,590 lines) — The heart. SQLite-backed knowledge graph with vector search, PageRank, Louvain communities, decay, KG-R1 graph actions, and temporal range queries all in one file.
 
-3. **`tm-ingest/src/pipeline.rs`** (~780 lines) — Follow the data path: text → governance check → heuristic NER → dedup → Memory-R1 CRUD decision → graph upsert → triple extraction.
+3. **`tm-ingest/src/pipeline.rs`** (~1,200 lines) — Two-speed ingestion. `ingest_fast()` is the <10 ms embed-first path that tags signals with a priority tier (1–4). `ingest()` + `consolidate_tier()` form the slow path: cluster unpromoted signals → pick representative → run the configured `EntityExtractor` (heuristic default, GLiNER behind feature) → Memory-R1 CRUD → graph upsert.
 
 4. **`tm-controller/src/planner.rs`** (~610 lines) — The brain's prefrontal cortex. Classifies queries into 7 actions (including temporal), selects strategy, supports re-planning.
 
@@ -203,20 +203,65 @@ triples:             Collect relationships for result entities
 confidence:          Low-confidence flag + suggestions
 ```
 
-### tm-ingest (Extraction — 870 lines, 13 tests)
+### tm-ingest (Extraction — ~1,200 lines, 31 tests)
 
-**Selective ingestion gate** (MEM-inspired): Before entity extraction, rejects noise:
-- Too short / all stopwords (< 3 semantic tokens) → skip
-- Near-exact duplicate (cosine sim > 0.95) → skip
-- Skipped inputs logged to trace with reason
+**Two-speed pipeline** (TM-5.1-001b). Capture latency and extraction quality are
+on different clocks, so ingestion splits:
 
-Memory-R1 CRUD decision at ingest time:
+```
+fast path  (ingest_fast)      slow path  (consolidate_* loops)
+──────────────────────        ─────────────────────────────────
+governance + dup-hash         scan unpromoted signals by tier
+semantic gate / structured    cluster by cosine (union-find)
+embed + priority classify     pick representative signal
+store signal (+ vector, tier) run EntityExtractor on rep text
+mark Tier-1 → instant promote graph upsert + triples
+return <10 ms                 every 30 s (T2) / 5 min (T3)
+```
+
+`ingest_fast()` never blocks on NER. Signals live in the `captured_signals`
+table with `priority_tier INTEGER` and are searchable immediately via
+`GraphStore::search_signals()` (hybrid search — see tm-retrieval).
+
+**4-tier signal promotion** — `SignalPriority` decides *when* a signal turns
+into graph entities:
+
+| Tier | Name          | Trigger                                   | Consolidation |
+|------|---------------|-------------------------------------------|---------------|
+| 1    | InstantEntity | URL / file path / code fence / env line   | none — full `ingest()` synchronously |
+| 2    | Priority      | top_sim < 0.40 OR lexical entropy > 0.7   | priority loop every ~30 s, singletons allowed |
+| 3    | Normal        | default                                   | normal loop every ~5 min, min cluster size 2 |
+| 4    | Ephemeral     | top_sim ≥ 0.85 (near-dup of existing)     | never promoted, stays searchable |
+
+The dual-loop pattern means novel captures reach the graph within ~30 s without
+forcing the 5-minute pass to run constantly on bulk ingest.
+
+**Selective ingestion gate** (MEM-inspired). Before the semantic gate, structured
+content (`https://…`, `/paths`, `~/paths`, ```` ``` ```` fences, `KEY=value`
+env lines, JSON) bypasses the `< 3 semantic tokens` short-text filter so a
+pasted URL is captured even though it's a single token. Near-duplicate signals
+(cosine sim > 0.95 against existing entities) are still rejected.
+
+**Memory-R1 CRUD decision** at graph upsert (inside `ingest()`):
 ```
 sim > 0.90 + same type  → Noop  (duplicate, reinforce +0.02)
 sim > 0.90 + diff type  → Update (reclassify, reinforce +0.10)
 sim 0.75–0.90           → Update (merge embeddings)
 sim < 0.75 or no match  → Add   (novel entity)
 ```
+
+**Pluggable entity extraction** (TM-5.1-001c). `EntityExtractor` trait:
+```rust
+pub trait EntityExtractor: Send + Sync {
+    fn extract_entities(&self, text: &str) -> Vec<Entity>;
+    fn extract_triples(&self, text: &str, entities: &[Entity]) -> Vec<Triple>;
+    fn name(&self) -> &'static str;
+}
+```
+- `HeuristicExtractor` (default) — stdlib-only Title-Case/URL/file heuristics, ~55 % F1.
+- `GlinerExtractor` (`--features gliner`) — ONNX GLiNER ~85 % F1. Loads from
+  `TM_GLINER_MODEL_PATH`, falls back to heuristics if the model is missing.
+  Swap in via `IngestPipeline::open(…)?.with_extractor(Box::new(ext))`.
 
 ### tm-reason (Intelligence — 1,100 lines, 9 tests)
 - **ChainBuilder** — BFS multi-hop paths, hop decay 0.85^n
@@ -238,22 +283,37 @@ sim < 0.75 or no match  → Add   (novel entity)
 
 ## Data Flow
 
-### Ingest
+### Ingest (fast path — two-speed pipeline)
 ```
-text → GovernanceFilter (PII regex) → heuristic NER → dedup (case-insensitive)
-     → decide_memory_op (Memory-R1 CRUD) → GraphStore.upsert() → embed + store vector
-     → extract_triples (pattern + co-occurrence) → TraceStore.append()
+text → GovernanceFilter (PII regex) → dup hash → structured bypass / short-text gate
+     → Embedder → classify_signal() → Tier {1|2|3|4}
+     → Tier 1: full ingest() inline (extractor + CRUD + triples + trace)
+     → Tier 2/3/4: insert_signal_with_embedding(priority_tier) — searchable immediately
+```
+
+### Ingest (slow path — consolidation)
+```
+priority loop every 30s (tier=2) / normal loop every 5min (tier<4)
+     → unconsolidated_signals_by_tier() → union-find cluster by cosine
+     → for each cluster ≥ min_size: pick rep, self.ingest(rep_text)
+          → EntityExtractor.extract_entities / .extract_triples
+          → Memory-R1 CRUD decision → GraphStore.upsert() + vector
+     → mark_signal_clustered() for all members
 ```
 
 ### Query (standard)
 ```
 text → QueryPlanner.plan() → LinUCB.select() → embed + session blend
-     → search_vectors() → ColBERT rerank → ColBERT MaxSim (arm 4)
+     → search_vectors() → search_signals()  [hybrid: entity + raw-signal recall]
+     → ColBERT rerank → ColBERT MaxSim (arm 4)
      → RRA fusion (sim + value + freq + recency rankings)
      → k-hop graph expand → collect triples → optional episodic scan
      → CausalTrace (full attribution) → auto-enrich (chains/analogies)
      → deferred reward → TraceStore.append()
 ```
+`search_signals()` scans the non-Ephemeral rows of `captured_signals` that
+haven't been promoted yet — closes the ingest-to-recall gap so fresh clipboard
+captures are findable in <10 ms without waiting for the slow-path loop.
 
 ### Query (temporal)
 ```
@@ -385,6 +445,17 @@ R1-inspired intelligence layer is fully operational:
 | ONNX embeddings everywhere | Ship real all-MiniLM-L6-v2 via fastembed, auto-download on first run | High — real semantic search |
 | Tauri desktop packaging | macOS .dmg, menu bar, auto-start, system tray | High — consumer distribution |
 | Performance benchmarking | Target: <200MB idle, <500MB active, <50ms query p95 | High — production readiness |
+
+### Phase 5.1 — Capture & consolidation (shipped)
+
+Background-capture work that turns TraceMind into a continuously-recording memory
+OS. Design principle: capture is cheap, promotion is selective, recall is hybrid.
+
+| ID | What | Impact |
+|----|------|--------|
+| TM-5.1-001a | **Two-speed ingestion** — `ingest_fast` embed-first <10 ms path + `consolidate_*` slow-path extraction | High — capture no longer blocks on NER |
+| TM-5.1-001b | **4-tier priority promotion** (InstantEntity / Priority / Normal / Ephemeral) + **hybrid search** over unpromoted signals + dual-rate consolidation loops (~30 s Tier-2, ~5 min Tier-3) | High — novel captures reach graph in ~30 s; fresh signals findable immediately |
+| TM-5.1-001c | **`EntityExtractor` trait** — `HeuristicExtractor` default, `GlinerExtractor` scaffolding behind `--features gliner` (loads ONNX GLiNER from `TM_GLINER_MODEL_PATH`, falls back to heuristic on missing model) | Medium — unblocks ~55 % → ~85 % F1 upgrade without call-site churn |
 
 ### Phase 5 — Predictive Intelligence
 

@@ -25,8 +25,12 @@ struct CaptureConfig {
     db_path: String,
     clipboard_interval: Duration,
     history_interval: Duration,
-    /// How often to run the slow-path consolidation pass (seconds).
+    /// How often to run the slow-path (Tier-3 Normal) consolidation pass.
     consolidation_interval: Duration,
+    /// How often to run the priority-path (Tier-2) consolidation pass — novel or
+    /// high-entropy captures get promoted on this tighter schedule so they don't
+    /// have to wait for the normal pass.
+    priority_interval: Duration,
     hash_embed: bool,
 }
 
@@ -58,7 +62,13 @@ impl CaptureConfig {
                 std::env::var("TM_CONSOLIDATE_INTERVAL_S")
                     .ok()
                     .and_then(|v| v.parse().ok())
-                    .unwrap_or(300), // default: every 5 minutes
+                    .unwrap_or(300), // default: every 5 minutes (Tier-3)
+            ),
+            priority_interval: Duration::from_secs(
+                std::env::var("TM_PRIORITY_INTERVAL_S")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(30), // default: every 30 seconds (Tier-2)
             ),
             hash_embed: std::env::var("TM_HASH_EMBED")
                 .map(|v| v == "1")
@@ -276,14 +286,14 @@ async fn history_loop(config: &CaptureConfig) {
 
 async fn consolidation_loop(config: &CaptureConfig) {
     info!(
-        "[consolidate] starting (interval={}s)",
+        "[consolidate/normal] starting (interval={}s, tier=3)",
         config.consolidation_interval.as_secs()
     );
 
     let pipeline = match IngestPipeline::open(&config.db_path, config.hash_embed) {
         Ok(p) => p,
         Err(e) => {
-            warn!("[consolidate] failed to open pipeline: {e}");
+            warn!("[consolidate/normal] failed to open pipeline: {e}");
             return;
         }
     };
@@ -295,7 +305,7 @@ async fn consolidation_loop(config: &CaptureConfig) {
             Ok(stats) => {
                 if stats.signals_scanned > 0 {
                     info!(
-                        "[consolidate] scanned={} clusters={} entities_promoted={} triples={} noise={}",
+                        "[consolidate/normal] scanned={} clusters={} entities_promoted={} triples={} noise={}",
                         stats.signals_scanned,
                         stats.clusters_formed,
                         stats.entities_promoted,
@@ -305,7 +315,46 @@ async fn consolidation_loop(config: &CaptureConfig) {
                 }
             }
             Err(e) => {
-                warn!("[consolidate] error: {e}");
+                warn!("[consolidate/normal] error: {e}");
+            }
+        }
+    }
+}
+
+/// Aggressive priority consolidation — promotes Tier-2 (novel/high-entropy)
+/// captures quickly so the graph reflects fresh insights without waiting for
+/// the normal 5-minute pass.
+async fn priority_consolidation_loop(config: &CaptureConfig) {
+    info!(
+        "[consolidate/priority] starting (interval={}s, tier=2)",
+        config.priority_interval.as_secs()
+    );
+
+    let pipeline = match IngestPipeline::open(&config.db_path, config.hash_embed) {
+        Ok(p) => p,
+        Err(e) => {
+            warn!("[consolidate/priority] failed to open pipeline: {e}");
+            return;
+        }
+    };
+
+    loop {
+        time::sleep(config.priority_interval).await;
+
+        match pipeline.consolidate_priority(100, 0.75) {
+            Ok(stats) => {
+                if stats.signals_scanned > 0 {
+                    info!(
+                        "[consolidate/priority] scanned={} clusters={} entities_promoted={} triples={}",
+                        stats.signals_scanned,
+                        stats.clusters_formed,
+                        stats.entities_promoted,
+                        stats.triples_created,
+                    );
+                }
+            }
+            Err(e) => {
+                warn!("[consolidate/priority] error: {e}");
             }
         }
     }
@@ -339,17 +388,19 @@ async fn main() {
 
     let config = CaptureConfig::from_env();
 
-    println!("TraceMind Capture Daemon (two-speed pipeline)");
+    println!("TraceMind Capture Daemon (two-speed pipeline, 4-tier promotion)");
     println!("  Data dir: {}", config.db_path.rsplit('/').nth(1).unwrap_or("?"));
-    println!("  Clipboard polling:  {}ms", config.clipboard_interval.as_millis());
-    println!("  History polling:    {}s", config.history_interval.as_secs());
-    println!("  Consolidation:      every {}s", config.consolidation_interval.as_secs());
+    println!("  Clipboard polling:     {}ms", config.clipboard_interval.as_millis());
+    println!("  History polling:       {}s", config.history_interval.as_secs());
+    println!("  Priority consolidate:  every {}s (Tier-2)", config.priority_interval.as_secs());
+    println!("  Normal consolidate:    every {}s (Tier-3)", config.consolidation_interval.as_secs());
     println!("  Press Ctrl+C to stop\n");
 
-    // Run fast-path capture + slow-path consolidation concurrently.
+    // Run fast-path capture + slow-path (normal + priority) consolidation concurrently.
     tokio::join!(
         clipboard_loop(&config),
         history_loop(&config),
+        priority_consolidation_loop(&config),
         consolidation_loop(&config),
     );
 }

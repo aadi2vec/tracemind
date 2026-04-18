@@ -133,10 +133,12 @@ impl GraphStore {
                 session_id      TEXT,
                 embedding       BLOB,
                 cluster_id      INTEGER,
-                promoted_entity TEXT
+                promoted_entity TEXT,
+                priority_tier   INTEGER DEFAULT 3
             );
             CREATE INDEX IF NOT EXISTS idx_signals_hash ON captured_signals(content_hash);
             CREATE INDEX IF NOT EXISTS idx_signals_cluster ON captured_signals(cluster_id);
+            CREATE INDEX IF NOT EXISTS idx_signals_tier ON captured_signals(priority_tier, cluster_id);
 
             CREATE TABLE IF NOT EXISTS retrieval_feedback (
                 id           INTEGER PRIMARY KEY,
@@ -176,12 +178,17 @@ impl GraphStore {
                 ("embedding", "BLOB"),
                 ("cluster_id", "INTEGER"),
                 ("promoted_entity", "TEXT"),
+                ("priority_tier", "INTEGER DEFAULT 3"),
             ] {
                 let sql = format!("ALTER TABLE captured_signals ADD COLUMN {col} {ty}");
                 let _ = conn.execute(&sql, []); // Ignore error if column already exists
             }
             let _ = conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_signals_cluster ON captured_signals(cluster_id)",
+                [],
+            );
+            let _ = conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_signals_tier ON captured_signals(priority_tier, cluster_id)",
                 [],
             );
         }
@@ -823,8 +830,14 @@ impl GraphStore {
         .is_ok()
     }
 
-    /// Insert a captured signal with its embedding (two-speed fast path).
+    /// Insert a captured signal with its embedding and priority tier (two-speed fast path).
     /// Returns the row ID of the inserted signal.
+    ///
+    /// Tiers:
+    /// - 1: InstantEntity (should not hit this method; promoted directly to graph)
+    /// - 2: Priority (consolidated every 30s)
+    /// - 3: Normal (consolidated every 5 min)
+    /// - 4: Ephemeral (stays searchable but never promoted)
     pub fn insert_signal_with_embedding(
         &self,
         source: &str,
@@ -833,20 +846,22 @@ impl GraphStore {
         session_id: Uuid,
         embedding: &[f32],
         relevance_score: Option<f64>,
+        priority_tier: i64,
     ) -> Result<i64> {
         let blob: Vec<u8> = embedding.iter().flat_map(|f| f.to_le_bytes()).collect();
         let conn = self.kg.connection();
         conn.execute(
             "INSERT INTO captured_signals \
-             (source, raw_text, content_hash, relevance_score, ingested, session_id, embedding) \
-             VALUES (?1, ?2, ?3, ?4, 0, ?5, ?6)",
+             (source, raw_text, content_hash, relevance_score, ingested, session_id, embedding, priority_tier) \
+             VALUES (?1, ?2, ?3, ?4, 0, ?5, ?6, ?7)",
             params![
                 source,
                 raw_text,
                 content_hash as i64,
                 relevance_score,
                 session_id.to_string(),
-                blob
+                blob,
+                priority_tier
             ],
         )
         .map_err(|e| TraceMindError::Storage(format!("insert_signal_with_embedding: {e}")))?;
@@ -854,30 +869,64 @@ impl GraphStore {
     }
 
     /// Load unconsolidated signals (those with no cluster_id and a stored embedding).
-    /// Used by the slow-path consolidation pass.
+    /// Used by the slow-path consolidation pass. Optionally filter by priority tier.
+    ///
+    /// `tier_filter`: Some(tier) restricts to that tier; None loads all tiers except ephemeral (4).
     pub fn unconsolidated_signals(&self, limit: usize) -> Result<Vec<CapturedSignal>> {
+        self.unconsolidated_signals_by_tier(None, limit)
+    }
+
+    /// Tier-scoped variant of `unconsolidated_signals`.
+    /// If `tier_filter` is Some(t), returns only signals at that tier.
+    /// If None, returns all non-ephemeral tiers (excludes tier 4).
+    pub fn unconsolidated_signals_by_tier(
+        &self,
+        tier_filter: Option<i64>,
+        limit: usize,
+    ) -> Result<Vec<CapturedSignal>> {
         let conn = self.kg.connection();
-        let mut stmt = conn
-            .prepare(
+        let (sql, use_filter) = match tier_filter {
+            Some(_) => (
                 "SELECT id, source, raw_text, content_hash, session_id, embedding, created_at \
                  FROM captured_signals \
-                 WHERE cluster_id IS NULL AND embedding IS NOT NULL \
+                 WHERE cluster_id IS NULL AND embedding IS NOT NULL AND priority_tier = ?1 \
+                 ORDER BY id ASC LIMIT ?2",
+                true,
+            ),
+            None => (
+                "SELECT id, source, raw_text, content_hash, session_id, embedding, created_at \
+                 FROM captured_signals \
+                 WHERE cluster_id IS NULL AND embedding IS NOT NULL AND priority_tier < 4 \
                  ORDER BY id ASC LIMIT ?1",
-            )
+                false,
+            ),
+        };
+
+        let mut stmt = conn
+            .prepare(sql)
             .map_err(|e| TraceMindError::Storage(format!("prep unconsolidated: {e}")))?;
 
-        let rows = stmt
-            .query_map(params![limit as i64], |row| {
-                let id: i64 = row.get(0)?;
-                let source: String = row.get(1)?;
-                let raw_text: String = row.get(2)?;
-                let hash_i64: i64 = row.get(3)?;
-                let session_str: Option<String> = row.get(4)?;
-                let blob: Vec<u8> = row.get(5)?;
-                let created_str: String = row.get(6)?;
-                Ok((id, source, raw_text, hash_i64, session_str, blob, created_str))
-            })
-            .map_err(|e| TraceMindError::Storage(format!("query unconsolidated: {e}")))?;
+        let mapper = |row: &rusqlite::Row| {
+            let id: i64 = row.get(0)?;
+            let source: String = row.get(1)?;
+            let raw_text: String = row.get(2)?;
+            let hash_i64: i64 = row.get(3)?;
+            let session_str: Option<String> = row.get(4)?;
+            let blob: Vec<u8> = row.get(5)?;
+            let created_str: String = row.get(6)?;
+            Ok((id, source, raw_text, hash_i64, session_str, blob, created_str))
+        };
+
+        let rows: Vec<_> = if use_filter {
+            let tier = tier_filter.unwrap();
+            stmt.query_map(params![tier, limit as i64], mapper)
+                .map_err(|e| TraceMindError::Storage(format!("query unconsolidated: {e}")))?
+                .collect()
+        } else {
+            stmt.query_map(params![limit as i64], mapper)
+                .map_err(|e| TraceMindError::Storage(format!("query unconsolidated: {e}")))?
+                .collect()
+        };
 
         let mut signals = Vec::new();
         for row in rows {
@@ -906,6 +955,42 @@ impl GraphStore {
             });
         }
         Ok(signals)
+    }
+
+    /// Search unpromoted signals by cosine similarity to a query embedding.
+    /// Used by the hybrid retrieval path so fresh captures are findable even
+    /// before consolidation has promoted them to entities.
+    ///
+    /// Returns at most `top_k` signals with similarity ≥ `min_sim`, sorted descending.
+    /// Excludes ephemeral (tier 4) and already-promoted signals.
+    pub fn search_signals(
+        &self,
+        query_embedding: &[f32],
+        top_k: usize,
+        min_sim: f32,
+    ) -> Result<Vec<(CapturedSignal, f32)>> {
+        // Load candidates — in practice this is bounded because most signals get consolidated.
+        // For large backlogs, we could use ANN; for now linear scan is fine (SQLite is already slow-ish).
+        let signals = self.unconsolidated_signals_by_tier(None, 2000)?;
+        if signals.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut scored: Vec<(CapturedSignal, f32)> = signals
+            .into_iter()
+            .filter_map(|s| {
+                let sim = cosine_sim_slice(query_embedding, &s.embedding);
+                if sim >= min_sim {
+                    Some((s, sim))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        scored.truncate(top_k);
+        Ok(scored)
     }
 
     /// Mark a signal as belonging to a cluster (and optionally promoted to an entity).
@@ -1436,6 +1521,25 @@ fn prop_datetime(val: Option<&serde_json::Value>) -> DateTime<Utc> {
     val.and_then(|v| v.as_str())
         .and_then(|s| s.parse::<DateTime<Utc>>().ok())
         .unwrap_or_else(Utc::now)
+}
+
+/// Cosine similarity between two slices. Returns 0.0 for mismatched/empty vectors.
+fn cosine_sim_slice(a: &[f32], b: &[f32]) -> f32 {
+    if a.len() != b.len() || a.is_empty() {
+        return 0.0;
+    }
+    let mut dot = 0.0f32;
+    let mut na = 0.0f32;
+    let mut nb = 0.0f32;
+    for (x, y) in a.iter().zip(b.iter()) {
+        dot += x * y;
+        na += x * x;
+        nb += y * y;
+    }
+    if na == 0.0 || nb == 0.0 {
+        return 0.0;
+    }
+    dot / (na.sqrt() * nb.sqrt())
 }
 
 // ─── Tests ──────────────────────────────────────────────────────────────
