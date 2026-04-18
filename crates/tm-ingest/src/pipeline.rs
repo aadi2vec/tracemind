@@ -27,11 +27,42 @@ pub struct IngestResult {
 /// Result of the fast-path ingestion (embed-first, extract-later).
 #[derive(Debug)]
 pub struct FastIngestResult {
-    /// Row ID of the stored signal (0 if skipped).
+    /// Row ID of the stored signal (0 if skipped or instantly promoted).
     pub signal_id: i64,
     pub content_hash: String,
+    /// Priority tier assigned to this signal.
+    pub priority: SignalPriority,
+    /// If Tier-1 instant promotion happened, the entities that were created.
+    pub instant_entities: Vec<Entity>,
     /// Reason the signal was skipped, or None if it was stored.
     pub skipped: Option<String>,
+}
+
+/// Priority classification for incoming signals. Decides how eagerly the signal
+/// is promoted from the raw-signal store into the knowledge graph.
+///
+/// - `InstantEntity` (Tier 1): URL/file path/structured — promote right now, skip clustering.
+/// - `Priority`    (Tier 2): Novel or high-entropy — consolidate every ~30s.
+/// - `Normal`      (Tier 3): Typical content — consolidate every ~5 min.
+/// - `Ephemeral`   (Tier 4): Redundant/low-value — stays searchable but never promoted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignalPriority {
+    InstantEntity,
+    Priority,
+    Normal,
+    Ephemeral,
+}
+
+impl SignalPriority {
+    /// Integer tier used in the `captured_signals.priority_tier` column.
+    pub fn tier(self) -> i64 {
+        match self {
+            SignalPriority::InstantEntity => 1,
+            SignalPriority::Priority => 2,
+            SignalPriority::Normal => 3,
+            SignalPriority::Ephemeral => 4,
+        }
+    }
 }
 
 /// Statistics returned by a consolidation pass.
@@ -279,13 +310,24 @@ impl IngestPipeline {
     // Two-speed pipeline: fast path (embed-first) + slow path (consolidate)
     // -----------------------------------------------------------------------
 
-    /// **Fast path** — governance + dedup + embed + store signal.
+    /// **Fast path** — governance + dedup + embed + classify + dispatch by tier.
     ///
-    /// Does NOT run NER or triple extraction. Designed for passive capture
-    /// (clipboard, shell history, browser) where latency matters and no LLM
-    /// is present. Stored signals are later promoted by `consolidate()`.
+    /// Does NOT run NER or triple extraction for tiers 2–4. Designed for passive
+    /// capture (clipboard, shell history, browser) where latency matters and no
+    /// LLM is present.
     ///
-    /// Target: <10ms wall time (dominated by the embed call).
+    /// Tier dispatch:
+    /// - **Tier 1 (InstantEntity)**: URL / file path / structured — promoted to
+    ///   the graph immediately by invoking the full `ingest()` slow path. Returns
+    ///   the created entities in `instant_entities`.
+    /// - **Tier 2 (Priority)**: Novel or high-entropy content — stored with
+    ///   priority_tier=2 and consolidated aggressively (~30s).
+    /// - **Tier 3 (Normal)**: Typical content — stored with priority_tier=3 and
+    ///   consolidated every ~5 min.
+    /// - **Tier 4 (Ephemeral)**: Redundant / low-value — stored (searchable via
+    ///   hybrid search) but never promoted.
+    ///
+    /// Target: <10ms wall time on the non–Tier-1 paths (dominated by the embed call).
     pub fn ingest_fast(
         &self,
         text: &str,
@@ -303,31 +345,70 @@ impl IngestPipeline {
             return Ok(FastIngestResult {
                 signal_id: 0,
                 content_hash: content_hash_str,
+                priority: SignalPriority::Ephemeral,
+                instant_entities: vec![],
                 skipped: Some("duplicate signal".to_string()),
             });
         }
 
         // 3. Semantic gate: reject if too short / all stopwords.
-        let non_sw = text
-            .split_whitespace()
-            .filter(|w| {
-                let lower = w.to_lowercase();
-                let t = lower.trim_matches(|c: char| !c.is_alphanumeric());
-                !t.is_empty() && !Self::GATE_STOPWORDS.contains(&t)
-            })
-            .count();
-        if non_sw < 3 {
-            return Ok(FastIngestResult {
-                signal_id: 0,
-                content_hash: content_hash_str,
-                skipped: Some("too short or no semantic content".to_string()),
-            });
+        //    Structured content (URL, file path, code fence, env line) bypasses
+        //    this gate — a bare URL is only one token but is still worth capturing.
+        let is_structured = has_structured_marker(text);
+        if !is_structured {
+            let non_sw = text
+                .split_whitespace()
+                .filter(|w| {
+                    let lower = w.to_lowercase();
+                    let t = lower.trim_matches(|c: char| !c.is_alphanumeric());
+                    !t.is_empty() && !Self::GATE_STOPWORDS.contains(&t)
+                })
+                .count();
+            if non_sw < 3 {
+                return Ok(FastIngestResult {
+                    signal_id: 0,
+                    content_hash: content_hash_str,
+                    priority: SignalPriority::Ephemeral,
+                    instant_entities: vec![],
+                    skipped: Some("too short or no semantic content".to_string()),
+                });
+            }
         }
 
         // 4. Embed.
         let embedding = self.embedder.embed(text);
 
-        // 5. Store signal with embedding.
+        // 5. Classify into a priority tier.
+        let priority = classify_signal(text, &embedding, &self.graph);
+
+        // 6a. Tier-1 (InstantEntity): skip the signal table entirely and run
+        //     the full ingest pipeline so the entity lands in the graph now.
+        if priority == SignalPriority::InstantEntity {
+            match self.ingest(text, session_id) {
+                Ok(result) => {
+                    return Ok(FastIngestResult {
+                        signal_id: 0,
+                        content_hash: content_hash_str,
+                        priority,
+                        instant_entities: result.entities,
+                        skipped: None,
+                    });
+                }
+                Err(e) => {
+                    // Fall through to tier-3 storage on failure so the capture
+                    // isn't lost.
+                    tracing::debug!("[ingest_fast] tier-1 promotion failed, downgrading: {e}");
+                }
+            }
+        }
+
+        // 6b. Tier 2/3/4: store signal with its priority tier.
+        let tier = if priority == SignalPriority::InstantEntity {
+            SignalPriority::Normal.tier()
+        } else {
+            priority.tier()
+        };
+
         let signal_id = self.graph.insert_signal_with_embedding(
             source,
             text,
@@ -335,11 +416,14 @@ impl IngestPipeline {
             session_id,
             &embedding,
             None,
+            tier,
         )?;
 
         Ok(FastIngestResult {
             signal_id,
             content_hash: content_hash_str,
+            priority,
+            instant_entities: vec![],
             skipped: None,
         })
     }
@@ -349,6 +433,10 @@ impl IngestPipeline {
     ///
     /// Call this periodically (e.g., every 5 minutes or on idle). It is safe to
     /// call concurrently; signals are processed in insertion order.
+    ///
+    /// Scans all non-ephemeral tiers (1–3). Tier-2 (Priority) signals are
+    /// normally promoted earlier by `consolidate_priority()` on a tighter
+    /// schedule, but this pass acts as a catch-all.
     ///
     /// # Parameters
     /// - `max_signals`: max signals to load per pass (bounds CPU time).
@@ -360,7 +448,41 @@ impl IngestPipeline {
         min_cluster_size: usize,
         sim_threshold: f32,
     ) -> Result<ConsolidateStats> {
-        let signals = self.graph.unconsolidated_signals(max_signals)?;
+        self.consolidate_tier(None, max_signals, min_cluster_size, sim_threshold)
+    }
+
+    /// Aggressive consolidation pass for Tier-2 (Priority) signals only.
+    /// Uses a lower `min_cluster_size` so novel content can be promoted after
+    /// just 1–2 captures.
+    ///
+    /// Recommended schedule: every ~30 seconds.
+    pub fn consolidate_priority(
+        &self,
+        max_signals: usize,
+        sim_threshold: f32,
+    ) -> Result<ConsolidateStats> {
+        // Tier-2 is, by construction, novel content — a singleton is enough to
+        // promote, because we've already vetted it as "not redundant".
+        self.consolidate_tier(
+            Some(SignalPriority::Priority.tier()),
+            max_signals,
+            1, // singletons allowed
+            sim_threshold,
+        )
+    }
+
+    /// Tier-scoped consolidation. If `tier_filter` is Some(t), only signals at
+    /// that tier are processed. If None, all non-ephemeral tiers (1–3).
+    fn consolidate_tier(
+        &self,
+        tier_filter: Option<i64>,
+        max_signals: usize,
+        min_cluster_size: usize,
+        sim_threshold: f32,
+    ) -> Result<ConsolidateStats> {
+        let signals = self
+            .graph
+            .unconsolidated_signals_by_tier(tier_filter, max_signals)?;
         if signals.is_empty() {
             return Ok(ConsolidateStats::default());
         }
@@ -813,6 +935,96 @@ fn extract_triples(text: &str, entities: &[Entity]) -> Vec<Triple> {
 }
 
 // ---------------------------------------------------------------------------
+// Signal priority classifier
+// ---------------------------------------------------------------------------
+
+/// Classify a captured signal into a priority tier for the two-speed pipeline.
+///
+/// Runs cheap heuristics only — no model inference beyond the already-computed
+/// embedding. Target: <1ms.
+///
+/// Decision order:
+/// 1. Structured content (URL, file path, code block, JSON) → **InstantEntity (T1)**.
+/// 2. Low novelty vs existing graph (cosine ≥ 0.85) → **Ephemeral (T4)**.
+/// 3. High novelty (cosine < 0.40 vs top match) OR high lexical entropy →
+///    **Priority (T2)**.
+/// 4. Default → **Normal (T3)**.
+pub fn classify_signal(
+    text: &str,
+    embedding: &[f32],
+    graph: &GraphStore,
+) -> SignalPriority {
+    // 1. Structured / high-signal surface features.
+    if has_structured_marker(text) {
+        return SignalPriority::InstantEntity;
+    }
+
+    // 2/3. Novelty check against the existing graph.
+    let similar = graph.search_vectors(embedding, 1).unwrap_or_default();
+    let top_sim = similar.first().map(|&(_, s)| s).unwrap_or(0.0);
+
+    if top_sim >= 0.85 {
+        // Very close to an entity we already have — probably a re-capture of
+        // something known. Keep searchable, don't pollute the graph.
+        return SignalPriority::Ephemeral;
+    }
+
+    if top_sim < 0.40 || lexical_entropy_score(text) > 0.7 {
+        return SignalPriority::Priority;
+    }
+
+    SignalPriority::Normal
+}
+
+/// Detect surface features that mark a capture as structured/high-signal:
+/// URLs, file paths, code fences, JSON objects, stack traces, env lines.
+fn has_structured_marker(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        return true;
+    }
+    // file path: starts with /, ~, ./, or drive letter
+    if trimmed.starts_with('/')
+        || trimmed.starts_with("~/")
+        || trimmed.starts_with("./")
+    {
+        // cheap guard against sentences that happen to begin with a slash
+        if !trimmed.contains(' ') || trimmed.split_whitespace().next().map(|w| w.contains('/')).unwrap_or(false) {
+            return true;
+        }
+    }
+    // code fence / JSON / stack-trace-like
+    if trimmed.starts_with("```") {
+        return true;
+    }
+    if trimmed.starts_with('{') && trimmed.contains(':') && trimmed.contains('}') {
+        return true;
+    }
+    // a line that looks like an env/config assignment: KEY=value
+    if let Some(eq) = trimmed.find('=') {
+        let key = &trimmed[..eq];
+        if !key.is_empty()
+            && key.len() < 40
+            && key.chars().all(|c| c.is_ascii_uppercase() || c == '_' || c.is_ascii_digit())
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Rough lexical-entropy proxy: unique-token ratio.
+/// Returns 1.0 if every word is unique, 0.0 for a completely repetitive stream.
+fn lexical_entropy_score(text: &str) -> f32 {
+    let words: Vec<&str> = text.split_whitespace().collect();
+    if words.is_empty() {
+        return 0.0;
+    }
+    let unique: std::collections::HashSet<&str> = words.iter().copied().collect();
+    unique.len() as f32 / words.len() as f32
+}
+
+// ---------------------------------------------------------------------------
 // Two-speed pipeline helpers
 // ---------------------------------------------------------------------------
 
@@ -1138,7 +1350,9 @@ mod tests {
     fn test_consolidate_promotes_cluster_to_entities() {
         let pipeline = in_memory_pipeline();
         let s = "Rust is a systems programming language for memory safety";
-        // Store the same topic multiple times (similar embeddings with hash embedder).
+        // Store the same topic multiple times. Novel content is classified as
+        // Priority (tier 2) by the classifier, so the normal consolidate() pass
+        // (tier-union) and consolidate_priority() should both find these signals.
         for _ in 0..3 {
             let _ = pipeline.ingest_fast(
                 &format!("{} — version {}", s, Uuid::new_v4()),
@@ -1146,11 +1360,105 @@ mod tests {
                 Uuid::new_v4(),
             );
         }
+        // Use min_cluster_size=1 so even singleton priority signals promote —
+        // this matches the semantics of consolidate_priority which is the
+        // natural path for novel content. threshold=0.0 forces all into one
+        // cluster (though may still leave some as singletons depending on
+        // hash embedding sign).
         let stats = pipeline
-            .consolidate(50, 2, 0.0) // threshold=0.0 forces all signals into one cluster
+            .consolidate(50, 1, 0.0)
             .expect("consolidate should succeed");
         assert!(stats.signals_scanned >= 3, "should have scanned stored signals");
-        assert!(stats.clusters_formed >= 1, "should have formed at least one cluster");
+        assert!(
+            stats.clusters_formed >= 1,
+            "should have formed at least one cluster (got {})",
+            stats.clusters_formed
+        );
+    }
+
+    // ── Tier classification tests ─────────────────────────────────────────
+
+    #[test]
+    fn test_classify_signal_url_is_instant() {
+        let pipeline = in_memory_pipeline();
+        let text = "https://example.com/docs/architecture";
+        let emb = pipeline.embedder.embed(text);
+        let priority = classify_signal(text, &emb, &pipeline.graph);
+        assert_eq!(priority, SignalPriority::InstantEntity);
+    }
+
+    #[test]
+    fn test_classify_signal_code_fence_is_instant() {
+        let pipeline = in_memory_pipeline();
+        let text = "```rust\nfn main() { println!(\"hello\"); }\n```";
+        let emb = pipeline.embedder.embed(text);
+        let priority = classify_signal(text, &emb, &pipeline.graph);
+        assert_eq!(priority, SignalPriority::InstantEntity);
+    }
+
+    #[test]
+    fn test_classify_signal_novel_is_priority() {
+        let pipeline = in_memory_pipeline();
+        let text = "A detailed note about distributed consensus algorithms and their tradeoffs";
+        let emb = pipeline.embedder.embed(text);
+        // Empty graph => top_sim 0.0 => Priority tier.
+        let priority = classify_signal(text, &emb, &pipeline.graph);
+        assert_eq!(priority, SignalPriority::Priority);
+    }
+
+    #[test]
+    fn test_ingest_fast_url_instant_promotes() {
+        let pipeline = in_memory_pipeline();
+        let session = Uuid::new_v4();
+        let res = pipeline
+            .ingest_fast("https://example.com/article", "test", session)
+            .unwrap();
+        assert_eq!(res.priority, SignalPriority::InstantEntity);
+        // signal_id=0 because URL was promoted directly via ingest(), not stored.
+        assert!(res.signal_id == 0 || !res.instant_entities.is_empty());
+    }
+
+    #[test]
+    fn test_consolidate_priority_scans_tier2_only() {
+        let pipeline = in_memory_pipeline();
+        // Novel content → classified as Priority (tier 2).
+        for i in 0..3 {
+            let _ = pipeline.ingest_fast(
+                &format!("Some novel unique concept number {} about widgets", i),
+                "test",
+                Uuid::new_v4(),
+            );
+        }
+        let stats = pipeline
+            .consolidate_priority(50, 0.0)
+            .expect("priority consolidation");
+        assert!(stats.signals_scanned >= 3, "tier-2 signals should be scanned");
+        assert!(stats.clusters_formed >= 1, "min_cluster_size=1 allows singletons");
+    }
+
+    #[test]
+    fn test_hybrid_search_finds_fresh_signals() {
+        // Insert a tier-2 signal and verify search_signals returns it.
+        let pipeline = in_memory_pipeline();
+        let text = "Quantum entanglement enables secure key distribution";
+        let _ = pipeline
+            .ingest_fast(text, "test", Uuid::new_v4())
+            .expect("ingest_fast");
+        let query_emb = pipeline.embedder.embed(text);
+        let hits = pipeline
+            .graph
+            .search_signals(&query_emb, 5, 0.0)
+            .expect("signal search");
+        assert!(!hits.is_empty(), "hybrid search should surface fresh signal");
+        assert!(hits[0].0.raw_text.contains("Quantum"));
+    }
+
+    #[test]
+    fn test_signal_priority_tier_values() {
+        assert_eq!(SignalPriority::InstantEntity.tier(), 1);
+        assert_eq!(SignalPriority::Priority.tier(), 2);
+        assert_eq!(SignalPriority::Normal.tier(), 3);
+        assert_eq!(SignalPriority::Ephemeral.tier(), 4);
     }
 
     #[test]

@@ -104,6 +104,8 @@ pub struct QueryWorkspace {
     pub low_confidence: bool,
     pub suggested_queries: Vec<String>,
     pub procedures: Vec<Procedure>,
+    /// Hybrid-search hits against unpromoted signals (fresh captures not yet consolidated).
+    pub signal_hits: Vec<SignalHit>,
 }
 
 impl QueryWorkspace {
@@ -116,6 +118,20 @@ impl QueryWorkspace {
             decision,
         });
     }
+}
+
+/// A hit from the unpromoted-signal hybrid search.
+///
+/// These are raw captures that haven't yet been consolidated into entities.
+/// Surfacing them lets fresh content be recalled the moment it lands, without
+/// waiting for the slow path.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SignalHit {
+    pub signal_id: i64,
+    pub text: String,
+    pub source: String,
+    pub score: f32,
+    pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
 /// A proactive recommendation with reason.
@@ -164,6 +180,9 @@ pub struct RetrievalResult {
     pub phases: Vec<PhaseRecord>,
     /// Unified reasoning narrative: strategy + process + evidence (3-layer explanation).
     pub reasoning_narrative: String,
+    /// Hits against unpromoted signals (hybrid retrieval path). These are raw captures
+    /// that haven't yet been consolidated into graph entities.
+    pub signal_hits: Vec<SignalHit>,
 }
 
 impl RetrievalEngine {
@@ -428,6 +447,7 @@ impl RetrievalEngine {
             low_confidence: false,
             suggested_queries: Vec::new(),
             procedures: Vec::new(),
+            signal_hits: Vec::new(),
         };
 
         // Record the plan phase
@@ -455,6 +475,37 @@ impl RetrievalEngine {
         ws.record_phase("vector_search", 0,
             format!("search_k={}, found={}", search_k, vs_count),
             vs_start);
+
+        // ── Phase: signal_search (hybrid — fresh unpromoted captures) ──
+        // Runs in parallel-in-concept with vector_search: the graph has entities,
+        // the signal table has raw captures. A fresh capture becomes recallable the
+        // moment it lands, without waiting for consolidation.
+        let ss_start = Instant::now();
+        let signal_top_k = (params.top_k / 2).max(3);
+        let raw_signal_hits = self
+            .graph
+            .search_signals(&blended_embedding, signal_top_k, 0.4)
+            .unwrap_or_default();
+        let raw_hit_count = raw_signal_hits.len();
+        ws.signal_hits = raw_signal_hits
+            .into_iter()
+            .map(|(sig, score)| SignalHit {
+                signal_id: sig.id,
+                text: sig.raw_text,
+                source: sig.source,
+                score,
+                created_at: sig.created_at,
+            })
+            .collect();
+        ws.record_phase(
+            "signal_search",
+            vs_count,
+            format!(
+                "signal_top_k={}, hits={}",
+                signal_top_k, raw_hit_count
+            ),
+            ss_start,
+        );
 
         // ── Phase: rerank (optional ColBERT) ──
         let rerank_start = Instant::now();
@@ -784,6 +835,7 @@ impl RetrievalEngine {
             procedures: ws.procedures,
             phases: ws.phases,
             reasoning_narrative,
+            signal_hits: ws.signal_hits,
         })
     }
 
@@ -925,6 +977,7 @@ impl RetrievalEngine {
                 decision: format!("{} sub-queries merged", sub_queries.len()),
             }],
             reasoning_narrative,
+            signal_hits: Vec::new(),
         })
     }
 
@@ -1157,6 +1210,7 @@ impl RetrievalEngine {
             procedures: self.match_procedures(original_text),
             phases,
             reasoning_narrative,
+            signal_hits: Vec::new(),
         })
     }
 
