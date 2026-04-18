@@ -6,10 +6,13 @@ use tm_graph::{CapturedSignal, GraphStore};
 use tm_vector::{Embedder, EmbedModel};
 use tm_governance::GovernanceFilter;
 
+use crate::extractor::{EntityExtractor, HeuristicExtractor};
+
 pub struct IngestPipeline {
     graph: GraphStore,
     embedder: Embedder,
     governance: GovernanceFilter,
+    extractor: Box<dyn EntityExtractor>,
 }
 
 #[derive(Debug)]
@@ -98,7 +101,17 @@ impl IngestPipeline {
             graph,
             embedder,
             governance,
+            extractor: Box::new(HeuristicExtractor),
         })
+    }
+
+    /// Replace the entity extractor used during `ingest()` and slow-path
+    /// consolidation. Defaults to [`HeuristicExtractor`]; the `gliner` cargo
+    /// feature provides a higher-quality drop-in replacement.
+    pub fn with_extractor(mut self, extractor: Box<dyn EntityExtractor>) -> Self {
+        tracing::info!("[ingest] entity extractor: {}", extractor.name());
+        self.extractor = extractor;
+        self
     }
 
     // Stopwords for the selective ingestion gate (lowercase).
@@ -181,8 +194,8 @@ impl IngestPipeline {
         // 2. Hash.
         let content_hash = hash_text(text);
 
-        // 3. Extract entities (multi-word aware).
-        let mut entities = extract_entities(text);
+        // 3. Extract entities via the configured extractor (heuristic by default).
+        let mut entities = self.extractor.extract_entities(text);
 
         // 4. Deduplicate: check each entity against the graph.
         //    - Exact or case-insensitive name match → reuse existing entity
@@ -284,7 +297,7 @@ impl IngestPipeline {
         entities = kept_entities;
 
         // 6. Extract typed triples via pattern matching, then fill with co-occurrence.
-        let triples = extract_triples(text, &entities);
+        let triples = self.extractor.extract_triples(text, &entities);
 
         // 7. Upsert triples to graph.
         for triple in &triples {
@@ -658,7 +671,7 @@ const SKIP_WORDS: &[&str] = &[
     "team", "teams", "device", "devices", "locally", "core", "part", "way", "thing",
 ];
 
-fn extract_entities(text: &str) -> Vec<Entity> {
+pub(crate) fn extract_entities(text: &str) -> Vec<Entity> {
     let mut seen_names: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut entities: Vec<Entity> = Vec::new();
 
@@ -828,7 +841,7 @@ fn classify_token(token: &str) -> Option<EntityType> {
 // ---------------------------------------------------------------------------
 
 /// Sentence-level pattern matching for typed predicates, with co-occurrence fallback.
-fn extract_triples(text: &str, entities: &[Entity]) -> Vec<Triple> {
+pub(crate) fn extract_triples(text: &str, entities: &[Entity]) -> Vec<Triple> {
     let mut triples: Vec<Triple> = Vec::new();
     let text_lower = text.to_lowercase();
 
@@ -1105,6 +1118,7 @@ mod tests {
             graph,
             embedder: Embedder::new_hash(),
             governance: GovernanceFilter::default(),
+            extractor: Box::new(HeuristicExtractor),
         }
     }
 
