@@ -106,8 +106,8 @@ impl IngestPipeline {
     }
 
     /// Replace the entity extractor used during `ingest()` and slow-path
-    /// consolidation. Defaults to [`HeuristicExtractor`]; the `gliner` cargo
-    /// feature provides a higher-quality drop-in replacement.
+    /// consolidation. Defaults to [`HeuristicExtractor`]. A real ONNX GLiNER
+    /// implementation is tracked by TM-NLP-004.
     pub fn with_extractor(mut self, extractor: Box<dyn EntityExtractor>) -> Self {
         tracing::info!("[ingest] entity extractor: {}", extractor.name());
         self.extractor = extractor;

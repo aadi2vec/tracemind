@@ -7,10 +7,11 @@
 //! entities which is good enough to bootstrap a graph but leaves meaningful
 //! headroom on the table.
 //!
-//! TM-5.1-001c introduces an [`EntityExtractor`] trait so we can swap in a
-//! stronger model (GLiNER / GLiREL ~85% F1) behind a cargo feature without
-//! touching the hot path. The heuristic implementation is still the default;
-//! GLiNER lives in [`crate::gliner`] under `--features gliner`.
+//! TM-5.1-001c introduced an [`EntityExtractor`] trait so we can swap in a
+//! stronger model (real ONNX GLiNER ~85% F1) without touching the hot path.
+//! The heuristic implementation is the default; a real GLiNER extractor is
+//! tracked by TM-NLP-004 and is gated on a local model + evaluation fixture
+//! (no scaffold / placeholder implementation ships).
 //!
 //! The trait is deliberately small — two methods mirroring the existing
 //! `extract_entities` / `extract_triples` pair — so plugging in a new model is

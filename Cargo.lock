@@ -5749,8 +5749,6 @@ name = "tm-ingest"
 version = "0.1.0"
 dependencies = [
  "chrono",
- "ndarray 0.16.1",
- "ort",
  "seahash",
  "serde",
  "serde_json",
@@ -5759,7 +5757,6 @@ dependencies = [
  "tm-graph",
  "tm-types",
  "tm-vector",
- "tokenizers 0.21.4",
  "tracing",
  "uuid",
 ]
