@@ -106,8 +106,8 @@ impl IngestPipeline {
     }
 
     /// Replace the entity extractor used during `ingest()` and slow-path
-    /// consolidation. Defaults to [`HeuristicExtractor`]; the `gliner` cargo
-    /// feature provides a higher-quality drop-in replacement.
+    /// consolidation. Defaults to [`HeuristicExtractor`]. A real ONNX GLiNER
+    /// implementation is tracked by TM-NLP-004.
     pub fn with_extractor(mut self, extractor: Box<dyn EntityExtractor>) -> Self {
         tracing::info!("[ingest] entity extractor: {}", extractor.name());
         self.extractor = extractor;
@@ -197,6 +197,13 @@ impl IngestPipeline {
         // 3. Extract entities via the configured extractor (heuristic by default).
         let mut entities = self.extractor.extract_entities(text);
 
+        // 3b. Case-insensitive graph-name linking (TM-NLP-003a):
+        //     The heuristic extractor skips lowercase tokens, so a sentence
+        //     like "I use rust daily" never yields an entity even if "Rust"
+        //     already exists in the graph. Rescue those mentions by scanning
+        //     non-title-case tokens against the known entity-name index.
+        self.link_lowercase_to_graph(text, &mut entities);
+
         // 4. Deduplicate: check each entity against the graph.
         //    - Exact or case-insensitive name match → reuse existing entity
         //    - Reinforces confidence of existing entities on re-mention
@@ -219,6 +226,20 @@ impl IngestPipeline {
                 entity.confidence = existing.confidence;
                 entity.created_at = existing.created_at;
                 // Reinforce confidence on re-mention
+                self.graph.reinforce_entity(existing.id, 0.05)?;
+                name_to_id.insert(key, entity.id);
+                continue;
+            }
+
+            // TM-NLP-003d — fuzzy match (Levenshtein ≤ 2) against the graph.
+            // Bridges casing / punctuation / minor spelling variants
+            // ("Rustlang" → "Rust", "TypeScript" → "Typescript") without
+            // fragmenting the graph. Only applied when the exact /
+            // case-insensitive lookup missed.
+            if let Some(existing) = self.fuzzy_match_entity(&entity.name) {
+                entity.id = existing.id;
+                entity.confidence = existing.confidence;
+                entity.created_at = existing.created_at;
                 self.graph.reinforce_entity(existing.id, 0.05)?;
             }
 
@@ -553,6 +574,122 @@ impl IngestPipeline {
     }
 
     // -----------------------------------------------------------------------
+    // TM-NLP-003a — case-insensitive graph-name linking
+    // -----------------------------------------------------------------------
+
+    /// Rescue lowercase / non-Title-Case mentions of entities that already
+    /// exist in the graph. The heuristic extractor is deliberately picky about
+    /// casing (to avoid false positives on prose), which means graph quality
+    /// grows with the graph itself: the moment `Rust` is stored, every future
+    /// "rust" in a captured note becomes a link rather than a miss.
+    ///
+    /// Cost is bounded: we hit the DB only for non-stopword tokens of length
+    /// ≥ 3 that weren't already emitted, and we short-circuit at 20 new hits.
+    fn link_lowercase_to_graph(&self, text: &str, entities: &mut Vec<Entity>) {
+        // Set of already-emitted names (lowercased) so we don't re-emit.
+        let mut seen: std::collections::HashSet<String> = entities
+            .iter()
+            .map(|e| e.name.to_lowercase())
+            .collect();
+        // Individual words that already participate in a multi-word entity —
+        // e.g. "Machine Learning" already covers "machine" and "learning".
+        for e in entities.iter() {
+            for w in e.name.split_whitespace() {
+                seen.insert(w.to_lowercase());
+            }
+        }
+
+        let mut added = 0;
+        for raw in text.split_whitespace() {
+            if added >= 20 || entities.len() >= 40 {
+                break;
+            }
+            let token = raw.trim_matches(STRIP_CHARS);
+            if token.len() < 3 {
+                continue;
+            }
+            let lower = token.to_lowercase();
+            if seen.contains(&lower) {
+                continue;
+            }
+            // Skip Title-Case tokens — the extractor already handled those in
+            // either its multi-word or single-token pass.
+            if is_title_case(token) {
+                continue;
+            }
+            // Skip stopwords and things that look like numbers.
+            if STOPWORDS.contains(&lower.as_str())
+                || lower.chars().all(|c| c.is_ascii_digit())
+            {
+                continue;
+            }
+
+            match self.graph.find_entity_by_name_icase(token) {
+                Ok(Some(existing)) => {
+                    // Preserve the graph's canonical casing for the entity name
+                    // so downstream dedup lines up with the stored row.
+                    let mut e = existing.clone();
+                    // The pipeline's main dedup pass will re-bind the id /
+                    // confidence / created_at, but carrying the existing id
+                    // here avoids a redundant INSERT attempt.
+                    e.confidence = existing.confidence;
+                    entities.push(e);
+                    seen.insert(lower);
+                    added += 1;
+                }
+                _ => { /* no match — leave it */ }
+            }
+        }
+
+        if added > 0 {
+            tracing::debug!("[ingest] linked {added} lowercase mentions to graph");
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // TM-NLP-003d — fuzzy (Levenshtein) entity linking
+    // -----------------------------------------------------------------------
+
+    /// Find an existing graph entity whose name is within edit-distance 2 of
+    /// `name`. Returns `None` when the best candidate is either absent or
+    /// further than the threshold.
+    ///
+    /// Avoids graph fragmentation from minor spelling / punctuation drift
+    /// ("Rustlang" ↔ "Rust" is too far; "TypeScript" ↔ "Typescript" is 1).
+    /// Length-prefiltered at the SQL layer to keep the candidate set small.
+    fn fuzzy_match_entity(&self, name: &str) -> Option<Entity> {
+        const MAX_DIST: usize = 2;
+        // Very short names are too noisy — 2 edits of a 3-letter word is
+        // half the name. Require at least 4 characters.
+        if name.chars().count() < 4 {
+            return None;
+        }
+
+        let candidates = self
+            .graph
+            .entities_near_length(name.len(), MAX_DIST)
+            .ok()?;
+        let lower = name.to_lowercase();
+
+        let mut best: Option<(usize, Entity)> = None;
+        for cand in candidates {
+            let d = levenshtein(&lower, &cand.name.to_lowercase());
+            if d == 0 {
+                // Exact match would have been caught upstream; skip.
+                continue;
+            }
+            if d > MAX_DIST {
+                continue;
+            }
+            match &best {
+                Some((bd, _)) if *bd <= d => {}
+                _ => best = Some((d, cand)),
+            }
+        }
+        best.map(|(_, e)| e)
+    }
+
+    // -----------------------------------------------------------------------
     // Memory-R1 CRUD decision logic
     // -----------------------------------------------------------------------
 
@@ -670,6 +807,143 @@ const SKIP_WORDS: &[&str] = &[
     "data", "time", "information", "system", "systems", "tool", "tools", "type", "types",
     "team", "teams", "device", "devices", "locally", "core", "part", "way", "thing",
 ];
+
+/// Classic two-row Levenshtein edit distance (stdlib only).
+///
+/// Compares byte-sequences. Callers normalise to lowercase before calling
+/// when case-insensitive matching is desired. O(|a| * |b|) time and O(|b|)
+/// memory, which is fine for the short entity names we compare.
+fn levenshtein(a: &str, b: &str) -> usize {
+    let a_bytes = a.as_bytes();
+    let b_bytes = b.as_bytes();
+    if a_bytes.is_empty() {
+        return b_bytes.len();
+    }
+    if b_bytes.is_empty() {
+        return a_bytes.len();
+    }
+
+    let n = b_bytes.len();
+    let mut prev: Vec<usize> = (0..=n).collect();
+    let mut curr: Vec<usize> = vec![0; n + 1];
+
+    for (i, &ac) in a_bytes.iter().enumerate() {
+        curr[0] = i + 1;
+        for (j, &bc) in b_bytes.iter().enumerate() {
+            let cost = if ac == bc { 0 } else { 1 };
+            let del = prev[j + 1] + 1;
+            let ins = curr[j] + 1;
+            let sub = prev[j] + cost;
+            curr[j + 1] = del.min(ins).min(sub);
+        }
+        std::mem::swap(&mut prev, &mut curr);
+    }
+    prev[n]
+}
+
+/// TM-NLP-003b — YAKE-style unsupervised keyphrase extraction.
+///
+/// Surfaces multi-word lowercase phrases the Title-Case extractor ignores
+/// (e.g. "machine learning", "vector search", "large language model").
+/// Scoring is intentionally simple — term frequency with a position
+/// bonus for phrases that appear earlier in the text. Any phrase whose
+/// score exceeds `threshold` is emitted as a [`EntityType::Concept`].
+///
+/// Stopwords and common verbs / generic nouns from `STOPWORDS` /
+/// `SKIP_WORDS` are never allowed inside a candidate phrase.
+pub(crate) fn extract_keyphrases(text: &str) -> Vec<Entity> {
+    const MAX_GRAM: usize = 3;
+    const MIN_GRAM: usize = 2;
+    const MIN_SCORE: f64 = 1.0;
+    const MAX_EMIT: usize = 8;
+
+    // Tokenize to lowercased word stream with original positions preserved.
+    let tokens: Vec<String> = text
+        .split_whitespace()
+        .map(|w| {
+            w.trim_matches(STRIP_CHARS)
+                .to_lowercase()
+                .chars()
+                .filter(|c| c.is_alphanumeric() || *c == '-')
+                .collect::<String>()
+        })
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    let total = tokens.len();
+    if total < MIN_GRAM {
+        return Vec::new();
+    }
+
+    // Cheap stopword / skip-word check (case-insensitive against the
+    // Title-Case STOPWORDS table + lowercase SKIP_WORDS).
+    let is_noise = |w: &str| -> bool {
+        if w.len() < 3 || w.chars().all(|c| c.is_ascii_digit()) {
+            return true;
+        }
+        if SKIP_WORDS.contains(&w) {
+            return true;
+        }
+        STOPWORDS.iter().any(|s| s.eq_ignore_ascii_case(w))
+    };
+
+    // Build (phrase -> (count, first_position)) table.
+    let mut phrases: std::collections::HashMap<String, (usize, usize)> =
+        std::collections::HashMap::new();
+    for n in MIN_GRAM..=MAX_GRAM {
+        if total < n {
+            break;
+        }
+        for i in 0..=(total - n) {
+            let window = &tokens[i..i + n];
+            if window.iter().any(|w| is_noise(w)) {
+                continue;
+            }
+            let phrase = window.join(" ");
+            let entry = phrases.entry(phrase).or_insert((0, i));
+            entry.0 += 1;
+            if i < entry.1 {
+                entry.1 = i;
+            }
+        }
+    }
+
+    // Score + threshold.
+    let mut scored: Vec<(String, f64)> = phrases
+        .into_iter()
+        .map(|(phrase, (count, first_pos))| {
+            let freq = count as f64;
+            // Earlier phrases score higher; normalise position by token count.
+            let position_bonus = 1.0 - (first_pos as f64 / total as f64).min(1.0);
+            (phrase, freq + position_bonus)
+        })
+        .filter(|(_, s)| *s >= MIN_SCORE)
+        .collect();
+
+    scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+    // If a longer candidate contains a shorter one AND the shorter one
+    // has strictly higher score, drop the longer — it was inflated by the
+    // shorter high-signal core. This keeps "machine learning" and drops
+    // "explored machine learning" when the bigram is more frequent.
+    let mut kept: Vec<(String, f64)> = Vec::with_capacity(scored.len());
+    for (phrase, score) in &scored {
+        let dominated = scored.iter().any(|(other, other_score)| {
+            other != phrase
+                && other.len() < phrase.len()
+                && phrase.contains(other.as_str())
+                && *other_score >= *score
+        });
+        if !dominated {
+            kept.push((phrase.clone(), *score));
+        }
+    }
+    kept.truncate(MAX_EMIT);
+
+    kept.into_iter()
+        .map(|(phrase, _)| Entity::new(&phrase, EntityType::Concept, 0.6))
+        .collect()
+}
 
 pub(crate) fn extract_entities(text: &str) -> Vec<Entity> {
     let mut seen_names: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -872,6 +1146,10 @@ pub(crate) fn extract_triples(text: &str, entities: &[Entity]) -> Vec<Triple> {
         (&["part of", "belongs to", "member of", "component of", "included in"], Predicate::PartOf),
         // "X references Y", "X mentions Y", "X links to Y"
         (&["references", "mentions", "links to", "points to", "refers to"], Predicate::References),
+        // TM-NLP-003c — possession / containment: "X has Y", "X contains Y"
+        // Use spaces around bare verbs to reduce substring false matches
+        // ("has" inside "washes", "have" inside "behaves").
+        (&[" has ", " have ", " having ", " contains ", " containing ", " includes ", " including "], Predicate::HasProperty),
     ];
 
     for (keywords, predicate) in patterns {
@@ -1221,6 +1499,20 @@ mod tests {
         );
     }
 
+    /// TM-NLP-003c — "X has Y" / "X contains Y" should emit HasProperty triples.
+    #[test]
+    fn test_typed_predicate_has_property() {
+        let text = "TraceMind contains Rust and Sqlite";
+        let entities = extract_entities(text);
+        let triples = extract_triples(text, &entities);
+        let has_property = triples.iter().any(|t| t.predicate == Predicate::HasProperty);
+        assert!(
+            has_property,
+            "expected HasProperty predicate; got: {:?}",
+            triples.iter().map(|t| &t.predicate).collect::<Vec<_>>()
+        );
+    }
+
     #[test]
     fn test_entity_dedup_across_ingests() {
         let pipeline = in_memory_pipeline();
@@ -1269,6 +1561,164 @@ mod tests {
                 "Case-insensitive name match should reuse entity"
             );
         }
+    }
+
+    /// TM-NLP-003a — once "Rust" is in the graph, a lowercase mention
+    /// "rust" in a later ingest should link to the same entity instead of
+    /// being dropped entirely by the Title-Case extractor.
+    #[test]
+    fn test_lowercase_mention_links_to_existing_entity() {
+        let pipeline = in_memory_pipeline();
+        let s1 = Uuid::new_v4();
+        let s2 = Uuid::new_v4();
+
+        let r1 = pipeline
+            .ingest("Rust is great for performance", s1)
+            .unwrap();
+        let rust_id = r1
+            .entities
+            .iter()
+            .find(|e| e.name.eq_ignore_ascii_case("rust"))
+            .map(|e| e.id)
+            .expect("first ingest should emit Rust entity");
+
+        // The second ingest has NO Title-Case clue for Rust — only lowercase.
+        let r2 = pipeline
+            .ingest("the rust compiler is fast", s2)
+            .unwrap();
+
+        let linked = r2
+            .entities
+            .iter()
+            .find(|e| e.name.eq_ignore_ascii_case("rust"));
+        assert!(
+            linked.is_some(),
+            "lowercase 'rust' should have been linked to graph; got: {:?}",
+            r2.entities
+        );
+        assert_eq!(
+            linked.unwrap().id,
+            rust_id,
+            "lowercase mention must re-use the existing entity id"
+        );
+    }
+
+    /// TM-NLP-003b — YAKE keyphrase extraction should surface repeated
+    /// lowercase multi-word concepts.
+    #[test]
+    fn test_yake_surfaces_repeated_lowercase_phrase() {
+        let text = "we explored machine learning today. machine learning is \
+                    a huge field and machine learning keeps growing.";
+        let kps = extract_keyphrases(text);
+        let has_ml = kps.iter().any(|e| e.name == "machine learning");
+        assert!(
+            has_ml,
+            "expected 'machine learning' as keyphrase; got: {:?}",
+            kps.iter().map(|e| &e.name).collect::<Vec<_>>()
+        );
+        // Emitted as Concept.
+        assert!(
+            kps.iter()
+                .filter(|e| e.name == "machine learning")
+                .all(|e| matches!(e.entity_type, EntityType::Concept)),
+        );
+    }
+
+    /// YAKE must not emit pure stopword / verb n-grams.
+    #[test]
+    fn test_yake_skips_noisy_grams() {
+        let text = "the the the and and the and the";
+        let kps = extract_keyphrases(text);
+        assert!(
+            kps.is_empty(),
+            "expected no keyphrases from stopword-only text; got: {:?}",
+            kps.iter().map(|e| &e.name).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_levenshtein_basic_cases() {
+        assert_eq!(levenshtein("rust", "rust"), 0);
+        assert_eq!(levenshtein("rust", "rost"), 1);          // sub
+        assert_eq!(levenshtein("rust", "ruts"), 2);          // transpose ≈ 2 in Lev
+        assert_eq!(levenshtein("typescript", "Typescript".to_lowercase().as_str()), 0);
+        assert_eq!(levenshtein("typescript", "typescripts"), 1); // ins
+        assert_eq!(levenshtein("", "abc"), 3);
+        assert_eq!(levenshtein("abc", ""), 3);
+    }
+
+    /// TM-NLP-003d — after "Typescript" is in the graph, a new mention of
+    /// "TypeScript" (casing variant, 1 char capitalization-drift away once
+    /// lowercased both are equal — so actually this goes through the icase
+    /// path; better test is "TypeScripts" → "Typescript" distance 1).
+    #[test]
+    fn test_fuzzy_match_merges_typo() {
+        let pipeline = in_memory_pipeline();
+        let s1 = Uuid::new_v4();
+        let s2 = Uuid::new_v4();
+
+        let r1 = pipeline
+            .ingest("Typescript is a typed language", s1)
+            .unwrap();
+        let canonical_id = r1
+            .entities
+            .iter()
+            .find(|e| e.name.eq_ignore_ascii_case("Typescript"))
+            .map(|e| e.id)
+            .expect("first ingest should emit Typescript entity");
+
+        // Minor spelling drift — 1 edit away.
+        let r2 = pipeline
+            .ingest("Typescripts is widely used", s2)
+            .unwrap();
+        let linked = r2
+            .entities
+            .iter()
+            .find(|e| e.name.eq_ignore_ascii_case("Typescripts") || e.id == canonical_id);
+        assert!(
+            linked.is_some(),
+            "fuzzy match should have merged 'Typescripts' into existing 'Typescript'; got: {:?}",
+            r2.entities
+        );
+        assert_eq!(
+            linked.unwrap().id,
+            canonical_id,
+            "Typescripts (d=1) must reuse the canonical entity id"
+        );
+    }
+
+    /// Too-far names must not collapse.
+    #[test]
+    fn test_fuzzy_match_rejects_unrelated_names() {
+        let pipeline = in_memory_pipeline();
+        pipeline
+            .ingest("Rust is great for performance", Uuid::new_v4())
+            .unwrap();
+
+        // 4+ edits apart from "Rust" — unrelated.
+        let m = pipeline.fuzzy_match_entity("Python");
+        assert!(
+            m.is_none(),
+            "fuzzy match must not collapse unrelated names; got: {m:?}"
+        );
+    }
+
+    /// Guard against false positives: on an empty graph the linking helper
+    /// must be a pure no-op — it should never invent entities for tokens
+    /// the extractor skipped.
+    #[test]
+    fn test_lowercase_linking_is_noop_on_empty_graph() {
+        let pipeline = in_memory_pipeline();
+        let mut entities: Vec<Entity> = Vec::new();
+        pipeline.link_lowercase_to_graph(
+            "the quick brown fox jumps over the lazy dog",
+            &mut entities,
+        );
+        assert!(
+            entities.is_empty(),
+            "linker must not add entities when graph is empty; got: {:?}",
+            entities
+        );
     }
 
     #[test]

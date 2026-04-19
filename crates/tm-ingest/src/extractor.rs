@@ -7,10 +7,11 @@
 //! entities which is good enough to bootstrap a graph but leaves meaningful
 //! headroom on the table.
 //!
-//! TM-5.1-001c introduces an [`EntityExtractor`] trait so we can swap in a
-//! stronger model (GLiNER / GLiREL ~85% F1) behind a cargo feature without
-//! touching the hot path. The heuristic implementation is still the default;
-//! GLiNER lives in [`crate::gliner`] under `--features gliner`.
+//! TM-5.1-001c introduced an [`EntityExtractor`] trait so we can swap in a
+//! stronger model (real ONNX GLiNER ~85% F1) without touching the hot path.
+//! The heuristic implementation is the default; a real GLiNER extractor is
+//! tracked by TM-NLP-004 and is gated on a local model + evaluation fixture
+//! (no scaffold / placeholder implementation ships).
 //!
 //! The trait is deliberately small — two methods mirroring the existing
 //! `extract_entities` / `extract_triples` pair — so plugging in a new model is
@@ -19,7 +20,7 @@
 
 use tm_types::{Entity, Triple};
 
-use crate::pipeline::{extract_entities, extract_triples};
+use crate::pipeline::{extract_entities, extract_keyphrases, extract_triples};
 
 /// Something that can turn raw text into entities + relations.
 ///
@@ -46,7 +47,21 @@ pub struct HeuristicExtractor;
 
 impl EntityExtractor for HeuristicExtractor {
     fn extract_entities(&self, text: &str) -> Vec<Entity> {
-        extract_entities(text)
+        let mut ents = extract_entities(text);
+
+        // TM-NLP-003b — YAKE-lite keyphrase pass. Adds lowercase multi-word
+        // concepts ("machine learning", "vector search") that the Title-Case
+        // extractor misses. Deduplicate against whatever the NER pass
+        // already produced so we don't double-emit the same phrase.
+        let existing: std::collections::HashSet<String> =
+            ents.iter().map(|e| e.name.to_lowercase()).collect();
+        for kp in extract_keyphrases(text) {
+            let key = kp.name.to_lowercase();
+            if !existing.contains(&key) {
+                ents.push(kp);
+            }
+        }
+        ents
     }
 
     fn extract_triples(&self, text: &str, entities: &[Entity]) -> Vec<Triple> {

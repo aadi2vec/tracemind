@@ -23,7 +23,7 @@ Layer 1: Foundation        tm-types
 
 2. **`tm-graph/src/store.rs`** (~1,590 lines) — The heart. SQLite-backed knowledge graph with vector search, PageRank, Louvain communities, decay, KG-R1 graph actions, and temporal range queries all in one file.
 
-3. **`tm-ingest/src/pipeline.rs`** (~1,200 lines) — Two-speed ingestion. `ingest_fast()` is the <10 ms embed-first path that tags signals with a priority tier (1–4). `ingest()` + `consolidate_tier()` form the slow path: cluster unpromoted signals → pick representative → run the configured `EntityExtractor` (heuristic default, GLiNER behind feature) → Memory-R1 CRUD → graph upsert.
+3. **`tm-ingest/src/pipeline.rs`** (~1,200 lines) — Two-speed ingestion. `ingest_fast()` is the <10 ms embed-first path that tags signals with a priority tier (1–4). `ingest()` + `consolidate_tier()` form the slow path: cluster unpromoted signals → pick representative → run the configured `EntityExtractor` (stdlib heuristic by default; pluggable trait for future ONNX GLiNER) → Memory-R1 CRUD → graph upsert.
 
 4. **`tm-controller/src/planner.rs`** (~610 lines) — The brain's prefrontal cortex. Classifies queries into 7 actions (including temporal), selects strategy, supports re-planning.
 
@@ -259,9 +259,11 @@ pub trait EntityExtractor: Send + Sync {
 }
 ```
 - `HeuristicExtractor` (default) — stdlib-only Title-Case/URL/file heuristics, ~55 % F1.
-- `GlinerExtractor` (`--features gliner`) — ONNX GLiNER ~85 % F1. Loads from
-  `TM_GLINER_MODEL_PATH`, falls back to heuristics if the model is missing.
-  Swap in via `IngestPipeline::open(…)?.with_extractor(Box::new(ext))`.
+  Swap in an alternate implementation via
+  `IngestPipeline::open(…)?.with_extractor(Box::new(ext))`.
+- A real ONNX GLiNER extractor (~85 % F1) is tracked by TM-NLP-004 and is
+  gated on a local model + evaluation fixture being available — there is no
+  scaffold path that pretends to be inference.
 
 ### tm-reason (Intelligence — 1,100 lines, 9 tests)
 - **ChainBuilder** — BFS multi-hop paths, hop decay 0.85^n
@@ -455,7 +457,9 @@ OS. Design principle: capture is cheap, promotion is selective, recall is hybrid
 |----|------|--------|
 | TM-5.1-001a | **Two-speed ingestion** — `ingest_fast` embed-first <10 ms path + `consolidate_*` slow-path extraction | High — capture no longer blocks on NER |
 | TM-5.1-001b | **4-tier priority promotion** (InstantEntity / Priority / Normal / Ephemeral) + **hybrid search** over unpromoted signals + dual-rate consolidation loops (~30 s Tier-2, ~5 min Tier-3) | High — novel captures reach graph in ~30 s; fresh signals findable immediately |
-| TM-5.1-001c | **`EntityExtractor` trait** — `HeuristicExtractor` default, `GlinerExtractor` scaffolding behind `--features gliner` (loads ONNX GLiNER from `TM_GLINER_MODEL_PATH`, falls back to heuristic on missing model) | Medium — unblocks ~55 % → ~85 % F1 upgrade without call-site churn |
+| TM-5.1-001c | **`EntityExtractor` trait** — `HeuristicExtractor` default; pluggable seam for real ONNX GLiNER (tracked by TM-NLP-004 once a local model + fixture exist) | Medium — unblocks ~55 % → ~85 % F1 upgrade without call-site churn |
+| TM-NLP-001 | **ColBERT reranker always-on** — removed the `colbert` feature gate in `tm-rerank` / `tm-retrieval`; `ColbertReranker::auto_download_or_none(0.7)` wires `mixedbread-ai/mxbai-edge-colbert-v0-17m` into both `tracemind query` and `tm-mcp` by default, falling back silently when offline | High — BEIR 0.49 vs MiniLM's 0.42 on every query |
+| TM-NLP-002 | **Deleted GLiNER scaffold** — `crates/tm-ingest/src/gliner.rs` and the `gliner` feature flag were removed. The pluggable extractor trait remains; a real GLiNER integration is gated on local model + fixture availability (TM-NLP-004) | Low (code hygiene) — no more "delegates to heuristic" stub pretending to be inference |
 
 ### Phase 5 — Predictive Intelligence
 

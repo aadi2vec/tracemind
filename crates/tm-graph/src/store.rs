@@ -340,6 +340,47 @@ impl GraphStore {
         }
     }
 
+    /// Enumerate entities whose name length is within `delta` of `len`.
+    ///
+    /// Intended for fuzzy-matching callers that need to score candidates
+    /// with edit-distance in application code. We pre-filter on length to
+    /// keep the candidate set small.
+    pub fn entities_near_length(
+        &self,
+        len: usize,
+        delta: usize,
+    ) -> Result<Vec<Entity>> {
+        let min_len = len.saturating_sub(delta) as i64;
+        let max_len = (len + delta) as i64;
+        let conn = self.kg.connection();
+        let mut stmt = conn
+            .prepare(
+                "SELECT entity_type, name, properties FROM kg_entities \
+                 WHERE length(name) BETWEEN ?1 AND ?2",
+            )
+            .map_err(|e| TraceMindError::Storage(e.to_string()))?;
+
+        let rows = stmt
+            .query_map(params![min_len, max_len], |row| {
+                let etype: String = row.get(0)?;
+                let name: String = row.get(1)?;
+                let props_str: String = row.get(2)?;
+                Ok((etype, name, props_str))
+            })
+            .map_err(|e| TraceMindError::Storage(e.to_string()))?;
+
+        let mut out = Vec::new();
+        for r in rows {
+            let (etype_str, name, props_str) =
+                r.map_err(|e| TraceMindError::Storage(e.to_string()))?;
+            let props: HashMap<String, serde_json::Value> =
+                serde_json::from_str(&props_str).unwrap_or_default();
+            let entity = props_to_tm_entity(&etype_str, &name, &props)?;
+            out.push(entity);
+        }
+        Ok(out)
+    }
+
     /// Reinforce an existing entity's confidence and update its timestamp.
     pub fn reinforce_entity(&self, id: Uuid, amount: f64) -> Result<()> {
         let map = self.entity_map.borrow();

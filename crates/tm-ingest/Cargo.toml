@@ -3,12 +3,6 @@ name = "tm-ingest"
 version.workspace = true
 edition.workspace = true
 
-[features]
-default = []
-# GLiNER / GLiREL entity + relation extraction via ONNX Runtime.
-# Requires a downloaded GLiNER model exposed via TM_GLINER_MODEL_PATH.
-gliner = ["dep:ort", "dep:tokenizers", "dep:ndarray"]
-
 [dependencies]
 tm-types = { workspace = true }
 tm-graph = { workspace = true }
@@ -21,8 +15,3 @@ chrono = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 seahash = { workspace = true }
-
-# Optional — only pulled in when the `gliner` feature is enabled.
-ort = { version = "=2.0.0-rc.10", optional = true }
-tokenizers = { version = "0.21", optional = true, default-features = false, features = ["onig"] }
-ndarray = { version = "0.16", optional = true }

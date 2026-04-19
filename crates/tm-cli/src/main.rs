@@ -7,6 +7,7 @@ use tm_controller::UcbBandit;
 use tm_episodic::{ProcedureStore, TraceStore, dry_run};
 use tm_graph::GraphStore;
 use tm_ingest::IngestPipeline;
+use tm_rerank::ColbertReranker;
 use tm_retrieval::RetrievalEngine;
 use tm_types::{Procedure, ProcedureStep};
 use uuid::Uuid;
@@ -178,8 +179,10 @@ fn main() {
         }
 
         Commands::Query { text } => {
+            let reranker = ColbertReranker::auto_download_or_none(0.7);
             let mut engine = RetrievalEngine::open(&db_path, &trace_path, cli.hash_embed)
-                .expect("failed to open retrieval engine");
+                .expect("failed to open retrieval engine")
+                .with_reranker_instance(reranker);
             let result = engine.query(&text).expect("query failed");
 
             // Build a name lookup from the returned entities.

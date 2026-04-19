@@ -3,10 +3,6 @@ name = "tm-retrieval"
 version.workspace = true
 edition.workspace = true
 
-[features]
-default = []
-colbert = ["tm-rerank/colbert"]
-
 [dependencies]
 tm-types = { workspace = true }
 tm-graph = { workspace = true }
