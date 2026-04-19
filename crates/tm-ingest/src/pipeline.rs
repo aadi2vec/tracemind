@@ -952,6 +952,10 @@ pub(crate) fn extract_triples(text: &str, entities: &[Entity]) -> Vec<Triple> {
         (&["part of", "belongs to", "member of", "component of", "included in"], Predicate::PartOf),
         // "X references Y", "X mentions Y", "X links to Y"
         (&["references", "mentions", "links to", "points to", "refers to"], Predicate::References),
+        // TM-NLP-003c — possession / containment: "X has Y", "X contains Y"
+        // Use spaces around bare verbs to reduce substring false matches
+        // ("has" inside "washes", "have" inside "behaves").
+        (&[" has ", " have ", " having ", " contains ", " containing ", " includes ", " including "], Predicate::HasProperty),
     ];
 
     for (keywords, predicate) in patterns {
@@ -1297,6 +1301,20 @@ mod tests {
         assert!(
             has_uses,
             "expected 'uses' predicate; got: {:?}",
+            triples.iter().map(|t| &t.predicate).collect::<Vec<_>>()
+        );
+    }
+
+    /// TM-NLP-003c — "X has Y" / "X contains Y" should emit HasProperty triples.
+    #[test]
+    fn test_typed_predicate_has_property() {
+        let text = "TraceMind contains Rust and Sqlite";
+        let entities = extract_entities(text);
+        let triples = extract_triples(text, &entities);
+        let has_property = triples.iter().any(|t| t.predicate == Predicate::HasProperty);
+        assert!(
+            has_property,
+            "expected HasProperty predicate; got: {:?}",
             triples.iter().map(|t| &t.predicate).collect::<Vec<_>>()
         );
     }
