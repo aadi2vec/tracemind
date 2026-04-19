@@ -10,6 +10,7 @@ use tm_episodic::TraceStore;
 use tm_graph::GraphStore;
 use tm_ingest::IngestPipeline;
 use tm_reason::{AnalogySolver, ChainBuilder, Consolidator};
+use tm_rerank::ColbertReranker;
 use tm_retrieval::RetrievalEngine;
 
 // ---------------------------------------------------------------------------
@@ -573,9 +574,13 @@ async fn main() -> Result<()> {
     let ingest = Arc::new(Mutex::new(
         IngestPipeline::open(&db_path, hash_embed).map_err(|e| anyhow::anyhow!(e.to_string()))?,
     ));
+    // Try to attach ColBERT reranker. If the download/load fails (offline,
+    // rate-limited), the engine transparently runs without reranking.
+    let reranker = ColbertReranker::auto_download_or_none(0.7);
     let retrieval = Arc::new(Mutex::new(
         RetrievalEngine::open(&db_path, &trace_path, hash_embed)
-            .map_err(|e| anyhow::anyhow!(e.to_string()))?,
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?
+            .with_reranker_instance(reranker),
     ));
     let traces = Arc::new(Mutex::new(
         TraceStore::open(&trace_path).map_err(|e| anyhow::anyhow!(e.to_string()))?,

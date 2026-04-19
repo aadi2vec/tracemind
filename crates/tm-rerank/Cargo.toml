@@ -3,12 +3,7 @@ name = "tm-rerank"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
-description = "Optional ColBERT late-interaction reranker for TraceMind"
-
-[features]
-default = []
-# Enable ONNX-based ColBERT reranking (~35MB model)
-colbert = ["ort", "tokenizers", "ndarray"]
+description = "ColBERT late-interaction reranker for TraceMind"
 
 [dependencies]
 tm-types = { workspace = true }
@@ -17,9 +12,14 @@ serde_json = { workspace = true }
 tracing = { workspace = true }
 anyhow = { workspace = true }
 
-# Optional: ONNX Runtime for ColBERT inference (pinned to match fastembed's ort)
-ort = { version = "=2.0.0-rc.10", optional = true }
-# Optional: HuggingFace tokenizer for BPE tokenization
-tokenizers = { version = "0.21", optional = true, default-features = false, features = ["onig"] }
-# Optional: ndarray for tensor manipulation
-ndarray = { version = "0.16", optional = true }
+# ONNX Runtime for ColBERT inference (pinned to match fastembed's ort).
+ort = { version = "=2.0.0-rc.10" }
+# HuggingFace tokenizer for BPE tokenization.
+tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
+# Tensor manipulation for ONNX inputs/outputs.
+ndarray = { version = "0.16" }
+# Model auto-download from HuggingFace Hub.
+hf-hub = { version = "0.4" }
+
+[dev-dependencies]
+tempfile = "3"

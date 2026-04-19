@@ -254,6 +254,16 @@ impl RetrievalEngine {
         Ok(self)
     }
 
+    /// Attach a pre-constructed ColBERT reranker instance (e.g. from
+    /// [`ColbertReranker::auto_download_or_none`]). No-op when `None`.
+    pub fn with_reranker_instance(mut self, reranker: Option<ColbertReranker>) -> Self {
+        if let Some(r) = reranker {
+            info!("[retrieval] ColBERT reranker attached (alpha={})", r.alpha);
+            self.reranker = Some(r);
+        }
+        self
+    }
+
     /// Match stored procedures against a query string.
     ///
     /// Scoring:
@@ -1512,7 +1522,7 @@ impl RetrievalEngine {
     }
 
     /// Apply ColBERT MaxSim scoring using cached per-token embeddings.
-    fn apply_colbert_maxsim(&self, ws: &mut QueryWorkspace, _query_text: &str) -> bool {
+    fn apply_colbert_maxsim(&self, ws: &mut QueryWorkspace, query_text: &str) -> bool {
         let candidate_ids: Vec<Uuid> = ws.candidates.iter().map(|(id, _)| *id).collect();
         let cached_tokens = self.graph.batch_colbert_tokens(&candidate_ids);
 
@@ -1520,29 +1530,28 @@ impl RetrievalEngine {
             return false;
         }
 
-        #[cfg(feature = "colbert")]
-        {
-            let query_tokens_opt: Option<Vec<Vec<f32>>> = self.reranker.as_ref()
-                .and_then(|r| r.encode_query(_query_text).ok());
+        let query_tokens_opt: Option<Vec<Vec<f32>>> = self
+            .reranker
+            .as_ref()
+            .and_then(|r| r.encode_query(query_text).ok());
 
-            if let Some(query_tokens) = query_tokens_opt {
-                let mut scored: Vec<(Uuid, f32)> = Vec::new();
-                for (id, orig_score) in &ws.candidates {
-                    if let Some((flat_embs, token_count, dim)) = cached_tokens.get(id) {
-                        let doc_tokens: Vec<Vec<f32>> = (0..*token_count)
-                            .map(|t| flat_embs[t * dim..(t + 1) * dim].to_vec())
-                            .collect();
-                        let maxsim_score = tm_rerank::maxsim(&query_tokens, &doc_tokens);
-                        let blended = 0.6 * maxsim_score + 0.4 * orig_score;
-                        scored.push((*id, blended));
-                    } else {
-                        scored.push((*id, *orig_score));
-                    }
+        if let Some(query_tokens) = query_tokens_opt {
+            let mut scored: Vec<(Uuid, f32)> = Vec::new();
+            for (id, orig_score) in &ws.candidates {
+                if let Some((flat_embs, token_count, dim)) = cached_tokens.get(id) {
+                    let doc_tokens: Vec<Vec<f32>> = (0..*token_count)
+                        .map(|t| flat_embs[t * dim..(t + 1) * dim].to_vec())
+                        .collect();
+                    let maxsim_score = tm_rerank::maxsim(&query_tokens, &doc_tokens);
+                    let blended = 0.6 * maxsim_score + 0.4 * orig_score;
+                    scored.push((*id, blended));
+                } else {
+                    scored.push((*id, *orig_score));
                 }
-                scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-                ws.candidates = scored;
-                return true;
             }
+            scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            ws.candidates = scored;
+            return true;
         }
 
         false
