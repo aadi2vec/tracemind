@@ -20,7 +20,7 @@
 
 use tm_types::{Entity, Triple};
 
-use crate::pipeline::{extract_entities, extract_triples};
+use crate::pipeline::{extract_entities, extract_keyphrases, extract_triples};
 
 /// Something that can turn raw text into entities + relations.
 ///
@@ -47,7 +47,21 @@ pub struct HeuristicExtractor;
 
 impl EntityExtractor for HeuristicExtractor {
     fn extract_entities(&self, text: &str) -> Vec<Entity> {
-        extract_entities(text)
+        let mut ents = extract_entities(text);
+
+        // TM-NLP-003b — YAKE-lite keyphrase pass. Adds lowercase multi-word
+        // concepts ("machine learning", "vector search") that the Title-Case
+        // extractor misses. Deduplicate against whatever the NER pass
+        // already produced so we don't double-emit the same phrase.
+        let existing: std::collections::HashSet<String> =
+            ents.iter().map(|e| e.name.to_lowercase()).collect();
+        for kp in extract_keyphrases(text) {
+            let key = kp.name.to_lowercase();
+            if !existing.contains(&key) {
+                ents.push(kp);
+            }
+        }
+        ents
     }
 
     fn extract_triples(&self, text: &str, entities: &[Entity]) -> Vec<Triple> {

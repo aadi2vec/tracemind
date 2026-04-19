@@ -841,6 +841,110 @@ fn levenshtein(a: &str, b: &str) -> usize {
     prev[n]
 }
 
+/// TM-NLP-003b — YAKE-style unsupervised keyphrase extraction.
+///
+/// Surfaces multi-word lowercase phrases the Title-Case extractor ignores
+/// (e.g. "machine learning", "vector search", "large language model").
+/// Scoring is intentionally simple — term frequency with a position
+/// bonus for phrases that appear earlier in the text. Any phrase whose
+/// score exceeds `threshold` is emitted as a [`EntityType::Concept`].
+///
+/// Stopwords and common verbs / generic nouns from `STOPWORDS` /
+/// `SKIP_WORDS` are never allowed inside a candidate phrase.
+pub(crate) fn extract_keyphrases(text: &str) -> Vec<Entity> {
+    const MAX_GRAM: usize = 3;
+    const MIN_GRAM: usize = 2;
+    const MIN_SCORE: f64 = 1.0;
+    const MAX_EMIT: usize = 8;
+
+    // Tokenize to lowercased word stream with original positions preserved.
+    let tokens: Vec<String> = text
+        .split_whitespace()
+        .map(|w| {
+            w.trim_matches(STRIP_CHARS)
+                .to_lowercase()
+                .chars()
+                .filter(|c| c.is_alphanumeric() || *c == '-')
+                .collect::<String>()
+        })
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    let total = tokens.len();
+    if total < MIN_GRAM {
+        return Vec::new();
+    }
+
+    // Cheap stopword / skip-word check (case-insensitive against the
+    // Title-Case STOPWORDS table + lowercase SKIP_WORDS).
+    let is_noise = |w: &str| -> bool {
+        if w.len() < 3 || w.chars().all(|c| c.is_ascii_digit()) {
+            return true;
+        }
+        if SKIP_WORDS.contains(&w) {
+            return true;
+        }
+        STOPWORDS.iter().any(|s| s.eq_ignore_ascii_case(w))
+    };
+
+    // Build (phrase -> (count, first_position)) table.
+    let mut phrases: std::collections::HashMap<String, (usize, usize)> =
+        std::collections::HashMap::new();
+    for n in MIN_GRAM..=MAX_GRAM {
+        if total < n {
+            break;
+        }
+        for i in 0..=(total - n) {
+            let window = &tokens[i..i + n];
+            if window.iter().any(|w| is_noise(w)) {
+                continue;
+            }
+            let phrase = window.join(" ");
+            let entry = phrases.entry(phrase).or_insert((0, i));
+            entry.0 += 1;
+            if i < entry.1 {
+                entry.1 = i;
+            }
+        }
+    }
+
+    // Score + threshold.
+    let mut scored: Vec<(String, f64)> = phrases
+        .into_iter()
+        .map(|(phrase, (count, first_pos))| {
+            let freq = count as f64;
+            // Earlier phrases score higher; normalise position by token count.
+            let position_bonus = 1.0 - (first_pos as f64 / total as f64).min(1.0);
+            (phrase, freq + position_bonus)
+        })
+        .filter(|(_, s)| *s >= MIN_SCORE)
+        .collect();
+
+    scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+    // If a longer candidate contains a shorter one AND the shorter one
+    // has strictly higher score, drop the longer — it was inflated by the
+    // shorter high-signal core. This keeps "machine learning" and drops
+    // "explored machine learning" when the bigram is more frequent.
+    let mut kept: Vec<(String, f64)> = Vec::with_capacity(scored.len());
+    for (phrase, score) in &scored {
+        let dominated = scored.iter().any(|(other, other_score)| {
+            other != phrase
+                && other.len() < phrase.len()
+                && phrase.contains(other.as_str())
+                && *other_score >= *score
+        });
+        if !dominated {
+            kept.push((phrase.clone(), *score));
+        }
+    }
+    kept.truncate(MAX_EMIT);
+
+    kept.into_iter()
+        .map(|(phrase, _)| Entity::new(&phrase, EntityType::Concept, 0.6))
+        .collect()
+}
+
 pub(crate) fn extract_entities(text: &str) -> Vec<Entity> {
     let mut seen_names: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut entities: Vec<Entity> = Vec::new();
@@ -1496,6 +1600,39 @@ mod tests {
             linked.unwrap().id,
             rust_id,
             "lowercase mention must re-use the existing entity id"
+        );
+    }
+
+    /// TM-NLP-003b — YAKE keyphrase extraction should surface repeated
+    /// lowercase multi-word concepts.
+    #[test]
+    fn test_yake_surfaces_repeated_lowercase_phrase() {
+        let text = "we explored machine learning today. machine learning is \
+                    a huge field and machine learning keeps growing.";
+        let kps = extract_keyphrases(text);
+        let has_ml = kps.iter().any(|e| e.name == "machine learning");
+        assert!(
+            has_ml,
+            "expected 'machine learning' as keyphrase; got: {:?}",
+            kps.iter().map(|e| &e.name).collect::<Vec<_>>()
+        );
+        // Emitted as Concept.
+        assert!(
+            kps.iter()
+                .filter(|e| e.name == "machine learning")
+                .all(|e| matches!(e.entity_type, EntityType::Concept)),
+        );
+    }
+
+    /// YAKE must not emit pure stopword / verb n-grams.
+    #[test]
+    fn test_yake_skips_noisy_grams() {
+        let text = "the the the and and the and the";
+        let kps = extract_keyphrases(text);
+        assert!(
+            kps.is_empty(),
+            "expected no keyphrases from stopword-only text; got: {:?}",
+            kps.iter().map(|e| &e.name).collect::<Vec<_>>()
         );
     }
 
