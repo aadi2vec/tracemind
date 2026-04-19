@@ -227,6 +227,20 @@ impl IngestPipeline {
                 entity.created_at = existing.created_at;
                 // Reinforce confidence on re-mention
                 self.graph.reinforce_entity(existing.id, 0.05)?;
+                name_to_id.insert(key, entity.id);
+                continue;
+            }
+
+            // TM-NLP-003d — fuzzy match (Levenshtein ≤ 2) against the graph.
+            // Bridges casing / punctuation / minor spelling variants
+            // ("Rustlang" → "Rust", "TypeScript" → "Typescript") without
+            // fragmenting the graph. Only applied when the exact /
+            // case-insensitive lookup missed.
+            if let Some(existing) = self.fuzzy_match_entity(&entity.name) {
+                entity.id = existing.id;
+                entity.confidence = existing.confidence;
+                entity.created_at = existing.created_at;
+                self.graph.reinforce_entity(existing.id, 0.05)?;
             }
 
             name_to_id.insert(key, entity.id);
@@ -633,6 +647,49 @@ impl IngestPipeline {
     }
 
     // -----------------------------------------------------------------------
+    // TM-NLP-003d — fuzzy (Levenshtein) entity linking
+    // -----------------------------------------------------------------------
+
+    /// Find an existing graph entity whose name is within edit-distance 2 of
+    /// `name`. Returns `None` when the best candidate is either absent or
+    /// further than the threshold.
+    ///
+    /// Avoids graph fragmentation from minor spelling / punctuation drift
+    /// ("Rustlang" ↔ "Rust" is too far; "TypeScript" ↔ "Typescript" is 1).
+    /// Length-prefiltered at the SQL layer to keep the candidate set small.
+    fn fuzzy_match_entity(&self, name: &str) -> Option<Entity> {
+        const MAX_DIST: usize = 2;
+        // Very short names are too noisy — 2 edits of a 3-letter word is
+        // half the name. Require at least 4 characters.
+        if name.chars().count() < 4 {
+            return None;
+        }
+
+        let candidates = self
+            .graph
+            .entities_near_length(name.len(), MAX_DIST)
+            .ok()?;
+        let lower = name.to_lowercase();
+
+        let mut best: Option<(usize, Entity)> = None;
+        for cand in candidates {
+            let d = levenshtein(&lower, &cand.name.to_lowercase());
+            if d == 0 {
+                // Exact match would have been caught upstream; skip.
+                continue;
+            }
+            if d > MAX_DIST {
+                continue;
+            }
+            match &best {
+                Some((bd, _)) if *bd <= d => {}
+                _ => best = Some((d, cand)),
+            }
+        }
+        best.map(|(_, e)| e)
+    }
+
+    // -----------------------------------------------------------------------
     // Memory-R1 CRUD decision logic
     // -----------------------------------------------------------------------
 
@@ -750,6 +807,39 @@ const SKIP_WORDS: &[&str] = &[
     "data", "time", "information", "system", "systems", "tool", "tools", "type", "types",
     "team", "teams", "device", "devices", "locally", "core", "part", "way", "thing",
 ];
+
+/// Classic two-row Levenshtein edit distance (stdlib only).
+///
+/// Compares byte-sequences. Callers normalise to lowercase before calling
+/// when case-insensitive matching is desired. O(|a| * |b|) time and O(|b|)
+/// memory, which is fine for the short entity names we compare.
+fn levenshtein(a: &str, b: &str) -> usize {
+    let a_bytes = a.as_bytes();
+    let b_bytes = b.as_bytes();
+    if a_bytes.is_empty() {
+        return b_bytes.len();
+    }
+    if b_bytes.is_empty() {
+        return a_bytes.len();
+    }
+
+    let n = b_bytes.len();
+    let mut prev: Vec<usize> = (0..=n).collect();
+    let mut curr: Vec<usize> = vec![0; n + 1];
+
+    for (i, &ac) in a_bytes.iter().enumerate() {
+        curr[0] = i + 1;
+        for (j, &bc) in b_bytes.iter().enumerate() {
+            let cost = if ac == bc { 0 } else { 1 };
+            let del = prev[j + 1] + 1;
+            let ins = curr[j] + 1;
+            let sub = prev[j] + cost;
+            curr[j + 1] = del.min(ins).min(sub);
+        }
+        std::mem::swap(&mut prev, &mut curr);
+    }
+    prev[n]
+}
 
 pub(crate) fn extract_entities(text: &str) -> Vec<Entity> {
     let mut seen_names: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -1406,6 +1496,73 @@ mod tests {
             linked.unwrap().id,
             rust_id,
             "lowercase mention must re-use the existing entity id"
+        );
+    }
+
+    #[test]
+    fn test_levenshtein_basic_cases() {
+        assert_eq!(levenshtein("rust", "rust"), 0);
+        assert_eq!(levenshtein("rust", "rost"), 1);          // sub
+        assert_eq!(levenshtein("rust", "ruts"), 2);          // transpose ≈ 2 in Lev
+        assert_eq!(levenshtein("typescript", "Typescript".to_lowercase().as_str()), 0);
+        assert_eq!(levenshtein("typescript", "typescripts"), 1); // ins
+        assert_eq!(levenshtein("", "abc"), 3);
+        assert_eq!(levenshtein("abc", ""), 3);
+    }
+
+    /// TM-NLP-003d — after "Typescript" is in the graph, a new mention of
+    /// "TypeScript" (casing variant, 1 char capitalization-drift away once
+    /// lowercased both are equal — so actually this goes through the icase
+    /// path; better test is "TypeScripts" → "Typescript" distance 1).
+    #[test]
+    fn test_fuzzy_match_merges_typo() {
+        let pipeline = in_memory_pipeline();
+        let s1 = Uuid::new_v4();
+        let s2 = Uuid::new_v4();
+
+        let r1 = pipeline
+            .ingest("Typescript is a typed language", s1)
+            .unwrap();
+        let canonical_id = r1
+            .entities
+            .iter()
+            .find(|e| e.name.eq_ignore_ascii_case("Typescript"))
+            .map(|e| e.id)
+            .expect("first ingest should emit Typescript entity");
+
+        // Minor spelling drift — 1 edit away.
+        let r2 = pipeline
+            .ingest("Typescripts is widely used", s2)
+            .unwrap();
+        let linked = r2
+            .entities
+            .iter()
+            .find(|e| e.name.eq_ignore_ascii_case("Typescripts") || e.id == canonical_id);
+        assert!(
+            linked.is_some(),
+            "fuzzy match should have merged 'Typescripts' into existing 'Typescript'; got: {:?}",
+            r2.entities
+        );
+        assert_eq!(
+            linked.unwrap().id,
+            canonical_id,
+            "Typescripts (d=1) must reuse the canonical entity id"
+        );
+    }
+
+    /// Too-far names must not collapse.
+    #[test]
+    fn test_fuzzy_match_rejects_unrelated_names() {
+        let pipeline = in_memory_pipeline();
+        pipeline
+            .ingest("Rust is great for performance", Uuid::new_v4())
+            .unwrap();
+
+        // 4+ edits apart from "Rust" — unrelated.
+        let m = pipeline.fuzzy_match_entity("Python");
+        assert!(
+            m.is_none(),
+            "fuzzy match must not collapse unrelated names; got: {m:?}"
         );
     }
 
