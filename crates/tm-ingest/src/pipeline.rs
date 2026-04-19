@@ -197,6 +197,13 @@ impl IngestPipeline {
         // 3. Extract entities via the configured extractor (heuristic by default).
         let mut entities = self.extractor.extract_entities(text);
 
+        // 3b. Case-insensitive graph-name linking (TM-NLP-003a):
+        //     The heuristic extractor skips lowercase tokens, so a sentence
+        //     like "I use rust daily" never yields an entity even if "Rust"
+        //     already exists in the graph. Rescue those mentions by scanning
+        //     non-title-case tokens against the known entity-name index.
+        self.link_lowercase_to_graph(text, &mut entities);
+
         // 4. Deduplicate: check each entity against the graph.
         //    - Exact or case-insensitive name match → reuse existing entity
         //    - Reinforces confidence of existing entities on re-mention
@@ -550,6 +557,79 @@ impl IngestPipeline {
         }
 
         Ok(stats)
+    }
+
+    // -----------------------------------------------------------------------
+    // TM-NLP-003a — case-insensitive graph-name linking
+    // -----------------------------------------------------------------------
+
+    /// Rescue lowercase / non-Title-Case mentions of entities that already
+    /// exist in the graph. The heuristic extractor is deliberately picky about
+    /// casing (to avoid false positives on prose), which means graph quality
+    /// grows with the graph itself: the moment `Rust` is stored, every future
+    /// "rust" in a captured note becomes a link rather than a miss.
+    ///
+    /// Cost is bounded: we hit the DB only for non-stopword tokens of length
+    /// ≥ 3 that weren't already emitted, and we short-circuit at 20 new hits.
+    fn link_lowercase_to_graph(&self, text: &str, entities: &mut Vec<Entity>) {
+        // Set of already-emitted names (lowercased) so we don't re-emit.
+        let mut seen: std::collections::HashSet<String> = entities
+            .iter()
+            .map(|e| e.name.to_lowercase())
+            .collect();
+        // Individual words that already participate in a multi-word entity —
+        // e.g. "Machine Learning" already covers "machine" and "learning".
+        for e in entities.iter() {
+            for w in e.name.split_whitespace() {
+                seen.insert(w.to_lowercase());
+            }
+        }
+
+        let mut added = 0;
+        for raw in text.split_whitespace() {
+            if added >= 20 || entities.len() >= 40 {
+                break;
+            }
+            let token = raw.trim_matches(STRIP_CHARS);
+            if token.len() < 3 {
+                continue;
+            }
+            let lower = token.to_lowercase();
+            if seen.contains(&lower) {
+                continue;
+            }
+            // Skip Title-Case tokens — the extractor already handled those in
+            // either its multi-word or single-token pass.
+            if is_title_case(token) {
+                continue;
+            }
+            // Skip stopwords and things that look like numbers.
+            if STOPWORDS.contains(&lower.as_str())
+                || lower.chars().all(|c| c.is_ascii_digit())
+            {
+                continue;
+            }
+
+            match self.graph.find_entity_by_name_icase(token) {
+                Ok(Some(existing)) => {
+                    // Preserve the graph's canonical casing for the entity name
+                    // so downstream dedup lines up with the stored row.
+                    let mut e = existing.clone();
+                    // The pipeline's main dedup pass will re-bind the id /
+                    // confidence / created_at, but carrying the existing id
+                    // here avoids a redundant INSERT attempt.
+                    e.confidence = existing.confidence;
+                    entities.push(e);
+                    seen.insert(lower);
+                    added += 1;
+                }
+                _ => { /* no match — leave it */ }
+            }
+        }
+
+        if added > 0 {
+            tracing::debug!("[ingest] linked {added} lowercase mentions to graph");
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -1269,6 +1349,64 @@ mod tests {
                 "Case-insensitive name match should reuse entity"
             );
         }
+    }
+
+    /// TM-NLP-003a — once "Rust" is in the graph, a lowercase mention
+    /// "rust" in a later ingest should link to the same entity instead of
+    /// being dropped entirely by the Title-Case extractor.
+    #[test]
+    fn test_lowercase_mention_links_to_existing_entity() {
+        let pipeline = in_memory_pipeline();
+        let s1 = Uuid::new_v4();
+        let s2 = Uuid::new_v4();
+
+        let r1 = pipeline
+            .ingest("Rust is great for performance", s1)
+            .unwrap();
+        let rust_id = r1
+            .entities
+            .iter()
+            .find(|e| e.name.eq_ignore_ascii_case("rust"))
+            .map(|e| e.id)
+            .expect("first ingest should emit Rust entity");
+
+        // The second ingest has NO Title-Case clue for Rust — only lowercase.
+        let r2 = pipeline
+            .ingest("the rust compiler is fast", s2)
+            .unwrap();
+
+        let linked = r2
+            .entities
+            .iter()
+            .find(|e| e.name.eq_ignore_ascii_case("rust"));
+        assert!(
+            linked.is_some(),
+            "lowercase 'rust' should have been linked to graph; got: {:?}",
+            r2.entities
+        );
+        assert_eq!(
+            linked.unwrap().id,
+            rust_id,
+            "lowercase mention must re-use the existing entity id"
+        );
+    }
+
+    /// Guard against false positives: on an empty graph the linking helper
+    /// must be a pure no-op — it should never invent entities for tokens
+    /// the extractor skipped.
+    #[test]
+    fn test_lowercase_linking_is_noop_on_empty_graph() {
+        let pipeline = in_memory_pipeline();
+        let mut entities: Vec<Entity> = Vec::new();
+        pipeline.link_lowercase_to_graph(
+            "the quick brown fox jumps over the lazy dog",
+            &mut entities,
+        );
+        assert!(
+            entities.is_empty(),
+            "linker must not add entities when graph is empty; got: {:?}",
+            entities
+        );
     }
 
     #[test]
