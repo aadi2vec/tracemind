@@ -119,6 +119,15 @@ fn ensure_data_dir(dir: &PathBuf) {
 // ---------------------------------------------------------------------------
 
 fn main() {
+    // TM-NLP-005: route model loaders at any bundled weights before first load.
+    if let Some(r) = tm_types::bundled::init() {
+        eprintln!(
+            "[tracemind] using bundled models from {} ({})",
+            r.hf_cache.display(),
+            r.source
+        );
+    }
+
     let cli = Cli::parse();
 
     let dir = data_dir();

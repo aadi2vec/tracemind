@@ -1040,12 +1040,26 @@ end tell
 // ---------------------------------------------------------------------------
 
 fn main() {
+    // TM-NLP-005: bundled-model resolution must happen before any hf-hub /
+    // fastembed code runs. In a packaged .app the Tauri bundler places
+    // model weights under Contents/Resources/models/; the resolver finds
+    // them via an exe-relative walk.
+    let bundled = tm_types::bundled::init();
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .init();
+
+    if let Some(r) = &bundled {
+        tracing::info!(
+            "[tm-tauri] bundled models resolved from {} ({})",
+            r.hf_cache.display(),
+            r.source
+        );
+    }
 
     let dir = if let Ok(val) = std::env::var("TM_DATA_DIR") {
         PathBuf::from(val)

@@ -394,12 +394,24 @@ fn truncate(s: &str, max: usize) -> String {
 
 #[tokio::main]
 async fn main() {
+    // TM-NLP-005: resolve bundled model directory before logging so that any
+    // later env-var reads see the bundle path.
+    let bundled = tm_types::bundled::init();
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
                 .add_directive("tm_capture=info".parse().unwrap()),
         )
         .init();
+
+    if let Some(r) = &bundled {
+        tracing::info!(
+            "[tm-capture] bundled models resolved from {} ({})",
+            r.hf_cache.display(),
+            r.source
+        );
+    }
 
     let config = CaptureConfig::from_env();
 

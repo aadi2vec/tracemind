@@ -553,6 +553,10 @@ async fn handle_request(
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // TM-NLP-005: point hf-hub + fastembed at bundled weights (if present)
+    // before any model loads. Silent if no bundle is found.
+    let bundled = tm_types::bundled::init();
+
     // All diagnostics go to stderr so stdout stays clean for MCP wire traffic.
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
@@ -561,6 +565,14 @@ async fn main() -> Result<()> {
                 .add_directive(tracing::Level::WARN.into()),
         )
         .init();
+
+    if let Some(r) = &bundled {
+        tracing::info!(
+            "[tm-mcp] bundled models resolved from {} ({})",
+            r.hf_cache.display(),
+            r.source
+        );
+    }
 
     // Resolve data directory and derive file paths.
     let dir = data_dir();

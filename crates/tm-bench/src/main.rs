@@ -504,6 +504,9 @@ fn chrono_date_now() -> String {
 // ═══════════════════════════════════════════════════════════════════════════
 
 fn main() {
+    // TM-NLP-005: honour bundled/override model directories.
+    let _ = tm_types::bundled::init();
+
     let args: Vec<String> = std::env::args().collect();
     let compare = args.iter().any(|a| a == "--compare");
     let use_hash = args.iter().any(|a| a == "--hash");
