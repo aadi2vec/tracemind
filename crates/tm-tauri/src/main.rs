@@ -1059,8 +1059,12 @@ fn main() {
     let trace_path = dir.join("traces.jsonl").to_str().unwrap().to_string();
     let bandit_path = dir.join("bandit.json");
 
-    let ingest = IngestPipeline::open(&db_path, false)
+    let mut ingest = IngestPipeline::open(&db_path, false)
         .expect("failed to open ingest pipeline");
+    // TM-NLP-004: real GLiNER NER when model is available; heuristic fallback otherwise.
+    if let Some(gli) = tm_ingest::GlinerExtractor::auto_download_default() {
+        ingest = ingest.with_extractor(Box::new(gli));
+    }
     let retrieval = RetrievalEngine::open(&db_path, &trace_path, false)
         .expect("failed to open retrieval engine");
     let trace_store = TraceStore::open(&trace_path)

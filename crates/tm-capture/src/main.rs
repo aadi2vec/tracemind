@@ -17,6 +17,21 @@ use uuid::Uuid;
 
 use tm_ingest::IngestPipeline;
 
+/// TM-NLP-004 helper: open an IngestPipeline and attach the real GLiNER
+/// NER extractor when the model is available on disk / over the network.
+/// The capture daemon benefits most from this — passive capture is where
+/// high-quality NER moves the needle.
+fn open_pipeline_with_ner(
+    db_path: &str,
+    hash_embed: bool,
+) -> Result<IngestPipeline, tm_types::TraceMindError> {
+    let mut pipeline = IngestPipeline::open(db_path, hash_embed)?;
+    if let Some(gli) = tm_ingest::GlinerExtractor::auto_download_default() {
+        pipeline = pipeline.with_extractor(Box::new(gli));
+    }
+    Ok(pipeline)
+}
+
 // ---------------------------------------------------------------------------
 // Config
 // ---------------------------------------------------------------------------
@@ -114,7 +129,7 @@ fn content_hash(s: &str) -> u64 {
 async fn clipboard_loop(config: &CaptureConfig) {
     info!("[clipboard] starting monitor (interval={}ms)", config.clipboard_interval.as_millis());
 
-    let pipeline = match IngestPipeline::open(&config.db_path, config.hash_embed) {
+    let pipeline = match open_pipeline_with_ner(&config.db_path, config.hash_embed) {
         Ok(p) => p,
         Err(e) => {
             warn!("[clipboard] failed to open pipeline: {e}");
@@ -227,7 +242,7 @@ async fn history_loop(config: &CaptureConfig) {
 
     info!("[history] monitoring {:?} (interval={}s)", hist_path, config.history_interval.as_secs());
 
-    let pipeline = match IngestPipeline::open(&config.db_path, config.hash_embed) {
+    let pipeline = match open_pipeline_with_ner(&config.db_path, config.hash_embed) {
         Ok(p) => p,
         Err(e) => {
             warn!("[history] failed to open pipeline: {e}");
@@ -290,7 +305,7 @@ async fn consolidation_loop(config: &CaptureConfig) {
         config.consolidation_interval.as_secs()
     );
 
-    let pipeline = match IngestPipeline::open(&config.db_path, config.hash_embed) {
+    let pipeline = match open_pipeline_with_ner(&config.db_path, config.hash_embed) {
         Ok(p) => p,
         Err(e) => {
             warn!("[consolidate/normal] failed to open pipeline: {e}");
@@ -330,7 +345,7 @@ async fn priority_consolidation_loop(config: &CaptureConfig) {
         config.priority_interval.as_secs()
     );
 
-    let pipeline = match IngestPipeline::open(&config.db_path, config.hash_embed) {
+    let pipeline = match open_pipeline_with_ner(&config.db_path, config.hash_embed) {
         Ok(p) => p,
         Err(e) => {
             warn!("[consolidate/priority] failed to open pipeline: {e}");

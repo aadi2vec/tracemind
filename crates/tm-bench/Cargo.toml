@@ -7,12 +7,24 @@ edition.workspace = true
 name = "tm-bench"
 path = "src/main.rs"
 
+# TM-NLP-004 NER evaluation harness.
+[[bin]]
+name = "tm-bench-ner"
+path = "src/ner_bench.rs"
+
+# TM-NLP-004 end-to-end ingest + query test.
+[[bin]]
+name = "tm-bench-ner-e2e"
+path = "src/ner_e2e.rs"
+
 [dependencies]
 tm-vector = { workspace = true }
 tm-graph = { workspace = true }
 tm-retrieval = { workspace = true }
 tm-types = { workspace = true }
 tm-ingest = { workspace = true }
+tm-episodic = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 uuid = { workspace = true }
+tempfile = "3"

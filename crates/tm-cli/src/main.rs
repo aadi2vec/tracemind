@@ -144,8 +144,13 @@ fn main() {
                 std::process::exit(1);
             }
 
-            let pipeline = IngestPipeline::open(&db_path, cli.hash_embed)
+            let mut pipeline = IngestPipeline::open(&db_path, cli.hash_embed)
                 .expect("failed to open ingest pipeline");
+            // TM-NLP-004: opt into real GLiNER NER when the model is available.
+            // Falls back silently to the heuristic extractor if offline.
+            if let Some(gli) = tm_ingest::GlinerExtractor::auto_download_default() {
+                pipeline = pipeline.with_extractor(Box::new(gli));
+            }
             let session_id = Uuid::new_v4();
             let result = pipeline.ingest(&text, session_id)
                 .expect("ingest failed");
@@ -380,8 +385,12 @@ fn cmd_import(path: &str, extensions: &str, max_kb: u64, dry_run: bool, hash_emb
 
     println!("Importing {} files from {}", files.len(), path);
 
-    let pipeline = IngestPipeline::open(db_path, hash_embed)
+    let mut pipeline = IngestPipeline::open(db_path, hash_embed)
         .expect("failed to open ingest pipeline");
+    // TM-NLP-004: real GLiNER NER for file imports too (bulk path benefits most).
+    if let Some(gli) = tm_ingest::GlinerExtractor::auto_download_default() {
+        pipeline = pipeline.with_extractor(Box::new(gli));
+    }
     let session_id = Uuid::new_v4();
 
     let mut imported = 0u32;

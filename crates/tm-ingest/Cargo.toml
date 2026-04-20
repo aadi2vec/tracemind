@@ -15,3 +15,16 @@ chrono = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 seahash = { workspace = true }
+
+# TM-NLP-004 — real GLiNER inference.
+# Mandatory (no feature flag): ort is already transitively present via tm-rerank.
+# Graceful offline fallback: GlinerExtractor::auto_download_or_none() returns None
+# when the model/tokenizer can't be fetched, and callers drop back to
+# HeuristicExtractor.
+ort = { version = "=2.0.0-rc.10" }
+tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
+ndarray = { version = "0.16" }
+hf-hub = { version = "0.4" }
+
+[dev-dependencies]
+tempfile = "3"

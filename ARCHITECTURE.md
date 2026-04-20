@@ -258,12 +258,24 @@ pub trait EntityExtractor: Send + Sync {
     fn name(&self) -> &'static str;
 }
 ```
-- `HeuristicExtractor` (default) — stdlib-only Title-Case/URL/file heuristics, ~55 % F1.
-  Swap in an alternate implementation via
+- `HeuristicExtractor` (fallback) — stdlib-only Title-Case/URL/file heuristics.
+  Measured on `crates/tm-bench/fixtures/ner_eval.jsonl` (30 labeled sentences):
+  P = 0.322, R = 0.961, **F1 = 0.483**.
+- `GlinerExtractor` (**default when the ONNX model is available**, TM-NLP-004) —
+  real span-based zero-shot NER via `onnx-community/gliner_small-v2.1`
+  (183 MB int8 ONNX) auto-downloaded through `hf-hub` on first run, executed
+  via `ort` with a DeBERTa-v3 tokenizer. Measured on the same fixture at
+  threshold 0.3: P = 0.928, R = 0.882, **F1 = 0.905** (≈ 10 ms/doc inference,
+  ≈ 44 ms/doc end-to-end ingest). Default labels:
+  `person / organization / location / technology / product / project /
+  concept / event`. End-to-end probe: **10/10 natural-language queries hit
+  the expected entity** on a fresh DB ingested from the fixture.
+- Every binary (`tracemind`, `tm-mcp`, `tm-tauri`, `tm-capture`) now calls
+  `GlinerExtractor::auto_download_default()` at startup and silently falls
+  back to the heuristic extractor if the model can't be fetched — no
+  scaffold path pretends to be inference.
+- Swap in a custom extractor with
   `IngestPipeline::open(…)?.with_extractor(Box::new(ext))`.
-- A real ONNX GLiNER extractor (~85 % F1) is tracked by TM-NLP-004 and is
-  gated on a local model + evaluation fixture being available — there is no
-  scaffold path that pretends to be inference.
 
 ### tm-reason (Intelligence — 1,100 lines, 9 tests)
 - **ChainBuilder** — BFS multi-hop paths, hop decay 0.85^n
@@ -460,6 +472,7 @@ OS. Design principle: capture is cheap, promotion is selective, recall is hybrid
 | TM-5.1-001c | **`EntityExtractor` trait** — `HeuristicExtractor` default; pluggable seam for real ONNX GLiNER (tracked by TM-NLP-004 once a local model + fixture exist) | Medium — unblocks ~55 % → ~85 % F1 upgrade without call-site churn |
 | TM-NLP-001 | **ColBERT reranker always-on** — removed the `colbert` feature gate in `tm-rerank` / `tm-retrieval`; `ColbertReranker::auto_download_or_none(0.7)` wires `mixedbread-ai/mxbai-edge-colbert-v0-17m` into both `tracemind query` and `tm-mcp` by default, falling back silently when offline | High — BEIR 0.49 vs MiniLM's 0.42 on every query |
 | TM-NLP-002 | **Deleted GLiNER scaffold** — `crates/tm-ingest/src/gliner.rs` and the `gliner` feature flag were removed. The pluggable extractor trait remains; a real GLiNER integration is gated on local model + fixture availability (TM-NLP-004) | Low (code hygiene) — no more "delegates to heuristic" stub pretending to be inference |
+| TM-NLP-004 | **Real GLiNER NER now default** — `onnx-community/gliner_small-v2.1` (int8, 183 MB) auto-downloaded via `hf-hub` and run through `ort` + DeBERTa-v3 tokenizer. 8-label zero-shot span extraction with threshold 0.3, greedy-NMS decoding. Fixed a silent `decide_memory_op` dedup bug that was collapsing multi-entity sentences under embedding similarity alone — now requires name-substring agreement before Update/Noop. Wired into every ingest call site: `tracemind`, `tm-mcp`, `tm-tauri`, `tm-capture` (4 loops). New eval harnesses `tm-bench-ner` (P/R/F1) and `tm-bench-ner-e2e` (ingest→query probes on a fresh temp DB). Measured F1 = 0.905 (vs heuristic 0.483); e2e 10/10 = 100 % probe hit. | High — ~55 % → ~90 % F1 everywhere; entity layer of the graph is finally trustworthy |
 
 ### Phase 5 — Predictive Intelligence
 
