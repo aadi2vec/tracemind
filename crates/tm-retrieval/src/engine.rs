@@ -144,6 +144,22 @@ pub struct Recommendation {
     pub reason: String,
 }
 
+/// A related entity surfaced alongside primary query results.
+///
+/// Related entities are 1-hop graph neighbours of the top-k direct hits,
+/// scored by vector similarity to the query (so the user sees "you might
+/// also want…" without having to ask a second query). See TM-UX-001.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RelatedEntity {
+    pub id: Uuid,
+    pub name: String,
+    pub entity_type: String,
+    /// Combined score: cosine(query, candidate) × graph_proximity weight.
+    pub score: f32,
+    /// Human-readable provenance, e.g. "1-hop from Alice".
+    pub reason: String,
+}
+
 pub struct RetrievalEngine {
     graph: GraphStore,
     trace_store: TraceStore,
@@ -183,6 +199,10 @@ pub struct RetrievalResult {
     /// Hits against unpromoted signals (hybrid retrieval path). These are raw captures
     /// that haven't yet been consolidated into graph entities.
     pub signal_hits: Vec<SignalHit>,
+    /// 1-hop graph neighbours of the primary hits, ranked by query-similarity.
+    /// Populated by `compute_related_entities`; surfaced as "Related:" in CLI
+    /// and `related_entities` in MCP responses. See TM-UX-001.
+    pub related_entities: Vec<RelatedEntity>,
 }
 
 impl RetrievalEngine {
@@ -832,6 +852,14 @@ impl RetrievalEngine {
             &phase_pairs,
         );
 
+        let related_entities = compute_related_entities(
+            &self.graph,
+            &ws.query_embedding,
+            &ws.entities,
+            5,  // max seeds — top 5 primary hits
+            5,  // max related
+        );
+
         Ok(RetrievalResult {
             arm: ws.arm,
             entities: ws.entities,
@@ -846,6 +874,7 @@ impl RetrievalEngine {
             phases: ws.phases,
             reasoning_narrative,
             signal_hits: ws.signal_hits,
+            related_entities,
         })
     }
 
@@ -940,6 +969,7 @@ impl RetrievalEngine {
 
         // Cache the original query embedding
         let emb = self.embedder.embed(original_text);
+        let orig_query_embedding = emb.clone();
         self.query_cache.push(original_text.to_string(), emb);
 
         // Log access
@@ -968,6 +998,14 @@ impl RetrievalEngine {
             &decompose_phases,
         );
 
+        let related_entities = compute_related_entities(
+            &self.graph,
+            &orig_query_embedding,
+            &all_entities,
+            5,
+            5,
+        );
+
         Ok(RetrievalResult {
             arm: 0,
             entities: all_entities,
@@ -988,6 +1026,7 @@ impl RetrievalEngine {
             }],
             reasoning_narrative,
             signal_hits: Vec::new(),
+            related_entities,
         })
     }
 
@@ -1207,6 +1246,15 @@ impl RetrievalEngine {
             &phase_pairs,
         );
 
+        let temporal_query_embedding = self.embedder.embed(original_text);
+        let related_entities = compute_related_entities(
+            &self.graph,
+            &temporal_query_embedding,
+            &final_entities,
+            5,
+            5,
+        );
+
         Ok(RetrievalResult {
             arm: 0,
             entities: final_entities,
@@ -1221,6 +1269,7 @@ impl RetrievalEngine {
             phases,
             reasoning_narrative,
             signal_hits: Vec::new(),
+            related_entities,
         })
     }
 
@@ -1631,6 +1680,82 @@ fn diversify_entities(entities: &mut Vec<Entity>, graph: &GraphStore, lambda: f6
     *entities = reordered;
 }
 
+/// TM-UX-001 Phase A — Seamless recommendation.
+///
+/// Compute 1-hop related entities from the primary hits: for each top-k
+/// direct result, pull graph neighbours (excluding entities already in the
+/// primary set), then rank by `cosine(query, candidate_embedding)`. Missing
+/// embeddings fall back to a small graph-proximity-only score so a structural
+/// neighbour still shows up even when vector recall is thin.
+///
+/// Bounded: `max_source_seeds` limits fan-out to the top primary hits,
+/// `max_related` caps output. Both guard against explosion on dense graphs.
+pub(crate) fn compute_related_entities(
+    graph: &GraphStore,
+    query_embedding: &[f32],
+    primary: &[Entity],
+    max_source_seeds: usize,
+    max_related: usize,
+) -> Vec<RelatedEntity> {
+    if primary.is_empty() || max_related == 0 {
+        return Vec::new();
+    }
+
+    let primary_ids: HashSet<Uuid> = primary.iter().map(|e| e.id).collect();
+    // Keep best score per candidate id and remember which seed it was reached from
+    // (first reaching seed wins for the `reason` attribution).
+    let mut best: HashMap<Uuid, (f32, Entity, String)> = HashMap::new();
+
+    for seed in primary.iter().take(max_source_seeds) {
+        let neighbors = match graph.k_hop_neighbors(seed.id, 1) {
+            Ok(n) => n,
+            Err(_) => continue,
+        };
+        for cand in neighbors {
+            if primary_ids.contains(&cand.id) {
+                continue;
+            }
+
+            // Vector sim to query; 0.0 when no embedding stored.
+            let vec_score = match graph.get_vector(cand.id) {
+                Ok(Some(v)) if !query_embedding.is_empty() && !v.is_empty() => {
+                    cosine_sim(query_embedding, &v)
+                }
+                _ => 0.0,
+            };
+
+            // Graph-proximity floor — a 1-hop neighbour is always at least mildly
+            // worth surfacing. 0.1 keeps it below any real cosine hit.
+            let score = vec_score.max(0.0) + 0.1;
+
+            let reason = format!("1-hop from {}", seed.name);
+            best.entry(cand.id)
+                .and_modify(|entry| {
+                    if score > entry.0 {
+                        entry.0 = score;
+                        entry.2 = reason.clone();
+                    }
+                })
+                .or_insert((score, cand, reason));
+        }
+    }
+
+    let mut scored: Vec<(f32, Entity, String)> = best.into_values().collect();
+    scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    scored.truncate(max_related);
+
+    scored
+        .into_iter()
+        .map(|(score, entity, reason)| RelatedEntity {
+            id: entity.id,
+            name: entity.name,
+            entity_type: format!("{:?}", entity.entity_type).to_lowercase(),
+            score,
+            reason,
+        })
+        .collect()
+}
+
 fn cosine_sim(a: &[f32], b: &[f32]) -> f32 {
     let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
     let norm_a: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
@@ -1732,5 +1857,61 @@ mod tests {
 
         let result2 = rra_fuse(&[vec![], vec![]], 60.0);
         assert!(result2.is_empty());
+    }
+
+    /// TM-UX-001: a query that hits entity A surfaces A's 1-hop neighbour B
+    /// as a `related_entity`, not as a primary hit.
+    #[test]
+    fn related_entities_surfaces_one_hop_neighbours() {
+        use tm_types::{Entity, EntityType, Predicate, Triple};
+
+        let dir = std::env::temp_dir().join(format!("tm_ret_related_{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("test.db").to_str().unwrap().to_string();
+
+        let graph = GraphStore::open(&db).unwrap();
+
+        // Seed graph: A (the hit) — related_to — B (the neighbour).
+        let a = Entity::new("Apple", EntityType::Organization, 0.9);
+        let b = Entity::new("M4 chip", EntityType::Concept, 0.9);
+        graph.upsert_entity(&a).unwrap();
+        graph.upsert_entity(&b).unwrap();
+        let t = Triple::new(a.id, Predicate::RelatedTo, b.id, 0.9);
+        graph.upsert_triple(&t).unwrap();
+
+        // Give both entities a query-like embedding so vector search returns A,
+        // and the related-entity scorer has a signal on B. Hash embedder is
+        // deterministic given the same text.
+        let embedder = Embedder::new_hash();
+        let query = "Apple hardware";
+        let query_emb = embedder.embed(query);
+        let a_emb = embedder.embed("Apple");
+        let b_emb = embedder.embed("M4 chip");
+        graph.upsert_vector(a.id, &a_emb).unwrap();
+        graph.upsert_vector(b.id, &b_emb).unwrap();
+
+        // Directly exercise the helper — isolates the feature from query() side-effects.
+        let primary = vec![a.clone()];
+        let related = compute_related_entities(&graph, &query_emb, &primary, 5, 5);
+
+        assert_eq!(related.len(), 1, "expected one related entity, got {related:?}");
+        assert_eq!(related[0].id, b.id);
+        assert_eq!(related[0].name, "M4 chip");
+        assert!(
+            related[0].reason.contains("Apple"),
+            "reason should attribute to seed entity: {:?}", related[0].reason
+        );
+
+        // Primary entity must never appear in related (dedup guarantee).
+        let primary_both = vec![a.clone(), b.clone()];
+        let related_both = compute_related_entities(&graph, &query_emb, &primary_both, 5, 5);
+        assert!(related_both.is_empty(),
+            "B should be filtered when already in primary set, got {related_both:?}");
+
+        // Empty primary → empty related (bounded).
+        let none = compute_related_entities(&graph, &query_emb, &[], 5, 5);
+        assert!(none.is_empty());
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
