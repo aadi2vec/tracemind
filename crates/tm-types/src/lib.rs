@@ -11,6 +11,7 @@ pub mod procedure;
 pub mod error;
 pub mod memory_op;
 pub mod time_range;
+pub mod bundled;
 
 pub use entity::*;
 pub use triple::*;

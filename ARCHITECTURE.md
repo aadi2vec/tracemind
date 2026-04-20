@@ -274,6 +274,14 @@ pub trait EntityExtractor: Send + Sync {
   `GlinerExtractor::auto_download_default()` at startup and silently falls
   back to the heuristic extractor if the model can't be fetched — no
   scaffold path pretends to be inference.
+- **Model loading is bundle-first** (TM-NLP-005). On startup every binary
+  calls `tm_types::bundled::init()`, which resolves a models directory in
+  priority order — `$TM_MODELS_DIR` → exe-relative bundle
+  (`<exe>/../Resources/models` in the Tauri `.app`) → `~/.tracemind/models`
+  — and sets `HF_HOME` + `FASTEMBED_CACHE_DIR` to point there. `hf-hub`
+  (GLiNER, ColBERT) and `fastembed` (BGE) then read bundled weights without
+  touching HuggingFace. See `THIRD_PARTY_LICENSES.md` for shipped model
+  attributions and `scripts/fetch-models.sh` for the build-time populator.
 - Swap in a custom extractor with
   `IngestPipeline::open(…)?.with_extractor(Box::new(ext))`.
 
@@ -473,6 +481,7 @@ OS. Design principle: capture is cheap, promotion is selective, recall is hybrid
 | TM-NLP-001 | **ColBERT reranker always-on** — removed the `colbert` feature gate in `tm-rerank` / `tm-retrieval`; `ColbertReranker::auto_download_or_none(0.7)` wires `mixedbread-ai/mxbai-edge-colbert-v0-17m` into both `tracemind query` and `tm-mcp` by default, falling back silently when offline | High — BEIR 0.49 vs MiniLM's 0.42 on every query |
 | TM-NLP-002 | **Deleted GLiNER scaffold** — `crates/tm-ingest/src/gliner.rs` and the `gliner` feature flag were removed. The pluggable extractor trait remains; a real GLiNER integration is gated on local model + fixture availability (TM-NLP-004) | Low (code hygiene) — no more "delegates to heuristic" stub pretending to be inference |
 | TM-NLP-004 | **Real GLiNER NER now default** — `onnx-community/gliner_small-v2.1` (int8, 183 MB) auto-downloaded via `hf-hub` and run through `ort` + DeBERTa-v3 tokenizer. 8-label zero-shot span extraction with threshold 0.3, greedy-NMS decoding. Fixed a silent `decide_memory_op` dedup bug that was collapsing multi-entity sentences under embedding similarity alone — now requires name-substring agreement before Update/Noop. Wired into every ingest call site: `tracemind`, `tm-mcp`, `tm-tauri`, `tm-capture` (4 loops). New eval harnesses `tm-bench-ner` (P/R/F1) and `tm-bench-ner-e2e` (ingest→query probes on a fresh temp DB). Measured F1 = 0.905 (vs heuristic 0.483); e2e 10/10 = 100 % probe hit. | High — ~55 % → ~90 % F1 everywhere; entity layer of the graph is finally trustworthy |
+| TM-NLP-005 | **Bundled / offline-first model loading.** New `tm_types::bundled::init()` runs at every binary startup and routes `hf-hub` (GLiNER, ColBERT) and `fastembed` (BGE) at a local model directory via `HF_HOME` / `FASTEMBED_CACHE_DIR`. Resolution ladder: `$TM_MODELS_DIR` → exe-relative bundle (`<exe>/../Resources/models` for the Tauri `.app`) → `~/.tracemind/models` → hf-hub default. Tauri `bundle.resources` glob includes `models/**/*` so the .dmg ships the weights; `scripts/fetch-models.sh` populates the cache from upstream HF during `beforeBundleCommand`. `THIRD_PARTY_LICENSES.md` documents the three shipped models (GLiNER Apache-2.0, mxbai-edge-colbert Apache-2.0, BGE MIT). | High — packaged binary makes zero outbound HF requests; air-gapped / privacy-sensitive users can set `TM_MODELS_DIR` and stay fully offline |
 
 ### Phase 5 — Predictive Intelligence
 

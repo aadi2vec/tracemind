@@ -7,7 +7,8 @@
     "frontendDist": "./ui/dist",
     "devUrl": "http://localhost:3000",
     "beforeDevCommand": "",
-    "beforeBuildCommand": ""
+    "beforeBuildCommand": "",
+    "beforeBundleCommand": "../../scripts/fetch-models.sh ./models"
   },
   "app": {
     "windows": [
@@ -30,6 +31,9 @@
     "targets": "all",
     "icon": [
       "icons/icon.png"
-    ]
+    ],
+    "resources": {
+      "models/**/*": "models/"
+    }
   }
 }
