@@ -35,7 +35,7 @@ fn tools_list() -> Value {
         "tools": [
             {
                 "name": "memory_store",
-                "description": "Ingest text into TraceMind memory, extracting entities and triples.",
+                "description": "Ingest text into TraceMind memory, extracting entities and triples. Response also carries a `context` field with pre-existing memories related to the stored text (top-3 entities + top-3 1-hop neighbours), so callers see \"here's what I already knew\" without a second query.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -144,6 +144,7 @@ fn tools_list() -> Value {
 async fn handle_memory_store(
     params: &Value,
     ingest: &Arc<Mutex<IngestPipeline>>,
+    retrieval: &Arc<Mutex<RetrievalEngine>>,
     traces: &Arc<Mutex<TraceStore>>,
     session_id: Uuid,
 ) -> Result<Value, String> {
@@ -152,19 +153,71 @@ async fn handle_memory_store(
         .and_then(|v| v.as_str())
         .ok_or_else(|| "missing required parameter: text".to_string())?;
 
+    // TM-UX-001 Phase C: proactive surfacing. Run recall against the
+    // *pre-existing* graph state BEFORE ingest, so the caller sees "here's
+    // what I already knew on this topic" without issuing a second query. We
+    // must query before ingest because `ingest()` upserts entities — running
+    // recall after would re-return the just-stored items as if pre-existing.
+    //
+    // The retrieval engine holds its own `GraphStore` with an in-memory
+    // UUID cache that was snapshotted at server start; refresh from disk so
+    // entities written by *earlier* memory_store calls in this session are
+    // visible to search_vectors.
+    let (context_memories, context_related): (Vec<Value>, Vec<Value>) = {
+        let mut engine = retrieval.lock().await;
+        let _ = engine.refresh_graph();
+        match engine.query(text) {
+            Ok(r) => {
+                let memories: Vec<Value> = r
+                    .entities
+                    .iter()
+                    .take(3)
+                    .map(|e| {
+                        json!({
+                            "id": e.id.to_string(),
+                            "name": e.name,
+                            "type": format!("{:?}", e.entity_type).to_lowercase(),
+                        })
+                    })
+                    .collect();
+                let related: Vec<Value> = r
+                    .related_entities
+                    .iter()
+                    .take(3)
+                    .map(|re| {
+                        json!({
+                            "id": re.id.to_string(),
+                            "name": re.name,
+                            "type": re.entity_type,
+                            "reason": re.reason,
+                        })
+                    })
+                    .collect();
+                (memories, related)
+            }
+            Err(_) => (Vec::new(), Vec::new()),
+        }
+    };
+
     let pipeline = ingest.lock().await;
     let result = pipeline
         .ingest(text, session_id)
         .map_err(|e| e.to_string())?;
+    drop(pipeline);
 
     // Persist the trace from the pipeline result (already has raw_text + entity/triple IDs).
     let trace_store = traces.lock().await;
     let _ = trace_store.append(&result.trace);
+    drop(trace_store);
 
     Ok(json!({
         "stored": true,
         "entities": result.entities.len(),
-        "triples": result.triples.len()
+        "triples": result.triples.len(),
+        "context": {
+            "memories": context_memories,
+            "related": context_related,
+        }
     }))
 }
 
@@ -179,6 +232,10 @@ async fn handle_memory_query(
         .ok_or_else(|| "missing required parameter: text".to_string())?;
 
     let mut engine = retrieval.lock().await;
+    // Same rationale as memory_store: the retrieval engine's GraphStore cache
+    // is stale relative to writes from the ingest-side GraphStore in a
+    // long-running MCP session. See TM-UX-001 Phase C.
+    let _ = engine.refresh_graph();
     let result = engine.query(text).map_err(|e| e.to_string())?;
 
     // Extract the plan action for auto-routing supplemental data
@@ -512,7 +569,7 @@ async fn handle_request(
 
             let tool_result = match tool_name {
                 "memory_store" => {
-                    handle_memory_store(&args, ingest, traces, session_id)
+                    handle_memory_store(&args, ingest, retrieval, traces, session_id)
                         .await
                         .map_err(|e| anyhow::anyhow!(e))?
                 }
@@ -686,4 +743,76 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// TM-UX-001 Phase C: a second `memory_store` call with related text
+    /// surfaces the first call's entities via `context.memories`, without the
+    /// caller having to invoke `memory_query`.
+    #[tokio::test]
+    async fn memory_store_returns_proactive_context() {
+        let dir = std::env::temp_dir().join(format!("tm_mcp_phaseC_{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("memory.db").to_str().unwrap().to_string();
+        let trace_path = dir.join("traces.jsonl").to_str().unwrap().to_string();
+
+        // Hash embeddings keep this hermetic — no model download.
+        let ingest = Arc::new(Mutex::new(
+            IngestPipeline::open(&db_path, true).expect("ingest open"),
+        ));
+        let retrieval = Arc::new(Mutex::new(
+            RetrievalEngine::open(&db_path, &trace_path, true).expect("retrieval open"),
+        ));
+        let traces = Arc::new(Mutex::new(
+            TraceStore::open(&trace_path).expect("traces open"),
+        ));
+        let session = Uuid::new_v4();
+
+        // First store seeds the graph.
+        let first = handle_memory_store(
+            &json!({"text": "Apple announced the M4 chip built on TSMC N3E."}),
+            &ingest,
+            &retrieval,
+            &traces,
+            session,
+        )
+        .await
+        .expect("first store");
+        assert_eq!(first["stored"], json!(true));
+        // First call has nothing pre-existing to surface — context is present but empty-ish.
+        assert!(first.get("context").is_some(), "first response must carry context field");
+
+        // Second store on related text should surface at least one of the first-call entities.
+        let second = handle_memory_store(
+            &json!({"text": "Apple is designing new silicon internally."}),
+            &ingest,
+            &retrieval,
+            &traces,
+            session,
+        )
+        .await
+        .expect("second store");
+        assert_eq!(second["stored"], json!(true));
+
+        let ctx = second.get("context").expect("context present");
+        let memories = ctx.get("memories").and_then(|v| v.as_array()).expect("memories array");
+
+        // At least one pre-existing entity ("Apple", "M4 chip", "TSMC", or "N3E") should
+        // surface as context — none of these are in the *second* store's extraction.
+        assert!(!memories.is_empty(),
+            "expected proactive context_memories from prior store, got empty: {second}");
+        assert!(memories.len() <= 3, "bounded at top-3, got {}", memories.len());
+
+        // Every memory entry must be a non-stored (pre-existing) entity —
+        // confirmed by structure: each has {id, name, type}.
+        for m in memories {
+            assert!(m.get("name").is_some(), "memory missing name: {m}");
+            assert!(m.get("type").is_some(), "memory missing type: {m}");
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }

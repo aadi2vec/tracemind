@@ -200,6 +200,63 @@ impl GraphStore {
         })
     }
 
+    /// Re-scan the underlying SQLite store and rebuild the UUID ↔ skg-id
+    /// caches from disk.
+    ///
+    /// Why: `GraphStore::open` snapshots the entity/triple maps once at open
+    /// time. When two separate `GraphStore` instances point at the same DB
+    /// (e.g. one inside `IngestPipeline`, one inside `RetrievalEngine` in a
+    /// long-running MCP server), the retrieval side never sees writes made
+    /// by the ingest side because `search_vectors` filters through the cache.
+    /// Callers that need read-after-write across instances must invoke this
+    /// before querying. TM-UX-001 Phase C relies on it for proactive
+    /// `memory_store` context.
+    pub fn reload_maps(&self) -> Result<()> {
+        let entities = self
+            .kg
+            .list_entities(None, None)
+            .map_err(|e| TraceMindError::Storage(format!("skg list_entities: {e}")))?;
+
+        let mut entity_map = HashMap::new();
+        for ent in &entities {
+            if let Some(skg_id) = ent.id {
+                if let Some(uuid) = prop_uuid(ent.get_property("uuid")) {
+                    entity_map.insert(uuid, skg_id);
+                }
+            }
+        }
+
+        let mut triple_map = HashMap::new();
+        {
+            let conn = self.kg.connection();
+            let mut stmt = conn
+                .prepare("SELECT id, properties FROM kg_relations")
+                .map_err(|e| TraceMindError::Storage(format!("load relations: {e}")))?;
+            let rows = stmt
+                .query_map([], |row| {
+                    let id: i64 = row.get(0)?;
+                    let props_str: String = row.get(1)?;
+                    Ok((id, props_str))
+                })
+                .map_err(|e| TraceMindError::Storage(format!("query relations: {e}")))?;
+            for row in rows {
+                let (id, props_str) =
+                    row.map_err(|e| TraceMindError::Storage(e.to_string()))?;
+                if let Ok(props) =
+                    serde_json::from_str::<HashMap<String, serde_json::Value>>(&props_str)
+                {
+                    if let Some(uuid) = prop_uuid(props.get("uuid")) {
+                        triple_map.insert(uuid, id);
+                    }
+                }
+            }
+        }
+
+        *self.entity_map.borrow_mut() = entity_map;
+        *self.triple_map.borrow_mut() = triple_map;
+        Ok(())
+    }
+
     // ─── Entity CRUD ────────────────────────────────────────────────────
 
     pub fn upsert_entity(&self, entity: &Entity) -> Result<()> {
