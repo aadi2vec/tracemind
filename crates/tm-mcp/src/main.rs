@@ -213,11 +213,27 @@ async fn handle_memory_query(
 
     let explanation = result.causal_trace.explain();
 
+    // TM-UX-001: surface 1-hop related entities as "you might also want…".
+    let related_entities: Vec<Value> = result
+        .related_entities
+        .iter()
+        .map(|r| {
+            json!({
+                "id": r.id.to_string(),
+                "name": r.name,
+                "type": r.entity_type,
+                "score": r.score,
+                "reason": r.reason,
+            })
+        })
+        .collect();
+
     // Auto-routing: if the planner detected a reasoning/analogy query,
     // enrich the response with supplemental reasoning data.
     let mut response = json!({
         "entities": entities,
         "triples": triples,
+        "related_entities": related_entities,
         "arm": result.arm,
         "explanation": explanation,
         "reasoning": result.reasoning_narrative,

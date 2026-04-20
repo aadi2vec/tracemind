@@ -219,6 +219,14 @@ fn main() {
                 }
             }
 
+            // TM-UX-001: surface 1-hop graph neighbours as recommendations.
+            if !result.related_entities.is_empty() {
+                println!("\nRelated:");
+                for r in &result.related_entities {
+                    println!("  [{}] {} ({})", r.entity_type, r.name, r.reason);
+                }
+            }
+
             // Bandit stats are auto-saved by RetrievalEngine after each query.
         }
 

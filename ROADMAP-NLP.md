@@ -100,17 +100,257 @@ Threshold sweep picked 0.3 (0.4 → 0.844, 0.5 → 0.795).
 
 **Acceptance met:** `cargo test -p tm-ingest` 44/44 green, `cargo run --bin tm-bench-ner-e2e` 10/10 green, F1 numbers committed above.
 
-### 5. TM-NLP-005 — MCP structured ingestion (TM-5.1-002 from main roadmap)
+### 5. TM-NLP-005 — Bundled / offline-first model loading — ✅ SHIPPED
 
-**Why deprioritised:** MCP is a minority of ingest traffic for this deployment. Still worth doing for the LLM-client path, but after the passive-path quality is lifted.
+**Shipped 2026-04-19.** Packaged binaries run with zero outbound HuggingFace traffic.
 
-**Scope:** extend `memory_store` MCP tool to accept `{text, entities?, triples?}` with optional pre-extracted structure. If the client provides entities/triples, skip the extractor and go straight to graph upsert. Adds a compatibility bump to the MCP schema.
+**What landed:**
+- `tm_types::bundled::init()` — single-call resolver that walks
+  `$TM_MODELS_DIR` → exe-relative bundle (`<exe>/../Resources/models` for
+  the Tauri `.app`) → `~/.tracemind/models` → hf-hub default, and sets
+  `HF_HOME` + `FASTEMBED_CACHE_DIR` so `hf-hub` (GLiNER, ColBERT) and
+  `fastembed` (BGE) all read bundled weights. Honours user-set env vars
+  (no clobber).
+- Wired into every binary's `main()`: `tracemind`, `tm-mcp`, `tm-tauri`,
+  `tm-capture`, `tm-bench`.
+- `crates/tm-tauri/tauri.conf.json` — `bundle.resources` globs
+  `models/**/*` into `Contents/Resources/models/`.
+- `scripts/fetch-models.sh` — pre-populates the HF cache layout at build
+  time (GLiNER, mxbai-edge-colbert, BGE); intended for
+  `beforeBundleCommand`.
+- `THIRD_PARTY_LICENSES.md` — GLiNER Apache-2.0, mxbai-edge-colbert
+  Apache-2.0, BGE MIT.
+
+**Size budget:** ~347 MB of int8 ONNX → ~200–250 MB compressed `.dmg`,
+comparable to Slack/Discord/VS Code.
+
+**Privacy guarantee:** when `init()` resolves a populated bundle, **no
+TraceMind binary opens a connection to HuggingFace at any point.** The
+`auto_download_or_none` paths still exist but only run when the bundle is
+missing a specific model.
+
+**Acceptance met:** `cargo test -p tm-types` 24/24 green (4 new
+`bundled::` tests); smoke:
+`TM_MODELS_DIR=/tmp/x tracemind status` → `"[tracemind] using bundled
+models from /tmp/x (TM_MODELS_DIR)"`.
+
+---
+
+## Quality gaps — next-up backlog
+
+After TM-NLP-001/002/003/004/005, these are the remaining holes, ranked
+by impact. Each gets its own ticket; sequencing reflects dependency + ROI.
+
+### 6. TM-NLP-006 — GLiREL relation extraction
+
+**Why:** the biggest remaining NLP hole. GLiNER is NER-only; edges in the
+graph are still surface-pattern regex (`works_at`, `uses`, …). Multi-hop
+reasoning collapses when edges are sparse or mislabelled.
+
+**Scope:**
+- Add a `RelationExtractor` trait (symmetric to `EntityExtractor`).
+- Ship `GlirelExtractor` over `knowledgator/gliner-multitask-large-v1.0`
+  or `jackboyla/glirel` ONNX export (same `ort` + `hf-hub` pattern as
+  GLiNER).
+- Zero-shot relation set, extendable via trait constructor; defaults:
+  `works_at`, `founded`, `part_of`, `uses`, `built_with`, `located_in`,
+  `collaborates_with`, `causes`.
+- Wire into `IngestPipeline::with_relation_extractor`.
+- New `tm-bench-rel` harness on a labeled relation fixture; target F1 ≥
+  0.70 (current regex baseline ≈ 0.35 on the same fixture).
+- Fall back to the heuristic patterns on model-load failure.
+
+**Impact:** High — graph edges become trustworthy, unlocks Phase 5
+reasoning chains that currently surface only because the node set is
+good enough.
+
+### 7. TM-NLP-007 — Coreference resolution
+
+**Why:** "Apple announced the M4. It has 40 % more cores." — "It" never
+links to M4, so that fact is a silently orphaned triple. Every pronoun in
+a multi-sentence capture is a lost edge.
+
+**Scope:**
+- Phase A (stdlib, cheap): deterministic pronoun resolver. Same-paragraph
+  back-reference from {it / they / he / she / this / that} to the most
+  recent matching entity by type + number agreement. Covers ~60 % of cases
+  with zero model cost; runs before relation extraction.
+- Phase B (optional): integrate `allenai/longformer-scico` or a small
+  ONNX-exported coreference model for cross-paragraph / cross-document
+  chains. Gated on Phase A not being enough in the eval harness.
+- Add a `coref_chains` field to `IngestResult` so downstream stages can
+  rewrite pronouns → canonical names before relation extraction.
+- Eval: extend `fixtures/ner_eval.jsonl` with 30 sentences containing
+  antecedent/pronoun pairs; target 80 % of pronouns correctly resolved.
+
+**Impact:** High — fixes a bug-class of missing edges across almost every
+multi-sentence capture.
+
+### 8. TM-NLP-008 — Entity canonicalization
+
+**Why:** `"Dario"`, `"Dario Amodei"`, `"Anthropic CEO"` stay as three
+separate nodes today. TM-NLP-003d (Levenshtein ≤ 2) catches typos but not
+semantic aliases. The graph fragments linearly over time.
+
+**Scope:**
+- New `Canonicalizer` that runs after ingest, batched (not per-sentence):
+  1. For each entity, compute an alias vector = BGE embedding of
+     `"<name> (<type>)"`.
+  2. Agglomerative cluster with cosine ≥ 0.90 threshold within-type.
+  3. For each cluster, pick the longest name as canonical and rewrite all
+     incoming/outgoing edges.
+  4. Keep the alias list on the canonical node for display + future match.
+- Run on every consolidation pass (no extra cost since embeddings already
+  exist).
+- Optional: manual override file
+  `~/.tracemind/aliases.toml` for hand-curated merges/splits.
+- Eval: synthetic fixture with 50 aliased entity sets; target ≥ 85 %
+  correct cluster assignment, ≤ 5 % false merges.
+
+**Impact:** Medium-high — graph stays compact over months of use instead
+of fragmenting.
+
+### 9. TM-UX-001 — Seamless capture + recommendation
+
+**Why:** the pipeline is capture-heavy and recall-reactive. Users have to
+ask a query to get value out. "Seamless" means (a) the user trusts the
+capture is happening (feedback), and (b) recall surfaces more than the
+literal top-k — adjacent memories the user didn't know to ask for.
+
+**Scope (landing in phases):**
+- **Phase A — Recommendation — ✅ SHIPPED (2026-04-20).** Every query
+  response now carries `related_entities` — 1-hop graph neighbours of the
+  top-k direct hits, filtered against the primary set, scored by
+  `cosine(query, candidate_embedding)` with a small graph-proximity floor
+  so structural neighbours still surface when vector recall is thin.
+  Surfaced via CLI (`tracemind query "…"` prints a `Related:` block with
+  reason attribution) and MCP (`memory_query` grows a `related_entities`
+  field with `{id, name, type, score, reason}`). Bounded fan-out
+  (top-5 seeds × 1 hop, top-5 returned). All three retrieval paths
+  (bandit, decomposed, temporal) populate the field. Unit test
+  `related_entities_surfaces_one_hop_neighbours` in `tm-retrieval` covers
+  the happy path + dedup guarantee + empty-primary case. See
+  `crates/tm-retrieval/src/engine.rs::compute_related_entities`.
+- **Phase B (separate ticket):** capture feedback UI. Capture daemon
+  emits a ring-buffered JSONL of recent captures (`~/.tracemind/recent.jsonl`,
+  last 100 events) with tier, dedup-hit, promoted-flag. Tauri tray shows
+  a live ticker + a "what TraceMind just captured" panel.
+- **Phase C (separate ticket):** proactive surfacing. When an MCP client
+  sends a tool call, `memory_query` gets auto-invoked on the query-derived
+  context even without an explicit ask — returns top-3 memories as a
+  system note.
+
+**Impact:** High — shifts TraceMind from "memory you query" to "memory
+that surfaces itself", which is the product differentiator vs Honcho.
+
+### 10. TM-QUAL-001 — Continuous retrieval eval
+
+**Why:** `tm-bench-ner-e2e` covers NER → retrieval but there's no CI-gated
+guard against quality regression on the query side. Quality quietly
+erodes between releases.
+
+**Scope:**
+- Extend `tm-bench-ner-e2e` to a 100-query fixture covering the 8 entity
+  types + temporal queries + multi-hop.
+- Add `tm-bench-retrieval` binary that reports MRR@10, NDCG@10, top-1
+  accuracy against the fixture.
+- GitHub Actions workflow runs it on every PR; fails if MRR drops by >
+  0.05 vs main.
+- Publish last-10-runs results to `docs/quality.md` (auto-committed).
+
+**Impact:** Medium — infrastructural, not user-visible, but unlocks
+aggressive iteration on the other quality gaps without fear of silent
+regression.
+
+### 11. TM-NLP-010 — Better embeddings for technical/code content
+
+**Why:** BGE-small is general-purpose. Much of TraceMind's capture volume
+is code, IDE content, and technical prose — embedded poorly compared to a
+domain-tuned model.
+
+**Scope:**
+- Add `EmbedModel::NomicV15` (`nomic-ai/nomic-embed-text-v1.5`) as an
+  option in `tm-vector`. 137 M params, still ONNX-exportable, 768-dim.
+- Add `EmbedModel::JinaCode` (`jinaai/jina-embeddings-v2-base-code`) as a
+  content-type-gated alternative for captures classified as code.
+- Consolidator re-embeds existing entities on model switch (gated behind
+  `TM_EMBED_MIGRATE=1`).
+- Eval: re-run retrieval eval (TM-QUAL-001) on technical fixture; pick
+  whichever model wins.
+
+**Impact:** Medium — lifts retrieval on the dominant capture type.
+
+### 12. TM-GOV-001 — PII filter upgrades
+
+**Why:** current governance is regex-only; misses international phone
+formats, address variants, contextual PII ("my SSN is nine digits no
+dashes"). Becomes blocking before multi-user.
+
+**Scope:**
+- Add locale-aware phone patterns (E.164 + regional).
+- Address detection (structured: postal-code + street-suffix co-occurrence).
+- Context classifier over GLiNER: if a `Person` entity co-occurs within 5
+  tokens of a digit run of length ≥ 7, redact unless explicitly exempted.
+- Redaction audit log: every governance decision recorded to
+  `~/.tracemind/governance.log` with text-hash (not plaintext).
+
+**Impact:** Medium — not a quality-of-recall issue, but a correctness
+issue that will bite multi-user ACL work in Phase 6.
+
+### 13. TM-NLP-011 — Consolidation super-entities
+
+**Why:** Ebbinghaus decay is wired but actual super-entity summarisation
+(Phase 5 goal) isn't. Graph grows linearly; clusters of near-duplicate
+entities accumulate.
+
+**Scope:**
+- Clustering pass in `consolidate_normal` that groups entities with
+  cosine ≥ 0.85 and shared graph neighbours; creates a `super_entity`
+  node with merged description + child-entity list.
+- Super-entities are recallable alongside leaves, ranked by cluster
+  coverage; query cost-amortisation for popular topics.
+- Migration: `tm-cli consolidate --super` runs the pass on existing
+  graphs.
+
+**Impact:** Medium — scales graph size sub-linearly over months.
+
+### 14. TM-NLP-012 — Query-time rewriting / synonym expansion
+
+**Why:** typos in the query route poorly; "macbook" misses
+"MacBook Pro" as an entity if the graph canonicalization hasn't caught
+it. No synonym expansion ("JS" → "JavaScript").
+
+**Scope:**
+- Pre-query pass: lowercase-match the query tokens against graph entity
+  names; if a close match (Levenshtein ≤ 2 or embedding cosine ≥ 0.85)
+  exists, inject the canonical form as an expanded query alongside the
+  original.
+- Synonym file `~/.tracemind/synonyms.toml` for hand-curated acronym
+  expansions.
+- Log query rewrites to the trace stream for auditability.
+
+**Impact:** Low-medium — easy wins on a long tail of queries; depends on
+TM-NLP-008 (canonicalization) to really shine.
+
+### 15. TM-NLP-009 — MCP structured ingestion (was TM-NLP-005 in the pre-bundling plan)
+
+**Why deprioritised:** MCP is a minority of ingest traffic for this
+deployment. Still worth doing for the LLM-client path, but after the
+passive-path quality is lifted.
+
+**Scope:** extend `memory_store` MCP tool to accept
+`{text, entities?, triples?}` with optional pre-extracted structure. If
+the client provides entities/triples, skip the extractor and go straight
+to graph upsert. Adds a compatibility bump to the MCP schema.
+
+**Impact:** Low — marginal improvement on the MCP path; large if the
+majority of traffic ever shifts there (unlikely given product direction).
 
 ## Out of scope for this sprint
 
-- Changes to retrieval ranking beyond enabling ColBERT.
-- Changes to consolidation scheduling or clustering.
-- MCP tool surface additions beyond `memory_store`.
+- Changes to consolidation scheduling itself (tracked in Phase 5).
+- JEPA / world-model work (Phase 5+).
+- Multi-user ACL / REST API (Phase 6).
 
 ## Architecture-doc follow-ups
 
