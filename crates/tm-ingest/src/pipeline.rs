@@ -702,7 +702,7 @@ impl IngestPipeline {
     /// - `0.75 .. 0.90`          => **Update** (merge / reinforce)
     /// - `< 0.75` (or no match)  => **Add** (novel entity)
     fn decide_memory_op(
-        _name: &str,
+        name: &str,
         embedding: &[f32],
         entity_type: &EntityType,
         graph: &GraphStore,
@@ -715,8 +715,21 @@ impl IngestPipeline {
 
         let (top_id, top_sim) = similar[0];
 
-        // Very high similarity (>0.90) = likely duplicate
-        if top_sim > 0.90 {
+        // TM-NLP-004 guard: entities get embedded as "name: full_source_text",
+        // so multiple entities extracted from the same sentence end up with
+        // near-identical vectors. Collapsing them by embedding similarity
+        // alone turned every secondary entity into a fake "duplicate" of the
+        // first. Require a name match (exact/case-insensitive/substring) on
+        // top of the vector sim before treating as Update/Noop.
+        let existing_name = graph
+            .get_entity(top_id)
+            .ok()
+            .map(|e| e.name)
+            .unwrap_or_default();
+        let names_agree = names_look_like_same_entity(name, &existing_name);
+
+        // Very high similarity (>0.90) AND name match = likely duplicate
+        if top_sim > 0.90 && names_agree {
             if let Ok(existing) = graph.get_entity(top_id) {
                 if existing.entity_type == *entity_type {
                     return MemoryOp::Noop {
@@ -730,16 +743,38 @@ impl IngestPipeline {
             }
         }
 
-        // High similarity (0.75-0.90) = update/merge
-        if top_sim > 0.75 {
+        // High similarity (0.75-0.90) AND name match = update/merge
+        if top_sim > 0.75 && names_agree {
             return MemoryOp::Update {
                 target_entity_id: top_id,
             };
         }
 
-        // Moderate or low similarity = add (different enough)
+        // Different-named entity (even at high embedding sim) is a new entity.
         MemoryOp::Add
     }
+}
+
+/// Conservative check: treat two names as the same entity only if one is a
+/// prefix/suffix/case-variant of the other. Prevents `decide_memory_op` from
+/// folding unrelated entities that merely share sentence context.
+fn names_look_like_same_entity(a: &str, b: &str) -> bool {
+    let al = a.trim().to_lowercase();
+    let bl = b.trim().to_lowercase();
+    if al.is_empty() || bl.is_empty() {
+        return false;
+    }
+    if al == bl {
+        return true;
+    }
+    // Sub-string match only counts if the shorter one is at least 4 chars —
+    // otherwise "I" / "US" style short names would swallow everything.
+    let (shorter, longer) = if al.len() <= bl.len() {
+        (al.as_str(), bl.as_str())
+    } else {
+        (bl.as_str(), al.as_str())
+    };
+    shorter.len() >= 4 && longer.contains(shorter)
 }
 
 // ---------------------------------------------------------------------------

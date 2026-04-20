@@ -4,6 +4,8 @@
 *.db-wal
 *.vec
 *.jsonl
+# Eval fixtures must ship with the repo (TM-NLP-004).
+!crates/tm-bench/fixtures/*.jsonl
 
 # Model cache
 .fastembed_cache/

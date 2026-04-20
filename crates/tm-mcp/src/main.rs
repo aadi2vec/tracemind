@@ -571,9 +571,14 @@ async fn main() -> Result<()> {
 
     // Open stores. Use TM_HASH_EMBED=1 to skip model download.
     let hash_embed = std::env::var("TM_HASH_EMBED").map(|v| v == "1").unwrap_or(false);
-    let ingest = Arc::new(Mutex::new(
-        IngestPipeline::open(&db_path, hash_embed).map_err(|e| anyhow::anyhow!(e.to_string()))?,
-    ));
+    // TM-NLP-004: attach real GLiNER NER if the model is available. Falls
+    // back to the heuristic extractor when offline (auto_download returns None).
+    let mut ingest_pipeline =
+        IngestPipeline::open(&db_path, hash_embed).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    if let Some(gli) = tm_ingest::GlinerExtractor::auto_download_default() {
+        ingest_pipeline = ingest_pipeline.with_extractor(Box::new(gli));
+    }
+    let ingest = Arc::new(Mutex::new(ingest_pipeline));
     // Try to attach ColBERT reranker. If the download/load fails (offline,
     // rate-limited), the engine transparently runs without reranking.
     let reranker = ColbertReranker::auto_download_or_none(0.7);

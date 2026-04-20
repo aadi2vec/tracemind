@@ -5646,6 +5646,8 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
+ "tempfile",
+ "tm-episodic",
  "tm-graph",
  "tm-ingest",
  "tm-retrieval",
@@ -5749,14 +5751,19 @@ name = "tm-ingest"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "hf-hub",
+ "ndarray 0.16.1",
+ "ort",
  "seahash",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 1.0.69",
  "tm-governance",
  "tm-graph",
  "tm-types",
  "tm-vector",
+ "tokenizers 0.21.4",
  "tracing",
  "uuid",
 ]
