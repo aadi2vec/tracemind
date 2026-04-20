@@ -71,6 +71,16 @@ enum Commands {
     },
     /// Show bandit arm statistics
     Status,
+    /// Show the most recent capture events from the ring buffer
+    /// (what the capture daemon / MCP server just ingested).
+    Recent {
+        /// Maximum number of events to show (newest first).
+        #[arg(long, default_value = "20")]
+        limit: usize,
+        /// Emit raw JSON lines instead of a formatted table.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(clap::Subcommand)]
@@ -363,6 +373,53 @@ fn main() {
             for (i, (pulls, avg_reward)) in stats.iter().enumerate() {
                 let name = UcbBandit::arm_name(i as u8);
                 println!("  Arm {} ({}): pulls={}, avg_reward={:.2}", i, name, pulls, avg_reward);
+            }
+        }
+
+        Commands::Recent { limit, json } => {
+            let recent_path = dir.join("recent.jsonl");
+            let store = match tm_episodic::RecentStore::open(&recent_path) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("failed to open recent store at {}: {}", recent_path.display(), e);
+                    std::process::exit(1);
+                }
+            };
+            let events = store.recent(limit).unwrap_or_default();
+
+            if json {
+                for ev in &events {
+                    match serde_json::to_string(ev) {
+                        Ok(line) => println!("{}", line),
+                        Err(e) => eprintln!("serialize error: {}", e),
+                    }
+                }
+                return;
+            }
+
+            if events.is_empty() {
+                println!("No recent captures. Start the capture daemon or ingest via MCP.");
+                return;
+            }
+
+            println!("Recent captures (newest first, limit={}):", limit);
+            for ev in &events {
+                let status = if let Some(reason) = &ev.skipped_reason {
+                    format!("skipped[{}]", reason)
+                } else if ev.promoted {
+                    "promoted".to_string()
+                } else {
+                    "stored".to_string()
+                };
+                let tier = ev.tier.as_deref().unwrap_or("--");
+                println!(
+                    "  {} [{:>8}] {:>10} {:>10}  {}",
+                    ev.timestamp.format("%H:%M:%S"),
+                    ev.source,
+                    tier,
+                    status,
+                    ev.text_preview,
+                );
             }
         }
     }

@@ -6,12 +6,13 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
-use tm_episodic::TraceStore;
+use tm_episodic::{RecentStore, TraceStore};
 use tm_graph::GraphStore;
 use tm_ingest::IngestPipeline;
 use tm_reason::{AnalogySolver, ChainBuilder, Consolidator};
 use tm_rerank::ColbertReranker;
 use tm_retrieval::RetrievalEngine;
+use tm_types::RecentCapture;
 
 // ---------------------------------------------------------------------------
 // Startup helpers
@@ -145,6 +146,7 @@ async fn handle_memory_store(
     params: &Value,
     ingest: &Arc<Mutex<IngestPipeline>>,
     traces: &Arc<Mutex<TraceStore>>,
+    recent: &Arc<Mutex<RecentStore>>,
     session_id: Uuid,
 ) -> Result<Value, String> {
     let text = params
@@ -160,6 +162,19 @@ async fn handle_memory_store(
     // Persist the trace from the pipeline result (already has raw_text + entity/triple IDs).
     let trace_store = traces.lock().await;
     let _ = trace_store.append(&result.trace);
+
+    // TM-UX-001 Phase B: emit a capture-feedback event so the UI can surface
+    // "just ingested via MCP" in the recent ticker.
+    let mut event = RecentCapture::new("mcp", &result.content_hash, text)
+        .with_tier("t1")
+        .with_promoted(!result.skip_gate);
+    if result.skip_gate {
+        event = event.with_skipped("gate_rejected");
+    }
+    let recent_store = recent.lock().await;
+    if let Err(e) = recent_store.append(&event) {
+        tracing::debug!("[mcp] failed to append recent capture: {e}");
+    }
 
     Ok(json!({
         "stored": true,
@@ -483,6 +498,7 @@ async fn handle_request(
     ingest: &Arc<Mutex<IngestPipeline>>,
     retrieval: &Arc<Mutex<RetrievalEngine>>,
     traces: &Arc<Mutex<TraceStore>>,
+    recent: &Arc<Mutex<RecentStore>>,
     session_id: Uuid,
     db_path: &str,
 ) -> Result<Value, anyhow::Error> {
@@ -512,7 +528,7 @@ async fn handle_request(
 
             let tool_result = match tool_name {
                 "memory_store" => {
-                    handle_memory_store(&args, ingest, traces, session_id)
+                    handle_memory_store(&args, ingest, traces, recent, session_id)
                         .await
                         .map_err(|e| anyhow::anyhow!(e))?
                 }
@@ -618,6 +634,10 @@ async fn main() -> Result<()> {
     let traces = Arc::new(Mutex::new(
         TraceStore::open(&trace_path).map_err(|e| anyhow::anyhow!(e.to_string()))?,
     ));
+    let recent_path = dir.join("recent.jsonl");
+    let recent = Arc::new(Mutex::new(
+        RecentStore::open(&recent_path).map_err(|e| anyhow::anyhow!(e.to_string()))?,
+    ));
 
     // One stable session ID for this server process lifetime.
     let session_id = Uuid::new_v4();
@@ -663,8 +683,17 @@ async fn main() -> Result<()> {
             .unwrap_or("")
             .to_string();
 
-        let response =
-            handle_request(&method, &request, &ingest, &retrieval, &traces, session_id, &db_path).await;
+        let response = handle_request(
+            &method,
+            &request,
+            &ingest,
+            &retrieval,
+            &traces,
+            &recent,
+            session_id,
+            &db_path,
+        )
+        .await;
 
         let resp_json = match response {
             Ok(result) => json!({

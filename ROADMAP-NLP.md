@@ -231,10 +231,20 @@ literal top-k — adjacent memories the user didn't know to ask for.
   `related_entities_surfaces_one_hop_neighbours` in `tm-retrieval` covers
   the happy path + dedup guarantee + empty-primary case. See
   `crates/tm-retrieval/src/engine.rs::compute_related_entities`.
-- **Phase B (separate ticket):** capture feedback UI. Capture daemon
-  emits a ring-buffered JSONL of recent captures (`~/.tracemind/recent.jsonl`,
-  last 100 events) with tier, dedup-hit, promoted-flag. Tauri tray shows
-  a live ticker + a "what TraceMind just captured" panel.
+- **Phase B — Capture feedback — ✅ SHIPPED (2026-04-20).** Capture
+  daemon and MCP `memory_store` now emit a bounded JSONL ring to
+  `~/.tracemind/recent.jsonl` (last 100 events, rewrite-on-append) with
+  `{timestamp, source, tier, content_hash, skipped_reason, promoted,
+  text_preview}`. `RecentCapture` lives in `tm-types::recent`; `RecentStore`
+  (open/append/read_all/recent) lives in `tm-episodic::recent_store`.
+  Sources wired: clipboard + shell-history loops in `tm-capture`, and
+  `handle_memory_store` in `tm-mcp`. Surfaced via
+  `tracemind recent [--limit N] [--json]` — a newest-first table with
+  promoted/skipped status per event. Unit tests in
+  `tm-episodic::recent_store` cover ring-cap-at-capacity (wraparound),
+  newest-first read, missing-file tolerance, and malformed-line skip.
+  Tauri tray ticker deferred to Phase B2 — the ring file is the shared
+  contract so any later UI can consume it without code changes.
 - **Phase C (separate ticket):** proactive surfacing. When an MCP client
   sends a tool call, `memory_query` gets auto-invoked on the query-derived
   context even without an explicit ask — returns top-3 memories as a
