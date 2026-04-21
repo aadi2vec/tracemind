@@ -16,6 +16,7 @@ members = [
     "crates/tm-rerank",
     "crates/tm-reason",
     "crates/tm-bench",
+    "crates/tm-answer",
 ]
 
 [workspace.package]
@@ -71,6 +72,7 @@ tm-controller = { path = "crates/tm-controller" }
 tm-ingest = { path = "crates/tm-ingest" }
 tm-retrieval = { path = "crates/tm-retrieval" }
 tm-reason = { path = "crates/tm-reason" }
+tm-answer = { path = "crates/tm-answer" }
 
 [profile.release]
 opt-level = 3

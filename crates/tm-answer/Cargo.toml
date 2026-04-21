@@ -1,0 +1,21 @@
+[package]
+name = "tm-answer"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+tm-types = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+anyhow = { workspace = true }
+async-trait = "0.1"
+tokio = { workspace = true }
+
+[features]
+default = []
+# Tier 1: bundled local LLM via llama.cpp. Pulls ~900 MB weights at first run.
+local-llm = []
+# Tier 2: Apple FoundationModels (macOS Tahoe 26+, Apple Silicon).
+apple-fm = []
