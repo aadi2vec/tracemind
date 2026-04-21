@@ -15,7 +15,9 @@ use tokio::time;
 use tracing::{info, warn, debug};
 use uuid::Uuid;
 
-use tm_ingest::IngestPipeline;
+use tm_episodic::RecentStore;
+use tm_ingest::{FastIngestResult, IngestPipeline, SignalPriority};
+use tm_types::RecentCapture;
 
 /// TM-NLP-004 helper: open an IngestPipeline and attach the real GLiNER
 /// NER extractor when the model is available on disk / over the network.
@@ -93,6 +95,47 @@ impl CaptureConfig {
 }
 
 // ---------------------------------------------------------------------------
+// Recent ring-buffer helpers
+// ---------------------------------------------------------------------------
+
+fn tier_label(priority: SignalPriority) -> &'static str {
+    match priority {
+        SignalPriority::InstantEntity => "t1",
+        SignalPriority::Priority => "t2",
+        SignalPriority::Normal => "t3",
+        SignalPriority::Ephemeral => "t4",
+    }
+}
+
+fn recent_path(db_path: &str) -> PathBuf {
+    let p = PathBuf::from(db_path);
+    let dir = p.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from("."));
+    dir.join("recent.jsonl")
+}
+
+fn record_capture(
+    store: &RecentStore,
+    source: &str,
+    text: &str,
+    result: &FastIngestResult,
+) {
+    let promoted = result.skipped.is_none()
+        && matches!(
+            result.priority,
+            SignalPriority::InstantEntity | SignalPriority::Priority | SignalPriority::Normal
+        );
+    let mut event = RecentCapture::new(source, &result.content_hash, text)
+        .with_tier(tier_label(result.priority))
+        .with_promoted(promoted);
+    if let Some(reason) = &result.skipped {
+        event = event.with_skipped(reason.clone());
+    }
+    if let Err(e) = store.append(&event) {
+        debug!("[recent] failed to append capture: {e}");
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Clipboard monitor
 // ---------------------------------------------------------------------------
 
@@ -137,6 +180,14 @@ async fn clipboard_loop(config: &CaptureConfig) {
         }
     };
 
+    let recent = match RecentStore::open(recent_path(&config.db_path)) {
+        Ok(r) => Some(r),
+        Err(e) => {
+            warn!("[clipboard] failed to open recent store: {e}");
+            None
+        }
+    };
+
     let mut seen_hashes: HashSet<u64> = HashSet::new();
     let mut last_hash: u64 = 0;
 
@@ -164,10 +215,13 @@ async fn clipboard_loop(config: &CaptureConfig) {
             let session = Uuid::new_v4();
             match pipeline.ingest_fast(&text, "clipboard", session) {
                 Ok(result) => {
-                    if let Some(reason) = result.skipped {
+                    if let Some(reason) = &result.skipped {
                         debug!("[clipboard] signal skipped: {reason}");
                     } else {
                         info!("[clipboard] signal stored (id={})", result.signal_id);
+                    }
+                    if let Some(store) = &recent {
+                        record_capture(store, "clipboard", &text, &result);
                     }
                 }
                 Err(e) => {
@@ -250,6 +304,14 @@ async fn history_loop(config: &CaptureConfig) {
         }
     };
 
+    let recent_store = match RecentStore::open(recent_path(&config.db_path)) {
+        Ok(r) => Some(r),
+        Err(e) => {
+            warn!("[history] failed to open recent store: {e}");
+            None
+        }
+    };
+
     let mut seen_hashes: HashSet<u64> = HashSet::new();
 
     // Seed with existing history to avoid re-ingesting on startup.
@@ -281,10 +343,13 @@ async fn history_loop(config: &CaptureConfig) {
             let session = Uuid::new_v4();
             match pipeline.ingest_fast(&prefixed, "shell", session) {
                 Ok(result) => {
-                    if let Some(reason) = result.skipped {
+                    if let Some(reason) = &result.skipped {
                         debug!("[history] signal skipped: {reason}");
                     } else {
                         info!("[history] signal stored (id={})", result.signal_id);
+                    }
+                    if let Some(store) = &recent_store {
+                        record_capture(store, "shell", &prefixed, &result);
                     }
                 }
                 Err(e) => {

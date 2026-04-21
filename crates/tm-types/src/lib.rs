@@ -12,6 +12,7 @@ pub mod error;
 pub mod memory_op;
 pub mod time_range;
 pub mod bundled;
+pub mod recent;
 
 pub use entity::*;
 pub use triple::*;
@@ -21,3 +22,4 @@ pub use procedure::*;
 pub use error::*;
 pub use memory_op::*;
 pub use time_range::*;
+pub use recent::*;
