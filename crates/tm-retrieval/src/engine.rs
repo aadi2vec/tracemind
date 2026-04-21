@@ -1273,6 +1273,17 @@ impl RetrievalEngine {
         })
     }
 
+    /// Refresh the engine's view of the graph store from disk.
+    ///
+    /// Required when another `GraphStore` instance (e.g. the one inside
+    /// `IngestPipeline` in a long-running MCP server) has written entities
+    /// since this engine was opened. Without it, `search_vectors` filters
+    /// fresh rows out because their UUIDs aren't in this engine's in-memory
+    /// cache. See TM-UX-001 Phase C.
+    pub fn refresh_graph(&self) -> Result<()> {
+        self.graph.reload_maps()
+    }
+
     /// Return per-arm `(pull_count, average_reward)` statistics from the bandit.
     pub fn bandit_stats(&self) -> [(u64, f64); tm_controller::NUM_ARMS] {
         self.bandit.arm_stats()
