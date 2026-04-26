@@ -17,6 +17,7 @@ members = [
     "crates/tm-reason",
     "crates/tm-bench",
     "crates/tm-answer",
+    "crates/tm-bench-locomo",
 ]
 
 [workspace.package]
