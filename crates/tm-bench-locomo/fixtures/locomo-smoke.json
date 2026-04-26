@@ -1,0 +1,47 @@
+{
+  "samples": [
+    {
+      "sample_id": "smoke-1",
+      "sessions": [
+        {
+          "session_id": "s1",
+          "date": "2026-04-01",
+          "turns": [
+            {"speaker": "Alice", "text": "I'm flying to Tokyo on May 3rd for a conference."},
+            {"speaker": "Bob", "text": "Nice — which conference?"},
+            {"speaker": "Alice", "text": "NeurIPS regional. I'll be there three days."}
+          ]
+        },
+        {
+          "session_id": "s2",
+          "date": "2026-04-15",
+          "turns": [
+            {"speaker": "Alice", "text": "Finished my talk prep last night."},
+            {"speaker": "Bob", "text": "What's the talk about?"},
+            {"speaker": "Alice", "text": "Local memory systems for consumer apps."}
+          ]
+        }
+      ],
+      "questions": [
+        {
+          "id": "q1",
+          "question": "When is Alice flying to Tokyo?",
+          "answers": ["May 3rd", "May 3", "3rd of May"],
+          "category": "temporal"
+        },
+        {
+          "id": "q2",
+          "question": "What is Alice's talk about?",
+          "answers": ["Local memory systems for consumer apps", "local memory systems"],
+          "category": "single_hop"
+        },
+        {
+          "id": "q3",
+          "question": "Why is Alice going to Tokyo?",
+          "answers": ["To give a talk at NeurIPS regional", "NeurIPS regional conference", "conference"],
+          "category": "multi_hop"
+        }
+      ]
+    }
+  ]
+}
