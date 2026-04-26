@@ -5691,10 +5691,15 @@ dependencies = [
  "clap 4.6.0",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 1.0.69",
+ "tm-ingest",
+ "tm-retrieval",
+ "tm-types",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]

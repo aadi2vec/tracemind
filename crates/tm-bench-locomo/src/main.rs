@@ -31,6 +31,11 @@ enum RunnerKind {
     Echo,
     /// Returns empty strings — F1=0.0, smoke-tests the gate failure path.
     Null,
+    /// Real TraceMind stack: ingest + retrieval + extractive synthesis.
+    /// Requires the `tracemind` feature. Uses hash embeddings by default
+    /// for CI determinism — pass --real-embeddings to flip to BGE.
+    #[cfg(feature = "tracemind")]
+    Tracemind,
 }
 
 #[derive(Parser, Debug)]
@@ -59,6 +64,12 @@ struct Args {
     /// Omit per-question outcomes from the emitted report.
     #[arg(long, default_value_t = false)]
     summary_only: bool,
+
+    /// For the tracemind runner: use real BGE embeddings instead of the
+    /// deterministic hash embedder. Slower, requires model download.
+    #[cfg(feature = "tracemind")]
+    #[arg(long, default_value_t = false)]
+    real_embeddings: bool,
 }
 
 #[tokio::main]
@@ -77,6 +88,14 @@ async fn main() -> anyhow::Result<()> {
     let report = match args.runner {
         RunnerKind::Echo => run(EchoRunner, &dataset).await?,
         RunnerKind::Null => run(NullRunner, &dataset).await?,
+        #[cfg(feature = "tracemind")]
+        RunnerKind::Tracemind => {
+            let cfg = tm_bench_locomo::TraceMindConfig {
+                hash_embed: !args.real_embeddings,
+                ..Default::default()
+            };
+            run(tm_bench_locomo::TraceMindRunner::new(cfg), &dataset).await?
+        }
     };
 
     let report = if args.summary_only { report.summarized() } else { report };

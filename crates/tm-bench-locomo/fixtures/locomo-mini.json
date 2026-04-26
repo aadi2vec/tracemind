@@ -1,0 +1,138 @@
+{
+  "samples": [
+    {
+      "sample_id": "alice-tokyo",
+      "sessions": [
+        {
+          "session_id": "s1",
+          "date": "2026-04-01",
+          "turns": [
+            {"speaker": "Alice", "text": "I'm flying to Tokyo on May 3rd for a conference."},
+            {"speaker": "Bob", "text": "Nice — which conference?"},
+            {"speaker": "Alice", "text": "NeurIPS regional. I'll be there three days."},
+            {"speaker": "Bob", "text": "Are you presenting?"},
+            {"speaker": "Alice", "text": "Yes, a talk on Wednesday morning."}
+          ]
+        },
+        {
+          "session_id": "s2",
+          "date": "2026-04-15",
+          "turns": [
+            {"speaker": "Alice", "text": "Finished my talk prep last night."},
+            {"speaker": "Bob", "text": "What's the talk about?"},
+            {"speaker": "Alice", "text": "Local memory systems for consumer apps."},
+            {"speaker": "Bob", "text": "Cool — staying in Shibuya again?"},
+            {"speaker": "Alice", "text": "No, this time I booked a hotel in Shinjuku near the venue."}
+          ]
+        },
+        {
+          "session_id": "s3",
+          "date": "2026-04-29",
+          "turns": [
+            {"speaker": "Alice", "text": "Just landed at Haneda, exhausted."},
+            {"speaker": "Bob", "text": "How was the flight?"},
+            {"speaker": "Alice", "text": "Eleven hours from JFK. I watched two movies and slept four hours."}
+          ]
+        }
+      ],
+      "questions": [
+        {"id": "q1", "question": "When is Alice flying to Tokyo?", "answers": ["May 3rd", "May 3", "3rd of May"], "category": "temporal"},
+        {"id": "q2", "question": "What is Alice's talk about?", "answers": ["Local memory systems for consumer apps", "local memory systems"], "category": "single_hop"},
+        {"id": "q3", "question": "Why is Alice going to Tokyo?", "answers": ["To present at NeurIPS regional", "NeurIPS regional conference", "conference"], "category": "multi_hop"},
+        {"id": "q4", "question": "Where is Alice staying in Tokyo?", "answers": ["Shinjuku", "a hotel in Shinjuku"], "category": "single_hop"},
+        {"id": "q5", "question": "Which airport did Alice fly into?", "answers": ["Haneda"], "category": "single_hop"},
+        {"id": "q6", "question": "Did Alice fly to Tokyo on May 1st?", "answers": ["No, May 3rd", "No"], "category": "adversarial"}
+      ]
+    },
+    {
+      "sample_id": "carol-startup",
+      "sessions": [
+        {
+          "session_id": "s1",
+          "date": "2026-03-10",
+          "turns": [
+            {"speaker": "Carol", "text": "I'm leaving Stripe to start a company."},
+            {"speaker": "Dan", "text": "Whoa, what are you building?"},
+            {"speaker": "Carol", "text": "A privacy-first memory system for Mac users. Working title: Loom."},
+            {"speaker": "Dan", "text": "Are you raising?"},
+            {"speaker": "Carol", "text": "Pre-seed, $1.5M target."}
+          ]
+        },
+        {
+          "session_id": "s2",
+          "date": "2026-03-25",
+          "turns": [
+            {"speaker": "Carol", "text": "Got the term sheet from Sequoia today."},
+            {"speaker": "Dan", "text": "On the original $1.5M?"},
+            {"speaker": "Carol", "text": "They wanted to lead at $2.5M instead, so we upsized."},
+            {"speaker": "Dan", "text": "Valuation?"},
+            {"speaker": "Carol", "text": "$15M post."}
+          ]
+        },
+        {
+          "session_id": "s3",
+          "date": "2026-04-12",
+          "turns": [
+            {"speaker": "Carol", "text": "Renamed Loom to Memex — the original name was trademarked."},
+            {"speaker": "Dan", "text": "First hire?"},
+            {"speaker": "Carol", "text": "An ML engineer named Priya, joining May 1."}
+          ]
+        }
+      ],
+      "questions": [
+        {"id": "q1", "question": "What was Carol's previous employer?", "answers": ["Stripe"], "category": "single_hop"},
+        {"id": "q2", "question": "Who led Carol's pre-seed round?", "answers": ["Sequoia"], "category": "single_hop"},
+        {"id": "q3", "question": "How much did Carol raise?", "answers": ["$2.5M", "2.5 million"], "category": "single_hop"},
+        {"id": "q4", "question": "What did Carol rename her company to?", "answers": ["Memex"], "category": "single_hop"},
+        {"id": "q5", "question": "Why did Carol rename the company?", "answers": ["Loom was trademarked", "the original name was trademarked", "trademark"], "category": "multi_hop"},
+        {"id": "q6", "question": "Who is Carol's first hire?", "answers": ["Priya"], "category": "single_hop"},
+        {"id": "q7", "question": "Did Carol raise from Andreessen Horowitz?", "answers": ["No, from Sequoia", "No"], "category": "adversarial"}
+      ]
+    },
+    {
+      "sample_id": "ethan-marathon",
+      "sessions": [
+        {
+          "session_id": "s1",
+          "date": "2026-01-05",
+          "turns": [
+            {"speaker": "Ethan", "text": "Signed up for the Boston Marathon. Race day is April 20."},
+            {"speaker": "Fiona", "text": "Nice! Goal time?"},
+            {"speaker": "Ethan", "text": "Sub-3:00 is the dream, but realistically 3:10."},
+            {"speaker": "Fiona", "text": "How are you training?"},
+            {"speaker": "Ethan", "text": "Hanson method, 6 days a week, peaking at 60 miles."}
+          ]
+        },
+        {
+          "session_id": "s2",
+          "date": "2026-03-15",
+          "turns": [
+            {"speaker": "Ethan", "text": "Did a 22-mile long run today at marathon pace."},
+            {"speaker": "Fiona", "text": "How'd it feel?"},
+            {"speaker": "Ethan", "text": "Tough at mile 18 but I held 7:00/mile."},
+            {"speaker": "Fiona", "text": "That puts you on track for sub-3:00."},
+            {"speaker": "Ethan", "text": "Yeah, I'm cautiously optimistic."}
+          ]
+        },
+        {
+          "session_id": "s3",
+          "date": "2026-04-21",
+          "turns": [
+            {"speaker": "Ethan", "text": "Finished Boston in 2:58:42!"},
+            {"speaker": "Fiona", "text": "You crushed your goal!"},
+            {"speaker": "Ethan", "text": "It rained the last 10K but I held pace."}
+          ]
+        }
+      ],
+      "questions": [
+        {"id": "q1", "question": "What marathon did Ethan run?", "answers": ["Boston", "Boston Marathon"], "category": "single_hop"},
+        {"id": "q2", "question": "What was Ethan's goal time?", "answers": ["sub-3:00", "Sub-3:00", "under three hours"], "category": "single_hop"},
+        {"id": "q3", "question": "What was Ethan's finish time?", "answers": ["2:58:42"], "category": "single_hop"},
+        {"id": "q4", "question": "Did Ethan beat his goal?", "answers": ["Yes", "Yes, he ran 2:58:42 vs sub-3:00 goal"], "category": "multi_hop"},
+        {"id": "q5", "question": "When did Ethan run Boston?", "answers": ["April 20", "April 20 2026"], "category": "temporal"},
+        {"id": "q6", "question": "Which training method did Ethan use?", "answers": ["Hanson", "Hanson method"], "category": "single_hop"},
+        {"id": "q7", "question": "Did Ethan miss his sub-3:00 goal?", "answers": ["No, he ran 2:58:42", "No"], "category": "adversarial"}
+      ]
+    }
+  ]
+}

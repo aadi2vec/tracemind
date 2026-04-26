@@ -28,6 +28,12 @@ pub mod report;
 pub mod runner;
 pub mod scoring;
 
+#[cfg(feature = "tracemind")]
+pub mod tracemind_runner;
+
+#[cfg(feature = "tracemind")]
+pub use tracemind_runner::{TraceMindConfig, TraceMindRunner};
+
 pub use dataset::{LocomoDataset, LocomoError, LocomoQuestion, LocomoSample, LocomoSession, Turn};
 pub use report::{BenchmarkReport, CategoryBreakdown, QuestionOutcome};
 pub use runner::{LocomoRunner, RunnerContext};
