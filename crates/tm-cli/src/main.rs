@@ -35,6 +35,29 @@ enum Commands {
     Ingest { text: String },
     /// Query memory with natural language
     Query { text: String },
+    /// Ask a question — clean prose answer with citations, dispatched
+    /// through the tiered answer layer (Tier 0 always; Tier 1 / Tier 2
+    /// when available). Hides the entity-rank dump that `query` shows.
+    Ask {
+        /// The question to ask.
+        text: String,
+        /// Force a specific tier: extractive | local-llm | apple-fm.
+        /// Default: auto (dispatcher picks based on task + availability).
+        #[arg(long)]
+        tier: Option<String>,
+        /// Task kind: short | open | summarize | extract | contradict.
+        #[arg(long, default_value = "short")]
+        task: String,
+        /// Max output tokens.
+        #[arg(long, default_value = "256")]
+        max_tokens: u32,
+        /// How many grounding chunks to feed the answer layer.
+        #[arg(long, default_value = "6")]
+        grounding: usize,
+        /// Render the full AnswerResponse as JSON.
+        #[arg(long)]
+        json: bool,
+    },
     /// Register a reward for a bandit arm
     Feedback { arm: u8, reward: f64 },
     /// Show recent traces with full audit detail
@@ -460,6 +483,20 @@ fn main() {
             // Bandit stats are auto-saved by RetrievalEngine after each query.
         }
 
+        Commands::Ask { text, tier, task, max_tokens, grounding, json } => {
+            cmd_ask(
+                &text,
+                tier.as_deref(),
+                &task,
+                max_tokens,
+                grounding,
+                json,
+                &db_path,
+                &trace_path,
+                cli.hash_embed,
+            );
+        }
+
         Commands::Feedback { arm, reward } => {
             let mut bandit = UcbBandit::load(&bandit_path);
             bandit.register_reward(arm, reward);
@@ -799,6 +836,128 @@ fn cmd_models(action: ModelsAction) {
                     }
                 }
             }
+        }
+    }
+}
+
+/// `tracemind ask <q>` — clean prose answer through the tiered answerer.
+///
+/// Distinct from `query`: skips the entity / triple / related dump and
+/// surfaces just the synthesized text + citations + tier badge. Designed
+/// for humans (and IDE/agent integrations) who want one answer, not a
+/// retrieval audit.
+fn cmd_ask(
+    text: &str,
+    tier_arg: Option<&str>,
+    task_arg: &str,
+    max_tokens: u32,
+    grounding_n: usize,
+    json: bool,
+    db_path: &str,
+    trace_path: &str,
+    hash_embed: bool,
+) {
+    use tm_answer::{AnswerRequest, AnswerTier, TaskKind};
+
+    let task = match task_arg.to_lowercase().as_str() {
+        "short" | "short_answer" | "short-answer" => TaskKind::ShortAnswer,
+        "open" | "synth" | "synthesis" | "open_ended" | "open-ended" => {
+            TaskKind::OpenEndedSynthesis
+        }
+        "summarize" | "summary" | "summarization" => TaskKind::Summarization,
+        "extract" | "structured" | "structured_extraction" => TaskKind::StructuredExtraction,
+        "contradict" | "contradiction" | "contradiction_check" => TaskKind::ContradictionCheck,
+        other => {
+            eprintln!(
+                "unknown --task '{}': use short | open | summarize | extract | contradict",
+                other
+            );
+            std::process::exit(2);
+        }
+    };
+
+    let preferred_tier: Option<AnswerTier> = match tier_arg {
+        None | Some("auto") => None,
+        Some(t) => match t.to_lowercase().as_str() {
+            "extractive" | "tier0" | "tier-0" | "0" => Some(AnswerTier::Extractive),
+            "local-llm" | "local_llm" | "localllm" | "tier1" | "tier-1" | "1" => {
+                Some(AnswerTier::LocalLlm)
+            }
+            "apple-fm" | "apple_fm" | "applefm" | "tier2" | "tier-2" | "2" => {
+                Some(AnswerTier::AppleFm)
+            }
+            other => {
+                eprintln!(
+                    "unknown --tier '{}': use auto | extractive | local-llm | apple-fm",
+                    other
+                );
+                std::process::exit(2);
+            }
+        },
+    };
+
+    let reranker = ColbertReranker::auto_download_or_none(0.7);
+    let mut engine = RetrievalEngine::open(db_path, trace_path, hash_embed)
+        .expect("failed to open retrieval engine")
+        .with_reranker_instance(reranker);
+    let result = engine.query(text).expect("query failed");
+
+    let answerer = answerer::build_answerer();
+    let grounding = answerer::grounding_from(&result, grounding_n.max(1));
+    let mut req = AnswerRequest::new(text.to_string(), task)
+        .with_grounding(grounding)
+        .with_max_tokens(max_tokens.max(8));
+    if let Some(t) = preferred_tier {
+        req = req.with_preferred_tier(t);
+    }
+
+    match answerer::answer_blocking(&answerer, &req) {
+        Ok(resp) => {
+            if json {
+                match serde_json::to_string_pretty(&resp) {
+                    Ok(s) => println!("{}", s),
+                    Err(e) => {
+                        eprintln!("json encode failed: {e}");
+                        std::process::exit(1);
+                    }
+                }
+            } else {
+                println!("{}", resp.text.trim());
+                println!();
+                let label = match resp.tier {
+                    AnswerTier::Extractive => "tier-0 extractive",
+                    AnswerTier::LocalLlm => "tier-1 local-llm",
+                    AnswerTier::AppleFm => "tier-2 apple-fm",
+                };
+                println!(
+                    "— {} • {} ms • {} citation(s)",
+                    label,
+                    resp.latency_ms,
+                    resp.citations.len()
+                );
+                for c in &resp.citations {
+                    println!("    [{}] {}", c.chunk_index + 1, c.trace_id);
+                }
+
+                // If we fell back to extractive while Tier-1 weights are
+                // missing, point the user at the one-command unlock.
+                if matches!(resp.tier, AnswerTier::Extractive) {
+                    let backend = tm_answer::LocalLlmBackend::new(
+                        tm_answer::LocalLlmConfig::primary(tm_answer::default_model_path()),
+                    );
+                    if !backend.weights_present() {
+                        let mb = tm_answer::QWEN_1_5B_Q4_APPROX_BYTES / (1024 * 1024);
+                        eprintln!(
+                            "\n(hint: Tier-1 weights not present. \
+                             `tracemind models pull` (~{mb} MB) unlocks prose answers.)"
+                        );
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("ask failed: {e}");
+            std::process::exit(1);
         }
     }
 }
