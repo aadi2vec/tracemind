@@ -1,2 +1,2 @@
 pub mod engine;
-pub use engine::RetrievalEngine;
+pub use engine::{RetrievalEngine, RetrievalResult, SignalHit};

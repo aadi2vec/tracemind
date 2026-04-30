@@ -13,9 +13,20 @@ anyhow = { workspace = true }
 async-trait = "0.1"
 tokio = { workspace = true }
 
+# Tier 1 (opt-in). llama.cpp via llama-cpp-2 for Qwen 2.5 / Llama 3.2 GGUF
+# inference. Pulls a heavy native build; only compiled when `local-llm` is on.
+llama-cpp-2 = { version = "0.1", optional = true }
+# HF Hub for first-run model download. Already used by tm-rerank.
+hf-hub = { version = "0.4", optional = true }
+
+[dev-dependencies]
+tempfile = "3"
+
 [features]
 default = []
 # Tier 1: bundled local LLM via llama.cpp. Pulls ~900 MB weights at first run.
-local-llm = []
+local-llm = ["dep:llama-cpp-2", "dep:hf-hub"]
+# Apple Silicon Metal acceleration for Tier 1 (macOS only). Implies local-llm.
+local-llm-metal = ["local-llm", "llama-cpp-2/metal"]
 # Tier 2: Apple FoundationModels (macOS Tahoe 26+, Apple Silicon).
 apple-fm = []

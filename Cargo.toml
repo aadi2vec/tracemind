@@ -18,6 +18,8 @@ members = [
     "crates/tm-bench",
     "crates/tm-answer",
     "crates/tm-bench-locomo",
+    "crates/tm-intent",
+    "crates/tm-reflect",
 ]
 
 [workspace.package]
@@ -74,6 +76,8 @@ tm-ingest = { path = "crates/tm-ingest" }
 tm-retrieval = { path = "crates/tm-retrieval" }
 tm-reason = { path = "crates/tm-reason" }
 tm-answer = { path = "crates/tm-answer" }
+tm-intent = { path = "crates/tm-intent" }
+tm-reflect = { path = "crates/tm-reflect" }
 
 [profile.release]
 opt-level = 3

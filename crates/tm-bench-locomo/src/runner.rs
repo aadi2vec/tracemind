@@ -19,7 +19,10 @@ pub struct RunnerContext<'a> {
 }
 
 #[async_trait]
-pub trait LocomoRunner: Send + Sync {
+/// Implementations are run sequentially by the harness, so we only require
+/// [`Send`] (not `Sync`). This lets backends hold `!Sync` resources like
+/// rusqlite connections directly.
+pub trait LocomoRunner: Send {
     /// Human-readable name for the report (e.g. "tracemind-v0.1").
     fn name(&self) -> &str;
 

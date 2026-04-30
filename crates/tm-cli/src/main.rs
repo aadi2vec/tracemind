@@ -12,6 +12,8 @@ use tm_retrieval::RetrievalEngine;
 use tm_types::{Procedure, ProcedureStep};
 use uuid::Uuid;
 
+mod answerer;
+
 // ---------------------------------------------------------------------------
 // CLI definition
 // ---------------------------------------------------------------------------
@@ -80,6 +82,133 @@ enum Commands {
         /// Emit raw JSON lines instead of a formatted table.
         #[arg(long)]
         json: bool,
+    },
+    /// Manage local model weights (Tier-1 LLM, embedders, rerankers).
+    Models {
+        #[command(subcommand)]
+        action: ModelsAction,
+    },
+    /// Record a Commitment (intent / decision / hypothesis) — the wedge
+    /// primitive of the system of intents (see `docs/INTENT_SYSTEM.md` §1.1).
+    Commit {
+        /// One of: intent | decision | hypothesis
+        #[arg(long)]
+        kind: String,
+        /// Free-text statement of the commitment.
+        statement: String,
+        /// Optional RFC3339 deadline / horizon (e.g. 2026-05-01T17:00:00Z).
+        #[arg(long)]
+        horizon: Option<String>,
+        /// Stakes: low | medium | high | reversible (default medium).
+        #[arg(long)]
+        stakes: Option<String>,
+        /// Confidence in [0,1].
+        #[arg(long)]
+        confidence: Option<f32>,
+        /// Comma-separated tags.
+        #[arg(long, default_value = "")]
+        tags: String,
+        /// Comma-separated options considered.
+        #[arg(long, default_value = "")]
+        options: String,
+        /// The chosen option (only meaningful for kind=decision).
+        #[arg(long, default_value = "")]
+        chosen: String,
+        /// Expected outcome (free text).
+        #[arg(long)]
+        expected: Option<String>,
+    },
+    /// Attach an Outcome to a Commitment, walking the state machine to Completed.
+    Resolve {
+        /// Commitment UUID returned by `tracemind commit`.
+        commitment_id: String,
+        /// Polarity: better | as_expected | worse | mixed | no_outcome
+        #[arg(long)]
+        polarity: String,
+        /// Free-text description of what actually happened.
+        description: String,
+        /// Optional free-text user note.
+        #[arg(long)]
+        note: Option<String>,
+    },
+    /// List open + acted (non-terminal) commitments.
+    Commitments {
+        #[arg(long, default_value = "20")]
+        limit: usize,
+    },
+    /// Mined commitment candidates awaiting confirmation
+    /// (`docs/INTENT_SYSTEM.md` §3.1).
+    Candidates {
+        #[command(subcommand)]
+        action: CandidatesAction,
+    },
+    /// Daily brief — overdue + open + recently resolved + pending
+    /// candidates. (`docs/INTENT_SYSTEM.md` §9.1)
+    Brief {
+        /// Render as JSON instead of formatted text. JSON is the
+        /// stable format consumed by agents / external tooling.
+        #[arg(long)]
+        json: bool,
+        /// Look-back window for the "resolved" section, in days.
+        #[arg(long, default_value = "7")]
+        resolved_days: i64,
+    },
+    /// Pattern detector surface — show / silence / unsilence the
+    /// detector's findings. (`docs/INTENT_SYSTEM.md` §5)
+    Patterns {
+        #[command(subcommand)]
+        action: PatternsAction,
+    },
+}
+
+#[derive(clap::Subcommand)]
+enum CandidatesAction {
+    /// Show pending candidates (newest first).
+    List {
+        #[arg(long, default_value = "20")]
+        limit: usize,
+    },
+    /// Promote a candidate into a real Open commitment.
+    Accept { candidate_id: String },
+    /// Mark a candidate dismissed (no commitment created).
+    Dismiss { candidate_id: String },
+}
+
+#[derive(clap::Subcommand)]
+enum PatternsAction {
+    /// List currently-surfacing patterns (the same set the brief
+    /// would show right now, after silences).
+    List,
+    /// List silenced cells. Useful before unsilencing.
+    Silenced,
+    /// Silence a cell so the detector stops surfacing it. Default
+    /// window: 90 days (`INTENT_SYSTEM.md` §5.1.3).
+    Silence {
+        /// 16-hex cell hash from the brief's "patterns spotted" section.
+        cell_hash: String,
+        /// Silence window in days. Default 90.
+        #[arg(long, default_value = "90")]
+        days: i64,
+        /// Optional reason — stored alongside the silence row.
+        #[arg(long)]
+        reason: Option<String>,
+    },
+    /// Re-enable surfacing for a previously-silenced cell.
+    Unsilence { cell_hash: String },
+}
+
+#[derive(clap::Subcommand)]
+enum ModelsAction {
+    /// Show whether Tier-1 weights are present and where they live.
+    Status,
+    /// Download Tier-1 LLM weights (Qwen 2.5 1.5B Q4_K_M, ~900 MB) from
+    /// HuggingFace into `~/.tracemind/models/`. Idempotent — no-op when
+    /// weights are already present.
+    Pull {
+        /// Use the mobile-class model (Qwen 2.5 0.5B Q4_K_M, ~350 MB)
+        /// instead of the laptop default.
+        #[arg(long)]
+        mobile: bool,
     },
 }
 
@@ -200,6 +329,72 @@ fn main() {
                 }
             }
             println!("  + {} co-occurrence triples", result.triples.len() - typed.len());
+
+            // Sprint C: mine commitment candidates from the ingested text.
+            // Soft-fail: any miner / store error is logged via eprintln! and
+            // never blocks the ingest path.
+            //
+            // Sprint D: also score the new text against open commitments
+            // (`INTENT_SYSTEM.md` §4.2) and surface proposed outcomes —
+            // the user can then run `tracemind resolve <id>` to confirm.
+            {
+                let intents_path = dir.join("intents.db").to_str().unwrap().to_string();
+                match tm_intent::IntentStore::open(&intents_path) {
+                    Ok(mut store) => {
+                        // -- mining --
+                        let mined = tm_intent::mine(&text);
+                        if !mined.is_empty() {
+                            let records: Vec<_> = mined
+                                .into_iter()
+                                .map(|c| tm_intent::CandidateRecord::from_mined(&c, text.clone()))
+                                .collect();
+                            match store.insert_candidates(&records) {
+                                Ok(n) => {
+                                    if n > 0 {
+                                        println!("  + {} commitment candidate(s) mined (run `tracemind candidates list`)", n);
+                                    }
+                                }
+                                Err(e) => eprintln!("  (candidate mining: insert failed: {e})"),
+                            }
+                        }
+
+                        // -- outcome matching --
+                        match store.list_open(50) {
+                            Ok(opens) if !opens.is_empty() => {
+                                let cfg = tm_reflect::MatcherConfig::default();
+                                let proposals =
+                                    tm_reflect::propose_outcomes(&text, &opens, &cfg);
+                                if !proposals.is_empty() {
+                                    println!(
+                                        "  + {} possible outcome match(es) — run `tracemind resolve <id>`:",
+                                        proposals.len()
+                                    );
+                                    for p in &proposals {
+                                        let hint = match p.polarity_hint {
+                                            Some(tm_intent::Polarity::Better) => " [hint: better]",
+                                            Some(tm_intent::Polarity::Worse) => " [hint: worse]",
+                                            Some(tm_intent::Polarity::AsExpected) => " [hint: as_expected]",
+                                            Some(tm_intent::Polarity::Mixed) => " [hint: mixed]",
+                                            Some(tm_intent::Polarity::NoOutcome) => " [hint: no_outcome]",
+                                            None => "",
+                                        };
+                                        println!(
+                                            "      {}  score={:.2}{}  → {}",
+                                            short_id(p.commitment_id),
+                                            p.score,
+                                            hint,
+                                            truncate_str(&p.commitment_statement, 50),
+                                        );
+                                    }
+                                }
+                            }
+                            Ok(_) => {}
+                            Err(e) => eprintln!("  (outcome matching: list_open failed: {e})"),
+                        }
+                    }
+                    Err(e) => eprintln!("  (intent store: open failed: {e})"),
+                }
+            }
         }
 
         Commands::Query { text } => {
@@ -209,7 +404,32 @@ fn main() {
                 .with_reranker_instance(reranker);
             let result = engine.query(&text).expect("query failed");
 
-            // Build a name lookup from the returned entities.
+            // Sprint A: dispatch through the tiered answerer (Tier 0 always;
+            // Tier 1 when `local-llm` feature is on and weights are present).
+            let answerer = answerer::build_answerer();
+            let grounding = answerer::grounding_from(&result, 6);
+            let req = answerer::short_answer_request(&text, grounding);
+            match answerer::answer_blocking(&answerer, &req) {
+                Ok(resp) => {
+                    println!("Answer ({:?}, {}ms):", resp.tier, resp.latency_ms);
+                    println!("{}", resp.text.trim());
+                    if !resp.citations.is_empty() {
+                        let cites: Vec<String> = resp
+                            .citations
+                            .iter()
+                            .map(|c| format!("[{}] {}", c.chunk_index + 1, c.trace_id))
+                            .collect();
+                        println!("\nCitations: {}", cites.join(", "));
+                    }
+                    println!();
+                }
+                Err(e) => {
+                    eprintln!("[answer] dispatch failed: {e}");
+                }
+            }
+
+            // Build a name lookup from the returned entities (used by the
+            // entity / triple / related listing below).
             let name_of: std::collections::HashMap<uuid::Uuid, String> = result
                 .entities
                 .iter()
@@ -422,12 +642,166 @@ fn main() {
                 );
             }
         }
+
+        Commands::Models { action } => {
+            cmd_models(action);
+        }
+        Commands::Commit {
+            kind,
+            statement,
+            horizon,
+            stakes,
+            confidence,
+            tags,
+            options,
+            chosen,
+            expected,
+        } => {
+            let intents_path = dir.join("intents.db").to_str().unwrap().to_string();
+            cmd_commit(
+                &intents_path,
+                &kind,
+                statement,
+                horizon.as_deref(),
+                stakes.as_deref(),
+                confidence,
+                &tags,
+                &options,
+                &chosen,
+                expected.as_deref(),
+            );
+        }
+        Commands::Resolve {
+            commitment_id,
+            polarity,
+            description,
+            note,
+        } => {
+            let intents_path = dir.join("intents.db").to_str().unwrap().to_string();
+            cmd_resolve(
+                &intents_path,
+                &commitment_id,
+                &polarity,
+                &description,
+                note.as_deref(),
+            );
+        }
+        Commands::Commitments { limit } => {
+            let intents_path = dir.join("intents.db").to_str().unwrap().to_string();
+            cmd_commitments(&intents_path, limit);
+        }
+        Commands::Candidates { action } => {
+            let intents_path = dir.join("intents.db").to_str().unwrap().to_string();
+            cmd_candidates(&intents_path, action);
+        }
+        Commands::Brief { json, resolved_days } => {
+            let intents_path = dir.join("intents.db").to_str().unwrap().to_string();
+            cmd_brief(&intents_path, json, resolved_days);
+        }
+        Commands::Patterns { action } => {
+            let intents_path = dir.join("intents.db").to_str().unwrap().to_string();
+            cmd_patterns(&intents_path, action);
+        }
     }
 }
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// `tracemind models …` handler. Reports tier-1 weight status and (when the
+/// `local-llm` feature is on) downloads the GGUF on demand.
+fn cmd_models(action: ModelsAction) {
+    use tm_answer::{LocalLlmBackend, LocalLlmConfig, default_model_path};
+
+    match action {
+        ModelsAction::Status => {
+            let path = default_model_path();
+            let cfg = LocalLlmConfig::primary(path.clone());
+            let backend = LocalLlmBackend::new(cfg);
+            let approx_mb = tm_answer::QWEN_1_5B_Q4_APPROX_BYTES / (1024 * 1024);
+            println!("Tier-1 LLM (Qwen 2.5 1.5B Q4_K_M)");
+            println!("  Path:     {}", path.display());
+            if backend.weights_present() {
+                let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                println!("  Status:   READY ({} MB on disk)", size / (1024 * 1024));
+            } else {
+                println!("  Status:   needs download (~{} MB)", approx_mb);
+                #[cfg(feature = "local-llm")]
+                println!("  Hint:     run `tracemind models pull` to fetch it.");
+                #[cfg(not(feature = "local-llm"))]
+                println!(
+                    "  Hint:     rebuild with `--features local-llm` (or local-llm-metal on macOS)\n            to enable Tier-1 inference + auto-download."
+                );
+            }
+            println!("  Source:   {}/{}", tm_answer::HF_REPO_PRIMARY, tm_answer::HF_FILE_PRIMARY);
+        }
+
+        ModelsAction::Pull { mobile } => {
+            let path = default_model_path();
+            // Mobile config swaps repo/file but keeps the same `models/` dir.
+            let mobile_path = path
+                .parent()
+                .map(|p| p.join(tm_answer::HF_FILE_MOBILE))
+                .unwrap_or_else(|| std::path::PathBuf::from(tm_answer::HF_FILE_MOBILE));
+            let (cfg, target) = if mobile {
+                (LocalLlmConfig::mobile(mobile_path.clone()), mobile_path)
+            } else {
+                (LocalLlmConfig::primary(path.clone()), path)
+            };
+            let backend = LocalLlmBackend::new(cfg);
+
+            if backend.weights_present() {
+                println!("Weights already present at {}", target.display());
+                return;
+            }
+
+            #[cfg(not(feature = "local-llm"))]
+            {
+                eprintln!(
+                    "tracemind was built without the `local-llm` feature, so it cannot download \
+                    Tier-1 weights.\nRebuild with: cargo build --release -p tm-cli --features local-llm \
+                    (add `local-llm-metal` on Apple Silicon for Metal acceleration)."
+                );
+                std::process::exit(2);
+            }
+
+            #[cfg(feature = "local-llm")]
+            {
+                let approx_mb = if mobile {
+                    350
+                } else {
+                    tm_answer::QWEN_1_5B_Q4_APPROX_BYTES / (1024 * 1024)
+                };
+                println!(
+                    "Downloading {}/{} (~{} MB) → {}",
+                    if mobile {
+                        tm_answer::HF_REPO_MOBILE
+                    } else {
+                        tm_answer::HF_REPO_PRIMARY
+                    },
+                    if mobile {
+                        tm_answer::HF_FILE_MOBILE
+                    } else {
+                        tm_answer::HF_FILE_PRIMARY
+                    },
+                    approx_mb,
+                    target.display(),
+                );
+                match backend.ensure_weights() {
+                    Ok(p) => {
+                        let size = std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
+                        println!("Done. Weights at {} ({} MB).", p.display(), size / (1024 * 1024));
+                    }
+                    Err(e) => {
+                        eprintln!("Download failed: {}", e);
+                        std::process::exit(1);
+                    }
+                }
+            }
+        }
+    }
+}
 
 fn cmd_import(path: &str, extensions: &str, max_kb: u64, dry_run: bool, hash_embed: bool, db_path: &str) {
     let ext_set: std::collections::HashSet<String> = extensions
@@ -476,7 +850,13 @@ fn cmd_import(path: &str, extensions: &str, max_kb: u64, dry_run: bool, hash_emb
         let rel_path = file_path.strip_prefix(root).unwrap_or(file_path);
 
         match std::fs::read_to_string(file_path) {
-            Ok(contents) => {
+            Ok(raw) => {
+                // Obsidian vaults store YAML frontmatter at the top of every
+                // note (`---\n...\n---`). Stripping it before ingest keeps the
+                // body's prose / wikilinks / tags intact while preventing
+                // metadata keys (created, tags:, aliases:) from polluting the
+                // entity extractor.
+                let contents = strip_md_frontmatter(&raw);
                 if contents.trim().is_empty() {
                     skipped += 1;
                     continue;
@@ -511,6 +891,56 @@ fn cmd_import(path: &str, extensions: &str, max_kb: u64, dry_run: bool, hash_emb
     println!("  Skipped:  {} (empty, non-UTF-8, or duplicate)", skipped);
     println!("  Errors:   {}", errors);
     println!("  Total:    {} KB processed", total_bytes / 1024);
+}
+
+/// Strip a YAML frontmatter block (`---\n…\n---`) from the start of a
+/// markdown document. Supports both `---` and `+++` (TOML) fences. If no
+/// fence is present at the very start, returns the input unchanged.
+///
+/// This makes `tracemind import <obsidian-vault>` ingest the *body* of each
+/// note without leaking metadata fields (created:, tags:, aliases:, …) into
+/// the entity / triple extractor.
+fn strip_md_frontmatter(s: &str) -> &str {
+    let trimmed_leading = s.trim_start_matches(|c: char| c == '\u{feff}');
+    let fence: &str = if trimmed_leading.starts_with("---\n") || trimmed_leading.starts_with("---\r\n") {
+        "---"
+    } else if trimmed_leading.starts_with("+++\n") || trimmed_leading.starts_with("+++\r\n") {
+        "+++"
+    } else {
+        return s;
+    };
+
+    // Skip the opening fence line, then look for the matching closing fence
+    // on its own line.
+    let body_start = match trimmed_leading.find('\n') {
+        Some(n) => n + 1,
+        None => return s,
+    };
+    let after_open = &trimmed_leading[body_start..];
+
+    // Look for "\n---\n" (or with \r) — the closing fence at line start.
+    let mut search_from = 0usize;
+    while let Some(idx) = after_open[search_from..].find(fence) {
+        let abs = search_from + idx;
+        let starts_at_line = abs == 0 || after_open.as_bytes()[abs - 1] == b'\n';
+        let after_fence = abs + fence.len();
+        let ends_line = after_fence == after_open.len()
+            || matches!(after_open.as_bytes().get(after_fence), Some(b'\n') | Some(b'\r'));
+        if starts_at_line && ends_line {
+            // Skip past the fence + trailing newline if any.
+            let mut tail = after_fence;
+            if after_open.as_bytes().get(tail) == Some(&b'\r') {
+                tail += 1;
+            }
+            if after_open.as_bytes().get(tail) == Some(&b'\n') {
+                tail += 1;
+            }
+            return &after_open[tail..];
+        }
+        search_from = abs + fence.len();
+    }
+    // Unterminated frontmatter — leave it alone rather than swallow content.
+    s
 }
 
 fn collect_files(
@@ -614,4 +1044,679 @@ fn print_trace_detail(trace: &tm_types::Trace, db_path: &str) {
             println!("  Latency: {}ms", ms);
         }
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::strip_md_frontmatter;
+
+    #[test]
+    fn no_frontmatter_passthrough() {
+        let s = "# Hello\n\nbody";
+        assert_eq!(strip_md_frontmatter(s), s);
+    }
+
+    #[test]
+    fn yaml_frontmatter_stripped() {
+        let s = "---\ntitle: Note\ntags: [a, b]\n---\n# Body\n\ntext";
+        assert_eq!(strip_md_frontmatter(s), "# Body\n\ntext");
+    }
+
+    #[test]
+    fn toml_frontmatter_stripped() {
+        let s = "+++\ntitle = \"Note\"\n+++\nbody";
+        assert_eq!(strip_md_frontmatter(s), "body");
+    }
+
+    #[test]
+    fn unterminated_frontmatter_left_alone() {
+        let s = "---\ntitle: oops\nno close fence";
+        assert_eq!(strip_md_frontmatter(s), s);
+    }
+
+    #[test]
+    fn crlf_frontmatter_stripped() {
+        let s = "---\r\ntitle: Note\r\n---\r\nbody";
+        assert_eq!(strip_md_frontmatter(s), "body");
+    }
+
+    #[test]
+    fn fence_inside_body_not_consumed() {
+        let s = "no frontmatter\n---\nseparator\n---\nmore";
+        assert_eq!(strip_md_frontmatter(s), s);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// `tracemind commit` / `resolve` / `commitments` — system of intents wedge.
+// Mirrors the MCP tools `memory_commit` / `memory_resolve` so the same
+// primitive works from the terminal. See `docs/INTENT_SYSTEM.md`.
+// ---------------------------------------------------------------------------
+
+#[allow(clippy::too_many_arguments)]
+fn cmd_commit(
+    intents_path: &str,
+    kind_s: &str,
+    statement: String,
+    horizon: Option<&str>,
+    stakes: Option<&str>,
+    confidence: Option<f32>,
+    tags_csv: &str,
+    options_csv: &str,
+    chosen: &str,
+    expected: Option<&str>,
+) {
+    use tm_intent::{Commitment, CommitmentKind, IntentStore, Source, Stakes};
+
+    let kind = match kind_s {
+        "intent" => CommitmentKind::Intent,
+        "decision" => CommitmentKind::Decision,
+        "hypothesis" => CommitmentKind::Hypothesis,
+        other => {
+            eprintln!("invalid --kind: {other} (expected intent|decision|hypothesis)");
+            std::process::exit(2);
+        }
+    };
+    let statement = statement.trim().to_string();
+    if statement.is_empty() {
+        eprintln!("statement must be non-empty");
+        std::process::exit(2);
+    }
+
+    let mut c = Commitment::new(kind, statement, Source::Cli);
+
+    if let Some(h) = horizon {
+        match chrono::DateTime::parse_from_rfc3339(h) {
+            Ok(t) => c.horizon = Some(t.with_timezone(&chrono::Utc)),
+            Err(e) => {
+                eprintln!("invalid --horizon (need RFC3339, e.g. 2026-05-01T17:00:00Z): {e}");
+                std::process::exit(2);
+            }
+        }
+    }
+    if let Some(s) = stakes {
+        c.stakes = match s {
+            "low" => Stakes::Low,
+            "medium" => Stakes::Medium,
+            "high" => Stakes::High,
+            "reversible" => Stakes::Reversible,
+            other => {
+                eprintln!("invalid --stakes: {other}");
+                std::process::exit(2);
+            }
+        };
+    }
+    if let Some(f) = confidence {
+        if !(0.0..=1.0).contains(&f) {
+            eprintln!("--confidence must be in [0,1], got {f}");
+            std::process::exit(2);
+        }
+        c.confidence = f;
+    }
+    if !tags_csv.is_empty() {
+        c.tags = tags_csv
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+    }
+    if !options_csv.is_empty() {
+        c.options_considered = options_csv
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+    }
+    if !chosen.is_empty() {
+        c.chosen = chosen.to_string();
+    }
+    if let Some(e) = expected {
+        c.expected_outcome = Some(e.to_string());
+    }
+
+    let store = match IntentStore::open(intents_path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("failed to open intent store at {intents_path}: {e}");
+            std::process::exit(1);
+        }
+    };
+    if let Err(e) = store.insert_commitment(&c) {
+        eprintln!("failed to persist commitment: {e}");
+        std::process::exit(1);
+    }
+    println!("commitment {} ({})", c.id, kind_s);
+    println!("  state:     open");
+    println!("  statement: {}", c.statement);
+    if let Some(h) = c.horizon {
+        println!("  horizon:   {}", h.to_rfc3339());
+    }
+}
+
+fn cmd_resolve(
+    intents_path: &str,
+    commitment_id: &str,
+    polarity_s: &str,
+    description: &str,
+    note: Option<&str>,
+) {
+    use tm_intent::{state::transition, IntentStore, Outcome, OutcomeSource, Polarity, State};
+
+    let cid = match Uuid::parse_str(commitment_id) {
+        Ok(u) => u,
+        Err(e) => {
+            eprintln!("invalid commitment id '{commitment_id}': {e}");
+            std::process::exit(2);
+        }
+    };
+    let polarity = match polarity_s {
+        "better" => Polarity::Better,
+        "as_expected" => Polarity::AsExpected,
+        "worse" => Polarity::Worse,
+        "mixed" => Polarity::Mixed,
+        "no_outcome" => Polarity::NoOutcome,
+        other => {
+            eprintln!(
+                "invalid --polarity: {other} (expected better|as_expected|worse|mixed|no_outcome)"
+            );
+            std::process::exit(2);
+        }
+    };
+
+    let store = match IntentStore::open(intents_path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("failed to open intent store at {intents_path}: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    let mut c = match store.get_commitment(cid) {
+        Ok(Some(c)) => c,
+        Ok(None) => {
+            eprintln!("no commitment with id {cid}");
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("lookup failed: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    let mut outcome = Outcome::new(c.id, polarity, description, OutcomeSource::Cli);
+    if let Some(n) = note {
+        outcome.user_note = Some(n.to_string());
+    }
+
+    if let Err(e) = transition(&mut c, State::Completed, Some(&outcome)) {
+        eprintln!("state transition rejected: {e}");
+        std::process::exit(1);
+    }
+
+    if let Err(e) = store.insert_outcome(&outcome) {
+        eprintln!("failed to persist outcome: {e}");
+        std::process::exit(1);
+    }
+    if let Err(e) = store.update_state(c.id, c.state, c.outcome_id) {
+        eprintln!("failed to update commitment state: {e}");
+        std::process::exit(1);
+    }
+
+    println!("commitment {cid} → completed ({polarity_s})");
+    println!("  outcome:   {}", outcome.id);
+    println!("  observed:  {}", outcome.observed_at.to_rfc3339());
+}
+
+fn cmd_commitments(intents_path: &str, limit: usize) {
+    use tm_intent::IntentStore;
+
+    let store = match IntentStore::open(intents_path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("failed to open intent store at {intents_path}: {e}");
+            std::process::exit(1);
+        }
+    };
+    let rows = match store.list_open(limit) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("query failed: {e}");
+            std::process::exit(1);
+        }
+    };
+    if rows.is_empty() {
+        println!("(no open or acted commitments)");
+        return;
+    }
+    for c in rows {
+        let horizon = c
+            .horizon
+            .map(|h| h.to_rfc3339())
+            .unwrap_or_else(|| "—".to_string());
+        let kind = format!("{:?}", c.kind).to_lowercase();
+        let state = format!("{:?}", c.state).to_lowercase();
+        println!(
+            "{}  [{:<10}]  {:<5}  horizon={}  {}",
+            c.id, kind, state, horizon, c.statement
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// `tracemind candidates` — mined commitment candidates awaiting review.
+// Mirrors the brief's confirm/dismiss surface for terminal users.
+// ---------------------------------------------------------------------------
+
+fn cmd_candidates(intents_path: &str, action: CandidatesAction) {
+    use tm_intent::IntentStore;
+
+    match action {
+        CandidatesAction::List { limit } => {
+            let store = match IntentStore::open(intents_path) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("failed to open intent store at {intents_path}: {e}");
+                    std::process::exit(1);
+                }
+            };
+            let pending = match store.list_pending_candidates(limit) {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("query failed: {e}");
+                    std::process::exit(1);
+                }
+            };
+            if pending.is_empty() {
+                println!("(no pending candidates)");
+                return;
+            }
+            for c in pending {
+                let kind = format!("{:?}", c.kind).to_lowercase();
+                println!(
+                    "{}  [{:<10}]  conf={:.2}  via=\"{}\"  {}",
+                    c.id, kind, c.confidence, c.matched_phrase, c.statement
+                );
+            }
+        }
+        CandidatesAction::Accept { candidate_id } => {
+            let cid = match Uuid::parse_str(&candidate_id) {
+                Ok(u) => u,
+                Err(e) => {
+                    eprintln!("invalid candidate id '{candidate_id}': {e}");
+                    std::process::exit(2);
+                }
+            };
+            let mut store = match IntentStore::open(intents_path) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("failed to open intent store at {intents_path}: {e}");
+                    std::process::exit(1);
+                }
+            };
+            match store.accept_candidate(cid) {
+                Ok(new_id) => {
+                    println!("candidate {cid} → commitment {new_id} (open)");
+                }
+                Err(e) => {
+                    eprintln!("accept failed: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        CandidatesAction::Dismiss { candidate_id } => {
+            let cid = match Uuid::parse_str(&candidate_id) {
+                Ok(u) => u,
+                Err(e) => {
+                    eprintln!("invalid candidate id '{candidate_id}': {e}");
+                    std::process::exit(2);
+                }
+            };
+            let store = match IntentStore::open(intents_path) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("failed to open intent store at {intents_path}: {e}");
+                    std::process::exit(1);
+                }
+            };
+            match store.dismiss_candidate(cid) {
+                Ok(true) => println!("candidate {cid} dismissed"),
+                Ok(false) => {
+                    eprintln!(
+                        "candidate {cid} was not pending (already accepted or dismissed)"
+                    );
+                    std::process::exit(1);
+                }
+                Err(e) => {
+                    eprintln!("dismiss failed: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+    }
+}
+
+/// `tracemind brief` — render the daily brief to stdout.
+///
+/// Two output modes:
+/// - text (default) — formatted for terminal reading per
+///   `INTENT_SYSTEM.md` §9.1
+/// - JSON (`--json`) — the [`tm_reflect::DailyBrief`] structure
+///   verbatim; this is the stable contract for agents and external
+///   tooling.
+fn cmd_brief(intents_path: &str, json: bool, resolved_days: i64) {
+    use chrono::{Duration, Utc};
+    use tm_intent::IntentStore;
+    use tm_reflect::{BriefBuilder, BriefConfig};
+
+    let store = match IntentStore::open(intents_path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("failed to open intent store at {intents_path}: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    let cfg = BriefConfig {
+        resolved_window: Duration::days(resolved_days),
+        ..Default::default()
+    };
+    let brief = match BriefBuilder::new(&store).with_config(cfg).build(Utc::now()) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("brief failed: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    if json {
+        match serde_json::to_string_pretty(&brief) {
+            Ok(s) => println!("{s}"),
+            Err(e) => {
+                eprintln!("brief json failed: {e}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+
+    print_brief_text(&brief);
+}
+
+/// `tracemind patterns` — pattern-detector surface
+/// (`INTENT_SYSTEM.md` §5). All actions key off the 16-hex
+/// `cell_hash` printed in the brief's "patterns spotted" section.
+fn cmd_patterns(intents_path: &str, action: PatternsAction) {
+    use chrono::{Duration, Utc};
+    use tm_intent::IntentStore;
+    use tm_reflect::{BriefBuilder, BriefConfig};
+
+    let store = match IntentStore::open(intents_path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("failed to open intent store at {intents_path}: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    match action {
+        PatternsAction::List => {
+            // Reuse the brief builder so `patterns list` is exactly
+            // what `brief` would surface — no schema drift.
+            let brief = match BriefBuilder::new(&store)
+                .with_config(BriefConfig::default())
+                .build(Utc::now())
+            {
+                Ok(b) => b,
+                Err(e) => {
+                    eprintln!("brief failed: {e}");
+                    std::process::exit(1);
+                }
+            };
+            if brief.patterns.is_empty() {
+                println!("(no patterns surfacing right now)");
+                println!("  needs ≥{} completed commitments globally + ≥{} per cell;",
+                    brief.counts.resolved.max(0), tm_reflect::PatternConfig::default().min_n);
+                println!("  also filters cells you've silenced.");
+                return;
+            }
+            println!("patterns spotted ({})", brief.patterns.len());
+            for p in &brief.patterns {
+                println!(
+                    "  {}  n={:>3}  lift_worse={:+.2}  support_lb={:.2}",
+                    &p.cell_hash, p.n, p.lift_worse, p.support_lb,
+                );
+                println!("    {}", p.render);
+            }
+            println!("\n  → `tracemind patterns silence <cell_hash>` to suppress");
+        }
+        PatternsAction::Silenced => {
+            let now = Utc::now();
+            let rows = match store.list_active_pattern_silences(now) {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("failed to read silences: {e}");
+                    std::process::exit(1);
+                }
+            };
+            if rows.is_empty() {
+                println!("(no active silences)");
+                return;
+            }
+            println!("active silences ({})", rows.len());
+            for s in &rows {
+                let until_local = s.silenced_until.with_timezone(&chrono::Local);
+                let reason = s.reason.as_deref().unwrap_or("—");
+                println!(
+                    "  {}  until {}  reason={}\n    cell: {}",
+                    s.cell_hash,
+                    until_local.format("%b %-d %Y"),
+                    reason,
+                    s.cell_label,
+                );
+            }
+        }
+        PatternsAction::Silence {
+            cell_hash,
+            days,
+            reason,
+        } => {
+            // Try to look up a current cell label so the silence row
+            // is self-describing in `patterns silenced`. Fall back to
+            // empty if no current pattern matches the hash (the user
+            // may pre-silence a hash they expect to see).
+            let label = match BriefBuilder::new(&store)
+                .with_config(BriefConfig::default())
+                .build(Utc::now())
+            {
+                Ok(b) => b
+                    .patterns
+                    .iter()
+                    .find(|p| p.cell_hash == cell_hash)
+                    .map(|p| p.cell.label())
+                    .unwrap_or_default(),
+                Err(_) => String::new(),
+            };
+            let now = Utc::now();
+            let until = now + Duration::days(days);
+            match store.upsert_pattern_silence(
+                &cell_hash,
+                &label,
+                now,
+                until,
+                reason.as_deref(),
+            ) {
+                Ok(()) => {
+                    let until_local = until.with_timezone(&chrono::Local);
+                    println!(
+                        "silenced cell {} until {} ({} days)",
+                        cell_hash,
+                        until_local.format("%b %-d %Y"),
+                        days,
+                    );
+                    if !label.is_empty() {
+                        println!("  cell: {label}");
+                    }
+                }
+                Err(e) => {
+                    eprintln!("failed to silence: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        PatternsAction::Unsilence { cell_hash } => match store.remove_pattern_silence(&cell_hash) {
+            Ok(true) => println!("unsilenced {cell_hash}"),
+            Ok(false) => println!("no silence found for {cell_hash}"),
+            Err(e) => {
+                eprintln!("failed to unsilence: {e}");
+                std::process::exit(1);
+            }
+        },
+    }
+}
+
+fn print_brief_text(brief: &tm_reflect::DailyBrief) {
+    let local_now = brief.generated_at.with_timezone(&chrono::Local);
+    println!(
+        "TRACEMIND BRIEF                  {}",
+        local_now.format("%a %b %d, %-I:%M %p")
+    );
+    println!(
+        "  overdue: {}    open: {}    resolved: {}    candidates: {}    patterns: {}",
+        brief.counts.overdue,
+        brief.counts.open,
+        brief.counts.resolved,
+        brief.counts.candidates,
+        brief.counts.patterns,
+    );
+    println!();
+
+    if !brief.overdue.is_empty() {
+        println!("▸ overdue ({})", brief.overdue.len());
+        for row in &brief.overdue {
+            let bucket = match row.overdue_class {
+                Some(tm_reflect::OverdueClass::DueToday) => "due today",
+                Some(tm_reflect::OverdueClass::OverdueRecent) => "overdue",
+                Some(tm_reflect::OverdueClass::OverdueStale) => "stale",
+                None => "—",
+            };
+            let horizon = row
+                .horizon
+                .map(|h| h.with_timezone(&chrono::Local).format("%b %-d").to_string())
+                .unwrap_or_else(|| "—".into());
+            println!(
+                "    {}  [{:>9}]  by {:>6}  {}",
+                short_id(row.id),
+                bucket,
+                horizon,
+                truncate_str(&row.statement, 60)
+            );
+        }
+        println!();
+    }
+
+    if !brief.open.is_empty() {
+        println!("▸ open intents ({})", brief.open.len());
+        for row in &brief.open {
+            let kind = match row.kind {
+                tm_intent::CommitmentKind::Intent => "intent",
+                tm_intent::CommitmentKind::Decision => "decision",
+                tm_intent::CommitmentKind::Hypothesis => "hypothesis",
+            };
+            let horizon = row
+                .horizon
+                .map(|h| h.with_timezone(&chrono::Local).format("%b %-d").to_string())
+                .unwrap_or_else(|| "—".into());
+            println!(
+                "    {}  [{:>10}]  by {:>6}  {}",
+                short_id(row.id),
+                kind,
+                horizon,
+                truncate_str(&row.statement, 60)
+            );
+        }
+        println!();
+    }
+
+    if !brief.resolved.is_empty() {
+        println!("▸ resolved (last 7d) ({})", brief.resolved.len());
+        for row in &brief.resolved {
+            let polarity = row
+                .polarity
+                .map(|p| match p {
+                    tm_intent::Polarity::Better => "better",
+                    tm_intent::Polarity::AsExpected => "as-expected",
+                    tm_intent::Polarity::Worse => "worse",
+                    tm_intent::Polarity::Mixed => "mixed",
+                    tm_intent::Polarity::NoOutcome => "no-outcome",
+                })
+                .unwrap_or("—");
+            let state = match row.state {
+                tm_intent::State::Completed => "completed",
+                tm_intent::State::Abandoned => "abandoned",
+                tm_intent::State::Superseded => "superseded",
+                _ => "?", // not expected — list_recent_resolved filters terminal states only
+            };
+            println!(
+                "    {}  [{:>10} / {:>11}]  {}",
+                short_id(row.id),
+                state,
+                polarity,
+                truncate_str(&row.statement, 60)
+            );
+        }
+        println!();
+    }
+
+    if !brief.candidates.is_empty() {
+        println!("▸ pending candidates ({})", brief.candidates.len());
+        for row in &brief.candidates {
+            let kind = match row.kind {
+                tm_intent::CommitmentKind::Intent => "intent",
+                tm_intent::CommitmentKind::Decision => "decision",
+                tm_intent::CommitmentKind::Hypothesis => "hypothesis",
+            };
+            println!(
+                "    {}  [{:>10}]  conf={:.2}  via=\"{}\"  {}",
+                short_id(row.id),
+                kind,
+                row.confidence,
+                row.matched_phrase,
+                truncate_str(&row.statement, 60)
+            );
+        }
+        println!("\n  → `tracemind candidates accept|dismiss <id>` to triage");
+        println!();
+    }
+
+    // Patterns — `INTENT_SYSTEM.md` §5 / §9.1. Statistical, factual,
+    // citation-friendly tone. The detector pre-renders the headline
+    // template per §5.1.4; we just frame it. Each row includes the
+    // 16-hex `cell_hash` the user can pass to `tracemind patterns
+    // silence <hash>` to suppress.
+    if !brief.patterns.is_empty() {
+        println!("▸ patterns spotted ({})", brief.patterns.len());
+        for p in &brief.patterns {
+            println!(
+                "    {}  n={:>3}  lift_worse={:+.2}  support_lb={:.2}",
+                &p.cell_hash, p.n, p.lift_worse, p.support_lb,
+            );
+            println!("      {}", p.render);
+        }
+        println!("    (correlation only — your call on what to do)");
+        println!("    → `tracemind patterns silence <cell_hash>` to suppress");
+        println!();
+    }
+
+    if brief.counts.overdue == 0
+        && brief.counts.open == 0
+        && brief.counts.resolved == 0
+        && brief.counts.candidates == 0
+        && brief.counts.patterns == 0
+    {
+        println!("(empty — no commitments yet. try `tracemind commit` or capture some text.)");
+    }
+}
+
+fn short_id(id: Uuid) -> String {
+    id.to_string()[..8].to_string()
 }

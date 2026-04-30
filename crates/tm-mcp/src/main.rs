@@ -6,6 +6,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
+use tm_answer::TieredAnswerer;
 use tm_episodic::{RecentStore, TraceStore};
 use tm_graph::GraphStore;
 use tm_ingest::IngestPipeline;
@@ -13,6 +14,8 @@ use tm_reason::{AnalogySolver, ChainBuilder, Consolidator};
 use tm_rerank::ColbertReranker;
 use tm_retrieval::RetrievalEngine;
 use tm_types::RecentCapture;
+
+mod answerer;
 
 // ---------------------------------------------------------------------------
 // Startup helpers
@@ -46,6 +49,105 @@ fn tools_list() -> Value {
                         }
                     },
                     "required": ["text"]
+                }
+            },
+            {
+                "name": "memory_store_structured",
+                "description": "Ingest pre-extracted entities and triples directly into TraceMind memory. Bypasses the heuristic NER — use this when the caller (typically an LLM) has already done extraction. Optional `text` is stored as the trace's raw text for provenance. Predicates use snake_case (related_to, is_a, part_of, has_property, works_at, collaborates_with, owns, depends_on, produces, references, has_procedure) or any custom string.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "text": {
+                            "type": "string",
+                            "description": "Optional source text (kept for provenance / trace audit)."
+                        },
+                        "entities": {
+                            "type": "array",
+                            "description": "Pre-extracted entities. Names are matched case-insensitively against the existing graph; duplicates merge.",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "name": { "type": "string" },
+                                    "type": {
+                                        "type": "string",
+                                        "description": "One of: person, organization, project, file, url, concept, technology, decision, event. Anything else is stored as Custom."
+                                    },
+                                    "confidence": {
+                                        "type": "number",
+                                        "description": "0.0–1.0, defaults to 0.9 when omitted."
+                                    }
+                                },
+                                "required": ["name", "type"]
+                            }
+                        },
+                        "triples": {
+                            "type": "array",
+                            "description": "Pre-extracted triples. Subject/object names must appear in this call's `entities` array or already exist in the graph.",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "subject": { "type": "string" },
+                                    "predicate": { "type": "string" },
+                                    "object": { "type": "string" },
+                                    "confidence": { "type": "number" }
+                                },
+                                "required": ["subject", "predicate", "object"]
+                            }
+                        }
+                    }
+                }
+            },
+            {
+                "name": "memory_commit",
+                "description": "Record a commitment (intent / decision / hypothesis) into the system of intents. The wedge primitive — a forward-leaning intent and a backward-resolving decision are two phases of the same Commitment. See `docs/INTENT_SYSTEM.md` §1.1. Returns the commitment id; the caller can later attach an Outcome via `memory_resolve`.",
+                "inputSchema": {
+                    "type": "object",
+                    "required": ["kind", "statement"],
+                    "properties": {
+                        "kind": {
+                            "type": "string",
+                            "enum": ["intent", "decision", "hypothesis"]
+                        },
+                        "statement": { "type": "string" },
+                        "options": { "type": "array", "items": {"type": "string"} },
+                        "chosen": { "type": "string", "description": "Which option won. Defaults to `statement`." },
+                        "expected_outcome": { "type": "string" },
+                        "horizon": { "type": "string", "format": "date-time", "description": "When we expect resolution. ISO-8601." },
+                        "stakes": {
+                            "type": "string",
+                            "enum": ["low", "medium", "high", "reversible"],
+                            "default": "medium"
+                        },
+                        "confidence": { "type": "number", "minimum": 0, "maximum": 1, "default": 0.7 },
+                        "tags": { "type": "array", "items": {"type": "string"} },
+                        "derived_from": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "UUIDs of prior commitments this one supersedes / refines."
+                        }
+                    }
+                }
+            },
+            {
+                "name": "memory_resolve",
+                "description": "Attach an Outcome to a previously-recorded Commitment. Walks the state machine `Open|Acted → Completed`. `polarity: no_outcome` is a legitimate value for things that fizzled. See `docs/INTENT_SYSTEM.md` §1.2.",
+                "inputSchema": {
+                    "type": "object",
+                    "required": ["commitment_id", "polarity"],
+                    "properties": {
+                        "commitment_id": { "type": "string" },
+                        "polarity": {
+                            "type": "string",
+                            "enum": ["better", "as_expected", "worse", "mixed", "no_outcome"]
+                        },
+                        "description": { "type": "string" },
+                        "evidence": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Trace UUIDs that prove the outcome."
+                        },
+                        "user_note": { "type": "string" }
+                    }
                 }
             },
             {
@@ -133,6 +235,25 @@ fn tools_list() -> Value {
                     "type": "object",
                     "properties": {}
                 }
+            },
+            {
+                "name": "memory_brief",
+                "description": "Generate the daily brief — overdue / open / recently-resolved commitments + pending mined candidates. Read-only view of the system of intents. See `docs/INTENT_SYSTEM.md` §9.1.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "resolved_days": {
+                            "type": "integer",
+                            "description": "Look-back window for the resolved section in days (default 7)",
+                            "default": 7
+                        },
+                        "limit_open": {
+                            "type": "integer",
+                            "description": "Cap on rows in each non-empty section (default 20)",
+                            "default": 20
+                        }
+                    }
+                }
             }
         ]
     })
@@ -149,6 +270,7 @@ async fn handle_memory_store(
     traces: &Arc<Mutex<TraceStore>>,
     recent: &Arc<Mutex<RecentStore>>,
     session_id: Uuid,
+    intents_path: &str,
 ) -> Result<Value, String> {
     let text = params
         .get("text")
@@ -224,11 +346,83 @@ async fn handle_memory_store(
     if let Err(e) = recent_store.append(&event) {
         tracing::debug!("[mcp] failed to append recent capture: {e}");
     }
+    drop(recent_store);
+
+    // Sprint C / INTENT_SYSTEM.md §3.1 — mine MCP turn text for
+    // commitment-shaped phrases. Each hit is persisted as a `pending`
+    // candidate for the daily brief to confirm. Miner / store failures
+    // are soft — they must never block the ingest response.
+    // We open the intent store once, do both miner work and outcome
+    // matching against the snapshot of open commitments. Both paths
+    // are soft-fail — neither blocks the ingest response.
+    let (mined_count, outcome_proposals): (usize, Vec<Value>) = {
+        let mined = tm_intent::mine(text);
+        match tm_intent::IntentStore::open(intents_path) {
+            Ok(mut store) => {
+                // Persist newly-mined candidates.
+                let n = if mined.is_empty() {
+                    0
+                } else {
+                    let records: Vec<tm_intent::store::CandidateRecord> = mined
+                        .iter()
+                        .map(|m| tm_intent::store::CandidateRecord::from_mined(m, text.to_string()))
+                        .collect();
+                    match store.insert_candidates(&records) {
+                        Ok(n) => n,
+                        Err(e) => {
+                            tracing::debug!("[mcp/miner] persist failed: {e}");
+                            0
+                        }
+                    }
+                };
+
+                // Sprint D / INTENT_SYSTEM.md §4.2 — implicit outcome
+                // matching. Score the new text against open
+                // commitments; surface proposals so the agent can
+                // choose to call `memory_resolve`.
+                let proposals = match store.list_open(50) {
+                    Ok(opens) => {
+                        let cfg = tm_reflect::MatcherConfig::default();
+                        tm_reflect::propose_outcomes(text, &opens, &cfg)
+                            .into_iter()
+                            .map(|p| {
+                                json!({
+                                    "commitment_id": p.commitment_id.to_string(),
+                                    "commitment_statement": p.commitment_statement,
+                                    "score": p.score,
+                                    "polarity_hint": p.polarity_hint.map(|x| match x {
+                                        tm_intent::Polarity::Better => "better",
+                                        tm_intent::Polarity::AsExpected => "as_expected",
+                                        tm_intent::Polarity::Worse => "worse",
+                                        tm_intent::Polarity::Mixed => "mixed",
+                                        tm_intent::Polarity::NoOutcome => "no_outcome",
+                                    }),
+                                    "reason": p.reason,
+                                })
+                            })
+                            .collect::<Vec<_>>()
+                    }
+                    Err(e) => {
+                        tracing::debug!("[mcp/matcher] list_open failed: {e}");
+                        Vec::new()
+                    }
+                };
+
+                (n, proposals)
+            }
+            Err(e) => {
+                tracing::debug!("[mcp/miner] open intents store failed: {e}");
+                (0, Vec::new())
+            }
+        }
+    };
 
     Ok(json!({
         "stored": true,
         "entities": result.entities.len(),
         "triples": result.triples.len(),
+        "candidates_mined": mined_count,
+        "outcome_proposals": outcome_proposals,
         "context": {
             "memories": context_memories,
             "related": context_related,
@@ -236,9 +430,420 @@ async fn handle_memory_store(
     }))
 }
 
+/// `memory_store_structured` — typed-schema ingestion for callers that have
+/// already done entity/triple extraction (an LLM, an MCP tool, a parser).
+///
+/// Skips the heuristic NER and the ingest pipeline's selective gate, but
+/// keeps the same dedup / case-insensitive name matching the natural-language
+/// path uses. A single `Trace` is written for the whole batch so audits can
+/// reconstruct provenance.
+async fn handle_memory_store_structured(
+    params: &Value,
+    db_path: &str,
+    traces: &Arc<Mutex<TraceStore>>,
+    recent: &Arc<Mutex<RecentStore>>,
+    session_id: Uuid,
+) -> Result<Value, String> {
+    use tm_types::{Entity, Trace, TraceEventType, Triple};
+
+    let text = params.get("text").and_then(|v| v.as_str()).unwrap_or("");
+    let raw_entities = params
+        .get("entities")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let raw_triples = params
+        .get("triples")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    if raw_entities.is_empty() && raw_triples.is_empty() {
+        return Err("at least one of `entities` or `triples` must be non-empty".to_string());
+    }
+
+    let graph = GraphStore::open(db_path).map_err(|e| e.to_string())?;
+
+    // Resolve / upsert each entity. Build a lower-cased name → UUID map so
+    // triples can reference subjects/objects by name regardless of casing.
+    let mut name_to_id: std::collections::HashMap<String, Uuid> =
+        std::collections::HashMap::new();
+    let mut stored_entities: Vec<Entity> = Vec::new();
+    let mut entity_outputs: Vec<Value> = Vec::new();
+
+    for raw in &raw_entities {
+        let name = raw
+            .get("name")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "entity missing required field: name".to_string())?
+            .trim()
+            .to_string();
+        if name.is_empty() {
+            return Err("entity name must be non-empty".to_string());
+        }
+        let type_str = raw
+            .get("type")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| format!("entity '{name}' missing required field: type"))?;
+        let entity_type = parse_entity_type(type_str);
+        let confidence = raw
+            .get("confidence")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.9);
+
+        // Reuse existing entity by case-insensitive name match; only mint a
+        // new UUID when this name is unknown.
+        let resolved = if let Ok(Some(existing)) = graph.find_entity_by_name_icase(&name) {
+            let _ = graph.reinforce_entity(existing.id, 0.05);
+            existing
+        } else {
+            let mut e = Entity::new(name.clone(), entity_type, confidence);
+            graph.upsert_entity(&e).map_err(|err| err.to_string())?;
+            // Re-read so we have the canonical timestamps.
+            if let Ok(Some(stored)) = graph.find_entity_by_name_icase(&name) {
+                e = stored;
+            }
+            e
+        };
+
+        name_to_id.insert(name.to_lowercase(), resolved.id);
+        entity_outputs.push(json!({
+            "id": resolved.id.to_string(),
+            "name": resolved.name,
+            "type": format!("{:?}", resolved.entity_type).to_lowercase(),
+        }));
+        stored_entities.push(resolved);
+    }
+
+    // Resolve triple endpoints. Subjects/objects can either be entities we
+    // just wrote in this call, or names already in the graph from earlier
+    // calls. Anything else is reported back so the caller can correct it.
+    let mut stored_triples: Vec<Triple> = Vec::new();
+    let mut skipped_triples: Vec<Value> = Vec::new();
+
+    let mut resolve = |name: &str| -> Option<Uuid> {
+        let key = name.trim().to_lowercase();
+        if let Some(id) = name_to_id.get(&key) {
+            return Some(*id);
+        }
+        if let Ok(Some(existing)) = graph.find_entity_by_name_icase(name.trim()) {
+            name_to_id.insert(key, existing.id);
+            return Some(existing.id);
+        }
+        None
+    };
+
+    for raw in &raw_triples {
+        let subj_name = raw.get("subject").and_then(|v| v.as_str()).unwrap_or("");
+        let obj_name = raw.get("object").and_then(|v| v.as_str()).unwrap_or("");
+        let pred_str = raw.get("predicate").and_then(|v| v.as_str()).unwrap_or("");
+        let confidence = raw
+            .get("confidence")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.85);
+
+        if subj_name.is_empty() || obj_name.is_empty() || pred_str.is_empty() {
+            skipped_triples.push(json!({
+                "subject": subj_name,
+                "predicate": pred_str,
+                "object": obj_name,
+                "reason": "missing subject/predicate/object",
+            }));
+            continue;
+        }
+
+        let subj_id = match resolve(subj_name) {
+            Some(id) => id,
+            None => {
+                skipped_triples.push(json!({
+                    "subject": subj_name,
+                    "predicate": pred_str,
+                    "object": obj_name,
+                    "reason": "subject not in entities[] and not found in graph",
+                }));
+                continue;
+            }
+        };
+        let obj_id = match resolve(obj_name) {
+            Some(id) => id,
+            None => {
+                skipped_triples.push(json!({
+                    "subject": subj_name,
+                    "predicate": pred_str,
+                    "object": obj_name,
+                    "reason": "object not in entities[] and not found in graph",
+                }));
+                continue;
+            }
+        };
+
+        let predicate = parse_predicate(pred_str);
+        let triple = Triple::new(subj_id, predicate, obj_id, confidence);
+        graph
+            .upsert_triple(&triple)
+            .map_err(|err| err.to_string())?;
+        stored_triples.push(triple);
+    }
+
+    // One trace for the whole batch so audits can recover what went in.
+    let content_hash = format!("structured:{:016x}", seahash_text(text));
+    let mut trace = Trace::new(session_id, TraceEventType::Ingest, &content_hash);
+    trace.raw_text = if text.is_empty() {
+        Some(format!(
+            "[structured ingest: {} entities, {} triples]",
+            stored_entities.len(),
+            stored_triples.len()
+        ))
+    } else {
+        Some(text.to_string())
+    };
+    trace.entities_extracted = stored_entities.iter().map(|e| e.id).collect();
+    trace.triples_extracted = stored_triples.iter().map(|t| t.id).collect();
+    let trace_store = traces.lock().await;
+    let _ = trace_store.append(&trace);
+    drop(trace_store);
+
+    // Capture-feedback ring buffer entry for parity with `memory_store`.
+    let preview = if text.is_empty() {
+        format!(
+            "{} entities / {} triples",
+            stored_entities.len(),
+            stored_triples.len()
+        )
+    } else {
+        text.to_string()
+    };
+    let event = RecentCapture::new("mcp-structured", &content_hash, &preview)
+        .with_tier("structured")
+        .with_promoted(true);
+    let recent_store = recent.lock().await;
+    if let Err(e) = recent_store.append(&event) {
+        tracing::debug!("[mcp] failed to append structured recent capture: {e}");
+    }
+
+    Ok(json!({
+        "stored": true,
+        "trace_id": trace.id.to_string(),
+        "entities": entity_outputs,
+        "triples": stored_triples.len(),
+        "skipped_triples": skipped_triples,
+    }))
+}
+
+// ---------------------------------------------------------------------------
+// Sprint B — system-of-intents handlers
+// ---------------------------------------------------------------------------
+
+/// `memory_commit` — record a Commitment (intent / decision / hypothesis).
+/// Opens the intent store fresh per call; cheap on SQLite and avoids
+/// holding a long-lived handle in the server state for what is still a
+/// low-volume surface.
+async fn handle_memory_commit(
+    params: &Value,
+    intents_path: &str,
+) -> Result<Value, String> {
+    use tm_intent::{Commitment, CommitmentKind, IntentStore, Source, Stakes};
+
+    let kind_s = params
+        .get("kind")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "missing required parameter: kind".to_string())?;
+    let kind = match kind_s {
+        "intent" => CommitmentKind::Intent,
+        "decision" => CommitmentKind::Decision,
+        "hypothesis" => CommitmentKind::Hypothesis,
+        other => return Err(format!("invalid kind: {other}")),
+    };
+
+    let statement = params
+        .get("statement")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "missing required parameter: statement".to_string())?
+        .trim()
+        .to_string();
+    if statement.is_empty() {
+        return Err("statement must be non-empty".to_string());
+    }
+
+    let mut c = Commitment::new(kind, statement, Source::McpStructured);
+
+    if let Some(opts) = params.get("options").and_then(|v| v.as_array()) {
+        c.options_considered = opts
+            .iter()
+            .filter_map(|o| o.as_str().map(|s| s.to_string()))
+            .collect();
+    }
+    if let Some(chosen) = params.get("chosen").and_then(|v| v.as_str()) {
+        c.chosen = chosen.to_string();
+    }
+    if let Some(exp) = params.get("expected_outcome").and_then(|v| v.as_str()) {
+        c.expected_outcome = Some(exp.to_string());
+    }
+    if let Some(h) = params.get("horizon").and_then(|v| v.as_str()) {
+        c.horizon = Some(
+            chrono::DateTime::parse_from_rfc3339(h)
+                .map(|t| t.with_timezone(&chrono::Utc))
+                .map_err(|e| format!("invalid horizon (need RFC3339): {e}"))?,
+        );
+    }
+    if let Some(s) = params.get("stakes").and_then(|v| v.as_str()) {
+        c.stakes = match s {
+            "low" => Stakes::Low,
+            "medium" => Stakes::Medium,
+            "high" => Stakes::High,
+            "reversible" => Stakes::Reversible,
+            other => return Err(format!("invalid stakes: {other}")),
+        };
+    }
+    if let Some(f) = params.get("confidence").and_then(|v| v.as_f64()) {
+        if !(0.0..=1.0).contains(&f) {
+            return Err(format!("confidence must be in [0,1], got {f}"));
+        }
+        c.confidence = f as f32;
+    }
+    if let Some(tags) = params.get("tags").and_then(|v| v.as_array()) {
+        c.tags = tags
+            .iter()
+            .filter_map(|t| t.as_str().map(|s| s.to_string()))
+            .collect();
+    }
+    if let Some(refs) = params.get("derived_from").and_then(|v| v.as_array()) {
+        let mut parsed = Vec::with_capacity(refs.len());
+        for r in refs {
+            let s = r.as_str().ok_or_else(|| "derived_from entries must be UUID strings".to_string())?;
+            parsed.push(Uuid::parse_str(s).map_err(|e| format!("invalid derived_from uuid '{s}': {e}"))?);
+        }
+        c.derived_from = parsed;
+    }
+
+    let store = IntentStore::open(intents_path).map_err(|e| e.to_string())?;
+    store.insert_commitment(&c).map_err(|e| e.to_string())?;
+
+    Ok(json!({
+        "commitment_id": c.id.to_string(),
+        "state": "open",
+        "kind": kind_s,
+    }))
+}
+
+/// `memory_resolve` — attach an Outcome and walk the state machine to
+/// `Completed`. Rejects mismatched commitment ids and terminal states
+/// at the state-machine layer.
+async fn handle_memory_resolve(
+    params: &Value,
+    intents_path: &str,
+) -> Result<Value, String> {
+    use tm_intent::{state::transition, IntentStore, Outcome, OutcomeSource, Polarity, State};
+
+    let cid = params
+        .get("commitment_id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "missing required parameter: commitment_id".to_string())?;
+    let cid = Uuid::parse_str(cid).map_err(|e| format!("invalid commitment_id: {e}"))?;
+
+    let polarity_s = params
+        .get("polarity")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "missing required parameter: polarity".to_string())?;
+    let polarity = match polarity_s {
+        "better" => Polarity::Better,
+        "as_expected" => Polarity::AsExpected,
+        "worse" => Polarity::Worse,
+        "mixed" => Polarity::Mixed,
+        "no_outcome" => Polarity::NoOutcome,
+        other => return Err(format!("invalid polarity: {other}")),
+    };
+
+    let description = params
+        .get("description")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let user_note = params
+        .get("user_note")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let evidence: Vec<Uuid> = params
+        .get("evidence")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|e| e.as_str().and_then(|s| Uuid::parse_str(s).ok()))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let store = IntentStore::open(intents_path).map_err(|e| e.to_string())?;
+    let mut commitment = store
+        .get_commitment(cid)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("commitment {cid} not found"))?;
+
+    let mut outcome = Outcome::new(cid, polarity, description, OutcomeSource::McpStructured);
+    outcome.user_note = user_note;
+    outcome.evidence_traces = evidence;
+
+    transition(&mut commitment, State::Completed, Some(&outcome))
+        .map_err(|e| format!("state transition rejected: {e}"))?;
+
+    store.insert_outcome(&outcome).map_err(|e| e.to_string())?;
+    store
+        .update_state(commitment.id, commitment.state, commitment.outcome_id)
+        .map_err(|e| e.to_string())?;
+
+    Ok(json!({
+        "outcome_id": outcome.id.to_string(),
+        "commitment_id": commitment.id.to_string(),
+        "commitment_state": "completed",
+        "polarity": polarity_s,
+    }))
+}
+
+fn parse_entity_type(s: &str) -> tm_types::EntityType {
+    use tm_types::EntityType;
+    match s.trim().to_lowercase().as_str() {
+        "person" => EntityType::Person,
+        "organization" | "org" => EntityType::Organization,
+        "project" => EntityType::Project,
+        "file" => EntityType::File,
+        "url" | "link" => EntityType::Url,
+        "concept" => EntityType::Concept,
+        "technology" | "tech" => EntityType::Technology,
+        "decision" => EntityType::Decision,
+        "event" => EntityType::Event,
+        other => EntityType::Custom(other.to_string()),
+    }
+}
+
+fn parse_predicate(s: &str) -> tm_types::Predicate {
+    use tm_types::Predicate;
+    match s.trim().to_lowercase().as_str() {
+        "related_to" | "relatedto" | "related-to" => Predicate::RelatedTo,
+        "is_a" | "isa" | "is-a" => Predicate::IsA,
+        "part_of" | "partof" | "part-of" => Predicate::PartOf,
+        "has_property" | "hasproperty" => Predicate::HasProperty,
+        "works_at" | "worksat" => Predicate::WorksAt,
+        "collaborates_with" | "collaborateswith" => Predicate::CollaboratesWith,
+        "owns" => Predicate::Owns,
+        "depends_on" | "dependson" => Predicate::DependsOn,
+        "produces" => Predicate::Produces,
+        "references" | "refs" => Predicate::References,
+        "has_procedure" | "hasprocedure" => Predicate::HasProcedure,
+        other => Predicate::Custom(other.to_string()),
+    }
+}
+
+fn seahash_text(s: &str) -> u64 {
+    use std::hash::Hasher;
+    let mut h = seahash::SeaHasher::default();
+    h.write(s.as_bytes());
+    h.finish()
+}
+
 async fn handle_memory_query(
     params: &Value,
     retrieval: &Arc<Mutex<RetrievalEngine>>,
+    answerer: &Arc<TieredAnswerer>,
     db_path: &str,
 ) -> Result<Value, String> {
     let text = params
@@ -252,6 +857,7 @@ async fn handle_memory_query(
     // long-running MCP session. See TM-UX-001 Phase C.
     let _ = engine.refresh_graph();
     let result = engine.query(text).map_err(|e| e.to_string())?;
+    drop(engine);
 
     // Extract the plan action for auto-routing supplemental data
     let plan_action = result.plan.as_ref().map(|p| format!("{:?}", p.action))
@@ -300,9 +906,40 @@ async fn handle_memory_query(
         })
         .collect();
 
+    // Sprint A: dispatch through the tiered answerer so MCP callers get a
+    // grounded prose answer (Tier 0 baseline; Tier 1 when local-llm feature
+    // is on and weights are present).
+    let grounding = answerer::grounding_from(&result, 6);
+    let req = answerer::short_answer_request(text, grounding);
+    let answer_value: Value = match answerer.answer(&req).await {
+        Ok(resp) => {
+            let cites: Vec<Value> = resp
+                .citations
+                .iter()
+                .map(|c| {
+                    json!({
+                        "trace_id": c.trace_id,
+                        "entity_ids": c.entity_ids,
+                        "chunk_index": c.chunk_index,
+                    })
+                })
+                .collect();
+            json!({
+                "text": resp.text,
+                "tier": format!("{:?}", resp.tier).to_lowercase(),
+                "citations": cites,
+                "latency_ms": resp.latency_ms,
+            })
+        }
+        Err(e) => {
+            json!({ "error": e.to_string() })
+        }
+    };
+
     // Auto-routing: if the planner detected a reasoning/analogy query,
     // enrich the response with supplemental reasoning data.
     let mut response = json!({
+        "answer": answer_value,
         "entities": entities,
         "triples": triples,
         "related_entities": related_entities,
@@ -545,6 +1182,48 @@ fn handle_memory_consolidate(db_path: &str) -> Result<Value, String> {
     }))
 }
 
+/// `memory_brief` — render the daily brief from the system of intents
+/// (`docs/INTENT_SYSTEM.md` §9.1).
+///
+/// Read-only: never mutates the intent store. Returns the
+/// [`tm_reflect::DailyBrief`] structure verbatim as JSON.
+fn handle_memory_brief(params: &Value, intents_path: &str) -> Result<Value, String> {
+    use chrono::{Duration, Utc};
+    use tm_intent::IntentStore;
+    use tm_reflect::{BriefBuilder, BriefConfig};
+
+    let resolved_days = params
+        .get("resolved_days")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(7);
+    let limit_open = params
+        .get("limit_open")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(20) as usize;
+
+    let store = IntentStore::open(intents_path)
+        .map_err(|e| format!("failed to open intent store: {e}"))?;
+
+    let cfg = BriefConfig {
+        resolved_window: Duration::days(resolved_days),
+        limit_open,
+        limit_overdue: limit_open,
+        limit_resolved: limit_open.min(20),
+        limit_candidates: limit_open.min(20),
+        // Pattern detector defaults — n ≥ 6, |lift| ≥ 0.25, etc.
+        // (`INTENT_SYSTEM.md` §5.1.3). The scan window is the
+        // 12-month lookback the spec calls for.
+        ..BriefConfig::default()
+    };
+
+    let brief = BriefBuilder::new(&store)
+        .with_config(cfg)
+        .build(Utc::now())
+        .map_err(|e| format!("brief failed: {e}"))?;
+
+    serde_json::to_value(&brief).map_err(|e| format!("brief serialization: {e}"))
+}
+
 // ---------------------------------------------------------------------------
 // Request dispatcher
 // ---------------------------------------------------------------------------
@@ -554,10 +1233,12 @@ async fn handle_request(
     request: &Value,
     ingest: &Arc<Mutex<IngestPipeline>>,
     retrieval: &Arc<Mutex<RetrievalEngine>>,
+    answerer: &Arc<TieredAnswerer>,
     traces: &Arc<Mutex<TraceStore>>,
     recent: &Arc<Mutex<RecentStore>>,
     session_id: Uuid,
     db_path: &str,
+    intents_path: &str,
 ) -> Result<Value, anyhow::Error> {
     match method {
         "initialize" => {
@@ -585,12 +1266,17 @@ async fn handle_request(
 
             let tool_result = match tool_name {
                 "memory_store" => {
-                    handle_memory_store(&args, ingest, retrieval, traces, recent, session_id)
+                    handle_memory_store(&args, ingest, retrieval, traces, recent, session_id, intents_path)
+                        .await
+                        .map_err(|e| anyhow::anyhow!(e))?
+                }
+                "memory_store_structured" => {
+                    handle_memory_store_structured(&args, db_path, traces, recent, session_id)
                         .await
                         .map_err(|e| anyhow::anyhow!(e))?
                 }
                 "memory_query" => {
-                    handle_memory_query(&args, retrieval, db_path)
+                    handle_memory_query(&args, retrieval, answerer, db_path)
                         .await
                         .map_err(|e| anyhow::anyhow!(e))?
                 }
@@ -610,6 +1296,20 @@ async fn handle_request(
                 }
                 "memory_consolidate" => {
                     handle_memory_consolidate(db_path)
+                        .map_err(|e| anyhow::anyhow!(e))?
+                }
+                "memory_commit" => {
+                    handle_memory_commit(&args, intents_path)
+                        .await
+                        .map_err(|e| anyhow::anyhow!(e))?
+                }
+                "memory_resolve" => {
+                    handle_memory_resolve(&args, intents_path)
+                        .await
+                        .map_err(|e| anyhow::anyhow!(e))?
+                }
+                "memory_brief" => {
+                    handle_memory_brief(&args, intents_path)
                         .map_err(|e| anyhow::anyhow!(e))?
                 }
                 unknown => {
@@ -669,6 +1369,7 @@ async fn main() -> Result<()> {
 
     let db_path = dir.join("memory.db").to_str().unwrap().to_string();
     let trace_path = dir.join("traces.jsonl").to_str().unwrap().to_string();
+    let intents_path = dir.join("intents.db").to_str().unwrap().to_string();
 
     // Open stores. Use TM_HASH_EMBED=1 to skip model download.
     let hash_embed = std::env::var("TM_HASH_EMBED").map(|v| v == "1").unwrap_or(false);
@@ -695,6 +1396,9 @@ async fn main() -> Result<()> {
     let recent = Arc::new(Mutex::new(
         RecentStore::open(&recent_path).map_err(|e| anyhow::anyhow!(e.to_string()))?,
     ));
+
+    // Sprint A: build the tiered answerer once for the server lifetime.
+    let answerer = Arc::new(answerer::build_answerer());
 
     // One stable session ID for this server process lifetime.
     let session_id = Uuid::new_v4();
@@ -745,10 +1449,12 @@ async fn main() -> Result<()> {
             &request,
             &ingest,
             &retrieval,
+            &answerer,
             &traces,
             &recent,
             session_id,
             &db_path,
+            &intents_path,
         )
         .await;
 
@@ -802,6 +1508,7 @@ mod tests {
         let recent = Arc::new(Mutex::new(
             RecentStore::open(&recent_path).expect("recent open"),
         ));
+        let intents_path = dir.join("intents.db").to_str().unwrap().to_string();
         let session = Uuid::new_v4();
 
         // First store seeds the graph.
@@ -812,6 +1519,7 @@ mod tests {
             &traces,
             &recent,
             session,
+            &intents_path,
         )
         .await
         .expect("first store");
@@ -827,6 +1535,7 @@ mod tests {
             &traces,
             &recent,
             session,
+            &intents_path,
         )
         .await
         .expect("second store");
@@ -847,6 +1556,334 @@ mod tests {
             assert!(m.get("name").is_some(), "memory missing name: {m}");
             assert!(m.get("type").is_some(), "memory missing type: {m}");
         }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Sprint C / INTENT_SYSTEM.md §3.1 — `memory_store` mines the
+    /// captured text for commitment-shaped phrases and persists pending
+    /// candidates into the intent store.
+    #[tokio::test]
+    async fn memory_store_mines_commitment_candidates() {
+        let dir = std::env::temp_dir().join(format!("tm_mcp_mined_{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("memory.db").to_str().unwrap().to_string();
+        let trace_path = dir.join("traces.jsonl").to_str().unwrap().to_string();
+
+        let _ = GraphStore::open(&db_path).expect("graph open");
+
+        let ingest = Arc::new(Mutex::new(
+            IngestPipeline::open(&db_path, true).expect("ingest open"),
+        ));
+        let retrieval = Arc::new(Mutex::new(
+            RetrievalEngine::open(&db_path, &trace_path, true).expect("retrieval open"),
+        ));
+        let traces = Arc::new(Mutex::new(
+            TraceStore::open(&trace_path).expect("traces open"),
+        ));
+        let recent = Arc::new(Mutex::new(
+            RecentStore::open(&dir.join("recent.jsonl")).expect("recent open"),
+        ));
+        let intents_path = dir.join("intents.db").to_str().unwrap().to_string();
+        let session = Uuid::new_v4();
+
+        let resp = handle_memory_store(
+            &json!({"text": "I'm going to migrate to Postgres next sprint. I decided to use bcrypt for password hashing."}),
+            &ingest,
+            &retrieval,
+            &traces,
+            &recent,
+            session,
+            &intents_path,
+        )
+        .await
+        .expect("memory_store ok");
+
+        // Two phrases ("i'm going to" + "i decided") → 2 candidates.
+        assert_eq!(resp["candidates_mined"], json!(2), "expected 2 mined: {resp}");
+
+        // Confirm they're queryable from the intent store.
+        let store = tm_intent::IntentStore::open(&intents_path).expect("open intents");
+        let pending = store.list_pending_candidates(10).expect("list pending");
+        assert_eq!(pending.len(), 2);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Sprint A: typed-schema ingestion path. Stores entities + triples
+    /// directly without invoking the heuristic NER, then reads them back via
+    /// `GraphStore` to confirm the wire round-trip works.
+    #[tokio::test]
+    async fn memory_store_structured_writes_and_resolves() {
+        let dir = std::env::temp_dir().join(format!("tm_mcp_structured_{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("memory.db").to_str().unwrap().to_string();
+        let trace_path = dir.join("traces.jsonl").to_str().unwrap().to_string();
+        let recent_path = dir.join("recent.jsonl");
+
+        // Touch the DB once so the tm-graph schema exists.
+        let _ = GraphStore::open(&db_path).expect("graph open");
+
+        let traces = Arc::new(Mutex::new(
+            TraceStore::open(&trace_path).expect("traces open"),
+        ));
+        let recent = Arc::new(Mutex::new(
+            RecentStore::open(&recent_path).expect("recent open"),
+        ));
+        let session = Uuid::new_v4();
+
+        let resp = handle_memory_store_structured(
+            &json!({
+                "text": "Aaditya works at TraceMind, which depends on Rust.",
+                "entities": [
+                    {"name": "Aaditya", "type": "person", "confidence": 0.95},
+                    {"name": "TraceMind", "type": "project"},
+                    {"name": "Rust", "type": "technology"},
+                ],
+                "triples": [
+                    {"subject": "Aaditya", "predicate": "works_at", "object": "TraceMind"},
+                    {"subject": "TraceMind", "predicate": "depends_on", "object": "Rust"},
+                    // Skipped: object not in entities or graph.
+                    {"subject": "Aaditya", "predicate": "owns", "object": "MysteryThing"},
+                ]
+            }),
+            &db_path,
+            &traces,
+            &recent,
+            session,
+        )
+        .await
+        .expect("structured ingest");
+
+        assert_eq!(resp["stored"], json!(true));
+        assert_eq!(resp["entities"].as_array().unwrap().len(), 3);
+        assert_eq!(resp["triples"], json!(2));
+        let skipped = resp["skipped_triples"].as_array().expect("skipped array");
+        assert_eq!(skipped.len(), 1);
+        assert!(skipped[0]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("object not in"));
+
+        // Re-open the graph and confirm the entities are persisted.
+        let g = GraphStore::open(&db_path).expect("graph reopen");
+        let aad = g
+            .find_entity_by_name_icase("Aaditya")
+            .unwrap()
+            .expect("Aaditya stored");
+        assert!(matches!(aad.entity_type, tm_types::EntityType::Person));
+
+        // A second call referencing only-by-name an existing entity should
+        // resolve via the graph lookup, not require re-passing it.
+        let resp2 = handle_memory_store_structured(
+            &json!({
+                "entities": [
+                    {"name": "Phase 3", "type": "project"},
+                ],
+                "triples": [
+                    {"subject": "Phase 3", "predicate": "part_of", "object": "TraceMind"},
+                ]
+            }),
+            &db_path,
+            &traces,
+            &recent,
+            session,
+        )
+        .await
+        .expect("structured ingest 2");
+        assert_eq!(resp2["triples"], json!(1));
+        assert!(resp2["skipped_triples"].as_array().unwrap().is_empty());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn memory_commit_then_resolve_drives_state_machine() {
+        // Sprint B: end-to-end Commitment lifecycle through the MCP handlers.
+        // commit (intent) → resolve (better outcome) → commitment is Completed
+        // and the outcome row points back to the same id.
+        let dir = std::env::temp_dir().join(format!("tm-mcp-intents-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let intents_path = dir.join("intents.db").to_str().unwrap().to_string();
+
+        let commit = handle_memory_commit(
+            &json!({
+                "kind": "intent",
+                "statement": "ship Sprint B by Friday",
+                "horizon": "2026-05-01T17:00:00Z",
+                "stakes": "medium",
+                "confidence": 0.8,
+                "tags": ["sprint-b"]
+            }),
+            &intents_path,
+        )
+        .await
+        .expect("commit ok");
+
+        let cid = commit["commitment_id"].as_str().expect("id").to_string();
+        assert_eq!(commit["state"], json!("open"));
+        assert_eq!(commit["kind"], json!("intent"));
+
+        let resolved = handle_memory_resolve(
+            &json!({
+                "commitment_id": cid,
+                "polarity": "better",
+                "description": "shipped Wednesday"
+            }),
+            &intents_path,
+        )
+        .await
+        .expect("resolve ok");
+
+        assert_eq!(resolved["commitment_id"].as_str().unwrap(), cid);
+        assert_eq!(resolved["commitment_state"], json!("completed"));
+        assert_eq!(resolved["polarity"], json!("better"));
+        assert!(resolved["outcome_id"].as_str().is_some());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn memory_store_surfaces_outcome_proposals_for_matching_text() {
+        // Sprint D / INTENT_SYSTEM.md §4.2: when the new ingested text
+        // overlaps an open Commitment's statement, memory_store
+        // returns `outcome_proposals` so the agent can suggest
+        // `memory_resolve`.
+        let dir = std::env::temp_dir().join(format!("tm-mcp-match-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let intents_path = dir.join("intents.db").to_str().unwrap().to_string();
+
+        // Seed an open commitment.
+        handle_memory_commit(
+            &json!({
+                "kind": "intent",
+                "statement": "ship the locomo report by friday"
+            }),
+            &intents_path,
+        )
+        .await
+        .expect("commit ok");
+
+        // Build the rest of the harness for memory_store.
+        let db_dir = std::env::temp_dir().join(format!("tm-mcp-store-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&db_dir).expect("create db dir");
+        let db_path = db_dir.join("memory.db").to_str().unwrap().to_string();
+        let trace_path = db_dir.join("traces.jsonl").to_str().unwrap().to_string();
+        let recent_path = db_dir.join("recent.jsonl").to_str().unwrap().to_string();
+
+        let pipeline = IngestPipeline::open(&db_path, /* hash_embed */ true).expect("ingest");
+        let engine = RetrievalEngine::open(&db_path, &trace_path, /* hash_embed */ true)
+            .expect("retrieval");
+        let traces = TraceStore::open(&trace_path).expect("traces");
+        let recent = RecentStore::open_with_capacity(&recent_path, 100).expect("recent");
+
+        let ingest_arc = Arc::new(Mutex::new(pipeline));
+        let engine_arc = Arc::new(Mutex::new(engine));
+        let traces_arc = Arc::new(Mutex::new(traces));
+        let recent_arc = Arc::new(Mutex::new(recent));
+
+        let result = handle_memory_store(
+            &json!({ "text": "shipped the locomo report this morning" }),
+            &ingest_arc,
+            &engine_arc,
+            &traces_arc,
+            &recent_arc,
+            Uuid::new_v4(),
+            &intents_path,
+        )
+        .await
+        .expect("memory_store ok");
+
+        let proposals = result["outcome_proposals"]
+            .as_array()
+            .expect("proposals array");
+        assert!(
+            !proposals.is_empty(),
+            "expected at least one outcome proposal, got: {result}"
+        );
+        let p = &proposals[0];
+        assert_eq!(p["polarity_hint"], json!("better"));
+        assert!(
+            p["score"].as_f64().unwrap() >= 0.25,
+            "score = {}",
+            p["score"]
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&db_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn memory_brief_returns_open_overdue_resolved_and_candidates() {
+        // Sprint D: end-to-end brief surface. We exercise the read path
+        // by seeding an intent store via the public MCP handlers (commit
+        // + resolve), then assert the brief reflects state.
+        let dir = std::env::temp_dir().join(format!("tm-mcp-brief-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let intents_path = dir.join("intents.db").to_str().unwrap().to_string();
+
+        // 1. open commitment with future horizon → ends up in `open`
+        let _open = handle_memory_commit(
+            &json!({
+                "kind": "intent",
+                "statement": "future work",
+                "horizon": "2099-01-01T00:00:00Z",
+                "stakes": "medium"
+            }),
+            &intents_path,
+        )
+        .await
+        .expect("open commit ok");
+
+        // 2. open commitment with past horizon → `overdue`
+        let _overdue = handle_memory_commit(
+            &json!({
+                "kind": "decision",
+                "statement": "should have been resolved",
+                "horizon": "2000-01-01T00:00:00Z",
+                "stakes": "high"
+            }),
+            &intents_path,
+        )
+        .await
+        .expect("overdue commit ok");
+
+        // 3. commit + resolve → `resolved` section
+        let resolvable = handle_memory_commit(
+            &json!({ "kind": "intent", "statement": "ship X" }),
+            &intents_path,
+        )
+        .await
+        .expect("commit ok");
+        handle_memory_resolve(
+            &json!({
+                "commitment_id": resolvable["commitment_id"].as_str().unwrap(),
+                "polarity": "as_expected",
+                "description": "fine"
+            }),
+            &intents_path,
+        )
+        .await
+        .expect("resolve ok");
+
+        let brief = handle_memory_brief(&json!({}), &intents_path).expect("brief ok");
+        let counts = &brief["counts"];
+        assert_eq!(counts["open"], 1, "one future-horizon commitment in open");
+        assert_eq!(counts["overdue"], 1, "one past-horizon commitment in overdue");
+        assert_eq!(counts["resolved"], 1, "one completed commitment in resolved");
+
+        // The overdue row carries an `overdue_class` bucket — we don't
+        // assert which (DueToday vs Stale depends on the test's wall
+        // clock); we just assert it's present.
+        assert!(
+            brief["overdue"][0]["overdue_class"].is_string(),
+            "overdue rows must carry an overdue_class"
+        );
+        assert_eq!(
+            brief["resolved"][0]["polarity"],
+            json!("as_expected"),
+            "resolved row carries polarity"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }

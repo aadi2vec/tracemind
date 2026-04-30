@@ -22,3 +22,17 @@ clap = { workspace = true }
 chrono = { workspace = true }
 async-trait = "0.1"
 tokio = { workspace = true }
+uuid = { workspace = true }
+tempfile = "3"
+
+# Optional: real TraceMind runner that exercises ingest + retrieval.
+tm-types = { workspace = true, optional = true }
+tm-ingest = { workspace = true, optional = true }
+tm-retrieval = { workspace = true, optional = true }
+
+[features]
+default = []
+# Enable the real TraceMind runner. Pulls in tm-ingest + tm-retrieval which
+# transitively bring fastembed; build is heavier but the runner produces
+# publishable LoCoMo numbers against the actual stack.
+tracemind = ["dep:tm-types", "dep:tm-ingest", "dep:tm-retrieval"]

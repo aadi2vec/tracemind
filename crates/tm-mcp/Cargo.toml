@@ -16,6 +16,10 @@ tm-graph = { workspace = true }
 tm-reason = { workspace = true }
 tm-controller = { workspace = true }
 tm-rerank = { path = "../tm-rerank" }
+tm-answer = { workspace = true }
+tm-intent = { workspace = true }
+tm-reflect = { workspace = true }
+chrono = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 uuid = { workspace = true }
@@ -24,3 +28,9 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
+seahash = { workspace = true }
+
+[features]
+default = []
+local-llm = ["tm-answer/local-llm"]
+local-llm-metal = ["tm-answer/local-llm-metal"]
