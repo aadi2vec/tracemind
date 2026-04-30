@@ -1,8 +1,34 @@
 # Phase 3 — Tiered Answers, Local LLMs, and the Seamless Moat
 
-**Window**: April 2026 → October 2026 (6 months)
-**Goal**: ship the best local memory intelligence platform of all time.
-**North-star metric**: LoCoMo ≥ 85, published, CI-gated.
+**Status**: ✅ **COMPLETED 2026-04-27** — superseded by `docs/INTENT_SYSTEM.md` (Phase 4).
+**Window**: April 2026 → April 2027 (compressed to ~2 weeks of focused work after pivot).
+**Goal (achieved)**: ship the tiered answer substrate (Tier-0 shipped; Tier-1/Tier-2 scaffolded behind feature flags).
+**North-star metric**: LoCoMo ≥ 85 — *deferred* to Phase 4 Sprint A tail; carryover into `PHASE4_DELIGHT.md`.
+
+## Carryover into Phase 4 (Intent System)
+
+These items were in Phase 3 scope but did not land before the wedge pivot. They are now absorbed into the seven-sprint plan in `docs/INTENT_SYSTEM.md` §10:
+
+| Item | New home |
+|---|---|
+| Tier-1 LoCoMo run (≥ 60 F1) — needs cmake + Qwen GGUF | Sprint A tail |
+| Signed .dmg, auto-start, tray icon | Sprint E (visible surface) |
+| Apple FoundationModels Tier-2 actual integration | Sprint E |
+| Obsidian plugin (TS, separate repo) | Sprint E |
+| LoCoMo ≥ 85 stretch target | Sprint G (world model v2 + scale) |
+
+What did land structurally in Phase 3:
+
+- ✅ `tm-answer` crate with `TieredAnswerer` + `ExtractiveBackend` (Tier 0)
+- ✅ `LocalLlmBackend` scaffold (llama-cpp-2 wired behind `local-llm` feature)
+- ✅ `AppleFmBackend` scaffold (behind `apple-fm` feature)
+- ✅ Tier-1 dispatch wired in tm-cli, tm-mcp, tm-retrieval answer paths
+- ✅ `tracemind models pull` first-run weight download
+- ✅ `tm-bench-locomo` harness + CI regression gate (v0.2 / v0.3 baselines saved)
+- ✅ MCP `memory_store_structured` typed-schema ingestion
+- ✅ Obsidian markdown frontmatter handling in `tracemind import`
+
+The historical plan below is preserved for reference. **For current work see `docs/INTENT_SYSTEM.md` and `docs/PHASE4_DELIGHT.md`.**
 
 ---
 

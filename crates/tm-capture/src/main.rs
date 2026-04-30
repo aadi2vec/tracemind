@@ -40,6 +40,10 @@ fn open_pipeline_with_ner(
 
 struct CaptureConfig {
     db_path: String,
+    /// Path to the intent store (`~/.tracemind/intents.db`). Mined
+    /// commitment candidates are persisted here for the daily-brief
+    /// to surface — see `docs/INTENT_SYSTEM.md` §3.1.
+    intents_path: String,
     clipboard_interval: Duration,
     history_interval: Duration,
     /// How often to run the slow-path (Tier-3 Normal) consolidation pass.
@@ -63,6 +67,7 @@ impl CaptureConfig {
 
         Self {
             db_path: dir.join("memory.db").to_str().unwrap().to_string(),
+            intents_path: dir.join("intents.db").to_str().unwrap().to_string(),
             clipboard_interval: Duration::from_millis(
                 std::env::var("TM_CLIP_INTERVAL_MS")
                     .ok()
@@ -135,6 +140,40 @@ fn record_capture(
     }
 }
 
+/// Run the [`tm_intent::miner`] over a freshly-captured text and persist
+/// any hits as `pending` candidates in the intent store.
+///
+/// `mut_store` is taken `&mut` because the bulk insert path uses a
+/// transaction. Callers hold one open `IntentStore` per loop and reuse
+/// it across captures — opening per-capture would be wasteful.
+///
+/// All errors are logged at `debug!` and swallowed: the miner is a
+/// soft-fail surface and a SQLite hiccup must never break ingest.
+fn mine_capture_for_candidates(
+    mut_store: &mut tm_intent::IntentStore,
+    source: &str,
+    text: &str,
+) {
+    let mined = tm_intent::mine(text);
+    if mined.is_empty() {
+        return;
+    }
+    let records: Vec<tm_intent::store::CandidateRecord> = mined
+        .iter()
+        .map(|m| tm_intent::store::CandidateRecord::from_mined(m, text.to_string()))
+        .collect();
+    match mut_store.insert_candidates(&records) {
+        Ok(n) if n > 0 => {
+            info!(
+                "[{source}/miner] queued {n} commitment candidate(s) — phrases: {:?}",
+                records.iter().map(|r| r.matched_phrase.as_str()).collect::<Vec<_>>()
+            );
+        }
+        Ok(_) => {}
+        Err(e) => debug!("[{source}/miner] persist failed: {e}"),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Clipboard monitor
 // ---------------------------------------------------------------------------
@@ -188,6 +227,14 @@ async fn clipboard_loop(config: &CaptureConfig) {
         }
     };
 
+    let mut intents = match tm_intent::IntentStore::open(&config.intents_path) {
+        Ok(s) => Some(s),
+        Err(e) => {
+            warn!("[clipboard] failed to open intent store: {e}");
+            None
+        }
+    };
+
     let mut seen_hashes: HashSet<u64> = HashSet::new();
     let mut last_hash: u64 = 0;
 
@@ -227,6 +274,13 @@ async fn clipboard_loop(config: &CaptureConfig) {
                 Err(e) => {
                     debug!("[clipboard] fast ingest skipped: {e}");
                 }
+            }
+
+            // Mine the captured text for commitment-shaped phrases. Runs
+            // independently of fast-ingest success so even skipped
+            // signals get a chance to surface as candidates.
+            if let Some(store) = intents.as_mut() {
+                mine_capture_for_candidates(store, "clipboard", &text);
             }
         }
     }
@@ -312,6 +366,14 @@ async fn history_loop(config: &CaptureConfig) {
         }
     };
 
+    let mut intents = match tm_intent::IntentStore::open(&config.intents_path) {
+        Ok(s) => Some(s),
+        Err(e) => {
+            warn!("[history] failed to open intent store: {e}");
+            None
+        }
+    };
+
     let mut seen_hashes: HashSet<u64> = HashSet::new();
 
     // Seed with existing history to avoid re-ingesting on startup.
@@ -355,6 +417,13 @@ async fn history_loop(config: &CaptureConfig) {
                 Err(e) => {
                     debug!("[history] fast ingest skipped: {e}");
                 }
+            }
+
+            // Mine the *unprefixed* line for commitment phrases — the
+            // "shell command:" prefix would otherwise pollute every
+            // mined statement.
+            if let Some(store) = intents.as_mut() {
+                mine_capture_for_candidates(store, "shell", &line);
             }
         }
     }
