@@ -5839,6 +5839,7 @@ dependencies = [
  "tm-rerank",
  "tm-retrieval",
  "tm-types",
+ "tm-world-model",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -6062,6 +6063,19 @@ dependencies = [
  "fastembed",
  "seahash",
  "tm-types",
+ "tracing",
+]
+
+[[package]]
+name = "tm-world-model"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tm-intent",
  "tracing",
 ]
 

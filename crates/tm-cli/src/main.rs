@@ -182,6 +182,15 @@ enum Commands {
         #[command(subcommand)]
         action: PatternsAction,
     },
+    /// World model v0 — `f_outcome` predictor over your completed
+    /// commitments. Trains a small multinomial logistic regression on
+    /// metadata features (stakes / time-band / horizon / kind / tags)
+    /// and persists weights to `~/.tracemind/world_model.json`.
+    /// See `docs/INTENT_SYSTEM.md` §7.
+    World {
+        #[command(subcommand)]
+        action: WorldAction,
+    },
 }
 
 #[derive(clap::Subcommand)]
@@ -218,6 +227,80 @@ enum PatternsAction {
     },
     /// Re-enable surfacing for a previously-silenced cell.
     Unsilence { cell_hash: String },
+}
+
+#[derive(clap::Subcommand)]
+enum WorldAction {
+    /// Train (or refresh) the world model from completed commitments.
+    Train {
+        /// Look-back window in days for completed commitments.
+        #[arg(long, default_value = "365")]
+        since_days: i64,
+        /// SGD epochs. Default 400 — converges fast on tiny N.
+        #[arg(long, default_value = "400")]
+        epochs: usize,
+        /// Learning rate.
+        #[arg(long, default_value = "0.1")]
+        lr: f32,
+        /// L2 weight-decay coefficient.
+        #[arg(long, default_value = "0.001")]
+        l2: f32,
+        /// Tag-vocab cap.
+        #[arg(long, default_value = "16")]
+        vocab: usize,
+        /// Skip training below this many completed commitments.
+        #[arg(long, default_value = "6")]
+        min_examples: usize,
+        /// Cap on rows fetched from the intent store.
+        #[arg(long, default_value = "5000")]
+        limit: usize,
+        /// Emit the TrainReport as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Predict the polarity distribution for a hypothetical commitment.
+    /// Mirrors the fields of `tracemind commit` so you can dry-run
+    /// "if I made this commitment now, what would my own track record
+    /// say about it?" before actually recording it.
+    Predict {
+        /// One of: intent | decision | hypothesis
+        #[arg(long, default_value = "intent")]
+        kind: String,
+        /// Free-text statement of the commitment (used for hashing only).
+        statement: String,
+        /// Stakes: low | medium | high | reversible (default medium).
+        #[arg(long)]
+        stakes: Option<String>,
+        /// Confidence in [0,1].
+        #[arg(long)]
+        confidence: Option<f32>,
+        /// Comma-separated tags.
+        #[arg(long, default_value = "")]
+        tags: String,
+        /// Optional RFC3339 horizon (presence flips the has-horizon
+        /// feature on; the actual time is unused for v0).
+        #[arg(long)]
+        horizon: Option<String>,
+        /// Comma-separated options considered (count > 1 trips the
+        /// has-options feature).
+        #[arg(long, default_value = "")]
+        options: String,
+        /// Show top-K feature contributions for the predicted class.
+        #[arg(long)]
+        explain: bool,
+        /// Number of features to show with --explain.
+        #[arg(long, default_value = "5")]
+        top_k: usize,
+        /// Emit the OutcomePrediction + explanation as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show whether a trained model is on disk and summarize it.
+    Status {
+        /// Emit JSON instead of a formatted summary.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(clap::Subcommand)]
@@ -738,6 +821,11 @@ fn main() {
         Commands::Patterns { action } => {
             let intents_path = dir.join("intents.db").to_str().unwrap().to_string();
             cmd_patterns(&intents_path, action);
+        }
+        Commands::World { action } => {
+            let intents_path = dir.join("intents.db").to_str().unwrap().to_string();
+            let world_path = dir.join("world_model.json");
+            cmd_world(&intents_path, &world_path, action);
         }
     }
 }
@@ -1878,4 +1966,330 @@ fn print_brief_text(brief: &tm_reflect::DailyBrief) {
 
 fn short_id(id: Uuid) -> String {
     id.to_string()[..8].to_string()
+}
+
+// ---------------------------------------------------------------------------
+// `tracemind world` — f_outcome predictor (`docs/INTENT_SYSTEM.md` §7).
+// v0: multinomial logistic regression on metadata features. The training
+// corpus is the user's *own* completed commitments — no aggregate priors,
+// no remote calls, no embeddings (yet — that's v1).
+// ---------------------------------------------------------------------------
+
+fn cmd_world(intents_path: &str, world_path: &std::path::Path, action: WorldAction) {
+    use tm_intent::IntentStore;
+    use tm_world_model::{
+        explain_top_k, from_pairs, load, save, train, OutcomeModel, TrainerConfig,
+    };
+
+    match action {
+        WorldAction::Train {
+            since_days,
+            epochs,
+            lr,
+            l2,
+            vocab,
+            min_examples,
+            limit,
+            json,
+        } => {
+            let store = match IntentStore::open(intents_path) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("failed to open intent store at {intents_path}: {e}");
+                    std::process::exit(1);
+                }
+            };
+            let since = chrono::Utc::now() - chrono::Duration::days(since_days);
+            let rows = match store.list_completed_with_polarity(since, limit) {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("failed to read completed commitments: {e}");
+                    std::process::exit(1);
+                }
+            };
+            let total_completed = rows.len();
+            let (examples, skipped) = from_pairs(rows);
+
+            let cfg = TrainerConfig {
+                epochs,
+                lr,
+                l2,
+                tag_vocab_size: vocab,
+                min_examples,
+            };
+            let (model, mut report) = train(&examples, &cfg);
+            report.skipped_no_outcome = skipped;
+
+            if let Err(e) = save(&model, world_path) {
+                eprintln!("failed to persist world model to {}: {e}", world_path.display());
+                std::process::exit(1);
+            }
+
+            if json {
+                match serde_json::to_string_pretty(&report) {
+                    Ok(s) => println!("{}", s),
+                    Err(e) => {
+                        eprintln!("json serialize failed: {e}");
+                        std::process::exit(1);
+                    }
+                }
+                return;
+            }
+
+            println!("world model trained → {}", world_path.display());
+            println!(
+                "  examples       : {} (from {} completed; {} skipped no-outcome)",
+                report.n_examples, total_completed, report.skipped_no_outcome
+            );
+            println!("  classes seen   : {}/4", report.n_classes_seen);
+            println!("  feature dim    : {} ({} fixed + {} tags)",
+                report.feature_dim,
+                tm_world_model::FIXED_FEATURES,
+                report.vocab_size,
+            );
+            println!("  epochs run     : {}", report.epochs_run);
+            if report.epochs_run > 0 {
+                println!("  final loss     : {:.4}", report.final_loss);
+                println!("  final accuracy : {:.1}%", report.final_accuracy * 100.0);
+            } else {
+                println!(
+                    "  (dormant — need ≥{} usable examples; have {}.)",
+                    cfg.min_examples, report.n_examples
+                );
+            }
+        }
+
+        WorldAction::Predict {
+            kind,
+            statement,
+            stakes,
+            confidence,
+            tags,
+            horizon,
+            options,
+            explain,
+            top_k,
+            json,
+        } => {
+            use tm_intent::{Commitment, CommitmentKind, Source, Stakes};
+
+            let kind_enum = match kind.as_str() {
+                "intent" => CommitmentKind::Intent,
+                "decision" => CommitmentKind::Decision,
+                "hypothesis" => CommitmentKind::Hypothesis,
+                other => {
+                    eprintln!("invalid --kind: {other} (expected intent|decision|hypothesis)");
+                    std::process::exit(2);
+                }
+            };
+            let statement = statement.trim().to_string();
+            if statement.is_empty() {
+                eprintln!("statement must be non-empty");
+                std::process::exit(2);
+            }
+
+            let mut probe = Commitment::new(kind_enum, statement, Source::Cli);
+            if let Some(s) = stakes.as_deref() {
+                probe.stakes = match s {
+                    "low" => Stakes::Low,
+                    "medium" => Stakes::Medium,
+                    "high" => Stakes::High,
+                    "reversible" => Stakes::Reversible,
+                    other => {
+                        eprintln!("invalid --stakes: {other}");
+                        std::process::exit(2);
+                    }
+                };
+            }
+            if let Some(f) = confidence {
+                if !(0.0..=1.0).contains(&f) {
+                    eprintln!("--confidence must be in [0,1], got {f}");
+                    std::process::exit(2);
+                }
+                probe.confidence = f;
+            }
+            if !tags.is_empty() {
+                probe.tags = tags
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+            }
+            if let Some(h) = horizon.as_deref() {
+                match chrono::DateTime::parse_from_rfc3339(h) {
+                    Ok(t) => probe.horizon = Some(t.with_timezone(&chrono::Utc)),
+                    Err(e) => {
+                        eprintln!("invalid --horizon (need RFC3339): {e}");
+                        std::process::exit(2);
+                    }
+                }
+            }
+            if !options.is_empty() {
+                probe.options_considered = options
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+            }
+
+            let model: OutcomeModel = match load(world_path) {
+                Ok(Some(m)) => m,
+                Ok(None) => {
+                    eprintln!(
+                        "no world model on disk yet — run `tracemind world train` first.\n\
+                         (looked at {})",
+                        world_path.display()
+                    );
+                    std::process::exit(1);
+                }
+                Err(e) => {
+                    eprintln!("failed to load world model: {e}");
+                    std::process::exit(1);
+                }
+            };
+
+            let pred = model.predict(&probe);
+            let explanation = if explain && model.is_trained() {
+                Some(explain_top_k(&model, &probe, pred.argmax, top_k))
+            } else {
+                None
+            };
+
+            if json {
+                #[derive(serde::Serialize)]
+                struct Out<'a> {
+                    prediction: &'a tm_world_model::OutcomePrediction,
+                    explanation: &'a Option<Vec<tm_world_model::FeatureContribution>>,
+                }
+                match serde_json::to_string_pretty(&Out {
+                    prediction: &pred,
+                    explanation: &explanation,
+                }) {
+                    Ok(s) => println!("{}", s),
+                    Err(e) => {
+                        eprintln!("json serialize failed: {e}");
+                        std::process::exit(1);
+                    }
+                }
+                return;
+            }
+
+            if !model.is_trained() {
+                println!("world model is dormant (untrained) — predictions are uniform.");
+                println!("  → run `tracemind world train` once you have ≥6 completed commitments.");
+                return;
+            }
+
+            let labels = ["better", "as_expected", "worse", "mixed"];
+            println!("prediction (n_priors={}):", pred.n_priors);
+            for (i, &l) in labels.iter().enumerate() {
+                let bar_len = (pred.dist.0[i] * 40.0).round() as usize;
+                let bar = "█".repeat(bar_len);
+                println!("  {:<12} {:>5.1}%  {}", l, pred.dist.0[i] * 100.0, bar);
+            }
+            println!(
+                "  argmax       : {:?}  (positive_prob={:.1}%, confidence={:.2})",
+                pred.argmax,
+                pred.positive_prob * 100.0,
+                pred.confidence,
+            );
+
+            if let Some(ex) = explanation {
+                println!("\ntop-{} contributors to {:?}:", ex.len(), pred.argmax);
+                for f in ex {
+                    let sign = if f.contribution >= 0.0 { "+" } else { "−" };
+                    println!(
+                        "  {} {:<22} φ={:.2}  w={:+.3}  Δlogit={:+.3}",
+                        sign,
+                        f.label,
+                        f.value,
+                        f.weight,
+                        f.contribution.abs() * f.contribution.signum(),
+                    );
+                }
+            }
+        }
+
+        WorldAction::Status { json } => {
+            let model_opt: Option<OutcomeModel> = match load(world_path) {
+                Ok(m) => m,
+                Err(e) => {
+                    eprintln!("failed to load world model: {e}");
+                    std::process::exit(1);
+                }
+            };
+
+            if json {
+                #[derive(serde::Serialize)]
+                struct Status {
+                    path: String,
+                    present: bool,
+                    schema_version: Option<u32>,
+                    n_train_examples: Option<usize>,
+                    trained_at: Option<String>,
+                    feature_dim: Option<usize>,
+                    vocab_size: Option<usize>,
+                }
+                let s = match &model_opt {
+                    Some(m) => Status {
+                        path: world_path.display().to_string(),
+                        present: true,
+                        schema_version: Some(m.schema_version),
+                        n_train_examples: Some(m.n_train_examples),
+                        trained_at: m.trained_at.clone(),
+                        feature_dim: Some(m.feature_dim()),
+                        vocab_size: Some(m.tag_vocab.len()),
+                    },
+                    None => Status {
+                        path: world_path.display().to_string(),
+                        present: false,
+                        schema_version: None,
+                        n_train_examples: None,
+                        trained_at: None,
+                        feature_dim: None,
+                        vocab_size: None,
+                    },
+                };
+                match serde_json::to_string_pretty(&s) {
+                    Ok(s) => println!("{}", s),
+                    Err(e) => {
+                        eprintln!("json serialize failed: {e}");
+                        std::process::exit(1);
+                    }
+                }
+                return;
+            }
+
+            match model_opt {
+                None => {
+                    println!("world model: (none on disk)");
+                    println!("  expected at: {}", world_path.display());
+                    println!("  → run `tracemind world train` to bootstrap.");
+                }
+                Some(m) => {
+                    println!("world model:");
+                    println!("  path           : {}", world_path.display());
+                    println!("  schema version : v{}", m.schema_version);
+                    println!("  trained        : {}", m.is_trained());
+                    println!("  n_train        : {}", m.n_train_examples);
+                    println!(
+                        "  trained_at     : {}",
+                        m.trained_at.as_deref().unwrap_or("—")
+                    );
+                    println!("  feature dim    : {}", m.feature_dim());
+                    println!("  tag vocab      : {} entries", m.tag_vocab.len());
+                    if !m.tag_vocab.is_empty() {
+                        let preview: Vec<&str> = m
+                            .tag_vocab
+                            .entries()
+                            .iter()
+                            .take(5)
+                            .map(|s| s.as_str())
+                            .collect();
+                        println!("    top tags     : {}", preview.join(", "));
+                    }
+                }
+            }
+        }
+    }
 }

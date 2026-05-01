@@ -20,6 +20,7 @@ members = [
     "crates/tm-bench-locomo",
     "crates/tm-intent",
     "crates/tm-reflect",
+    "crates/tm-world-model",
 ]
 
 [workspace.package]
@@ -78,6 +79,7 @@ tm-reason = { path = "crates/tm-reason" }
 tm-answer = { path = "crates/tm-answer" }
 tm-intent = { path = "crates/tm-intent" }
 tm-reflect = { path = "crates/tm-reflect" }
+tm-world-model = { path = "crates/tm-world-model" }
 
 [profile.release]
 opt-level = 3
