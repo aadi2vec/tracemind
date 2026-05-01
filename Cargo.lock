@@ -5953,6 +5953,7 @@ dependencies = [
  "tm-rerank",
  "tm-retrieval",
  "tm-types",
+ "tm-world-model",
  "tokio",
  "tracing",
  "tracing-subscriber",

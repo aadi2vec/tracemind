@@ -140,6 +140,11 @@ enum Commands {
         /// Expected outcome (free text).
         #[arg(long)]
         expected: Option<String>,
+        /// Skip the world-model preflight line. Default: preflight on
+        /// when a trained model + ≥6 priors are available. See
+        /// `docs/INTENT_SYSTEM.md` §6.2.
+        #[arg(long)]
+        no_preflight: bool,
     },
     /// Attach an Outcome to a Commitment, walking the state machine to Completed.
     Resolve {
@@ -776,10 +781,18 @@ fn main() {
             options,
             chosen,
             expected,
+            no_preflight,
         } => {
             let intents_path = dir.join("intents.db").to_str().unwrap().to_string();
+            let world_path = dir.join("world_model.json");
+            // Preflight is suppressed by either --no-preflight or
+            // TM_NO_PREFLIGHT=1, so agents driving the CLI in scripted
+            // contexts can opt out without touching argv.
+            let preflight_off =
+                no_preflight || std::env::var_os("TM_NO_PREFLIGHT").is_some();
             cmd_commit(
                 &intents_path,
+                &world_path,
                 &kind,
                 statement,
                 horizon.as_deref(),
@@ -789,6 +802,7 @@ fn main() {
                 &options,
                 &chosen,
                 expected.as_deref(),
+                !preflight_off,
             );
         }
         Commands::Resolve {
@@ -1343,6 +1357,7 @@ mod tests {
 #[allow(clippy::too_many_arguments)]
 fn cmd_commit(
     intents_path: &str,
+    world_path: &std::path::Path,
     kind_s: &str,
     statement: String,
     horizon: Option<&str>,
@@ -1352,6 +1367,7 @@ fn cmd_commit(
     options_csv: &str,
     chosen: &str,
     expected: Option<&str>,
+    preflight: bool,
 ) {
     use tm_intent::{Commitment, CommitmentKind, IntentStore, Source, Stakes};
 
@@ -1438,6 +1454,64 @@ fn cmd_commit(
     if let Some(h) = c.horizon {
         println!("  horizon:   {}", h.to_rfc3339());
     }
+
+    // World-model preflight: best-effort, side-effect-free. Failure to
+    // load → silent skip. We deliberately run *after* persist so a slow
+    // model load can never block a commit; the user sees the prediction
+    // as a separate line.
+    if preflight {
+        emit_preflight(world_path, &c);
+    }
+}
+
+/// Emit a one-line "your track record" summary if the world model is
+/// trained and has enough priors. Quiet when there's nothing to say —
+/// silence is the safe failure mode here. See INTENT_SYSTEM.md §6.2.
+fn emit_preflight(world_path: &std::path::Path, c: &tm_intent::Commitment) {
+    use tm_world_model::{load, PolarityClass};
+
+    // Threshold below which we don't speak — INTENT_SYSTEM.md §5/§7
+    // pin support gates around N≥6 to avoid pareidolia.
+    const MIN_PRIORS: usize = 6;
+
+    let model = match load(world_path) {
+        Ok(Some(m)) if m.is_trained() && m.n_train_examples >= MIN_PRIORS => m,
+        _ => return, // missing / dormant / under-supported → silent
+    };
+    let pred = model.predict(c);
+
+    // Decide tone:
+    // - argmax = Worse AND positive_prob < 0.40 → loud warning.
+    // - argmax = Better/AsExpected AND positive_prob > 0.65 → quiet
+    //   tailwind line.
+    // - otherwise → mixed signal line, neutral.
+    let positive = pred.positive_prob;
+    let pct_better = (pred.dist.0[PolarityClass::Better.index()] * 100.0).round() as i32;
+    let pct_as_exp = (pred.dist.0[PolarityClass::AsExpected.index()] * 100.0).round() as i32;
+    let pct_worse = (pred.dist.0[PolarityClass::Worse.index()] * 100.0).round() as i32;
+
+    println!();
+    if matches!(pred.argmax, PolarityClass::Worse) && positive < 0.40 {
+        println!(
+            "  ⚠ track record (n={}): {}% worse, {}% better, {}% as-expected.",
+            pred.n_priors, pct_worse, pct_better, pct_as_exp,
+        );
+        println!("    your call — but similar-shaped commitments tend to land worse.");
+    } else if positive > 0.65 {
+        println!(
+            "  ✓ track record (n={}): {}% better/as-expected ({}% better, {}% as-expected).",
+            pred.n_priors,
+            pct_better + pct_as_exp,
+            pct_better,
+            pct_as_exp,
+        );
+    } else {
+        println!(
+            "  ~ track record (n={}): mixed signal — {}% better, {}% worse, {}% as-expected.",
+            pred.n_priors, pct_better, pct_worse, pct_as_exp,
+        );
+    }
+    println!("    (`tracemind world predict` for full breakdown · `--no-preflight` to silence)");
 }
 
 fn cmd_resolve(

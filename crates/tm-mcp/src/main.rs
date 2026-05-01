@@ -99,7 +99,7 @@ fn tools_list() -> Value {
             },
             {
                 "name": "memory_commit",
-                "description": "Record a commitment (intent / decision / hypothesis) into the system of intents. The wedge primitive — a forward-leaning intent and a backward-resolving decision are two phases of the same Commitment. See `docs/INTENT_SYSTEM.md` §1.1. Returns the commitment id; the caller can later attach an Outcome via `memory_resolve`.",
+                "description": "Record a commitment (intent / decision / hypothesis) into the system of intents. The wedge primitive — a forward-leaning intent and a backward-resolving decision are two phases of the same Commitment. See `docs/INTENT_SYSTEM.md` §1.1. Returns the commitment id; the caller can later attach an Outcome via `memory_resolve`. When a trained world model with ≥6 priors is available, the response also includes a `preflight` block with the user's track-record distribution for similar-shaped commitments and a `tone` ∈ {warning, mixed, tailwind} agents can route on.",
                 "inputSchema": {
                     "type": "object",
                     "required": ["kind", "statement"],
@@ -719,10 +719,67 @@ async fn handle_memory_commit(
     let store = IntentStore::open(intents_path).map_err(|e| e.to_string())?;
     store.insert_commitment(&c).map_err(|e| e.to_string())?;
 
-    Ok(json!({
+    // World-model preflight (INTENT_SYSTEM.md §6.2). The world model
+    // lives at <dir>/world_model.json — sibling of the intents store.
+    // Failure to load is silent: a missing/dormant model just omits
+    // the preflight block from the response.
+    let preflight = build_preflight_for(&c, intents_path);
+
+    let mut resp = json!({
         "commitment_id": c.id.to_string(),
         "state": "open",
         "kind": kind_s,
+    });
+    if let Some(p) = preflight {
+        resp["preflight"] = p;
+    }
+    Ok(resp)
+}
+
+/// Best-effort world-model preflight for `memory_commit`. Returns
+/// `None` when the model is missing, untrained, or under-supported
+/// (n_priors < 6), so the caller can opt in by simply checking for
+/// the field.
+fn build_preflight_for(
+    c: &tm_intent::Commitment,
+    intents_path: &str,
+) -> Option<Value> {
+    use tm_world_model::{load, PolarityClass};
+
+    const MIN_PRIORS: usize = 6;
+
+    let world_path = std::path::Path::new(intents_path)
+        .parent()
+        .map(|p| p.join("world_model.json"))?;
+    let model = match load(&world_path) {
+        Ok(Some(m)) if m.is_trained() && m.n_train_examples >= MIN_PRIORS => m,
+        _ => return None,
+    };
+    let pred = model.predict(c);
+    let dist = pred.dist.0;
+    // Match the CLI's tone bands so MCP and CLI consumers see the
+    // same "tone" signal — agents can branch on it without mirroring
+    // the threshold logic.
+    let positive = pred.positive_prob;
+    let tone = if matches!(pred.argmax, PolarityClass::Worse) && positive < 0.40 {
+        "warning"
+    } else if positive > 0.65 {
+        "tailwind"
+    } else {
+        "mixed"
+    };
+    Some(json!({
+        "n_priors": pred.n_priors,
+        "argmax": format!("{:?}", pred.argmax).to_lowercase(),
+        "positive_prob": positive,
+        "confidence": pred.confidence,
+        "dist": {
+            "better": dist[PolarityClass::Better.index()],
+            "as_expected": dist[PolarityClass::AsExpected.index()],
+            "worse": dist[PolarityClass::Worse.index()],
+            "mixed": dist[PolarityClass::Mixed.index()],
+        },
+        "tone": tone,
     }))
 }
 
@@ -1884,6 +1941,77 @@ mod tests {
             json!("as_expected"),
             "resolved row carries polarity"
         );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn memory_commit_omits_preflight_when_no_world_model() {
+        // Without a world_model.json sibling, the response must NOT
+        // include a `preflight` field — agents check for its presence
+        // to decide whether to render a track-record line.
+        let dir = std::env::temp_dir().join(format!("tm-mcp-no-world-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let intents_path = dir.join("intents.db").to_str().unwrap().to_string();
+
+        let resp = handle_memory_commit(
+            &json!({"kind": "intent", "statement": "no world model present"}),
+            &intents_path,
+        )
+        .await
+        .expect("commit ok");
+
+        assert!(resp["preflight"].is_null(), "preflight must be absent when model missing");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn memory_commit_attaches_preflight_when_model_trained() {
+        // When a trained, well-supported world model is on disk, the
+        // commit response carries a preflight block with the user's
+        // prior distribution. Agents can route on `tone`.
+        use tm_intent::{Commitment, CommitmentKind, Source, Stakes};
+        use tm_world_model::{save, train, Example, OutcomeModel, PolarityClass, TagVocab, TrainerConfig};
+
+        let dir = std::env::temp_dir().join(format!("tm-mcp-preflight-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let intents_path = dir.join("intents.db").to_str().unwrap().to_string();
+        let world_path = dir.join("world_model.json");
+
+        // Hand-build a separable training set: high-stakes always Worse.
+        let mut examples = Vec::new();
+        for _ in 0..6 {
+            let mut c = Commitment::new(CommitmentKind::Intent, "x", Source::Cli);
+            c.stakes = Stakes::High;
+            examples.push(Example { commitment: c, target: PolarityClass::Worse });
+        }
+        for _ in 0..6 {
+            let mut c = Commitment::new(CommitmentKind::Intent, "y", Source::Cli);
+            c.stakes = Stakes::Low;
+            examples.push(Example { commitment: c, target: PolarityClass::Better });
+        }
+        let cfg = TrainerConfig::default();
+        let (model, _report): (OutcomeModel, _) = train(&examples, &cfg);
+        // Use the workspace TagVocab default for vocab consistency check.
+        let _ = TagVocab::default();
+        save(&model, &world_path).expect("save world model");
+
+        let resp = handle_memory_commit(
+            &json!({"kind": "intent", "statement": "ship migration", "stakes": "high"}),
+            &intents_path,
+        )
+        .await
+        .expect("commit ok");
+
+        let pre = &resp["preflight"];
+        assert!(!pre.is_null(), "preflight must be present after training");
+        assert_eq!(pre["argmax"], json!("worse"));
+        assert_eq!(pre["tone"], json!("warning"));
+        let n = pre["n_priors"].as_u64().unwrap();
+        assert_eq!(n, 12);
+        let dist_worse = pre["dist"]["worse"].as_f64().unwrap();
+        assert!(dist_worse > 0.5, "high-stakes probe should lean worse, got {dist_worse}");
 
         std::fs::remove_dir_all(&dir).ok();
     }
