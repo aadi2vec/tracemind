@@ -83,6 +83,29 @@ pub struct CommitmentBriefRow {
     /// overdue; populated on the *overdue* section.
     pub overdue_class: Option<OverdueClass>,
     pub tags: Vec<String>,
+    /// World-model outlook — populated only when the brief builder was
+    /// given a trained model with ≥6 priors. INTENT_SYSTEM.md §6.2.
+    /// Stays `None` for the cold-start case (no model, dormant model,
+    /// under-supported) so the brief is honest about uncertainty.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outlook: Option<CommitmentOutlook>,
+}
+
+/// Slim, JSON-friendly projection of [`tm_world_model::OutcomePrediction`]
+/// for the brief surface. We carry only what the brief renders + the
+/// `tone` agents route on (mirrors the MCP preflight schema in
+/// `memory_commit` so external consumers see the same shape twice).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CommitmentOutlook {
+    pub n_priors: usize,
+    pub argmax: String, // "better" / "as_expected" / "worse" / "mixed"
+    pub positive_prob: f32,
+    pub confidence: f32,
+    pub better: f32,
+    pub as_expected: f32,
+    pub worse: f32,
+    pub mixed: f32,
+    pub tone: String, // "warning" | "tailwind" | "mixed"
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -207,6 +230,12 @@ pub struct BriefCounts {
 pub struct BriefBuilder<'a> {
     store: &'a IntentStore,
     config: BriefConfig,
+    /// Optional world-model for outlook attachment. When `None`, every
+    /// row's `outlook` stays `None` (cold-start surface). When `Some`
+    /// but the model is dormant (`!is_trained()`) or under-supported
+    /// (`n_train_examples < MIN_PRIORS_FOR_OUTLOOK`), we still skip
+    /// attachment — same n-too-small cliff as CLI/MCP preflight.
+    world_model: Option<&'a tm_world_model::OutcomeModel>,
 }
 
 impl<'a> BriefBuilder<'a> {
@@ -214,6 +243,7 @@ impl<'a> BriefBuilder<'a> {
         Self {
             store,
             config: BriefConfig::default(),
+            world_model: None,
         }
     }
 
@@ -222,9 +252,25 @@ impl<'a> BriefBuilder<'a> {
         self
     }
 
+    /// Attach a trained world model. Outlook fields stay `None` unless
+    /// the model is trained AND has ≥ `MIN_PRIORS_FOR_OUTLOOK` priors.
+    pub fn with_world_model(mut self, model: &'a tm_world_model::OutcomeModel) -> Self {
+        self.world_model = Some(model);
+        self
+    }
+
     /// Build the brief as of `now`. Pure: no internal clock reads.
     pub fn build(&self, now: DateTime<Utc>) -> Result<DailyBrief, BriefError> {
         let cfg = &self.config;
+
+        // World-model gate: only surface outlooks when the model is
+        // actually trained and has enough priors to be honest. Same
+        // threshold as `tm-cli` preflight + `tm-mcp` `memory_commit`
+        // preflight so all three surfaces stay aligned.
+        let active_model: Option<&tm_world_model::OutcomeModel> =
+            self.world_model.filter(|m| {
+                m.is_trained() && m.n_train_examples >= MIN_PRIORS_FOR_OUTLOOK
+            });
 
         // Overdue first — sorted by horizon ASC by the store query.
         let overdue_raw = self.store.list_overdue_open(now, cfg.limit_overdue)?;
@@ -233,7 +279,7 @@ impl<'a> BriefBuilder<'a> {
 
         let overdue: Vec<CommitmentBriefRow> = overdue_raw
             .into_iter()
-            .map(|c| commitment_row(c, now, /* tag_overdue */ true))
+            .map(|c| commitment_row(c, now, /* tag_overdue */ true, active_model))
             .collect();
 
         // Open list — drop anything already shown in `overdue` so a
@@ -243,7 +289,7 @@ impl<'a> BriefBuilder<'a> {
             .into_iter()
             .filter(|c| !overdue_ids.contains(&c.id))
             .take(cfg.limit_open)
-            .map(|c| commitment_row(c, now, /* tag_overdue */ false))
+            .map(|c| commitment_row(c, now, /* tag_overdue */ false, active_model))
             .collect();
 
         let cutoff = now - cfg.resolved_window;
@@ -331,12 +377,21 @@ impl<'a> BriefBuilder<'a> {
     }
 }
 
-fn commitment_row(c: Commitment, now: DateTime<Utc>, tag_overdue: bool) -> CommitmentBriefRow {
+fn commitment_row(
+    c: Commitment,
+    now: DateTime<Utc>,
+    tag_overdue: bool,
+    model: Option<&tm_world_model::OutcomeModel>,
+) -> CommitmentBriefRow {
     let overdue_class = if tag_overdue {
         c.horizon.map(|h| OverdueClass::classify(h, now))
     } else {
         None
     };
+    let outlook = model.map(|m| {
+        let pred = m.predict(&c);
+        outlook_from_prediction(&pred, m.n_train_examples)
+    });
     CommitmentBriefRow {
         id: c.id,
         kind: c.kind,
@@ -348,13 +403,51 @@ fn commitment_row(c: Commitment, now: DateTime<Utc>, tag_overdue: bool) -> Commi
         horizon: c.horizon,
         overdue_class,
         tags: c.tags,
+        outlook,
+    }
+}
+
+/// Minimum prior commitments required before the world model is
+/// allowed to surface predictions in the brief. Mirrors the threshold
+/// in `tm-cli` preflight + `tm-mcp` `memory_commit` preflight so all
+/// three surfaces stay honest about the same "n is too small" cliff.
+const MIN_PRIORS_FOR_OUTLOOK: usize = 6;
+
+/// Map a [`tm_world_model::OutcomePrediction`] into the brief's
+/// `CommitmentOutlook`. Tone routing matches the MCP preflight in
+/// `tm-mcp::build_preflight_for` exactly: callers that key off `tone`
+/// see one shape across CLI brief, MCP brief and MCP commit responses.
+fn outlook_from_prediction(
+    pred: &tm_world_model::OutcomePrediction,
+    n_priors: usize,
+) -> CommitmentOutlook {
+    use tm_world_model::PolarityClass as P;
+    let positive = pred.positive_prob;
+    let tone = if matches!(pred.argmax, P::Worse) || positive < 0.40 {
+        "warning"
+    } else if positive > 0.65 {
+        "tailwind"
+    } else {
+        "mixed"
+    };
+    let d = &pred.dist.0;
+    CommitmentOutlook {
+        n_priors,
+        argmax: pred.argmax.label().to_string(),
+        positive_prob: positive,
+        confidence: pred.confidence,
+        better: d[P::Better.index()],
+        as_expected: d[P::AsExpected.index()],
+        worse: d[P::Worse.index()],
+        mixed: d[P::Mixed.index()],
+        tone: tone.to_string(),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::Duration;
+    use chrono::{Duration, TimeZone};
     use tm_intent::{
         Commitment, CommitmentKind, IntentStore, Outcome, OutcomeSource, Polarity, Source, State,
         state::transition,
@@ -695,5 +788,150 @@ mod tests {
         let back: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(back["counts"]["overdue"], 1);
         assert_eq!(back["overdue"][0]["overdue_class"], "due_today");
+    }
+
+    /// Build a small linearly-separable training set using the same
+    /// strategy as `tm-world-model`'s own tests: high-stakes evenings
+    /// trend Worse, low-stakes mornings trend Better. We use this to
+    /// fabricate a model the brief can then consult.
+    fn trained_model() -> tm_world_model::OutcomeModel {
+        use chrono::TimeZone;
+        use tm_world_model::{train, Example, PolarityClass, TrainerConfig};
+        let mk = |stakes: Stakes, hour: u32, target: PolarityClass| {
+            let mut c = Commitment::new(CommitmentKind::Intent, "seed", Source::Cli);
+            c.stakes = stakes;
+            c.made_at = Utc.with_ymd_and_hms(2026, 4, 28, hour, 0, 0).unwrap();
+            Example { commitment: c, target }
+        };
+        let mut exs = Vec::new();
+        for _ in 0..6 {
+            exs.push(mk(Stakes::High, 19, PolarityClass::Worse));
+        }
+        for _ in 0..6 {
+            exs.push(mk(Stakes::Low, 9, PolarityClass::Better));
+        }
+        let (model, _) = train(&exs, &TrainerConfig::default());
+        assert!(model.is_trained(), "fixture must produce a trained model");
+        model
+    }
+
+    #[test]
+    fn outlook_omitted_when_no_world_model_attached() {
+        let store = fresh_store();
+        let now = Utc::now();
+        let mut c = Commitment::new(CommitmentKind::Intent, "draft outline", Source::Manual);
+        c.horizon = Some(now + Duration::days(2));
+        store.insert_commitment(&c).unwrap();
+
+        let brief = BriefBuilder::new(&store).build(now).unwrap();
+        assert_eq!(brief.open.len(), 1);
+        assert!(brief.open[0].outlook.is_none(), "no model attached → no outlook");
+    }
+
+    #[test]
+    fn outlook_omitted_when_model_below_min_priors() {
+        // A "trained" model that lies about being trained but only saw
+        // 1 example: BriefBuilder must still refuse to surface predictions.
+        // We synthesize this by hand-constructing a model and clamping
+        // its example count below the threshold.
+        use tm_world_model::{OutcomeModel, TagVocab};
+        let store = fresh_store();
+        let now = Utc::now();
+        let mut c = Commitment::new(CommitmentKind::Intent, "draft outline", Source::Manual);
+        c.horizon = Some(now + Duration::days(2));
+        store.insert_commitment(&c).unwrap();
+
+        let mut model = OutcomeModel::fresh(TagVocab::default());
+        model.n_train_examples = MIN_PRIORS_FOR_OUTLOOK - 1; // dormant by gate
+        let brief = BriefBuilder::new(&store)
+            .with_world_model(&model)
+            .build(now)
+            .unwrap();
+        assert!(
+            brief.open[0].outlook.is_none(),
+            "model under min priors → outlook stays None even when attached"
+        );
+    }
+
+    #[test]
+    fn outlook_attaches_warning_tone_for_worse_trending_open_row() {
+        let model = trained_model();
+        let store = fresh_store();
+        let now = Utc::now();
+
+        // Open commitment that *matches* the worse-trending cell
+        // (high stakes, evening hour, no horizon → not overdue).
+        let mut c = Commitment::new(CommitmentKind::Intent, "ship hot fix", Source::Manual);
+        c.stakes = Stakes::High;
+        c.made_at = Utc::now().with_timezone(&Utc);
+        // Match the trained pattern by shifting hour into the evening.
+        // BriefBuilder pulls c.made_at as-is so we set explicit hour.
+        c.made_at = chrono::Utc
+            .with_ymd_and_hms(2026, 4, 30, 19, 0, 0)
+            .unwrap();
+        store.insert_commitment(&c).unwrap();
+
+        let brief = BriefBuilder::new(&store)
+            .with_world_model(&model)
+            .build(now)
+            .unwrap();
+        assert_eq!(brief.open.len(), 1);
+        let outlook = brief.open[0]
+            .outlook
+            .as_ref()
+            .expect("outlook attached when model trained + above min priors");
+        assert_eq!(outlook.argmax, "worse");
+        assert_eq!(outlook.tone, "warning");
+        assert!(outlook.n_priors >= MIN_PRIORS_FOR_OUTLOOK);
+        // Probabilities sum ~1.0
+        let total = outlook.better + outlook.as_expected + outlook.worse + outlook.mixed;
+        assert!((total - 1.0).abs() < 1e-3, "probs sum to ~1, got {total}");
+    }
+
+    #[test]
+    fn outlook_attaches_tailwind_tone_for_better_trending_open_row() {
+        let model = trained_model();
+        let store = fresh_store();
+        let now = Utc::now();
+
+        // Low-stakes morning commitment matches the Better cell.
+        let mut c = Commitment::new(CommitmentKind::Intent, "draft note", Source::Manual);
+        c.stakes = Stakes::Low;
+        c.made_at = chrono::Utc
+            .with_ymd_and_hms(2026, 4, 30, 9, 0, 0)
+            .unwrap();
+        store.insert_commitment(&c).unwrap();
+
+        let brief = BriefBuilder::new(&store)
+            .with_world_model(&model)
+            .build(now)
+            .unwrap();
+        let outlook = brief.open[0].outlook.as_ref().expect("outlook attached");
+        assert_eq!(outlook.argmax, "better");
+        assert_eq!(outlook.tone, "tailwind");
+        assert!(outlook.positive_prob > 0.65);
+    }
+
+    #[test]
+    fn outlook_serializes_into_brief_json() {
+        let model = trained_model();
+        let store = fresh_store();
+        let now = Utc::now();
+        let mut c = Commitment::new(CommitmentKind::Intent, "draft note", Source::Manual);
+        c.stakes = Stakes::Low;
+        c.made_at = chrono::Utc
+            .with_ymd_and_hms(2026, 4, 30, 9, 0, 0)
+            .unwrap();
+        store.insert_commitment(&c).unwrap();
+
+        let brief = BriefBuilder::new(&store)
+            .with_world_model(&model)
+            .build(now)
+            .unwrap();
+        let json = serde_json::to_value(&brief).unwrap();
+        let row = &json["open"][0];
+        assert!(row.get("outlook").is_some(), "outlook field present in JSON");
+        assert_eq!(row["outlook"]["argmax"], "better");
+        assert_eq!(row["outlook"]["tone"], "tailwind");
     }
 }

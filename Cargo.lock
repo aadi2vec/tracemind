@@ -5984,6 +5984,7 @@ dependencies = [
  "tempfile",
  "thiserror 1.0.69",
  "tm-intent",
+ "tm-world-model",
  "uuid",
 ]
 

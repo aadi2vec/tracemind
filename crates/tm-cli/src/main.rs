@@ -812,8 +812,10 @@ fn main() {
             note,
         } => {
             let intents_path = dir.join("intents.db").to_str().unwrap().to_string();
+            let world_path = dir.join("world_model.json");
             cmd_resolve(
                 &intents_path,
+                &world_path,
                 &commitment_id,
                 &polarity,
                 &description,
@@ -830,7 +832,8 @@ fn main() {
         }
         Commands::Brief { json, resolved_days } => {
             let intents_path = dir.join("intents.db").to_str().unwrap().to_string();
-            cmd_brief(&intents_path, json, resolved_days);
+            let world_path = dir.join("world_model.json");
+            cmd_brief(&intents_path, &world_path, json, resolved_days);
         }
         Commands::Patterns { action } => {
             let intents_path = dir.join("intents.db").to_str().unwrap().to_string();
@@ -1516,6 +1519,7 @@ fn emit_preflight(world_path: &std::path::Path, c: &tm_intent::Commitment) {
 
 fn cmd_resolve(
     intents_path: &str,
+    world_path: &std::path::Path,
     commitment_id: &str,
     polarity_s: &str,
     description: &str,
@@ -1586,6 +1590,42 @@ fn cmd_resolve(
     println!("commitment {cid} → completed ({polarity_s})");
     println!("  outcome:   {}", outcome.id);
     println!("  observed:  {}", outcome.observed_at.to_rfc3339());
+
+    // Ambient retrain — refresh the world model so tomorrow's brief
+    // surfaces on this new outcome. Best-effort: failures here never
+    // block the resolve. Silent below `min_examples` so the user
+    // doesn't see noise on day one.
+    if let Some(msg) = auto_retrain_world_model(&store, world_path) {
+        println!("  world:     {msg}");
+    }
+}
+
+/// Re-train the world model after a resolve. Returns a one-line
+/// status string when training actually ran (so the CLI/MCP caller
+/// can surface a single line of feedback), or `None` when we silently
+/// skipped (no examples yet, or persistence failed). Soft-fail
+/// throughout — never propagates errors back to the resolve path.
+fn auto_retrain_world_model(
+    store: &tm_intent::IntentStore,
+    world_path: &std::path::Path,
+) -> Option<String> {
+    use tm_world_model::{from_pairs, save, train, TrainerConfig};
+    let cfg = TrainerConfig::default();
+    // Pull a year of completed-with-polarity outcomes — same window
+    // the explicit `tracemind world train` uses by default.
+    let since = chrono::Utc::now() - chrono::Duration::days(365);
+    let rows = store.list_completed_with_polarity(since, 5000).ok()?;
+    let (examples, _skipped) = from_pairs(rows);
+    if examples.len() < cfg.min_examples {
+        return None;
+    }
+    let (model, report) = train(&examples, &cfg);
+    save(&model, world_path).ok()?;
+    Some(format!(
+        "retrained on {} priors (acc {:.0}%)",
+        report.n_examples,
+        report.final_accuracy * 100.0
+    ))
 }
 
 fn cmd_commitments(intents_path: &str, limit: usize) {
@@ -1724,7 +1764,7 @@ fn cmd_candidates(intents_path: &str, action: CandidatesAction) {
 /// - JSON (`--json`) — the [`tm_reflect::DailyBrief`] structure
 ///   verbatim; this is the stable contract for agents and external
 ///   tooling.
-fn cmd_brief(intents_path: &str, json: bool, resolved_days: i64) {
+fn cmd_brief(intents_path: &str, world_path: &std::path::Path, json: bool, resolved_days: i64) {
     use chrono::{Duration, Utc};
     use tm_intent::IntentStore;
     use tm_reflect::{BriefBuilder, BriefConfig};
@@ -1737,11 +1777,21 @@ fn cmd_brief(intents_path: &str, json: bool, resolved_days: i64) {
         }
     };
 
+    // Best-effort world-model load. Missing file / corrupt schema /
+    // dormant model all fall through to "no outlook" — the brief
+    // renders fine without it. Surfacing the load error would be noise
+    // on first-run installs.
+    let world_model = tm_world_model::load(world_path).ok().flatten();
+
     let cfg = BriefConfig {
         resolved_window: Duration::days(resolved_days),
         ..Default::default()
     };
-    let brief = match BriefBuilder::new(&store).with_config(cfg).build(Utc::now()) {
+    let mut builder = BriefBuilder::new(&store).with_config(cfg);
+    if let Some(ref m) = world_model {
+        builder = builder.with_world_model(m);
+    }
+    let brief = match builder.build(Utc::now()) {
         Ok(b) => b,
         Err(e) => {
             eprintln!("brief failed: {e}");
@@ -1931,6 +1981,7 @@ fn print_brief_text(brief: &tm_reflect::DailyBrief) {
                 horizon,
                 truncate_str(&row.statement, 60)
             );
+            print_outlook_line(row.outlook.as_ref());
         }
         println!();
     }
@@ -1954,6 +2005,7 @@ fn print_brief_text(brief: &tm_reflect::DailyBrief) {
                 horizon,
                 truncate_str(&row.statement, 60)
             );
+            print_outlook_line(row.outlook.as_ref());
         }
         println!();
     }
@@ -2040,6 +2092,28 @@ fn print_brief_text(brief: &tm_reflect::DailyBrief) {
 
 fn short_id(id: Uuid) -> String {
     id.to_string()[..8].to_string()
+}
+
+/// Render the world-model outlook one-liner under a brief row. The
+/// glyph mirrors the tone classification done in `tm-reflect::brief`
+/// (warning / tailwind / mixed) so the visual cue matches the JSON
+/// `tone` field. No-op when `outlook` is None — the brief stays
+/// honest about cold starts and dormant models.
+fn print_outlook_line(outlook: Option<&tm_reflect::CommitmentOutlook>) {
+    let Some(o) = outlook else { return };
+    let glyph = match o.tone.as_str() {
+        "warning" => "⚠",
+        "tailwind" => "✓",
+        _ => "~",
+    };
+    println!(
+        "        {} outlook: {} {:.0}%  (positive {:.0}%, n={})",
+        glyph,
+        o.argmax,
+        o.confidence * 100.0,
+        o.positive_prob * 100.0,
+        o.n_priors,
+    );
 }
 
 // ---------------------------------------------------------------------------

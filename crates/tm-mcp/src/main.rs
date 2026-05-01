@@ -848,12 +848,49 @@ async fn handle_memory_resolve(
         .update_state(commitment.id, commitment.state, commitment.outcome_id)
         .map_err(|e| e.to_string())?;
 
-    Ok(json!({
+    // Ambient retrain — refresh `world_model.json` so the next
+    // `memory_brief` / `memory_commit` preflight reflects this newly
+    // observed outcome. Soft-fail; never blocks the resolve.
+    let world_retrain = auto_retrain_world_model_for(intents_path);
+
+    let mut resp = json!({
         "outcome_id": outcome.id.to_string(),
         "commitment_id": commitment.id.to_string(),
         "commitment_state": "completed",
         "polarity": polarity_s,
-    }))
+    });
+    if let Some(msg) = world_retrain {
+        resp["world_model"] = Value::String(msg);
+    }
+    Ok(resp)
+}
+
+/// MCP-side mirror of the CLI's `auto_retrain_world_model`. Same
+/// hard-floor (`min_examples`), same window (365d), same persistence
+/// path (sibling of the intents store). Returns `None` silently when
+/// we don't have enough priors yet OR when persistence fails — the
+/// caller never sees an error from this path.
+fn auto_retrain_world_model_for(intents_path: &str) -> Option<String> {
+    use tm_intent::IntentStore;
+    use tm_world_model::{from_pairs, save, train, TrainerConfig};
+    let world_path = std::path::Path::new(intents_path)
+        .parent()
+        .map(|p| p.join("world_model.json"))?;
+    let store = IntentStore::open(intents_path).ok()?;
+    let cfg = TrainerConfig::default();
+    let since = chrono::Utc::now() - chrono::Duration::days(365);
+    let rows = store.list_completed_with_polarity(since, 5000).ok()?;
+    let (examples, _skipped) = from_pairs(rows);
+    if examples.len() < cfg.min_examples {
+        return None;
+    }
+    let (model, report) = train(&examples, &cfg);
+    save(&model, &world_path).ok()?;
+    Some(format!(
+        "retrained on {} priors (acc {:.0}%)",
+        report.n_examples,
+        report.final_accuracy * 100.0
+    ))
 }
 
 fn parse_entity_type(s: &str) -> tm_types::EntityType {
@@ -1273,8 +1310,18 @@ fn handle_memory_brief(params: &Value, intents_path: &str) -> Result<Value, Stri
         ..BriefConfig::default()
     };
 
-    let brief = BriefBuilder::new(&store)
-        .with_config(cfg)
+    // Best-effort world-model load. If `world_model.json` is missing,
+    // dormant, or schema-mismatched, the brief still renders without
+    // outlook annotations — same cold-start contract as the CLI.
+    let world_model = std::path::Path::new(intents_path)
+        .parent()
+        .and_then(|p| tm_world_model::load(&p.join("world_model.json")).ok().flatten());
+
+    let mut builder = BriefBuilder::new(&store).with_config(cfg);
+    if let Some(ref m) = world_model {
+        builder = builder.with_world_model(m);
+    }
+    let brief = builder
         .build(Utc::now())
         .map_err(|e| format!("brief failed: {e}"))?;
 
@@ -2012,6 +2059,175 @@ mod tests {
         assert_eq!(n, 12);
         let dist_worse = pre["dist"]["worse"].as_f64().unwrap();
         assert!(dist_worse > 0.5, "high-stakes probe should lean worse, got {dist_worse}");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn memory_resolve_auto_retrains_world_model_when_enough_priors() {
+        // After 6 resolved commitments, calling memory_resolve a 7th
+        // time should produce a `world_model` status string AND leave
+        // a freshly-written `world_model.json` next to the intents db.
+        let dir = std::env::temp_dir().join(format!("tm-mcp-retrain-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let intents_path = dir.join("intents.db").to_str().unwrap().to_string();
+        let world_path = dir.join("world_model.json");
+
+        // Seed + resolve 6 commitments (the trainer's `min_examples`).
+        // The 6th resolve is the one that crosses the threshold and
+        // therefore must trigger a retrain.
+        let mut last_resp = json!({});
+        for i in 0..6 {
+            let commit = handle_memory_commit(
+                &json!({
+                    "kind": "intent",
+                    "statement": format!("seed-{i}"),
+                    "stakes": if i % 2 == 0 { "high" } else { "low" },
+                }),
+                &intents_path,
+            )
+            .await
+            .expect("commit ok");
+            let cid = commit["commitment_id"].as_str().expect("id").to_string();
+            let pol = if i % 2 == 0 { "worse" } else { "better" };
+            last_resp = handle_memory_resolve(
+                &json!({
+                    "commitment_id": cid,
+                    "polarity": pol,
+                    "description": "seed outcome"
+                }),
+                &intents_path,
+            )
+            .await
+            .expect("resolve ok");
+        }
+
+        let msg = last_resp["world_model"].as_str();
+        assert!(
+            msg.is_some(),
+            "6th resolve must trigger an auto-retrain; got resp = {last_resp}"
+        );
+        assert!(
+            msg.unwrap().contains("retrained on 6 priors"),
+            "expected '6 priors' in status, got: {msg:?}"
+        );
+        assert!(
+            world_path.exists(),
+            "auto-retrain must persist world_model.json"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn memory_resolve_skips_retrain_silently_below_min_examples() {
+        // First resolve (n=1) is well under min_examples=6: response
+        // must NOT carry a `world_model` field (silent skip), and no
+        // file should appear on disk.
+        let dir = std::env::temp_dir().join(format!("tm-mcp-skipretrain-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let intents_path = dir.join("intents.db").to_str().unwrap().to_string();
+        let world_path = dir.join("world_model.json");
+
+        let commit = handle_memory_commit(
+            &json!({"kind": "intent", "statement": "first ever"}),
+            &intents_path,
+        )
+        .await
+        .expect("commit ok");
+        let cid = commit["commitment_id"].as_str().unwrap().to_string();
+        let resp = handle_memory_resolve(
+            &json!({
+                "commitment_id": cid,
+                "polarity": "better",
+                "description": "shipped"
+            }),
+            &intents_path,
+        )
+        .await
+        .expect("resolve ok");
+
+        assert!(
+            resp.get("world_model").is_none(),
+            "below min_examples → no world_model status should be emitted"
+        );
+        assert!(
+            !world_path.exists(),
+            "below min_examples → no world_model.json should be written"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn memory_brief_attaches_outlook_to_open_rows_when_model_trained() {
+        // With a trained world_model.json next to intents.db, the
+        // brief response's `open[*].outlook` block must be populated.
+        // Without it (or below min_priors), `outlook` must be omitted.
+        use tm_intent::{Commitment, CommitmentKind, Source, Stakes};
+        use tm_world_model::{save, train, Example, PolarityClass, TrainerConfig};
+
+        let dir = std::env::temp_dir().join(format!("tm-mcp-brief-outlook-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let intents_path = dir.join("intents.db").to_str().unwrap().to_string();
+        let world_path = dir.join("world_model.json");
+
+        // Train a separable model and persist it.
+        let mut examples = Vec::new();
+        for _ in 0..6 {
+            let mut c = Commitment::new(CommitmentKind::Intent, "x", Source::Cli);
+            c.stakes = Stakes::High;
+            examples.push(Example { commitment: c, target: PolarityClass::Worse });
+        }
+        for _ in 0..6 {
+            let mut c = Commitment::new(CommitmentKind::Intent, "y", Source::Cli);
+            c.stakes = Stakes::Low;
+            examples.push(Example { commitment: c, target: PolarityClass::Better });
+        }
+        let (model, _r) = train(&examples, &TrainerConfig::default());
+        save(&model, &world_path).expect("save model");
+
+        // Open commitment that should match the worse cell.
+        handle_memory_commit(
+            &json!({"kind": "intent", "statement": "ship migration", "stakes": "high"}),
+            &intents_path,
+        )
+        .await
+        .expect("commit ok");
+
+        let brief = handle_memory_brief(&json!({}), &intents_path).expect("brief ok");
+        let open = brief["open"].as_array().expect("open array");
+        assert_eq!(open.len(), 1);
+        let outlook = &open[0]["outlook"];
+        assert!(!outlook.is_null(), "outlook must be present, got brief={brief}");
+        assert_eq!(outlook["argmax"], json!("worse"));
+        assert_eq!(outlook["tone"], json!("warning"));
+        assert!(outlook["n_priors"].as_u64().unwrap() >= 6);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn memory_brief_omits_outlook_when_no_world_model() {
+        let dir = std::env::temp_dir().join(format!("tm-mcp-brief-cold-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let intents_path = dir.join("intents.db").to_str().unwrap().to_string();
+
+        handle_memory_commit(
+            &json!({"kind": "intent", "statement": "no model present"}),
+            &intents_path,
+        )
+        .await
+        .expect("commit ok");
+
+        let brief = handle_memory_brief(&json!({}), &intents_path).expect("brief ok");
+        let open = brief["open"].as_array().expect("open array");
+        assert_eq!(open.len(), 1);
+        assert!(
+            open[0].get("outlook").is_none(),
+            "no model on disk → outlook field must be omitted (skip_serializing_if), got {:?}",
+            open[0]
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }

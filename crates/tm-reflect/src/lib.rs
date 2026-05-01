@@ -30,8 +30,8 @@ pub mod matcher;
 pub mod pattern;
 
 pub use brief::{
-    BriefBuilder, BriefConfig, BriefError, CandidateBriefRow, CommitmentBriefRow, DailyBrief,
-    OverdueClass, PatternBriefRow, ResolvedBriefRow,
+    BriefBuilder, BriefConfig, BriefError, CandidateBriefRow, CommitmentBriefRow,
+    CommitmentOutlook, DailyBrief, OverdueClass, PatternBriefRow, ResolvedBriefRow,
 };
 pub use matcher::{propose_outcomes, MatcherConfig, OutcomeProposal};
 pub use pattern::{
