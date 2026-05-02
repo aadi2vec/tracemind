@@ -1952,14 +1952,32 @@ fn print_brief_text(brief: &tm_reflect::DailyBrief) {
         local_now.format("%a %b %d, %-I:%M %p")
     );
     println!(
-        "  overdue: {}    open: {}    resolved: {}    candidates: {}    patterns: {}",
+        "  overdue: {}    open: {}    resolved: {}    candidates: {}    patterns: {}    insights: {}",
         brief.counts.overdue,
         brief.counts.open,
         brief.counts.resolved,
         brief.counts.candidates,
         brief.counts.patterns,
+        brief.counts.insights,
     );
     println!();
+
+    // Insights panel — printed first so the user sees the most
+    // attention-worthy rows before drowning in the open list.
+    if !brief.insights.is_empty() {
+        println!("▸ insights ({})", brief.insights.len());
+        for ins in &brief.insights {
+            let glyph = match ins.tone.as_str() {
+                "warning" => "⚠",
+                "tailwind" => "✓",
+                _ => "~",
+            };
+            println!("    {} {}", glyph, ins.render);
+        }
+        println!("    (model deviation from your completed-rate baseline; n={} priors)",
+            brief.insights.first().map(|i| i.n_priors).unwrap_or(0));
+        println!();
+    }
 
     if !brief.overdue.is_empty() {
         println!("▸ overdue ({})", brief.overdue.len());

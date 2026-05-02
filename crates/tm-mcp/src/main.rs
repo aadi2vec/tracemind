@@ -2231,4 +2231,143 @@ mod tests {
 
         std::fs::remove_dir_all(&dir).ok();
     }
+
+    #[tokio::test]
+    async fn memory_brief_surfaces_insights_when_open_row_diverges_from_baseline() {
+        // With a trained world model AND a completed-rate baseline that
+        // *diverges* from the model's per-row outlook, memory_brief
+        // must surface the divergence in the top-level `insights` array
+        // and bump `counts.insights`. Mirrors the tm-reflect integration
+        // test, but exercises the full MCP JSON shape.
+        use tm_world_model::{save, train, Example, PolarityClass, TrainerConfig};
+        use uuid::Uuid as TestUuid;
+
+        let dir = std::env::temp_dir().join(format!("tm-mcp-brief-insights-{}", TestUuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let intents_path = dir.join("intents.db").to_str().unwrap().to_string();
+        let world_path = dir.join("world_model.json");
+
+        // 1. Train a separable model: high stakes → worse, low stakes → better.
+        let mut examples = Vec::new();
+        for _ in 0..6 {
+            let mut c = tm_intent::Commitment::new(
+                tm_intent::CommitmentKind::Intent,
+                "x",
+                tm_intent::Source::Cli,
+            );
+            c.stakes = tm_intent::Stakes::High;
+            examples.push(Example { commitment: c, target: PolarityClass::Worse });
+        }
+        for _ in 0..6 {
+            let mut c = tm_intent::Commitment::new(
+                tm_intent::CommitmentKind::Intent,
+                "y",
+                tm_intent::Source::Cli,
+            );
+            c.stakes = tm_intent::Stakes::Low;
+            examples.push(Example { commitment: c, target: PolarityClass::Better });
+        }
+        let (model, _r) = train(&examples, &TrainerConfig::default());
+        save(&model, &world_path).expect("save model");
+
+        // 2. Seed completed commitments to establish a *positive-leaning*
+        //    baseline (≥ 6 priors so insights detector trusts it).
+        //    8 better + 4 worse = 67% positive baseline.
+        for i in 0..8 {
+            let commit = handle_memory_commit(
+                &json!({
+                    "kind": "intent",
+                    "statement": format!("low-stakes win {i}"),
+                    "stakes": "low",
+                }),
+                &intents_path,
+            )
+            .await
+            .expect("commit ok");
+            let cid = commit["commitment_id"].as_str().unwrap().to_string();
+            handle_memory_resolve(
+                &json!({"commitment_id": cid, "polarity": "better", "description": "shipped"}),
+                &intents_path,
+            )
+            .await
+            .expect("resolve ok");
+        }
+        for i in 0..4 {
+            let commit = handle_memory_commit(
+                &json!({
+                    "kind": "intent",
+                    "statement": format!("high-stakes loss {i}"),
+                    "stakes": "high",
+                }),
+                &intents_path,
+            )
+            .await
+            .expect("commit ok");
+            let cid = commit["commitment_id"].as_str().unwrap().to_string();
+            handle_memory_resolve(
+                &json!({"commitment_id": cid, "polarity": "worse", "description": "missed"}),
+                &intents_path,
+            )
+            .await
+            .expect("resolve ok");
+        }
+
+        // The auto-retrain on the last resolve overwrites our hand-crafted
+        // separable model with one trained on the seeded baseline. Re-save
+        // the separable model so the open-row outlook is sharply skewed.
+        save(&model, &world_path).expect("re-save separable model");
+
+        // 3. Open commitment that the model thinks is *worse* (high stakes)
+        //    while the baseline is positive-leaning → must surface as a
+        //    warning insight.
+        handle_memory_commit(
+            &json!({
+                "kind": "intent",
+                "statement": "ship risky vendor migration",
+                "stakes": "high",
+            }),
+            &intents_path,
+        )
+        .await
+        .expect("commit ok");
+
+        let brief = handle_memory_brief(&json!({}), &intents_path).expect("brief ok");
+        let insights = brief["insights"].as_array().expect("insights array present");
+        assert!(
+            !insights.is_empty(),
+            "model + diverging baseline must surface ≥ 1 insight, got brief={brief}"
+        );
+        let first = &insights[0];
+        assert_eq!(first["tone"], json!("warning"));
+        assert!(first["delta"].as_f64().unwrap() < -0.20);
+        assert!(first["render"].as_str().unwrap().contains("riskier"));
+        assert_eq!(brief["counts"]["insights"], json!(insights.len()));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn memory_brief_omits_insights_when_no_world_model() {
+        // Without a trained world model on disk, the insights array
+        // must be empty (insight detection requires per-row outlooks).
+        use uuid::Uuid as TestUuid;
+
+        let dir = std::env::temp_dir().join(format!("tm-mcp-brief-noinsights-{}", TestUuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let intents_path = dir.join("intents.db").to_str().unwrap().to_string();
+
+        handle_memory_commit(
+            &json!({"kind": "intent", "statement": "no model present"}),
+            &intents_path,
+        )
+        .await
+        .expect("commit ok");
+
+        let brief = handle_memory_brief(&json!({}), &intents_path).expect("brief ok");
+        let insights = brief["insights"].as_array().expect("insights array present");
+        assert!(insights.is_empty(), "no model → no insights, got {brief}");
+        assert_eq!(brief["counts"]["insights"], json!(0));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }

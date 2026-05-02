@@ -16,6 +16,7 @@ use tm_intent::{
     Commitment, CommitmentKind, IntentStore, Polarity, Source, Stakes, State,
 };
 
+use crate::insights::{detect_insights, BaselineRate, InsightBriefRow, InsightConfig};
 use crate::pattern::{
     default_window_start, detect_patterns, CellKey, DetectedPattern, PatternConfig, PolarityDist,
 };
@@ -42,6 +43,11 @@ pub struct BriefConfig {
     /// nightly compute bounded for power-users with thousands of
     /// outcomes. Default: 2000.
     pub patterns_scan_limit: usize,
+    /// Insight-detector config (`crate::insights`). Controls which
+    /// open commitments get hoisted into the focused
+    /// `▸ insights` panel based on world-model deviation from the
+    /// completed-rate baseline.
+    pub insights: InsightConfig,
 }
 
 impl Default for BriefConfig {
@@ -55,6 +61,7 @@ impl Default for BriefConfig {
             patterns: PatternConfig::default(),
             patterns_window: Duration::days(365),
             patterns_scan_limit: 2000,
+            insights: InsightConfig::default(),
         }
     }
 }
@@ -214,6 +221,13 @@ pub struct DailyBrief {
     /// May be empty when the user has too few completed commitments
     /// for the global baseline to be trustworthy.
     pub patterns: Vec<PatternBriefRow>,
+    /// Per-row world-model insights — open commitments whose outlook
+    /// diverges most from the user's completed-rate baseline. Sorted
+    /// by `|delta|` desc. Empty when no world model is attached, or
+    /// when no row crosses the `min_abs_delta` floor. INTENT_SYSTEM
+    /// §6.2 generalised to row-level "what's surprising".
+    #[serde(default)]
+    pub insights: Vec<InsightBriefRow>,
     /// Section counts for quick rendering of section headers.
     pub counts: BriefCounts,
 }
@@ -225,6 +239,8 @@ pub struct BriefCounts {
     pub resolved: usize,
     pub candidates: usize,
     pub patterns: usize,
+    #[serde(default)]
+    pub insights: usize,
 }
 
 pub struct BriefBuilder<'a> {
@@ -357,12 +373,44 @@ impl<'a> BriefBuilder<'a> {
             Err(_) => Vec::new(),
         };
 
+        // Insights — only compute when a world model is attached
+        // (otherwise the open rows have no `outlook` to compare).
+        // Pull the same completed-with-polarity slice as the pattern
+        // detector to stay consistent on what counts as a "prior".
+        // Soft-fail: if the store query errors we drop insights but
+        // keep the rest of the brief.
+        let insights: Vec<InsightBriefRow> = if active_model.is_some() {
+            match self
+                .store
+                .list_completed_with_polarity(pattern_window_start, cfg.patterns_scan_limit)
+            {
+                Ok(completed) => {
+                    let baseline = BaselineRate::from_completed(&completed);
+                    // Insights apply to overdue + open together — the
+                    // overdue rows are the most attention-worthy ones,
+                    // we shouldn't filter them out of the panel.
+                    // `detect_insights` takes a slice by reference, so
+                    // collect both sections into one owned Vec.
+                    let combined: Vec<CommitmentBriefRow> = overdue
+                        .iter()
+                        .chain(open.iter())
+                        .cloned()
+                        .collect();
+                    detect_insights(&combined, baseline, &cfg.insights)
+                }
+                Err(_) => Vec::new(),
+            }
+        } else {
+            Vec::new()
+        };
+
         let counts = BriefCounts {
             overdue: overdue.len(),
             open: open.len(),
             resolved: resolved.len(),
             candidates: candidates.len(),
             patterns: patterns.len(),
+            insights: insights.len(),
         };
 
         Ok(DailyBrief {
@@ -372,6 +420,7 @@ impl<'a> BriefBuilder<'a> {
             resolved,
             candidates,
             patterns,
+            insights,
             counts,
         })
     }
@@ -910,6 +959,97 @@ mod tests {
         assert_eq!(outlook.argmax, "better");
         assert_eq!(outlook.tone, "tailwind");
         assert!(outlook.positive_prob > 0.65);
+    }
+
+    #[test]
+    fn insights_surface_when_open_row_diverges_from_baseline() {
+        // Seed a baseline of 8 Better outcomes (high positive rate),
+        // then create one open commitment whose features (high
+        // stakes, vendor tag) trigger a Worse-leaning model
+        // prediction. The resulting delta should hoist this row into
+        // the insights panel.
+        let model = trained_model();
+        let store = fresh_store();
+        let now = Utc::now();
+
+        // 8 historical Better outcomes establish a strong positive
+        // baseline (~80%+). They use a *different* shape than the
+        // open row so the cell-level pattern detector won't conflate.
+        for i in 0..8 {
+            let mut c = Commitment::new(
+                CommitmentKind::Intent,
+                format!("morning-task-{i}"),
+                Source::Manual,
+            );
+            c.stakes = Stakes::Low;
+            c.tags = vec!["writing".into()];
+            c.made_at = Utc.with_ymd_and_hms(2026, 4, 15, 9, 0, 0).unwrap()
+                + Duration::days(i);
+            store.insert_commitment(&c).unwrap();
+            let o = Outcome::new(
+                c.id,
+                Polarity::Better,
+                "shipped",
+                OutcomeSource::UserPrompted,
+            );
+            store.insert_outcome(&o).unwrap();
+            let mut after = c.clone();
+            transition(&mut after, State::Completed, Some(&o)).unwrap();
+            store
+                .update_state(after.id, after.state, after.outcome_id)
+                .unwrap();
+        }
+
+        // Open row: high-stakes evening — model trained on the
+        // separable set predicts Worse, so positive_prob is small,
+        // delta vs the rosy baseline is large negative.
+        let mut c = Commitment::new(CommitmentKind::Intent, "ship hot fix", Source::Manual);
+        c.stakes = Stakes::High;
+        c.made_at = Utc.with_ymd_and_hms(2026, 4, 30, 19, 0, 0).unwrap();
+        store.insert_commitment(&c).unwrap();
+
+        let brief = BriefBuilder::new(&store)
+            .with_world_model(&model)
+            .build(now)
+            .unwrap();
+
+        assert!(
+            !brief.insights.is_empty(),
+            "open row well below baseline should appear in insights, got {brief:?}"
+        );
+        let row = &brief.insights[0];
+        assert_eq!(row.tone, "warning");
+        assert!(row.delta < 0.0);
+        assert_eq!(brief.counts.insights, brief.insights.len());
+    }
+
+    #[test]
+    fn insights_omitted_when_no_world_model_attached() {
+        let store = fresh_store();
+        let now = Utc::now();
+        // Even with a stack of completed commitments, no model = no
+        // insights — the panel exists strictly to surface model
+        // predictions, not raw cell statistics (that's `patterns`).
+        for i in 0..10 {
+            let mut c = Commitment::new(
+                CommitmentKind::Intent,
+                format!("seed-{i}"),
+                Source::Manual,
+            );
+            c.stakes = Stakes::Low;
+            c.made_at = Utc::now() - Duration::days(i);
+            store.insert_commitment(&c).unwrap();
+            let o = Outcome::new(c.id, Polarity::Better, "ok", OutcomeSource::UserPrompted);
+            store.insert_outcome(&o).unwrap();
+            let mut after = c.clone();
+            transition(&mut after, State::Completed, Some(&o)).unwrap();
+            store
+                .update_state(after.id, after.state, after.outcome_id)
+                .unwrap();
+        }
+        let brief = BriefBuilder::new(&store).build(now).unwrap();
+        assert!(brief.insights.is_empty(), "no model → no insights");
+        assert_eq!(brief.counts.insights, 0);
     }
 
     #[test]

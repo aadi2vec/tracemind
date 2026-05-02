@@ -26,6 +26,7 @@
 //! actions go through the existing `IntentStore` mutators.
 
 pub mod brief;
+pub mod insights;
 pub mod matcher;
 pub mod pattern;
 
@@ -33,6 +34,7 @@ pub use brief::{
     BriefBuilder, BriefConfig, BriefError, CandidateBriefRow, CommitmentBriefRow,
     CommitmentOutlook, DailyBrief, OverdueClass, PatternBriefRow, ResolvedBriefRow,
 };
+pub use insights::{detect_insights, BaselineRate, InsightBriefRow, InsightConfig};
 pub use matcher::{propose_outcomes, MatcherConfig, OutcomeProposal};
 pub use pattern::{
     default_window_start, detect_patterns, wilson_lower_bound, CellKey, DetectedPattern,
