@@ -172,6 +172,27 @@ impl IntentStore {
             );
 
             CREATE INDEX IF NOT EXISTS idx_silences_until ON pattern_silences(silenced_until);
+
+            -- Insight silences. Per `INTENT_SYSTEM.md` §6.2 (the user
+            -- can silence any prediction surface), and per the
+            -- TM-INTENT-006 insights panel: a warning/tailwind insight
+            -- on an open commitment can be silenced so it stops
+            -- surfacing on subsequent briefs. Unit of silence is the
+            -- *commitment_id* — once the user says "I get it, stop
+            -- highlighting this row", we suppress every insight tone
+            -- for that commitment until the silence window expires.
+            -- Silencing is per-row, not per-cell, because the
+            -- TM-INTENT-006 detector compares an individual outlook
+            -- against the global completed-rate baseline; cells aren't
+            -- the right grain.
+            CREATE TABLE IF NOT EXISTS insight_silences (
+                commitment_id  TEXT PRIMARY KEY,
+                silenced_at    TEXT NOT NULL,
+                silenced_until TEXT NOT NULL,
+                reason         TEXT
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_insight_silences_until ON insight_silences(silenced_until);
             "#,
         )?;
         Ok(())
@@ -446,6 +467,91 @@ impl IntentStore {
                 silenced_at: parse_dt(&silenced_at_s, "silenced_at")?,
                 silenced_until: parse_dt(&silenced_until_s, "silenced_until")?,
                 cell_label,
+                reason,
+            });
+        }
+        Ok(out)
+    }
+
+    // ----- insight silencing ---------------------------------------------
+
+    /// Insert / extend an insight silence for the given commitment.
+    /// Same idempotent semantics as [`Self::upsert_pattern_silence`]:
+    /// re-silencing an already-silenced commitment can only *extend*
+    /// the window, never shorten it.
+    ///
+    /// `commitment_id` is the *open* commitment whose insight surface
+    /// the user wants suppressed; the brief filters its
+    /// [`tm_reflect::detect_insights`] output against the active set.
+    pub fn upsert_insight_silence(
+        &self,
+        commitment_id: Uuid,
+        silenced_at: chrono::DateTime<chrono::Utc>,
+        silenced_until: chrono::DateTime<chrono::Utc>,
+        reason: Option<&str>,
+    ) -> Result<()> {
+        self.conn.execute(
+            r#"
+            INSERT INTO insight_silences (commitment_id, silenced_at, silenced_until, reason)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(commitment_id) DO UPDATE SET
+                silenced_until = MAX(silenced_until, excluded.silenced_until),
+                reason = COALESCE(excluded.reason, insight_silences.reason)
+            "#,
+            params![
+                commitment_id.to_string(),
+                silenced_at.to_rfc3339(),
+                silenced_until.to_rfc3339(),
+                reason,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Remove an insight silence (re-enable surfacing for that
+    /// commitment). Returns `true` if a row was deleted, `false` if
+    /// no silence existed.
+    pub fn remove_insight_silence(&self, commitment_id: Uuid) -> Result<bool> {
+        let n = self.conn.execute(
+            "DELETE FROM insight_silences WHERE commitment_id = ?",
+            params![commitment_id.to_string()],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// All non-expired insight silences as of `now`. Brief uses this
+    /// to filter its insight panel; CLI / MCP `silenced` commands use
+    /// it for the inventory view.
+    pub fn list_active_insight_silences(
+        &self,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Vec<InsightSilence>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT commitment_id, silenced_at, silenced_until, reason
+             FROM insight_silences
+             WHERE silenced_until > ?
+             ORDER BY silenced_at DESC",
+        )?;
+        let rows = stmt.query_map(params![now.to_rfc3339()], |row| {
+            let commitment_id: String = row.get(0)?;
+            let silenced_at_s: String = row.get(1)?;
+            let silenced_until_s: String = row.get(2)?;
+            let reason: Option<String> = row.get(3)?;
+            Ok((commitment_id, silenced_at_s, silenced_until_s, reason))
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            let (commitment_id_s, silenced_at_s, silenced_until_s, reason) = r?;
+            let commitment_id = Uuid::parse_str(&commitment_id_s).map_err(|_| {
+                StoreError::Invalid {
+                    field: "insight_silences.commitment_id",
+                    value: commitment_id_s.clone(),
+                }
+            })?;
+            out.push(InsightSilence {
+                commitment_id,
+                silenced_at: parse_dt(&silenced_at_s, "silenced_at")?,
+                silenced_until: parse_dt(&silenced_until_s, "silenced_until")?,
                 reason,
             });
         }
@@ -751,6 +857,20 @@ pub struct PatternSilence {
     /// without re-deriving from a possibly-evolved CellKey schema.
     pub cell_label: String,
     /// Optional reason the user gave (`--reason "noisy"`).
+    pub reason: Option<String>,
+}
+
+/// One row of the `insight_silences` table — a user choice to
+/// suppress all insight surfaces (warning + tailwind) for a single
+/// commitment for some window. See `INTENT_SYSTEM.md` §6.2 +
+/// `tm_reflect::insights` for the surface this silences.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InsightSilence {
+    /// The open commitment whose insight we're suppressing.
+    pub commitment_id: Uuid,
+    pub silenced_at: chrono::DateTime<chrono::Utc>,
+    pub silenced_until: chrono::DateTime<chrono::Utc>,
+    /// Optional reason the user gave.
     pub reason: Option<String>,
 }
 
@@ -1369,5 +1489,76 @@ mod tests {
 
         store.accept_candidate(cands[1].id).unwrap();
         assert_eq!(store.count_pending_candidates().unwrap(), 0);
+    }
+
+    // ----- insight silences -----------------------------------------------
+
+    #[test]
+    fn insight_silence_round_trips_via_active_list() {
+        let store = fresh_store();
+        let cid = Uuid::new_v4();
+        let now = chrono::Utc::now();
+        let until = now + chrono::Duration::days(30);
+
+        store
+            .upsert_insight_silence(cid, now, until, Some("noisy"))
+            .unwrap();
+
+        let active = store.list_active_insight_silences(now).unwrap();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].commitment_id, cid);
+        assert_eq!(active[0].reason.as_deref(), Some("noisy"));
+    }
+
+    #[test]
+    fn insight_silence_extension_only_grows_window_never_shrinks() {
+        let store = fresh_store();
+        let cid = Uuid::new_v4();
+        let now = chrono::Utc::now();
+        let far = now + chrono::Duration::days(90);
+        let near = now + chrono::Duration::days(7);
+
+        store.upsert_insight_silence(cid, now, far, None).unwrap();
+        // Re-silence with a shorter window — must NOT shrink the
+        // existing block. Mirrors the pattern_silences semantics.
+        store.upsert_insight_silence(cid, now, near, None).unwrap();
+
+        let active = store.list_active_insight_silences(now).unwrap();
+        assert_eq!(active.len(), 1);
+        assert_eq!(
+            active[0].silenced_until.timestamp(),
+            far.timestamp(),
+            "re-silence with a shorter window must not shrink the existing block"
+        );
+    }
+
+    #[test]
+    fn expired_insight_silences_are_excluded_from_active_list() {
+        let store = fresh_store();
+        let cid = Uuid::new_v4();
+        let now = chrono::Utc::now();
+        let past_until = now - chrono::Duration::days(1);
+
+        store
+            .upsert_insight_silence(cid, now - chrono::Duration::days(60), past_until, None)
+            .unwrap();
+        let active = store.list_active_insight_silences(now).unwrap();
+        assert!(active.is_empty(), "expired silence must be filtered out");
+    }
+
+    #[test]
+    fn remove_insight_silence_returns_true_then_false() {
+        let store = fresh_store();
+        let cid = Uuid::new_v4();
+        let now = chrono::Utc::now();
+        store
+            .upsert_insight_silence(cid, now, now + chrono::Duration::days(30), None)
+            .unwrap();
+
+        assert!(store.remove_insight_silence(cid).unwrap());
+        // Idempotent: second remove is a no-op.
+        assert!(!store.remove_insight_silence(cid).unwrap());
+        let active = store.list_active_insight_silences(now).unwrap();
+        assert!(active.is_empty());
     }
 }

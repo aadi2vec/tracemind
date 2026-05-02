@@ -187,6 +187,15 @@ enum Commands {
         #[command(subcommand)]
         action: PatternsAction,
     },
+    /// Insights surface — silence / unsilence per-commitment outlook
+    /// divergences shown in the daily brief. Unit of silence is the
+    /// commitment_id (the *open row*); silencing one row never
+    /// removes the row itself, only the insight panel highlight.
+    /// See TM-INTENT-006 + TM-INTENT-007.
+    Insights {
+        #[command(subcommand)]
+        action: InsightsAction,
+    },
     /// World model v0 — `f_outcome` predictor over your completed
     /// commitments. Trains a small multinomial logistic regression on
     /// metadata features (stakes / time-band / horizon / kind / tags)
@@ -232,6 +241,33 @@ enum PatternsAction {
     },
     /// Re-enable surfacing for a previously-silenced cell.
     Unsilence { cell_hash: String },
+}
+
+#[derive(clap::Subcommand)]
+enum InsightsAction {
+    /// List currently-surfacing insights (the same set the brief
+    /// would show right now, after silences).
+    List,
+    /// List active insight silences. Useful before unsilencing.
+    Silenced,
+    /// Silence the insight surface on a specific commitment for some
+    /// window. The commitment row itself is not affected — only the
+    /// insight panel highlight is suppressed.
+    Silence {
+        /// Commitment UUID from the brief's "insights" or "open" sections.
+        commitment_id: String,
+        /// Silence window in days. Default 30 — shorter than the
+        /// pattern silence default (90) because insights are
+        /// per-commitment and self-resolve when the commitment moves
+        /// to a terminal state.
+        #[arg(long, default_value = "30")]
+        days: i64,
+        /// Optional reason — stored alongside the silence row.
+        #[arg(long)]
+        reason: Option<String>,
+    },
+    /// Re-enable insight surfacing for a previously-silenced commitment.
+    Unsilence { commitment_id: String },
 }
 
 #[derive(clap::Subcommand)]
@@ -838,6 +874,11 @@ fn main() {
         Commands::Patterns { action } => {
             let intents_path = dir.join("intents.db").to_str().unwrap().to_string();
             cmd_patterns(&intents_path, action);
+        }
+        Commands::Insights { action } => {
+            let intents_path = dir.join("intents.db").to_str().unwrap().to_string();
+            let world_path = dir.join("world_model.json");
+            cmd_insights(&intents_path, &world_path, action);
         }
         Commands::World { action } => {
             let intents_path = dir.join("intents.db").to_str().unwrap().to_string();
@@ -1942,6 +1983,133 @@ fn cmd_patterns(intents_path: &str, action: PatternsAction) {
                 std::process::exit(1);
             }
         },
+    }
+}
+
+fn cmd_insights(intents_path: &str, world_path: &std::path::Path, action: InsightsAction) {
+    use chrono::{Duration, Utc};
+    use tm_intent::IntentStore;
+    use tm_reflect::{BriefBuilder, BriefConfig};
+
+    let store = match IntentStore::open(intents_path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("failed to open intent store at {intents_path}: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    match action {
+        InsightsAction::List => {
+            // Mirror `patterns list` — reuse the brief builder so the
+            // CLI surface matches the daily brief exactly. World model
+            // load is best-effort: a missing model means insights
+            // can't be computed, and we explain why.
+            let model = tm_world_model::load(world_path).ok().flatten();
+            let mut builder = BriefBuilder::new(&store).with_config(BriefConfig::default());
+            if let Some(ref m) = model {
+                builder = builder.with_world_model(m);
+            }
+            let brief = match builder.build(Utc::now()) {
+                Ok(b) => b,
+                Err(e) => {
+                    eprintln!("brief failed: {e}");
+                    std::process::exit(1);
+                }
+            };
+            if model.is_none() {
+                println!("(no world model trained yet — insights need `tracemind world train`)");
+                return;
+            }
+            if brief.insights.is_empty() {
+                println!("(no insights surfacing right now)");
+                println!("  insights only fire when an open row's outlook diverges from your");
+                println!("  completed-rate baseline by ≥20pp; also filters silenced commitments.");
+                return;
+            }
+            println!("insights ({})", brief.insights.len());
+            for i in &brief.insights {
+                let glyph = match i.tone.as_str() {
+                    "warning" => "⚠",
+                    "tailwind" => "✓",
+                    _ => "~",
+                };
+                println!("  {glyph} {}  {}", i.commitment_id, i.render);
+            }
+            println!("\n  → `tracemind insights silence <commitment_id>` to suppress");
+        }
+        InsightsAction::Silenced => {
+            let now = Utc::now();
+            let rows = match store.list_active_insight_silences(now) {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("failed to read insight silences: {e}");
+                    std::process::exit(1);
+                }
+            };
+            if rows.is_empty() {
+                println!("(no active insight silences)");
+                return;
+            }
+            println!("active insight silences ({})", rows.len());
+            for s in &rows {
+                let until_local = s.silenced_until.with_timezone(&chrono::Local);
+                let reason = s.reason.as_deref().unwrap_or("—");
+                println!(
+                    "  {}  until {}  reason={}",
+                    s.commitment_id,
+                    until_local.format("%b %-d %Y"),
+                    reason,
+                );
+            }
+        }
+        InsightsAction::Silence {
+            commitment_id,
+            days,
+            reason,
+        } => {
+            let cid = match uuid::Uuid::parse_str(&commitment_id) {
+                Ok(u) => u,
+                Err(_) => {
+                    eprintln!("invalid commitment_id: {commitment_id}");
+                    std::process::exit(2);
+                }
+            };
+            let now = Utc::now();
+            let until = now + Duration::days(days);
+            match store.upsert_insight_silence(cid, now, until, reason.as_deref()) {
+                Ok(()) => {
+                    let until_local = until.with_timezone(&chrono::Local);
+                    println!(
+                        "silenced insights for {} until {} ({} days)",
+                        cid,
+                        until_local.format("%b %-d %Y"),
+                        days,
+                    );
+                }
+                Err(e) => {
+                    eprintln!("failed to silence: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        InsightsAction::Unsilence { commitment_id } => {
+            let cid = match uuid::Uuid::parse_str(&commitment_id) {
+                Ok(u) => u,
+                Err(_) => {
+                    eprintln!("invalid commitment_id: {commitment_id}");
+                    std::process::exit(2);
+                }
+            };
+            match store.remove_insight_silence(cid) {
+                Ok(true) => println!("unsilenced insights for {cid}"),
+                Ok(false) => println!("no insight silence found for {cid}"),
+                Err(e) => {
+                    eprintln!("failed to unsilence: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
     }
 }
 

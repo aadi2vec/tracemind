@@ -254,6 +254,65 @@ fn tools_list() -> Value {
                         }
                     }
                 }
+            },
+            {
+                "name": "memory_insight_silence",
+                "description": "Silence the insight-panel surface for one open commitment. Suppresses outlook-divergence highlights for the given commitment_id over a TTL window. Does NOT remove the commitment row itself — only the insight highlight. Idempotent: re-silencing only extends the window.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "commitment_id": {"type": "string", "description": "UUID of the open commitment to silence."},
+                        "days":          {"type": "integer", "description": "Silence window in days (default 30).", "default": 30},
+                        "reason":        {"type": "string", "description": "Optional free-text reason — stored alongside the silence."}
+                    },
+                    "required": ["commitment_id"]
+                }
+            },
+            {
+                "name": "memory_insight_unsilence",
+                "description": "Remove an active insight silence for a commitment. No-op if no silence exists. Returns `{ removed: bool }`.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "commitment_id": {"type": "string"}
+                    },
+                    "required": ["commitment_id"]
+                }
+            },
+            {
+                "name": "memory_insight_silences",
+                "description": "List active (non-expired) insight silences as of `now`. Returns `{ silences: [{ commitment_id, silenced_at, silenced_until, reason }] }`.",
+                "inputSchema": {"type": "object", "properties": {}}
+            },
+            {
+                "name": "memory_pattern_silence",
+                "description": "Silence a pattern-detector cell so it stops surfacing in the brief. `cell_hash` comes from a prior brief or `memory_pattern_silences` listing. Idempotent: extends an existing silence window, never shrinks it.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "cell_hash":  {"type": "string"},
+                        "cell_label": {"type": "string", "description": "Optional human-readable label of the cell, stored for the silenced-list view."},
+                        "days":       {"type": "integer", "description": "Silence window in days (default 90).", "default": 90},
+                        "reason":     {"type": "string"}
+                    },
+                    "required": ["cell_hash"]
+                }
+            },
+            {
+                "name": "memory_pattern_unsilence",
+                "description": "Remove an active pattern-cell silence. Returns `{ removed: bool }`.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "cell_hash": {"type": "string"}
+                    },
+                    "required": ["cell_hash"]
+                }
+            },
+            {
+                "name": "memory_pattern_silences",
+                "description": "List active (non-expired) pattern-cell silences. Returns `{ silences: [{ cell_hash, cell_label, silenced_at, silenced_until, reason }] }`.",
+                "inputSchema": {"type": "object", "properties": {}}
             }
         ]
     })
@@ -1329,6 +1388,147 @@ fn handle_memory_brief(params: &Value, intents_path: &str) -> Result<Value, Stri
 }
 
 // ---------------------------------------------------------------------------
+// Insight + pattern silencing handlers (TM-INTENT-007)
+// ---------------------------------------------------------------------------
+
+fn handle_memory_insight_silence(params: &Value, intents_path: &str) -> Result<Value, String> {
+    use chrono::{Duration, Utc};
+    use tm_intent::IntentStore;
+
+    let cid_s = params
+        .get("commitment_id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "missing required parameter: commitment_id".to_string())?;
+    let cid = Uuid::parse_str(cid_s).map_err(|e| format!("invalid commitment_id: {e}"))?;
+    let days = params.get("days").and_then(|v| v.as_i64()).unwrap_or(30);
+    let reason = params.get("reason").and_then(|v| v.as_str());
+
+    let store = IntentStore::open(intents_path)
+        .map_err(|e| format!("failed to open intent store: {e}"))?;
+    let now = Utc::now();
+    let until = now + Duration::days(days);
+    store
+        .upsert_insight_silence(cid, now, until, reason)
+        .map_err(|e| format!("upsert_insight_silence: {e}"))?;
+    Ok(json!({
+        "ok": true,
+        "commitment_id": cid.to_string(),
+        "silenced_until": until.to_rfc3339(),
+        "days": days,
+    }))
+}
+
+fn handle_memory_insight_unsilence(params: &Value, intents_path: &str) -> Result<Value, String> {
+    use tm_intent::IntentStore;
+
+    let cid_s = params
+        .get("commitment_id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "missing required parameter: commitment_id".to_string())?;
+    let cid = Uuid::parse_str(cid_s).map_err(|e| format!("invalid commitment_id: {e}"))?;
+
+    let store = IntentStore::open(intents_path)
+        .map_err(|e| format!("failed to open intent store: {e}"))?;
+    let removed = store
+        .remove_insight_silence(cid)
+        .map_err(|e| format!("remove_insight_silence: {e}"))?;
+    Ok(json!({ "removed": removed, "commitment_id": cid.to_string() }))
+}
+
+fn handle_memory_insight_silences(intents_path: &str) -> Result<Value, String> {
+    use chrono::Utc;
+    use tm_intent::IntentStore;
+
+    let store = IntentStore::open(intents_path)
+        .map_err(|e| format!("failed to open intent store: {e}"))?;
+    let rows = store
+        .list_active_insight_silences(Utc::now())
+        .map_err(|e| format!("list_active_insight_silences: {e}"))?;
+    let silences: Vec<Value> = rows
+        .into_iter()
+        .map(|s| {
+            json!({
+                "commitment_id":  s.commitment_id.to_string(),
+                "silenced_at":    s.silenced_at.to_rfc3339(),
+                "silenced_until": s.silenced_until.to_rfc3339(),
+                "reason":         s.reason,
+            })
+        })
+        .collect();
+    Ok(json!({ "silences": silences }))
+}
+
+fn handle_memory_pattern_silence(params: &Value, intents_path: &str) -> Result<Value, String> {
+    use chrono::{Duration, Utc};
+    use tm_intent::IntentStore;
+
+    let cell_hash = params
+        .get("cell_hash")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "missing required parameter: cell_hash".to_string())?;
+    let cell_label = params
+        .get("cell_label")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let days = params.get("days").and_then(|v| v.as_i64()).unwrap_or(90);
+    let reason = params.get("reason").and_then(|v| v.as_str());
+
+    let store = IntentStore::open(intents_path)
+        .map_err(|e| format!("failed to open intent store: {e}"))?;
+    let now = Utc::now();
+    let until = now + Duration::days(days);
+    store
+        .upsert_pattern_silence(cell_hash, cell_label, now, until, reason)
+        .map_err(|e| format!("upsert_pattern_silence: {e}"))?;
+    Ok(json!({
+        "ok": true,
+        "cell_hash": cell_hash,
+        "silenced_until": until.to_rfc3339(),
+        "days": days,
+    }))
+}
+
+fn handle_memory_pattern_unsilence(params: &Value, intents_path: &str) -> Result<Value, String> {
+    use tm_intent::IntentStore;
+
+    let cell_hash = params
+        .get("cell_hash")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "missing required parameter: cell_hash".to_string())?;
+
+    let store = IntentStore::open(intents_path)
+        .map_err(|e| format!("failed to open intent store: {e}"))?;
+    let removed = store
+        .remove_pattern_silence(cell_hash)
+        .map_err(|e| format!("remove_pattern_silence: {e}"))?;
+    Ok(json!({ "removed": removed, "cell_hash": cell_hash }))
+}
+
+fn handle_memory_pattern_silences(intents_path: &str) -> Result<Value, String> {
+    use chrono::Utc;
+    use tm_intent::IntentStore;
+
+    let store = IntentStore::open(intents_path)
+        .map_err(|e| format!("failed to open intent store: {e}"))?;
+    let rows = store
+        .list_active_pattern_silences(Utc::now())
+        .map_err(|e| format!("list_active_pattern_silences: {e}"))?;
+    let silences: Vec<Value> = rows
+        .into_iter()
+        .map(|s| {
+            json!({
+                "cell_hash":      s.cell_hash,
+                "cell_label":     s.cell_label,
+                "silenced_at":    s.silenced_at.to_rfc3339(),
+                "silenced_until": s.silenced_until.to_rfc3339(),
+                "reason":         s.reason,
+            })
+        })
+        .collect();
+    Ok(json!({ "silences": silences }))
+}
+
+// ---------------------------------------------------------------------------
 // Request dispatcher
 // ---------------------------------------------------------------------------
 
@@ -1414,6 +1614,30 @@ async fn handle_request(
                 }
                 "memory_brief" => {
                     handle_memory_brief(&args, intents_path)
+                        .map_err(|e| anyhow::anyhow!(e))?
+                }
+                "memory_insight_silence" => {
+                    handle_memory_insight_silence(&args, intents_path)
+                        .map_err(|e| anyhow::anyhow!(e))?
+                }
+                "memory_insight_unsilence" => {
+                    handle_memory_insight_unsilence(&args, intents_path)
+                        .map_err(|e| anyhow::anyhow!(e))?
+                }
+                "memory_insight_silences" => {
+                    handle_memory_insight_silences(intents_path)
+                        .map_err(|e| anyhow::anyhow!(e))?
+                }
+                "memory_pattern_silence" => {
+                    handle_memory_pattern_silence(&args, intents_path)
+                        .map_err(|e| anyhow::anyhow!(e))?
+                }
+                "memory_pattern_unsilence" => {
+                    handle_memory_pattern_unsilence(&args, intents_path)
+                        .map_err(|e| anyhow::anyhow!(e))?
+                }
+                "memory_pattern_silences" => {
+                    handle_memory_pattern_silences(intents_path)
                         .map_err(|e| anyhow::anyhow!(e))?
                 }
                 unknown => {
@@ -2367,6 +2591,218 @@ mod tests {
         let insights = brief["insights"].as_array().expect("insights array present");
         assert!(insights.is_empty(), "no model → no insights, got {brief}");
         assert_eq!(brief["counts"]["insights"], json!(0));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn memory_insight_silence_round_trips_via_mcp() {
+        // memory_insight_silence + memory_insight_silences + brief
+        // must agree: silenced commitment shows up in the silences
+        // list AND the brief's insights array is filtered.
+        use tm_world_model::{save, train, Example, PolarityClass, TrainerConfig};
+        use uuid::Uuid as TestUuid;
+
+        let dir = std::env::temp_dir().join(format!("tm-mcp-insilence-{}", TestUuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let intents_path = dir.join("intents.db").to_str().unwrap().to_string();
+        let world_path = dir.join("world_model.json");
+
+        // Persist a separable model.
+        let mut examples = Vec::new();
+        for _ in 0..6 {
+            let mut c = tm_intent::Commitment::new(
+                tm_intent::CommitmentKind::Intent,
+                "x",
+                tm_intent::Source::Cli,
+            );
+            c.stakes = tm_intent::Stakes::High;
+            examples.push(Example { commitment: c, target: PolarityClass::Worse });
+        }
+        for _ in 0..6 {
+            let mut c = tm_intent::Commitment::new(
+                tm_intent::CommitmentKind::Intent,
+                "y",
+                tm_intent::Source::Cli,
+            );
+            c.stakes = tm_intent::Stakes::Low;
+            examples.push(Example { commitment: c, target: PolarityClass::Better });
+        }
+        let (model, _r) = train(&examples, &TrainerConfig::default());
+        save(&model, &world_path).expect("save model");
+
+        // Build a positive baseline (8 better / 4 worse) so the
+        // high-stakes open row diverges enough to surface as warning.
+        for i in 0..8 {
+            let commit = handle_memory_commit(
+                &json!({
+                    "kind": "intent",
+                    "statement": format!("low-stakes win {i}"),
+                    "stakes": "low",
+                }),
+                &intents_path,
+            )
+            .await
+            .expect("commit ok");
+            let cid = commit["commitment_id"].as_str().unwrap().to_string();
+            handle_memory_resolve(
+                &json!({"commitment_id": cid, "polarity": "better", "description": "shipped"}),
+                &intents_path,
+            )
+            .await
+            .expect("resolve ok");
+        }
+        for i in 0..4 {
+            let commit = handle_memory_commit(
+                &json!({
+                    "kind": "intent",
+                    "statement": format!("high-stakes loss {i}"),
+                    "stakes": "high",
+                }),
+                &intents_path,
+            )
+            .await
+            .expect("commit ok");
+            let cid = commit["commitment_id"].as_str().unwrap().to_string();
+            handle_memory_resolve(
+                &json!({"commitment_id": cid, "polarity": "worse", "description": "missed"}),
+                &intents_path,
+            )
+            .await
+            .expect("resolve ok");
+        }
+        // Restore the separable model — the auto-retrain on the last
+        // resolve will have overwritten it with one trained on the
+        // baseline (which is mixed and won't fire a sharp insight).
+        save(&model, &world_path).expect("re-save separable model");
+
+        // Open commitment that the model flags as worse.
+        let commit = handle_memory_commit(
+            &json!({
+                "kind": "intent",
+                "statement": "ship risky migration",
+                "stakes": "high",
+            }),
+            &intents_path,
+        )
+        .await
+        .expect("commit ok");
+        let cid_str = commit["commitment_id"].as_str().unwrap().to_string();
+
+        // Sanity: pre-silence brief surfaces the warning.
+        let pre = handle_memory_brief(&json!({}), &intents_path).expect("brief ok");
+        assert!(
+            !pre["insights"].as_array().unwrap().is_empty(),
+            "pre-silence: insight must surface"
+        );
+
+        // Silence via MCP.
+        let silenced = handle_memory_insight_silence(
+            &json!({"commitment_id": cid_str, "days": 30, "reason": "I get it"}),
+            &intents_path,
+        )
+        .expect("silence ok");
+        assert_eq!(silenced["ok"], json!(true));
+        assert_eq!(silenced["days"], json!(30));
+
+        // Listing must show the silence.
+        let listed = handle_memory_insight_silences(&intents_path).expect("list ok");
+        let arr = listed["silences"].as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["commitment_id"], json!(cid_str));
+        assert_eq!(arr[0]["reason"], json!("I get it"));
+
+        // Brief now omits the insight even though the row is still open.
+        let post = handle_memory_brief(&json!({}), &intents_path).expect("brief ok");
+        assert!(
+            post["insights"].as_array().unwrap().is_empty(),
+            "post-silence: insight must be filtered, got {post}"
+        );
+        assert!(
+            post["open"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|r| r["id"] == json!(cid_str)),
+            "open row must still be present after silencing the insight surface"
+        );
+
+        // Unsilence — round-trip back to surfaced.
+        let removed = handle_memory_insight_unsilence(
+            &json!({"commitment_id": cid_str}),
+            &intents_path,
+        )
+        .expect("unsilence ok");
+        assert_eq!(removed["removed"], json!(true));
+        let brief2 = handle_memory_brief(&json!({}), &intents_path).expect("brief ok");
+        assert!(
+            !brief2["insights"].as_array().unwrap().is_empty(),
+            "after unsilence: insight must resurface"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn memory_insight_unsilence_returns_false_when_nothing_to_remove() {
+        use uuid::Uuid as TestUuid;
+        let dir = std::env::temp_dir().join(format!("tm-mcp-noopunsilence-{}", TestUuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let intents_path = dir.join("intents.db").to_str().unwrap().to_string();
+        // Force schema init.
+        let _ = tm_intent::IntentStore::open(&intents_path).expect("open ok");
+
+        let cid = TestUuid::new_v4().to_string();
+        let r = handle_memory_insight_unsilence(
+            &json!({"commitment_id": cid}),
+            &intents_path,
+        )
+        .expect("unsilence ok");
+        assert_eq!(r["removed"], json!(false));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn memory_pattern_silence_round_trips_via_mcp() {
+        // Pattern-silence parity test: storage already covered by
+        // tm-intent's tests, but MCP tools need their own coverage so
+        // the JSON contract doesn't drift.
+        use uuid::Uuid as TestUuid;
+        let dir = std::env::temp_dir().join(format!("tm-mcp-patsilence-{}", TestUuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let intents_path = dir.join("intents.db").to_str().unwrap().to_string();
+        let _ = tm_intent::IntentStore::open(&intents_path).expect("open ok");
+
+        let resp = handle_memory_pattern_silence(
+            &json!({
+                "cell_hash": "abc123def4567890",
+                "cell_label": "stakes=high · evening · vendor",
+                "days": 60,
+                "reason": "noisy",
+            }),
+            &intents_path,
+        )
+        .expect("silence ok");
+        assert_eq!(resp["ok"], json!(true));
+        assert_eq!(resp["days"], json!(60));
+
+        let listed = handle_memory_pattern_silences(&intents_path).expect("list ok");
+        let arr = listed["silences"].as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["cell_hash"], json!("abc123def4567890"));
+        assert_eq!(arr[0]["cell_label"], json!("stakes=high · evening · vendor"));
+        assert_eq!(arr[0]["reason"], json!("noisy"));
+
+        let removed = handle_memory_pattern_unsilence(
+            &json!({"cell_hash": "abc123def4567890"}),
+            &intents_path,
+        )
+        .expect("unsilence ok");
+        assert_eq!(removed["removed"], json!(true));
+
+        let listed2 = handle_memory_pattern_silences(&intents_path).expect("list ok");
+        assert!(listed2["silences"].as_array().unwrap().is_empty());
 
         std::fs::remove_dir_all(&dir).ok();
     }

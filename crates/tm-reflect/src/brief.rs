@@ -380,6 +380,14 @@ impl<'a> BriefBuilder<'a> {
         // Soft-fail: if the store query errors we drop insights but
         // keep the rest of the brief.
         let insights: Vec<InsightBriefRow> = if active_model.is_some() {
+            // Active per-commitment silences — same soft-fail
+            // semantics as `pattern_silences`: if the read errors we
+            // drop insights for this brief rather than block.
+            let insight_silenced: std::collections::HashSet<uuid::Uuid> = self
+                .store
+                .list_active_insight_silences(now)
+                .map(|rows| rows.into_iter().map(|s| s.commitment_id).collect())
+                .unwrap_or_default();
             match self
                 .store
                 .list_completed_with_polarity(pattern_window_start, cfg.patterns_scan_limit)
@@ -397,6 +405,9 @@ impl<'a> BriefBuilder<'a> {
                         .cloned()
                         .collect();
                     detect_insights(&combined, baseline, &cfg.insights)
+                        .into_iter()
+                        .filter(|row| !insight_silenced.contains(&row.commitment_id))
+                        .collect()
                 }
                 Err(_) => Vec::new(),
             }
@@ -1050,6 +1061,140 @@ mod tests {
         let brief = BriefBuilder::new(&store).build(now).unwrap();
         assert!(brief.insights.is_empty(), "no model → no insights");
         assert_eq!(brief.counts.insights, 0);
+    }
+
+    #[test]
+    fn silenced_commitment_is_filtered_from_brief_insights() {
+        // Reproduce the same setup as
+        // `insights_surface_when_open_row_diverges_from_baseline`,
+        // then silence the open commitment and confirm the insight
+        // disappears while the row itself is still present.
+        let model = trained_model();
+        let store = fresh_store();
+        let now = Utc::now();
+
+        for i in 0..8 {
+            let mut c = Commitment::new(
+                CommitmentKind::Intent,
+                format!("morning-task-{i}"),
+                Source::Manual,
+            );
+            c.stakes = Stakes::Low;
+            c.tags = vec!["writing".into()];
+            c.made_at =
+                Utc.with_ymd_and_hms(2026, 4, 15, 9, 0, 0).unwrap() + Duration::days(i);
+            store.insert_commitment(&c).unwrap();
+            let o = Outcome::new(
+                c.id,
+                Polarity::Better,
+                "shipped",
+                OutcomeSource::UserPrompted,
+            );
+            store.insert_outcome(&o).unwrap();
+            let mut after = c.clone();
+            transition(&mut after, State::Completed, Some(&o)).unwrap();
+            store
+                .update_state(after.id, after.state, after.outcome_id)
+                .unwrap();
+        }
+
+        let mut c = Commitment::new(CommitmentKind::Intent, "ship hot fix", Source::Manual);
+        c.stakes = Stakes::High;
+        c.made_at = Utc.with_ymd_and_hms(2026, 4, 30, 19, 0, 0).unwrap();
+        let cid = c.id;
+        store.insert_commitment(&c).unwrap();
+
+        // Sanity: without a silence we still see the warning insight.
+        let brief = BriefBuilder::new(&store)
+            .with_world_model(&model)
+            .build(now)
+            .unwrap();
+        assert!(!brief.insights.is_empty(), "pre-silence: insight should surface");
+        assert!(
+            brief.open.iter().any(|r| r.id == cid),
+            "open row must still be present"
+        );
+
+        // Silence the commitment for 30 days.
+        store
+            .upsert_insight_silence(cid, now, now + chrono::Duration::days(30), Some("noted"))
+            .unwrap();
+
+        let brief = BriefBuilder::new(&store)
+            .with_world_model(&model)
+            .build(now)
+            .unwrap();
+        assert!(
+            brief.insights.is_empty(),
+            "post-silence: insight panel must be empty, got {brief:?}"
+        );
+        assert_eq!(brief.counts.insights, 0);
+        // The underlying open row must NOT disappear — silence is on
+        // the *insight surface*, not the commitment itself.
+        assert!(
+            brief.open.iter().any(|r| r.id == cid),
+            "silencing the insight must NOT remove the open row"
+        );
+    }
+
+    #[test]
+    fn expired_insight_silence_resurfaces_insight() {
+        // A silence with `silenced_until` in the past must NOT
+        // suppress the insight — same correctness contract as
+        // pattern silences (TTL-based, not permanent).
+        let model = trained_model();
+        let store = fresh_store();
+        let now = Utc::now();
+
+        for i in 0..8 {
+            let mut c = Commitment::new(
+                CommitmentKind::Intent,
+                format!("morning-task-{i}"),
+                Source::Manual,
+            );
+            c.stakes = Stakes::Low;
+            c.tags = vec!["writing".into()];
+            c.made_at =
+                Utc.with_ymd_and_hms(2026, 4, 15, 9, 0, 0).unwrap() + Duration::days(i);
+            store.insert_commitment(&c).unwrap();
+            let o = Outcome::new(
+                c.id,
+                Polarity::Better,
+                "shipped",
+                OutcomeSource::UserPrompted,
+            );
+            store.insert_outcome(&o).unwrap();
+            let mut after = c.clone();
+            transition(&mut after, State::Completed, Some(&o)).unwrap();
+            store
+                .update_state(after.id, after.state, after.outcome_id)
+                .unwrap();
+        }
+
+        let mut c = Commitment::new(CommitmentKind::Intent, "ship hot fix", Source::Manual);
+        c.stakes = Stakes::High;
+        c.made_at = Utc.with_ymd_and_hms(2026, 4, 30, 19, 0, 0).unwrap();
+        let cid = c.id;
+        store.insert_commitment(&c).unwrap();
+
+        // Silence already in the past.
+        store
+            .upsert_insight_silence(
+                cid,
+                now - chrono::Duration::days(60),
+                now - chrono::Duration::days(1),
+                None,
+            )
+            .unwrap();
+
+        let brief = BriefBuilder::new(&store)
+            .with_world_model(&model)
+            .build(now)
+            .unwrap();
+        assert!(
+            !brief.insights.is_empty(),
+            "expired silence must not suppress the insight"
+        );
     }
 
     #[test]

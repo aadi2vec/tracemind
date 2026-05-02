@@ -33,7 +33,7 @@ pub mod types;
 
 pub use miner::{mine, MinedCandidate};
 pub use state::{transition, StateError};
-pub use store::{CandidateRecord, IntentStore, PatternSilence};
+pub use store::{CandidateRecord, InsightSilence, IntentStore, PatternSilence};
 pub use types::{
     AmbientState, Anticipation, AnticipationKind, Commitment, CommitmentDraft, CommitmentKind,
     ContextSnapshot, Outcome, OutcomeSource, Polarity, Source, Stakes, State, TriggerContext,
