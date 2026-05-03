@@ -386,6 +386,52 @@ impl IntentStore {
         Ok(out)
     }
 
+    /// Same shape as [`list_completed_with_polarity`] but also returns
+    /// the outcome's `observed_at` so callers (the calibration view in
+    /// particular) can split rows into in-sample vs out-of-sample
+    /// against `model.trained_at`.
+    ///
+    /// `since` is the window-start applied to `c.made_at` (matches the
+    /// existing API). Newest first.
+    pub fn list_completed_with_outcome_meta(
+        &self,
+        since: chrono::DateTime<chrono::Utc>,
+        limit: usize,
+    ) -> Result<Vec<(Commitment, Polarity, chrono::DateTime<chrono::Utc>)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT c.id, c.kind, c.statement, c.made_at, c.horizon, c.context_snapshot_id,
+                    c.options_considered, c.chosen, c.confidence, c.expected_outcome,
+                    c.stakes, c.state, c.outcome_id, c.derived_from, c.tags, c.source,
+                    o.polarity, o.observed_at
+             FROM commitments c
+             JOIN outcomes o ON o.id = c.outcome_id
+             WHERE c.state = 'completed'
+               AND c.made_at >= ?
+             ORDER BY c.made_at DESC
+             LIMIT ?",
+        )?;
+        let rows = stmt.query_map(params![since.to_rfc3339(), limit as i64], |row| {
+            let commitment_result = row_to_commitment(row)?;
+            let polarity_str: String = row.get(16)?;
+            let observed_str: String = row.get(17)?;
+            Ok((commitment_result, polarity_str, observed_str))
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            let (commitment_result, polarity_str, observed_str) = r?;
+            let commitment = commitment_result?;
+            let polarity = parse_polarity(&polarity_str)?;
+            let observed_at = chrono::DateTime::parse_from_rfc3339(&observed_str)
+                .map_err(|_| StoreError::Invalid {
+                    field: "outcomes.observed_at",
+                    value: observed_str.clone(),
+                })?
+                .with_timezone(&chrono::Utc);
+            out.push((commitment, polarity, observed_at));
+        }
+        Ok(out)
+    }
+
     // ----- pattern silencing ---------------------------------------------
 
     /// Insert a silence row for the given `cell_hash`. If a silence

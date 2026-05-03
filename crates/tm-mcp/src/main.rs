@@ -313,6 +313,18 @@ fn tools_list() -> Value {
                 "name": "memory_pattern_silences",
                 "description": "List active (non-expired) pattern-cell silences. Returns `{ silences: [{ cell_hash, cell_label, silenced_at, silenced_until, reason }] }`.",
                 "inputSchema": {"type": "object", "properties": {}}
+            },
+            {
+                "name": "memory_world_calibration",
+                "description": "Score the world model's predictions against eventual resolution polarity. Out-of-sample by default (only commitments resolved after `model.trained_at` are scored) so the report is honest about generalization. Returns the full `CalibrationReport` (accuracy, positive_recall, warning_precision, multiclass Brier, per-class confusion-matrix breakdown, plus skip counters). See `docs/INTENT_SYSTEM.md` §7.2.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "since_days": {"type": "integer", "description": "Look-back window in days for completed commitments (default 365).", "default": 365},
+                        "limit":      {"type": "integer", "description": "Cap on rows fetched from the intent store (default 5000).", "default": 5000},
+                        "all":        {"type": "boolean", "description": "Skip the out-of-sample filter and score every completed row, including rows the model trained on. Off by default.", "default": false}
+                    }
+                }
             }
         ]
     })
@@ -1528,6 +1540,64 @@ fn handle_memory_pattern_silences(intents_path: &str) -> Result<Value, String> {
     Ok(json!({ "silences": silences }))
 }
 
+/// Out-of-sample calibration of `f_outcome` against eventual outcome
+/// polarity. Mirrors the CLI `tracemind world calibration` subcommand
+/// — same report shape, same defaults, same `--all` debug knob.
+///
+/// Resolves the world model from the intent-store sibling
+/// `world_model.json` (matches the layout used by `memory_brief` /
+/// `memory_commit`). Returns a 400-equivalent error string when no
+/// model is on disk so the caller knows to run `world train` first.
+fn handle_memory_world_calibration(
+    params: &Value,
+    intents_path: &str,
+) -> Result<Value, String> {
+    use tm_intent::IntentStore;
+    use tm_world_model::{evaluate, load, split_out_of_sample};
+
+    let since_days = params.get("since_days").and_then(|v| v.as_i64()).unwrap_or(365);
+    let limit = params
+        .get("limit")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as usize)
+        .unwrap_or(5000);
+    let include_all = params.get("all").and_then(|v| v.as_bool()).unwrap_or(false);
+
+    let world_path = std::path::Path::new(intents_path)
+        .parent()
+        .map(|p| p.join("world_model.json"))
+        .ok_or_else(|| "could not resolve world_model.json sibling path".to_string())?;
+    let model = match load(&world_path) {
+        Ok(Some(m)) => m,
+        Ok(None) => {
+            return Err(format!(
+                "no world model on disk at {} — run `tracemind world train` first",
+                world_path.display()
+            ));
+        }
+        Err(e) => return Err(format!("failed to load world model: {e}")),
+    };
+
+    let store = IntentStore::open(intents_path)
+        .map_err(|e| format!("failed to open intent store: {e}"))?;
+    let since = chrono::Utc::now() - chrono::Duration::days(since_days);
+    let rows = store
+        .list_completed_with_outcome_meta(since, limit)
+        .map_err(|e| format!("list_completed_with_outcome_meta: {e}"))?;
+
+    let (pairs, in_sample_skipped) = if include_all {
+        let kept = rows.into_iter().map(|(c, p, _)| (c, p)).collect();
+        (kept, 0usize)
+    } else {
+        split_out_of_sample(&model, rows)
+    };
+
+    let mut report = evaluate(&model, &pairs);
+    report.n_in_sample_skipped = in_sample_skipped;
+
+    serde_json::to_value(&report).map_err(|e| format!("serialize CalibrationReport: {e}"))
+}
+
 // ---------------------------------------------------------------------------
 // Request dispatcher
 // ---------------------------------------------------------------------------
@@ -1638,6 +1708,10 @@ async fn handle_request(
                 }
                 "memory_pattern_silences" => {
                     handle_memory_pattern_silences(intents_path)
+                        .map_err(|e| anyhow::anyhow!(e))?
+                }
+                "memory_world_calibration" => {
+                    handle_memory_world_calibration(&args, intents_path)
                         .map_err(|e| anyhow::anyhow!(e))?
                 }
                 unknown => {
@@ -2803,6 +2877,123 @@ mod tests {
 
         let listed2 = handle_memory_pattern_silences(&intents_path).expect("list ok");
         assert!(listed2["silences"].as_array().unwrap().is_empty());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn memory_world_calibration_errors_when_no_model_on_disk() {
+        // Without `world_model.json` next to the intent store, the
+        // calibration tool must surface a clear "train first" error
+        // — never silently return a degenerate report.
+        let dir = std::env::temp_dir().join(format!("tm-mcp-calibration-no-model-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let intents_path = dir.join("intents.db").to_str().unwrap().to_string();
+        let _ = tm_intent::IntentStore::open(&intents_path).expect("open ok");
+
+        let err = handle_memory_world_calibration(&json!({}), &intents_path)
+            .expect_err("expected a no-model error");
+        assert!(
+            err.contains("no world model on disk"),
+            "error should mention missing world model, got: {err}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn memory_world_calibration_returns_full_report_with_all_flag() {
+        // With a trained model on disk + a couple of resolved
+        // commitments in the intent store, `--all` (which bypasses
+        // the trained_at cutoff) should return a complete, parseable
+        // CalibrationReport over those rows.
+        use tm_intent::{Commitment, CommitmentKind, Source, Stakes};
+        use tm_world_model::{save, train, Example, OutcomeModel, PolarityClass, TrainerConfig};
+
+        let dir = std::env::temp_dir().join(format!("tm-mcp-calibration-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let intents_path = dir.join("intents.db").to_str().unwrap().to_string();
+        let world_path = dir.join("world_model.json");
+
+        // Train a separable model: high-stakes → Worse, low-stakes → Better.
+        let mut training = Vec::new();
+        for _ in 0..6 {
+            let mut c = Commitment::new(CommitmentKind::Intent, "x", Source::Cli);
+            c.stakes = Stakes::High;
+            training.push(Example { commitment: c, target: PolarityClass::Worse });
+        }
+        for _ in 0..6 {
+            let mut c = Commitment::new(CommitmentKind::Intent, "y", Source::Cli);
+            c.stakes = Stakes::Low;
+            training.push(Example { commitment: c, target: PolarityClass::Better });
+        }
+        let (model, _report): (OutcomeModel, _) = train(&training, &TrainerConfig::default());
+        save(&model, &world_path).expect("save world model");
+
+        // Seed a couple of completed commitments (one of each polarity)
+        // through the public MCP commit/resolve handlers.
+        let high = handle_memory_commit(
+            &json!({"kind": "intent", "statement": "ship risky migration", "stakes": "high"}),
+            &intents_path,
+        )
+        .await
+        .expect("commit ok");
+        handle_memory_resolve(
+            &json!({
+                "commitment_id": high["commitment_id"].as_str().unwrap(),
+                "polarity": "worse",
+                "description": "rolled back"
+            }),
+            &intents_path,
+        )
+        .await
+        .expect("resolve ok");
+
+        let low = handle_memory_commit(
+            &json!({"kind": "intent", "statement": "tidy up README", "stakes": "low"}),
+            &intents_path,
+        )
+        .await
+        .expect("commit ok");
+        handle_memory_resolve(
+            &json!({
+                "commitment_id": low["commitment_id"].as_str().unwrap(),
+                "polarity": "better",
+                "description": "merged"
+            }),
+            &intents_path,
+        )
+        .await
+        .expect("resolve ok");
+
+        // `--all` skips the OOS filter, so both rows are scored even
+        // though their `observed_at` is after `trained_at`.
+        let report = handle_memory_world_calibration(
+            &json!({"all": true, "since_days": 365}),
+            &intents_path,
+        )
+        .expect("calibration ok");
+
+        assert_eq!(report["n_evaluated"], json!(2));
+        assert_eq!(report["n_in_sample_skipped"], json!(0));
+        assert_eq!(report["n_no_outcome_skipped"], json!(0));
+        // All four classes are present in per_class even when only two
+        // were observed — surface code can render zeros without
+        // tripping over missing keys.
+        let per = report["per_class"].as_array().expect("per_class is an array");
+        assert_eq!(per.len(), 4);
+        let labels: Vec<&str> = per.iter().map(|e| e["label"].as_str().unwrap()).collect();
+        assert!(labels.contains(&"better"));
+        assert!(labels.contains(&"as_expected"));
+        assert!(labels.contains(&"worse"));
+        assert!(labels.contains(&"mixed"));
+        // Trained model on a separable problem should classify both rows correctly.
+        assert!(
+            (report["accuracy"].as_f64().unwrap() - 1.0).abs() < 1e-3,
+            "separable trained model should score perfect on these two rows, got {}",
+            report["accuracy"]
+        );
+        assert!(report["trained_at"].is_string());
 
         std::fs::remove_dir_all(&dir).ok();
     }

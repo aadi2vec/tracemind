@@ -342,6 +342,27 @@ enum WorldAction {
         #[arg(long)]
         json: bool,
     },
+    /// Score the world model's predictions against eventual resolution
+    /// polarity. Out-of-sample by default — only commitments resolved
+    /// after `model.trained_at` are scored — so the report says
+    /// something honest about generalization. Pass `--all` to include
+    /// in-sample rows too (useful for sanity-checking a fresh train).
+    Calibration {
+        /// Look-back window in days for completed commitments.
+        #[arg(long, default_value = "365")]
+        since_days: i64,
+        /// Cap on rows fetched from the intent store.
+        #[arg(long, default_value = "5000")]
+        limit: usize,
+        /// Skip the out-of-sample filter and score every completed row,
+        /// even rows the model trained on. Off by default; this is a
+        /// debug knob, not the trust-building surface.
+        #[arg(long)]
+        all: bool,
+        /// Emit the CalibrationReport as JSON.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(clap::Subcommand)]
@@ -2541,6 +2562,95 @@ fn cmd_world(intents_path: &str, world_path: &std::path::Path, action: WorldActi
                         f.contribution.abs() * f.contribution.signum(),
                     );
                 }
+            }
+        }
+
+        WorldAction::Calibration {
+            since_days,
+            limit,
+            all,
+            json,
+        } => {
+            let model = match load(world_path) {
+                Ok(Some(m)) => m,
+                Ok(None) => {
+                    eprintln!(
+                        "no world model on disk at {} — run `tracemind world train` first.",
+                        world_path.display()
+                    );
+                    std::process::exit(1);
+                }
+                Err(e) => {
+                    eprintln!("failed to load world model: {e}");
+                    std::process::exit(1);
+                }
+            };
+
+            let store = match IntentStore::open(intents_path) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("failed to open intent store at {intents_path}: {e}");
+                    std::process::exit(1);
+                }
+            };
+            let since = chrono::Utc::now() - chrono::Duration::days(since_days);
+            let rows = match store.list_completed_with_outcome_meta(since, limit) {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("failed to read completed commitments: {e}");
+                    std::process::exit(1);
+                }
+            };
+
+            let (pairs, in_sample_skipped) = if all {
+                // --all: keep everything, ignore trained_at cutoff.
+                let kept = rows.into_iter().map(|(c, p, _)| (c, p)).collect();
+                (kept, 0usize)
+            } else {
+                tm_world_model::split_out_of_sample(&model, rows)
+            };
+
+            let mut report = tm_world_model::evaluate(&model, &pairs);
+            report.n_in_sample_skipped = in_sample_skipped;
+
+            if json {
+                match serde_json::to_string_pretty(&report) {
+                    Ok(s) => println!("{}", s),
+                    Err(e) => {
+                        eprintln!("json serialize failed: {e}");
+                        std::process::exit(1);
+                    }
+                }
+                return;
+            }
+
+            println!("world model calibration");
+            println!("  trained_at     : {}", report.trained_at.as_deref().unwrap_or("—"));
+            println!("  evaluated_at   : {}", report.evaluated_at);
+            println!(
+                "  n_evaluated    : {} ({} in-sample skipped, {} no-outcome skipped){}",
+                report.n_evaluated,
+                report.n_in_sample_skipped,
+                report.n_no_outcome_skipped,
+                if all { " [--all: in-sample included]" } else { "" }
+            );
+            if report.n_evaluated == 0 {
+                println!(
+                    "  (no out-of-sample completions to score — resolve more commitments \
+                     after the last `world train` and try again.)"
+                );
+                return;
+            }
+            println!("  accuracy           : {:.1}%", report.accuracy * 100.0);
+            println!("  positive recall    : {:.1}%", report.positive_recall * 100.0);
+            println!("  warning precision  : {:.1}%", report.warning_precision * 100.0);
+            println!("  brier score        : {:.4}  (lower is better; uniform=0.75)", report.brier_score);
+            println!("  per-class:");
+            for pc in &report.per_class {
+                println!(
+                    "    {:<12} actual={:>3}  predicted={:>3}  correct={:>3}",
+                    pc.label, pc.n_actual, pc.n_predicted, pc.n_correct
+                );
             }
         }
 

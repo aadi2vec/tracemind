@@ -23,12 +23,14 @@
 //! (L1 prefetch, L2 pattern surfacing, L3 recommendation) all consume
 //! the same [`OutcomePrediction`] shape, so v0 unlocks them today.
 
+pub mod calibration;
 pub mod features;
 pub mod predictor;
 pub mod store;
 pub mod trainer;
 pub mod types;
 
+pub use calibration::{evaluate, split_out_of_sample, CalibrationReport, PerClass};
 pub use features::{extract, feature_dim, normalize_tag, TagVocab, FIXED_FEATURES};
 pub use predictor::{
     explain_top_k, softmax, FeatureContribution, OutcomeModel, N_CLASSES, SCHEMA_VERSION,
