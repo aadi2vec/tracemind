@@ -2396,7 +2396,40 @@ fn print_brief_text(brief: &tm_reflect::DailyBrief) {
 
     // Insights panel — printed first so the user sees the most
     // attention-worthy rows before drowning in the open list.
-    if !brief.insights.is_empty() {
+    // If the calibration gate suppressed the panel (TM-INTENT-010),
+    // surface that fact directly so the user knows the model has
+    // an opinion that's being held back.
+    if let Some(reason) = &brief.model_quiet {
+        let line = match reason {
+            tm_reflect::ModelQuietReason::InsufficientEvaluations { n_evaluated, required } => {
+                format!(
+                    "▸ insights — model warming up ({}/{} completions evaluated)",
+                    n_evaluated, required
+                )
+            }
+            tm_reflect::ModelQuietReason::LowAccuracy { accuracy, floor, n_evaluated } => {
+                format!(
+                    "▸ insights — paused (accuracy {:.0}% < {:.0}% floor over {} completions)",
+                    accuracy * 100.0,
+                    floor * 100.0,
+                    n_evaluated
+                )
+            }
+            tm_reflect::ModelQuietReason::LowWarningPrecision {
+                warning_precision,
+                floor,
+                n_evaluated,
+            } => format!(
+                "▸ insights — paused (warning precision {:.0}% < {:.0}% floor over {} completions)",
+                warning_precision * 100.0,
+                floor * 100.0,
+                n_evaluated
+            ),
+        };
+        println!("{line}");
+        println!("    (run `tracemind world calibration` to see the score card)");
+        println!();
+    } else if !brief.insights.is_empty() {
         println!("▸ insights ({})", brief.insights.len());
         for ins in &brief.insights {
             let glyph = match ins.tone.as_str() {

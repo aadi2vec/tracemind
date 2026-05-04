@@ -2926,6 +2926,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn memory_brief_quiets_insights_when_model_uncalibrated() {
+        // TM-INTENT-010: when the world model is attached but has no
+        // out-of-sample completions yet (n_evaluated < min floor),
+        // memory_brief must surface a `model_quiet` reason of
+        // `insufficient_evaluations` AND keep the insights array
+        // empty. This is the cold-start surface for a fresh user
+        // who's just trained a model but hasn't resolved anything.
+        use tm_world_model::{save, train, Example, PolarityClass, TrainerConfig};
+        use uuid::Uuid as TestUuid;
+
+        let dir = std::env::temp_dir()
+            .join(format!("tm-mcp-brief-quiet-{}", TestUuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let intents_path = dir.join("intents.db").to_str().unwrap().to_string();
+        let world_path = dir.join("world_model.json");
+
+        // Train + save a model — but no resolved commitments exist
+        // yet, so calibration will see zero out-of-sample pairs.
+        let mut examples = Vec::new();
+        for _ in 0..6 {
+            let mut c = tm_intent::Commitment::new(
+                tm_intent::CommitmentKind::Intent,
+                "x",
+                tm_intent::Source::Cli,
+            );
+            c.stakes = tm_intent::Stakes::High;
+            examples.push(Example { commitment: c, target: PolarityClass::Worse });
+        }
+        for _ in 0..6 {
+            let mut c = tm_intent::Commitment::new(
+                tm_intent::CommitmentKind::Intent,
+                "y",
+                tm_intent::Source::Cli,
+            );
+            c.stakes = tm_intent::Stakes::Low;
+            examples.push(Example { commitment: c, target: PolarityClass::Better });
+        }
+        let (model, _r) = train(&examples, &TrainerConfig::default());
+        save(&model, &world_path).expect("save model");
+
+        // One open commitment that the model would otherwise flag.
+        handle_memory_commit(
+            &json!({
+                "kind": "intent",
+                "statement": "ship risky vendor migration",
+                "stakes": "high",
+            }),
+            &intents_path,
+        )
+        .await
+        .expect("commit ok");
+
+        let brief = handle_memory_brief(&json!({}), &intents_path).expect("brief ok");
+        let insights = brief["insights"].as_array().expect("insights array present");
+        assert!(
+            insights.is_empty(),
+            "untrustworthy model must suppress insights, got {brief}"
+        );
+        let quiet = brief
+            .get("model_quiet")
+            .expect("model_quiet field present when gate engages");
+        assert_eq!(quiet["kind"], json!("insufficient_evaluations"));
+        assert_eq!(quiet["n_evaluated"], json!(0));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
     async fn memory_insight_silence_round_trips_via_mcp() {
         // memory_insight_silence + memory_insight_silences + brief
         // must agree: silenced commitment shows up in the silences

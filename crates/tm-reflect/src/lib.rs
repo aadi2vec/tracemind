@@ -32,7 +32,8 @@ pub mod pattern;
 
 pub use brief::{
     BriefBuilder, BriefConfig, BriefError, CandidateBriefRow, CommitmentBriefRow,
-    CommitmentOutlook, DailyBrief, OverdueClass, PatternBriefRow, ResolvedBriefRow,
+    CommitmentOutlook, DailyBrief, InsightGateConfig, ModelQuietReason, OverdueClass,
+    OutcomeProposalBriefRow, PatternBriefRow, ResolvedBriefRow,
 };
 pub use insights::{detect_insights, BaselineRate, InsightBriefRow, InsightConfig};
 pub use matcher::{propose_outcomes, MatcherConfig, OutcomeProposal};

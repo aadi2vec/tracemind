@@ -60,6 +60,17 @@ pub struct CalibrationReport {
     pub n_in_sample_skipped: usize,
     /// Pairs dropped because `Polarity::NoOutcome` is not predictable.
     pub n_no_outcome_skipped: usize,
+    /// Number of evaluated rows where the model's `positive_prob <
+    /// 0.5` — i.e. the model would have *fired a warning* on this
+    /// row. Used by the trust gate to distinguish "no warnings
+    /// issued" (no evidence) from "warnings issued but inaccurate"
+    /// (untrustworthy). Always `<= n_evaluated`.
+    #[serde(default)]
+    pub n_warning: usize,
+    /// Number of evaluated rows whose actual polarity was Better or
+    /// AsExpected — denominator of `positive_recall`.
+    #[serde(default)]
+    pub n_actual_positive: usize,
     pub accuracy: f32,
     /// P(positive_prob >= 0.5 | actual ∈ {Better, AsExpected}). The
     /// rate at which the model correctly signals tailwind on rows
@@ -97,6 +108,8 @@ impl CalibrationReport {
             n_evaluated: 0,
             n_in_sample_skipped: 0,
             n_no_outcome_skipped: 0,
+            n_warning: 0,
+            n_actual_positive: 0,
             accuracy: 0.0,
             positive_recall: 0.0,
             warning_precision: 0.0,
@@ -215,6 +228,8 @@ pub fn evaluate(model: &OutcomeModel, pairs: &[(Commitment, Polarity)]) -> Calib
         report.accuracy = n_correct as f32 / n as f32;
         report.brier_score = brier_sum / n as f32;
     }
+    report.n_warning = n_warn;
+    report.n_actual_positive = n_actual_pos;
     report.positive_recall = if n_actual_pos > 0 {
         n_recall_hits as f32 / n_actual_pos as f32
     } else {

@@ -52,6 +52,63 @@ pub struct BriefConfig {
     /// `▸ insights` panel based on world-model deviation from the
     /// completed-rate baseline.
     pub insights: InsightConfig,
+    /// Trust gate on the world model's calibration. When the gate
+    /// fails we suppress the insights panel and emit
+    /// [`DailyBrief::model_quiet`] explaining why. Closes the loop
+    /// opened by TM-INTENT-008 (read-only calibration view) per
+    /// `INTENT_SYSTEM.md` §11 ("auto-quiet on bad accuracy").
+    pub insight_gate: InsightGateConfig,
+}
+
+/// Calibration thresholds the brief uses to decide whether the world
+/// model is trustworthy enough to surface insights.
+///
+/// All three checks are AND-gated — failing any one drops the panel
+/// for this brief. Floors are deliberately conservative; we'd rather
+/// stay quiet than mislead.
+#[derive(Debug, Clone)]
+pub struct InsightGateConfig {
+    /// Minimum out-of-sample evaluations required before the gate
+    /// will even consider opening. Below this we don't have enough
+    /// signal to call the model trustworthy *or* untrustworthy — we
+    /// stay quiet and say so. Default: 8 (one work-week of resolved
+    /// commitments at typical pace).
+    pub min_n_evaluated: usize,
+    /// `accuracy` floor. Uniform-prediction baseline is 0.25 (4
+    /// classes). Default: 0.35 — meaningfully above uniform without
+    /// demanding heroic performance from the v0 linear model.
+    pub accuracy_floor: f32,
+    /// `warning_precision` floor. The trust knob on the L2 warning
+    /// surface (`crate::insights`): when the model said "watch out,"
+    /// how often was it right? Below 0.5 we're worse than a coin
+    /// flip — pull the panel. Default: 0.5.
+    pub warning_precision_floor: f32,
+}
+
+impl Default for InsightGateConfig {
+    fn default() -> Self {
+        Self {
+            min_n_evaluated: 8,
+            accuracy_floor: 0.35,
+            warning_precision_floor: 0.5,
+        }
+    }
+}
+
+/// Why the brief pulled the insights panel. `None` on `DailyBrief`
+/// means the gate either passed or never engaged (no model attached).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ModelQuietReason {
+    /// We don't have enough resolved-after-train commitments to
+    /// compute a calibration the user can trust. The brief surface
+    /// renders "▸ model warming up — N of M completions evaluated".
+    InsufficientEvaluations { n_evaluated: usize, required: usize },
+    /// Top-1 accuracy fell below the floor.
+    LowAccuracy { accuracy: f32, floor: f32, n_evaluated: usize },
+    /// Warning precision fell below the floor — the model's "watch
+    /// out" signals are noisier than coin flips.
+    LowWarningPrecision { warning_precision: f32, floor: f32, n_evaluated: usize },
 }
 
 impl Default for BriefConfig {
@@ -67,6 +124,7 @@ impl Default for BriefConfig {
             patterns_window: Duration::days(365),
             patterns_scan_limit: 2000,
             insights: InsightConfig::default(),
+            insight_gate: InsightGateConfig::default(),
         }
     }
 }
@@ -265,6 +323,13 @@ pub struct DailyBrief {
     pub proposals: Vec<OutcomeProposalBriefRow>,
     /// Section counts for quick rendering of section headers.
     pub counts: BriefCounts,
+    /// Set when the calibration gate suppressed the insights panel.
+    /// When this is `Some`, `insights` is empty by construction —
+    /// surfaces should render a neutral banner explaining that the
+    /// model is being quiet, *not* hide the fact that it has an
+    /// opinion. TM-INTENT-010 / `INTENT_SYSTEM.md` §11.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_quiet: Option<ModelQuietReason>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
@@ -410,13 +475,32 @@ impl<'a> BriefBuilder<'a> {
             Err(_) => Vec::new(),
         };
 
+        // Calibration gate (TM-INTENT-010). Evaluate the world model
+        // against its own out-of-sample completions; if the gate
+        // fails, drop the insights panel for this brief and tell the
+        // caller why via `model_quiet`. Soft-fail: any store error
+        // just leaves the gate open (matches the rest of the brief's
+        // best-effort posture).
+        let model_quiet: Option<ModelQuietReason> = match active_model {
+            Some(model) => evaluate_insight_gate(
+                self.store,
+                model,
+                &cfg.insight_gate,
+                pattern_window_start,
+                cfg.patterns_scan_limit,
+            ),
+            None => None,
+        };
+
         // Insights — only compute when a world model is attached
         // (otherwise the open rows have no `outlook` to compare).
         // Pull the same completed-with-polarity slice as the pattern
         // detector to stay consistent on what counts as a "prior".
         // Soft-fail: if the store query errors we drop insights but
         // keep the rest of the brief.
-        let insights: Vec<InsightBriefRow> = if active_model.is_some() {
+        // The calibration gate above can also force-drop the panel —
+        // we honour it by short-circuiting here.
+        let insights: Vec<InsightBriefRow> = if active_model.is_some() && model_quiet.is_none() {
             // Active per-commitment silences — same soft-fail
             // semantics as `pattern_silences`: if the read errors we
             // drop insights for this brief rather than block.
@@ -510,8 +594,60 @@ impl<'a> BriefBuilder<'a> {
             insights,
             proposals,
             counts,
+            model_quiet,
         })
     }
+}
+
+/// Run a calibration evaluation of `model` against its own
+/// out-of-sample completions and decide whether the insights panel
+/// should fire. Returns:
+/// - `None` → gate passed; surface insights normally.
+/// - `Some(reason)` → gate failed; suppress insights and let the
+///   surface render a "model is being quiet" banner.
+///
+/// Soft-fail: any store error returns `None` (open the gate). The
+/// rest of the brief stays best-effort; we don't punish the user for
+/// a flaky read by suppressing their insights.
+fn evaluate_insight_gate(
+    store: &IntentStore,
+    model: &tm_world_model::OutcomeModel,
+    cfg: &InsightGateConfig,
+    window_start: DateTime<Utc>,
+    scan_limit: usize,
+) -> Option<ModelQuietReason> {
+    let pairs = match store.list_completed_with_outcome_meta(window_start, scan_limit) {
+        Ok(p) => p,
+        Err(_) => return None,
+    };
+    let (oos, _in_sample_skipped) = tm_world_model::split_out_of_sample(model, pairs);
+    let report = tm_world_model::evaluate(model, &oos);
+    let n = report.n_evaluated;
+    if n < cfg.min_n_evaluated {
+        return Some(ModelQuietReason::InsufficientEvaluations {
+            n_evaluated: n,
+            required: cfg.min_n_evaluated,
+        });
+    }
+    if report.accuracy < cfg.accuracy_floor {
+        return Some(ModelQuietReason::LowAccuracy {
+            accuracy: report.accuracy,
+            floor: cfg.accuracy_floor,
+            n_evaluated: n,
+        });
+    }
+    // Warning-precision is only evidence when the model actually
+    // issued warnings during evaluation. `warning_precision = 0.0`
+    // with `n_warning = 0` means "no signal", not "untrustworthy" —
+    // don't punish the user for a quiet-but-correct model.
+    if report.n_warning > 0 && report.warning_precision < cfg.warning_precision_floor {
+        return Some(ModelQuietReason::LowWarningPrecision {
+            warning_precision: report.warning_precision,
+            floor: cfg.warning_precision_floor,
+            n_evaluated: n,
+        });
+    }
+    None
 }
 
 fn commitment_row(
@@ -1272,6 +1408,242 @@ mod tests {
             !brief.insights.is_empty(),
             "expired silence must not suppress the insight"
         );
+    }
+
+    /// Helper to seed a "diverging open row" scenario: 8 Better
+    /// completions at the model's sweet spot and one open commitment
+    /// at the model's Worse-shape (high stakes, evening). With a
+    /// passing gate the brief surfaces an insight; we use this in
+    /// the gate tests to assert that suppression is what's flipping
+    /// the panel state.
+    fn seed_diverging_scenario(store: &IntentStore) -> uuid::Uuid {
+        for i in 0..8 {
+            let mut c = Commitment::new(
+                CommitmentKind::Intent,
+                format!("morning-task-{i}"),
+                Source::Manual,
+            );
+            c.stakes = Stakes::Low;
+            c.tags = vec!["writing".into()];
+            c.made_at = Utc.with_ymd_and_hms(2026, 4, 15, 9, 0, 0).unwrap()
+                + Duration::days(i);
+            store.insert_commitment(&c).unwrap();
+            let o = Outcome::new(
+                c.id,
+                Polarity::Better,
+                "shipped",
+                OutcomeSource::UserPrompted,
+            );
+            store.insert_outcome(&o).unwrap();
+            let mut after = c.clone();
+            transition(&mut after, State::Completed, Some(&o)).unwrap();
+            store
+                .update_state(after.id, after.state, after.outcome_id)
+                .unwrap();
+        }
+        let mut c = Commitment::new(CommitmentKind::Intent, "ship hot fix", Source::Manual);
+        c.stakes = Stakes::High;
+        c.made_at = Utc.with_ymd_and_hms(2026, 4, 30, 19, 0, 0).unwrap();
+        let cid = c.id;
+        store.insert_commitment(&c).unwrap();
+        cid
+    }
+
+    #[test]
+    fn gate_quiets_brief_when_n_evaluated_below_floor() {
+        // Stand up a model trained from data that has *not* been
+        // resolved-after-train, so n_evaluated == 0. Even when the
+        // open row would otherwise produce a fat insight, the panel
+        // must stay empty and the brief must explain why.
+        let model = trained_model();
+        let store = fresh_store();
+        // Single open row, no completions in the store at all → the
+        // calibration evaluator gets zero pairs.
+        let mut c = Commitment::new(CommitmentKind::Intent, "ship hot fix", Source::Manual);
+        c.stakes = Stakes::High;
+        c.made_at = Utc.with_ymd_and_hms(2026, 4, 30, 19, 0, 0).unwrap();
+        store.insert_commitment(&c).unwrap();
+
+        let now = Utc::now();
+        let brief = BriefBuilder::new(&store)
+            .with_world_model(&model)
+            .build(now)
+            .unwrap();
+        assert!(brief.insights.is_empty(), "thin-N must suppress insights");
+        match brief.model_quiet {
+            Some(ModelQuietReason::InsufficientEvaluations { n_evaluated, required }) => {
+                assert_eq!(n_evaluated, 0);
+                assert_eq!(required, InsightGateConfig::default().min_n_evaluated);
+            }
+            other => panic!("expected InsufficientEvaluations, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn gate_passes_when_model_aligns_with_completions() {
+        // Seed completions at the model's Better-shape (Stakes::Low,
+        // hour 9). Out-of-sample evaluation should give high
+        // accuracy and zero warnings issued — the warning_precision
+        // floor is correctly ignored when there's no evidence to
+        // judge it on. Insights stay surfaced.
+        let model = trained_model();
+        let store = fresh_store();
+        let _cid = seed_diverging_scenario(&store);
+        let now = Utc::now();
+
+        let brief = BriefBuilder::new(&store)
+            .with_world_model(&model)
+            .build(now)
+            .unwrap();
+        assert!(
+            brief.model_quiet.is_none(),
+            "well-aligned model should not auto-quiet, got {:?}",
+            brief.model_quiet
+        );
+        assert!(
+            !brief.insights.is_empty(),
+            "well-aligned model should still surface insights"
+        );
+    }
+
+    #[test]
+    fn gate_quiets_brief_when_accuracy_below_floor() {
+        // Seed 8 *adversarial* completions — Stakes::High/hour 19
+        // (where the trained model predicts Worse) but actual
+        // polarity Better. Model is wrong on every row → accuracy
+        // = 0.0, well below the default floor. Insights must drop
+        // with a `LowAccuracy` reason.
+        let model = trained_model();
+        let store = fresh_store();
+        for i in 0..8 {
+            let mut c = Commitment::new(
+                CommitmentKind::Intent,
+                format!("adversarial-{i}"),
+                Source::Manual,
+            );
+            // Model's Worse-shape ...
+            c.stakes = Stakes::High;
+            c.made_at = Utc.with_ymd_and_hms(2026, 4, 15, 19, 0, 0).unwrap()
+                + Duration::days(i);
+            store.insert_commitment(&c).unwrap();
+            // ... but actual outcome is Better. Model is wrong.
+            let o = Outcome::new(c.id, Polarity::Better, "ok", OutcomeSource::UserPrompted);
+            store.insert_outcome(&o).unwrap();
+            let mut after = c.clone();
+            transition(&mut after, State::Completed, Some(&o)).unwrap();
+            store
+                .update_state(after.id, after.state, after.outcome_id)
+                .unwrap();
+        }
+        // Plus an open row that would otherwise be the insight.
+        let mut c = Commitment::new(CommitmentKind::Intent, "ship hot fix", Source::Manual);
+        c.stakes = Stakes::High;
+        c.made_at = Utc.with_ymd_and_hms(2026, 4, 30, 19, 0, 0).unwrap();
+        store.insert_commitment(&c).unwrap();
+
+        let now = Utc::now();
+        let brief = BriefBuilder::new(&store)
+            .with_world_model(&model)
+            .build(now)
+            .unwrap();
+        assert!(brief.insights.is_empty(), "accuracy gate must drop insights");
+        match brief.model_quiet {
+            Some(ModelQuietReason::LowAccuracy { accuracy, floor, n_evaluated }) => {
+                assert!(accuracy < floor, "accuracy {accuracy} must be below floor {floor}");
+                assert!(n_evaluated >= 8);
+            }
+            other => panic!("expected LowAccuracy, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn gate_quiets_brief_when_warning_precision_below_floor() {
+        // Seed 8 commitments at the model's Worse-shape, but with
+        // *actual* polarity Better. The model fires a warning on
+        // each (positive_prob < 0.5) but the actual outcome is
+        // positive — warning_precision = 0.0, n_warning = 8.
+        // Even though accuracy might cross the default floor on
+        // some rows, warning_precision must trip the gate.
+        //
+        // We crank `accuracy_floor` to 0.0 to isolate the
+        // warning-precision check.
+        let model = trained_model();
+        let store = fresh_store();
+        for i in 0..8 {
+            let mut c = Commitment::new(
+                CommitmentKind::Intent,
+                format!("noisy-warn-{i}"),
+                Source::Manual,
+            );
+            c.stakes = Stakes::High; // model predicts Worse → warns
+            c.made_at = Utc.with_ymd_and_hms(2026, 4, 15, 19, 0, 0).unwrap()
+                + Duration::days(i);
+            store.insert_commitment(&c).unwrap();
+            let o = Outcome::new(c.id, Polarity::Better, "ok", OutcomeSource::UserPrompted);
+            store.insert_outcome(&o).unwrap();
+            let mut after = c.clone();
+            transition(&mut after, State::Completed, Some(&o)).unwrap();
+            store
+                .update_state(after.id, after.state, after.outcome_id)
+                .unwrap();
+        }
+        let mut c = Commitment::new(CommitmentKind::Intent, "ship hot fix", Source::Manual);
+        c.stakes = Stakes::High;
+        c.made_at = Utc.with_ymd_and_hms(2026, 4, 30, 19, 0, 0).unwrap();
+        store.insert_commitment(&c).unwrap();
+
+        let cfg = BriefConfig {
+            insight_gate: InsightGateConfig {
+                min_n_evaluated: 1,
+                accuracy_floor: 0.0,
+                warning_precision_floor: 0.5,
+            },
+            ..BriefConfig::default()
+        };
+        let now = Utc::now();
+        let brief = BriefBuilder::new(&store)
+            .with_world_model(&model)
+            .with_config(cfg)
+            .build(now)
+            .unwrap();
+        assert!(brief.insights.is_empty(), "warning_precision gate must drop insights");
+        match brief.model_quiet {
+            Some(ModelQuietReason::LowWarningPrecision {
+                warning_precision,
+                floor,
+                n_evaluated,
+            }) => {
+                assert!(warning_precision < floor);
+                assert!(n_evaluated >= 8);
+            }
+            other => panic!("expected LowWarningPrecision, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn gate_does_not_engage_without_world_model() {
+        // No model attached → no calibration, no quiet-reason. The
+        // gate should never engage on the cold-start surface.
+        let store = fresh_store();
+        let _cid = seed_diverging_scenario(&store);
+        let now = Utc::now();
+        let brief = BriefBuilder::new(&store).build(now).unwrap();
+        assert!(brief.insights.is_empty(), "no model → no insights");
+        assert!(brief.model_quiet.is_none(), "no model → no quiet reason");
+    }
+
+    #[test]
+    fn quiet_reason_round_trips_json() {
+        let r = ModelQuietReason::LowAccuracy {
+            accuracy: 0.18,
+            floor: 0.35,
+            n_evaluated: 12,
+        };
+        let s = serde_json::to_string(&r).unwrap();
+        // Tag-driven discriminator so MCP / Tauri consumers can route.
+        assert!(s.contains("\"kind\":\"low_accuracy\""), "tagged: {s}");
+        let back: ModelQuietReason = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, r);
     }
 
     #[test]
