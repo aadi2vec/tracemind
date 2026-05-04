@@ -193,6 +193,50 @@ impl IntentStore {
             );
 
             CREATE INDEX IF NOT EXISTS idx_insight_silences_until ON insight_silences(silenced_until);
+
+            -- Outcome proposals. When the implicit text matcher
+            -- (`tm-reflect::propose_outcomes`) finds that a fresh
+            -- capture's text overlaps an open commitment's statement /
+            -- expected_outcome, we persist the suggestion here so the
+            -- daily brief can carry it forward — without persistence,
+            -- the proposal is lost the moment the capture response is
+            -- discarded. See `docs/INTENT_SYSTEM.md` §4.2.
+            --
+            -- Lifecycle:
+            --   - `pending`   : freshly proposed, surfaces in brief
+            --   - `accepted`  : user confirmed; outcome row attached;
+            --                   `resolved_outcome_id` points at it
+            --   - `dismissed` : user said no; cell is suppressed for
+            --                   the same (commitment, polarity) pair
+            --                   for 14d to avoid re-prompting
+            --   - `expired`   : `proposed_at` + 30d passed without
+            --                   action; treated identically to dismissed
+            --                   except no replay-suppression
+            --
+            -- `cell_key` is a stable hash of (commitment_id, polarity)
+            -- that lets us dedupe re-proposals from later captures of
+            -- the same intent. We never insert a second pending row
+            -- with the same cell_key.
+            CREATE TABLE IF NOT EXISTS outcome_proposals (
+                id                    TEXT PRIMARY KEY,
+                commitment_id         TEXT NOT NULL,
+                cell_key              TEXT NOT NULL,
+                proposed_polarity     TEXT NOT NULL,
+                description           TEXT NOT NULL,
+                similarity            REAL NOT NULL,
+                source_trace_id       TEXT,
+                proposed_at           TEXT NOT NULL,
+                expires_at            TEXT NOT NULL,
+                status                TEXT NOT NULL DEFAULT 'pending',
+                resolved_at           TEXT,
+                resolved_outcome_id   TEXT,
+                FOREIGN KEY(commitment_id) REFERENCES commitments(id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_proposals_status      ON outcome_proposals(status);
+            CREATE INDEX IF NOT EXISTS idx_proposals_commitment  ON outcome_proposals(commitment_id);
+            CREATE INDEX IF NOT EXISTS idx_proposals_cell_key    ON outcome_proposals(cell_key);
+            CREATE INDEX IF NOT EXISTS idx_proposals_expires     ON outcome_proposals(expires_at);
             "#,
         )?;
         Ok(())
@@ -604,6 +648,173 @@ impl IntentStore {
         Ok(out)
     }
 
+    // ----- outcome proposals --------------------------------------------
+
+    /// Insert a new outcome proposal. Skips (returns `Ok(false)`) if a
+    /// `pending` row already exists with the same `cell_key` — keeps
+    /// the brief from re-prompting on every fresh capture that fires
+    /// the same `(commitment, polarity)` cell.
+    ///
+    /// Lifecycle (see `init_schema` doc): row stays `pending` until
+    /// the user accepts (`mark_outcome_proposal_accepted`) or
+    /// dismisses (`mark_outcome_proposal_dismissed`); a periodic
+    /// `expire_outcome_proposals(now)` sweep flips stale rows to
+    /// `expired`.
+    pub fn insert_outcome_proposal(&self, p: &OutcomeProposal) -> Result<bool> {
+        // Idempotency: if a pending row exists for the same cell_key,
+        // we don't re-insert. We *do* allow new proposals once an
+        // earlier one is accepted/dismissed/expired (those are
+        // terminal — a re-fire after dismissal will be re-suppressed
+        // by the cell-level dismissal silence handled at caller
+        // level; we don't enforce that here so the dismissal window
+        // policy stays in one place outside the store).
+        let exists: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM outcome_proposals
+             WHERE cell_key = ? AND status = 'pending'",
+            params![p.cell_key],
+            |r| r.get(0),
+        )?;
+        if exists > 0 {
+            return Ok(false);
+        }
+        self.conn.execute(
+            r#"
+            INSERT INTO outcome_proposals (
+                id, commitment_id, cell_key, proposed_polarity,
+                description, similarity, source_trace_id,
+                proposed_at, expires_at, status, resolved_at,
+                resolved_outcome_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+            params![
+                p.id.to_string(),
+                p.commitment_id.to_string(),
+                p.cell_key,
+                polarity_to_str(p.proposed_polarity),
+                p.description,
+                p.similarity as f64,
+                p.source_trace_id,
+                p.proposed_at.to_rfc3339(),
+                p.expires_at.to_rfc3339(),
+                p.status,
+                p.resolved_at.map(|t| t.to_rfc3339()),
+                p.resolved_outcome_id.map(|u| u.to_string()),
+            ],
+        )?;
+        Ok(true)
+    }
+
+    /// All `pending` proposals whose `expires_at` is still in the
+    /// future as of `now`. Newest-first by `proposed_at`. Brief reads
+    /// this for its "what happened with X?" panel.
+    pub fn list_active_outcome_proposals(
+        &self,
+        now: chrono::DateTime<chrono::Utc>,
+        limit: usize,
+    ) -> Result<Vec<OutcomeProposal>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, commitment_id, cell_key, proposed_polarity, description,
+                    similarity, source_trace_id, proposed_at, expires_at,
+                    status, resolved_at, resolved_outcome_id
+             FROM outcome_proposals
+             WHERE status = 'pending' AND expires_at > ?
+             ORDER BY proposed_at DESC
+             LIMIT ?",
+        )?;
+        let rows = stmt.query_map(params![now.to_rfc3339(), limit as i64], row_to_proposal)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r??);
+        }
+        Ok(out)
+    }
+
+    /// Fetch a single proposal by id (any status). Used by accept /
+    /// dismiss handlers to look up the polarity / description before
+    /// constructing the matching `Outcome`.
+    pub fn get_outcome_proposal(&self, id: Uuid) -> Result<Option<OutcomeProposal>> {
+        self.conn
+            .query_row(
+                "SELECT id, commitment_id, cell_key, proposed_polarity, description,
+                        similarity, source_trace_id, proposed_at, expires_at,
+                        status, resolved_at, resolved_outcome_id
+                 FROM outcome_proposals WHERE id = ?",
+                params![id.to_string()],
+                row_to_proposal,
+            )
+            .optional()
+            .map_err(StoreError::from)
+            .and_then(|opt| opt.transpose())
+    }
+
+    /// Mark a proposal as `accepted` and link it to the new outcome.
+    /// Returns `false` if the row didn't exist or wasn't pending.
+    pub fn mark_outcome_proposal_accepted(
+        &self,
+        id: Uuid,
+        outcome_id: Uuid,
+        resolved_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<bool> {
+        let n = self.conn.execute(
+            "UPDATE outcome_proposals
+             SET status = 'accepted', resolved_at = ?, resolved_outcome_id = ?
+             WHERE id = ? AND status = 'pending'",
+            params![
+                resolved_at.to_rfc3339(),
+                outcome_id.to_string(),
+                id.to_string()
+            ],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Mark a proposal as `dismissed`. Caller decides whether to
+    /// also write a per-cell suppression elsewhere.
+    pub fn mark_outcome_proposal_dismissed(
+        &self,
+        id: Uuid,
+        resolved_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<bool> {
+        let n = self.conn.execute(
+            "UPDATE outcome_proposals
+             SET status = 'dismissed', resolved_at = ?
+             WHERE id = ? AND status = 'pending'",
+            params![resolved_at.to_rfc3339(), id.to_string()],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Bulk-flip all stale `pending` rows (`expires_at <= now`) to
+    /// `expired`. Cheap to run on every brief render. Returns the
+    /// count flipped.
+    pub fn expire_outcome_proposals(
+        &self,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<usize> {
+        let n = self.conn.execute(
+            "UPDATE outcome_proposals
+             SET status = 'expired', resolved_at = ?
+             WHERE status = 'pending' AND expires_at <= ?",
+            params![now.to_rfc3339(), now.to_rfc3339()],
+        )?;
+        Ok(n)
+    }
+
+    /// Count of active (pending, unexpired) proposals — for the
+    /// brief header head-count without deserializing the full list.
+    pub fn count_active_outcome_proposals(
+        &self,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<usize> {
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM outcome_proposals
+             WHERE status = 'pending' AND expires_at > ?",
+            params![now.to_rfc3339()],
+            |r| r.get(0),
+        )?;
+        Ok(n as usize)
+    }
+
     /// Count of pending candidates — fast head-count for the brief
     /// without paying to deserialize the full list.
     pub fn count_pending_candidates(&self) -> Result<usize> {
@@ -920,6 +1131,58 @@ pub struct InsightSilence {
     pub reason: Option<String>,
 }
 
+/// One row of the `outcome_proposals` table — a persisted suggestion
+/// from the implicit text matcher (`tm_reflect::propose_outcomes`)
+/// that a fresh capture may have just described what happened to an
+/// open commitment. See `INTENT_SYSTEM.md` §4.2 + the
+/// `outcome_proposals` schema in [`IntentStore::init_schema`] for
+/// lifecycle semantics.
+///
+/// The proposal is *not* yet an [`Outcome`]. It surfaces in the
+/// daily brief; only `accept_outcome_proposal` (caller-side) inserts
+/// the matching `Outcome` row and links it back via
+/// `resolved_outcome_id`. Dismissal marks the row terminal and
+/// suppresses re-prompting for the same `(commitment, polarity)`
+/// cell for some window.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OutcomeProposal {
+    pub id: Uuid,
+    pub commitment_id: Uuid,
+    /// Stable hash of (commitment_id, proposed_polarity) — used to
+    /// dedupe re-proposals from later captures that fire on the same
+    /// open commitment with the same polarity hint. Computed by
+    /// [`OutcomeProposal::cell_key_for`].
+    pub cell_key: String,
+    pub proposed_polarity: Polarity,
+    /// Short human-readable description of *what fired the match* —
+    /// caller pulls this from the matcher's `reason` field so the
+    /// brief can show "you said …".
+    pub description: String,
+    /// 0.0 .. 1.0 — token-Jaccard score from the matcher.
+    pub similarity: f32,
+    /// Optional pointer to the originating capture trace (so the
+    /// brief / CLI can offer "show capture"). Stored as the trace's
+    /// uuid string verbatim; we don't parse it here.
+    pub source_trace_id: Option<String>,
+    pub proposed_at: chrono::DateTime<chrono::Utc>,
+    pub expires_at: chrono::DateTime<chrono::Utc>,
+    /// One of: `pending` | `accepted` | `dismissed` | `expired`.
+    pub status: String,
+    pub resolved_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Set when `status == "accepted"` — points at the new
+    /// [`Outcome`] row the caller inserted.
+    pub resolved_outcome_id: Option<Uuid>,
+}
+
+impl OutcomeProposal {
+    /// Stable cell key for a `(commitment_id, polarity)` pair. The
+    /// matcher pipeline calls this so dedup is consistent across the
+    /// brief, the MCP layer, and the persistence layer.
+    pub fn cell_key_for(commitment_id: Uuid, polarity: Polarity) -> String {
+        format!("{}:{}", commitment_id, polarity_to_str(polarity))
+    }
+}
+
 /// brief can show "you said …" with one click to re-open the trace).
 #[derive(Debug, Clone)]
 pub struct CandidateRecord {
@@ -1054,6 +1317,46 @@ fn row_to_candidate(row: &rusqlite::Row<'_>) -> rusqlite::Result<Result<Candidat
             span: (span_start as usize, span_end as usize),
             confidence: confidence as f32,
             tags: serde_json::from_str(&tags_json)?,
+        })
+    })())
+}
+
+fn row_to_proposal(row: &rusqlite::Row<'_>) -> rusqlite::Result<Result<OutcomeProposal>> {
+    let id_s: String = row.get(0)?;
+    let cid_s: String = row.get(1)?;
+    let cell_key: String = row.get(2)?;
+    let polarity_s: String = row.get(3)?;
+    let description: String = row.get(4)?;
+    let similarity: f64 = row.get(5)?;
+    let source_trace_id: Option<String> = row.get(6)?;
+    let proposed_s: String = row.get(7)?;
+    let expires_s: String = row.get(8)?;
+    let status: String = row.get(9)?;
+    let resolved_s: Option<String> = row.get(10)?;
+    let resolved_outcome_s: Option<String> = row.get(11)?;
+
+    Ok((|| -> Result<OutcomeProposal> {
+        let resolved_at = match resolved_s {
+            Some(s) => Some(parse_dt(&s, "outcome_proposals.resolved_at")?),
+            None => None,
+        };
+        let resolved_outcome_id = match resolved_outcome_s {
+            Some(s) => Some(parse_uuid(&s, "outcome_proposals.resolved_outcome_id")?),
+            None => None,
+        };
+        Ok(OutcomeProposal {
+            id: parse_uuid(&id_s, "outcome_proposals.id")?,
+            commitment_id: parse_uuid(&cid_s, "outcome_proposals.commitment_id")?,
+            cell_key,
+            proposed_polarity: parse_polarity(&polarity_s)?,
+            description,
+            similarity: similarity as f32,
+            source_trace_id,
+            proposed_at: parse_dt(&proposed_s, "outcome_proposals.proposed_at")?,
+            expires_at: parse_dt(&expires_s, "outcome_proposals.expires_at")?,
+            status,
+            resolved_at,
+            resolved_outcome_id,
         })
     })())
 }
@@ -1606,5 +1909,140 @@ mod tests {
         assert!(!store.remove_insight_silence(cid).unwrap());
         let active = store.list_active_insight_silences(now).unwrap();
         assert!(active.is_empty());
+    }
+
+    // ----- outcome proposal tests -----
+
+    fn mk_proposal(commitment_id: Uuid, polarity: Polarity, now: chrono::DateTime<chrono::Utc>) -> OutcomeProposal {
+        OutcomeProposal {
+            id: Uuid::new_v4(),
+            commitment_id,
+            cell_key: OutcomeProposal::cell_key_for(commitment_id, polarity),
+            proposed_polarity: polarity,
+            description: "shipped friday".into(),
+            similarity: 0.42,
+            source_trace_id: Some("trace-abc".into()),
+            proposed_at: now,
+            expires_at: now + chrono::Duration::days(30),
+            status: "pending".into(),
+            resolved_at: None,
+            resolved_outcome_id: None,
+        }
+    }
+
+    #[test]
+    fn outcome_proposal_round_trips_via_active_list() {
+        let store = fresh_store();
+        let c = Commitment::new(CommitmentKind::Intent, "ship the locomo eval", Source::Manual);
+        store.insert_commitment(&c).unwrap();
+        let now = chrono::Utc::now();
+
+        let p = mk_proposal(c.id, Polarity::Better, now);
+        let inserted = store.insert_outcome_proposal(&p).unwrap();
+        assert!(inserted, "first insert should succeed");
+
+        let active = store.list_active_outcome_proposals(now, 10).unwrap();
+        assert_eq!(active.len(), 1);
+        let got = &active[0];
+        assert_eq!(got.id, p.id);
+        assert_eq!(got.commitment_id, c.id);
+        assert_eq!(got.proposed_polarity, Polarity::Better);
+        assert_eq!(got.status, "pending");
+        assert!((got.similarity - 0.42).abs() < 1e-5);
+
+        assert_eq!(store.count_active_outcome_proposals(now).unwrap(), 1);
+    }
+
+    #[test]
+    fn outcome_proposal_dedupes_pending_cell_key() {
+        let store = fresh_store();
+        let c = Commitment::new(CommitmentKind::Intent, "fix the gnarly bug", Source::Manual);
+        store.insert_commitment(&c).unwrap();
+        let now = chrono::Utc::now();
+
+        let p1 = mk_proposal(c.id, Polarity::Better, now);
+        let p2 = mk_proposal(c.id, Polarity::Better, now);
+        assert!(store.insert_outcome_proposal(&p1).unwrap());
+        assert!(
+            !store.insert_outcome_proposal(&p2).unwrap(),
+            "second pending insert with same cell_key should be skipped"
+        );
+        assert_eq!(store.list_active_outcome_proposals(now, 10).unwrap().len(), 1);
+
+        // Different polarity = different cell_key, both should land.
+        let p3 = mk_proposal(c.id, Polarity::Worse, now);
+        assert!(store.insert_outcome_proposal(&p3).unwrap());
+        assert_eq!(store.list_active_outcome_proposals(now, 10).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn outcome_proposal_accept_sets_outcome_id_and_drops_from_active() {
+        let store = fresh_store();
+        let c = Commitment::new(CommitmentKind::Intent, "send the proposal", Source::Manual);
+        store.insert_commitment(&c).unwrap();
+        let now = chrono::Utc::now();
+        let p = mk_proposal(c.id, Polarity::Better, now);
+        store.insert_outcome_proposal(&p).unwrap();
+
+        let outcome_id = Uuid::new_v4();
+        let accepted = store
+            .mark_outcome_proposal_accepted(p.id, outcome_id, now + chrono::Duration::seconds(5))
+            .unwrap();
+        assert!(accepted);
+
+        // Second accept on same row is a no-op (already terminal).
+        let accepted_again = store
+            .mark_outcome_proposal_accepted(p.id, Uuid::new_v4(), now)
+            .unwrap();
+        assert!(!accepted_again);
+
+        // Drops from active list.
+        assert!(store.list_active_outcome_proposals(now, 10).unwrap().is_empty());
+
+        // But still fetchable directly with linked outcome.
+        let got = store.get_outcome_proposal(p.id).unwrap().unwrap();
+        assert_eq!(got.status, "accepted");
+        assert_eq!(got.resolved_outcome_id, Some(outcome_id));
+        assert!(got.resolved_at.is_some());
+    }
+
+    #[test]
+    fn outcome_proposal_dismiss_marks_terminal() {
+        let store = fresh_store();
+        let c = Commitment::new(CommitmentKind::Intent, "draft the deck", Source::Manual);
+        store.insert_commitment(&c).unwrap();
+        let now = chrono::Utc::now();
+        let p = mk_proposal(c.id, Polarity::Better, now);
+        store.insert_outcome_proposal(&p).unwrap();
+
+        assert!(store.mark_outcome_proposal_dismissed(p.id, now).unwrap());
+        assert!(store.list_active_outcome_proposals(now, 10).unwrap().is_empty());
+
+        let got = store.get_outcome_proposal(p.id).unwrap().unwrap();
+        assert_eq!(got.status, "dismissed");
+        assert!(got.resolved_outcome_id.is_none());
+    }
+
+    #[test]
+    fn expire_outcome_proposals_flips_stale_pending() {
+        let store = fresh_store();
+        let c = Commitment::new(CommitmentKind::Intent, "review prs", Source::Manual);
+        store.insert_commitment(&c).unwrap();
+        let now = chrono::Utc::now();
+
+        // Manually craft a proposal with expires_at in the past.
+        let mut p = mk_proposal(c.id, Polarity::Better, now - chrono::Duration::days(60));
+        p.expires_at = now - chrono::Duration::days(30);
+        store.insert_outcome_proposal(&p).unwrap();
+
+        let flipped = store.expire_outcome_proposals(now).unwrap();
+        assert_eq!(flipped, 1);
+
+        let got = store.get_outcome_proposal(p.id).unwrap().unwrap();
+        assert_eq!(got.status, "expired");
+        assert!(got.resolved_at.is_some());
+
+        // Re-running is a no-op for already-flipped rows.
+        assert_eq!(store.expire_outcome_proposals(now).unwrap(), 0);
     }
 }

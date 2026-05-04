@@ -205,6 +205,13 @@ enum Commands {
         #[command(subcommand)]
         action: WorldAction,
     },
+    /// Persistent outcome proposals from the implicit text matcher
+    /// (`docs/INTENT_SYSTEM.md` §4.2). The brief surfaces active
+    /// proposals; this surface lets you accept / dismiss them.
+    Outcomes {
+        #[command(subcommand)]
+        action: OutcomesAction,
+    },
 }
 
 #[derive(clap::Subcommand)]
@@ -362,6 +369,34 @@ enum WorldAction {
         /// Emit the CalibrationReport as JSON.
         #[arg(long)]
         json: bool,
+    },
+}
+
+#[derive(clap::Subcommand)]
+enum OutcomesAction {
+    /// Show active (pending, unexpired) outcome proposals.
+    List {
+        #[arg(long, default_value = "20")]
+        limit: usize,
+        /// Render as JSON for agent / external consumption.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Accept a proposal — promotes it into a real `Outcome` row,
+    /// transitions the underlying commitment, and links the proposal
+    /// to the new outcome id.
+    Accept {
+        /// Proposal UUID from `outcomes list`.
+        proposal_id: String,
+        /// Optional free-text user note for the resulting Outcome.
+        #[arg(long)]
+        note: Option<String>,
+    },
+    /// Dismiss a proposal — marks it terminal so the brief stops
+    /// surfacing it. Does *not* touch the underlying commitment.
+    Dismiss {
+        /// Proposal UUID from `outcomes list`.
+        proposal_id: String,
     },
 }
 
@@ -527,14 +562,21 @@ fn main() {
                         }
 
                         // -- outcome matching --
+                        // TM-INTENT-009: persist polarity-hinted
+                        // proposals so `tracemind brief` can carry
+                        // them forward into the daily view, not just
+                        // print them once at ingest-time.
                         match store.list_open(50) {
                             Ok(opens) if !opens.is_empty() => {
                                 let cfg = tm_reflect::MatcherConfig::default();
                                 let proposals =
                                     tm_reflect::propose_outcomes(&text, &opens, &cfg);
                                 if !proposals.is_empty() {
+                                    let now = chrono::Utc::now();
+                                    let expiry = now + chrono::Duration::days(30);
+                                    let mut persisted = 0usize;
                                     println!(
-                                        "  + {} possible outcome match(es) — run `tracemind resolve <id>`:",
+                                        "  + {} possible outcome match(es) — run `tracemind outcomes list`:",
                                         proposals.len()
                                     );
                                     for p in &proposals {
@@ -553,6 +595,35 @@ fn main() {
                                             hint,
                                             truncate_str(&p.commitment_statement, 50),
                                         );
+                                        if let Some(polarity) = p.polarity_hint {
+                                            let record = tm_intent::OutcomeProposal {
+                                                id: uuid::Uuid::new_v4(),
+                                                commitment_id: p.commitment_id,
+                                                cell_key: tm_intent::OutcomeProposal::cell_key_for(
+                                                    p.commitment_id,
+                                                    polarity,
+                                                ),
+                                                proposed_polarity: polarity,
+                                                description: p.reason.clone(),
+                                                similarity: p.score,
+                                                source_trace_id: None,
+                                                proposed_at: now,
+                                                expires_at: expiry,
+                                                status: "pending".into(),
+                                                resolved_at: None,
+                                                resolved_outcome_id: None,
+                                            };
+                                            match store.insert_outcome_proposal(&record) {
+                                                Ok(true) => persisted += 1,
+                                                Ok(false) => {}
+                                                Err(e) => eprintln!(
+                                                    "      (persist proposal failed: {e})"
+                                                ),
+                                            }
+                                        }
+                                    }
+                                    if persisted > 0 {
+                                        println!("    ({} persisted into daily brief)", persisted);
                                     }
                                 }
                             }
@@ -905,6 +976,10 @@ fn main() {
             let intents_path = dir.join("intents.db").to_str().unwrap().to_string();
             let world_path = dir.join("world_model.json");
             cmd_world(&intents_path, &world_path, action);
+        }
+        Commands::Outcomes { action } => {
+            let intents_path = dir.join("intents.db").to_str().unwrap().to_string();
+            cmd_outcomes(&intents_path, action);
         }
     }
 }
@@ -1726,6 +1801,173 @@ fn cmd_commitments(intents_path: &str, limit: usize) {
 }
 
 // ---------------------------------------------------------------------------
+// `tracemind outcomes` — persistent outcome proposals from the implicit
+// text matcher (`docs/INTENT_SYSTEM.md` §4.2 + TM-INTENT-009). Lets the
+// user accept (promote into a real Outcome) or dismiss the proposals
+// the brief is surfacing.
+// ---------------------------------------------------------------------------
+
+fn cmd_outcomes(intents_path: &str, action: OutcomesAction) {
+    use tm_intent::{state::transition, IntentStore, Outcome, OutcomeSource, State};
+
+    let store = match IntentStore::open(intents_path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("failed to open intent store at {intents_path}: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    match action {
+        OutcomesAction::List { limit, json } => {
+            let now = chrono::Utc::now();
+            // Best-effort: flip stale rows to expired so the list
+            // matches reality even if no brief has run lately.
+            let _ = store.expire_outcome_proposals(now);
+
+            let rows = match store.list_active_outcome_proposals(now, limit) {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("query failed: {e}");
+                    std::process::exit(1);
+                }
+            };
+            if json {
+                let out: Vec<_> = rows
+                    .iter()
+                    .map(|p| {
+                        serde_json::json!({
+                            "id": p.id.to_string(),
+                            "commitment_id": p.commitment_id.to_string(),
+                            "proposed_polarity": format!("{:?}", p.proposed_polarity).to_lowercase(),
+                            "description": p.description,
+                            "similarity": p.similarity,
+                            "proposed_at": p.proposed_at.to_rfc3339(),
+                            "expires_at": p.expires_at.to_rfc3339(),
+                        })
+                    })
+                    .collect();
+                println!("{}", serde_json::to_string_pretty(&out).unwrap());
+                return;
+            }
+            if rows.is_empty() {
+                println!("(no active outcome proposals — clean slate)");
+                return;
+            }
+            println!(
+                "{} active outcome proposal(s) — `tracemind outcomes accept <id>` or `dismiss <id>`:",
+                rows.len()
+            );
+            for p in rows {
+                let pol = format!("{:?}", p.proposed_polarity).to_lowercase();
+                println!(
+                    "  {}  [{:<11}]  score={:.2}  → {}",
+                    short_id(p.id),
+                    pol,
+                    p.similarity,
+                    truncate_str(&p.description, 60),
+                );
+                println!(
+                    "      ↳ commitment {}  proposed_at={}",
+                    short_id(p.commitment_id),
+                    p.proposed_at.to_rfc3339()
+                );
+            }
+        }
+        OutcomesAction::Accept { proposal_id, note } => {
+            let pid = match Uuid::parse_str(&proposal_id) {
+                Ok(u) => u,
+                Err(e) => {
+                    eprintln!("invalid proposal id '{proposal_id}': {e}");
+                    std::process::exit(2);
+                }
+            };
+            let proposal = match store.get_outcome_proposal(pid) {
+                Ok(Some(p)) => p,
+                Ok(None) => {
+                    eprintln!("no proposal with id {pid}");
+                    std::process::exit(1);
+                }
+                Err(e) => {
+                    eprintln!("lookup failed: {e}");
+                    std::process::exit(1);
+                }
+            };
+            if proposal.status != "pending" {
+                eprintln!(
+                    "proposal {pid} is already {} (no-op)",
+                    proposal.status
+                );
+                std::process::exit(1);
+            }
+            let mut c = match store.get_commitment(proposal.commitment_id) {
+                Ok(Some(c)) => c,
+                Ok(None) => {
+                    eprintln!("commitment {} not found", proposal.commitment_id);
+                    std::process::exit(1);
+                }
+                Err(e) => {
+                    eprintln!("commitment lookup failed: {e}");
+                    std::process::exit(1);
+                }
+            };
+
+            let mut outcome = Outcome::new(
+                c.id,
+                proposal.proposed_polarity,
+                &proposal.description,
+                OutcomeSource::ImplicitMatched,
+            );
+            if let Some(n) = note {
+                outcome.user_note = Some(n);
+            }
+            if let Err(e) = transition(&mut c, State::Completed, Some(&outcome)) {
+                eprintln!("state transition rejected: {e}");
+                std::process::exit(1);
+            }
+            if let Err(e) = store.insert_outcome(&outcome) {
+                eprintln!("failed to persist outcome: {e}");
+                std::process::exit(1);
+            }
+            if let Err(e) = store.update_state(c.id, c.state, c.outcome_id) {
+                eprintln!("failed to update commitment state: {e}");
+                std::process::exit(1);
+            }
+            let now = chrono::Utc::now();
+            if let Err(e) = store.mark_outcome_proposal_accepted(pid, outcome.id, now) {
+                eprintln!(
+                    "warning: outcome was created but proposal mark-accept failed: {e}"
+                );
+            }
+            println!("proposal {pid} → accepted");
+            println!("  commitment {} → completed", c.id);
+            println!("  outcome    {}", outcome.id);
+        }
+        OutcomesAction::Dismiss { proposal_id } => {
+            let pid = match Uuid::parse_str(&proposal_id) {
+                Ok(u) => u,
+                Err(e) => {
+                    eprintln!("invalid proposal id '{proposal_id}': {e}");
+                    std::process::exit(2);
+                }
+            };
+            let now = chrono::Utc::now();
+            match store.mark_outcome_proposal_dismissed(pid, now) {
+                Ok(true) => println!("proposal {pid} → dismissed"),
+                Ok(false) => {
+                    eprintln!("proposal {pid} is not pending (already terminal or unknown)");
+                    std::process::exit(1);
+                }
+                Err(e) => {
+                    eprintln!("dismiss failed: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // `tracemind candidates` — mined commitment candidates awaiting review.
 // Mirrors the brief's confirm/dismiss surface for terminal users.
 // ---------------------------------------------------------------------------
@@ -2141,13 +2383,14 @@ fn print_brief_text(brief: &tm_reflect::DailyBrief) {
         local_now.format("%a %b %d, %-I:%M %p")
     );
     println!(
-        "  overdue: {}    open: {}    resolved: {}    candidates: {}    patterns: {}    insights: {}",
+        "  overdue: {}    open: {}    resolved: {}    candidates: {}    patterns: {}    insights: {}    proposals: {}",
         brief.counts.overdue,
         brief.counts.open,
         brief.counts.resolved,
         brief.counts.candidates,
         brief.counts.patterns,
         brief.counts.insights,
+        brief.counts.proposals,
     );
     println!();
 
@@ -2268,6 +2511,35 @@ fn print_brief_text(brief: &tm_reflect::DailyBrief) {
         println!();
     }
 
+    // Outcome proposals — TM-INTENT-009 / `INTENT_SYSTEM.md` §4.2.
+    // Persistent suggestions from the implicit text matcher: a fresh
+    // capture's text overlapped an open commitment, with a polarity
+    // hint. Surfaced here so "what happened with X?" lands days
+    // later when the user opens the brief, not only at the moment
+    // the capture happened.
+    if !brief.proposals.is_empty() {
+        println!("▸ what happened with… ({})", brief.proposals.len());
+        for p in &brief.proposals {
+            let pol = match p.proposed_polarity {
+                tm_intent::Polarity::Better => "better",
+                tm_intent::Polarity::AsExpected => "as-expected",
+                tm_intent::Polarity::Worse => "worse",
+                tm_intent::Polarity::Mixed => "mixed",
+                tm_intent::Polarity::NoOutcome => "no-outcome",
+            };
+            println!(
+                "    {}  [{:>11}]  score={:.2}  ↦ {}",
+                short_id(p.id),
+                pol,
+                p.similarity,
+                truncate_str(&p.commitment_statement, 56),
+            );
+            println!("        ↳ \"{}\"", truncate_str(&p.description, 70));
+        }
+        println!("    → `tracemind outcomes accept|dismiss <id>` to triage");
+        println!();
+    }
+
     // Patterns — `INTENT_SYSTEM.md` §5 / §9.1. Statistical, factual,
     // citation-friendly tone. The detector pre-renders the headline
     // template per §5.1.4; we just frame it. Each row includes the
@@ -2292,6 +2564,7 @@ fn print_brief_text(brief: &tm_reflect::DailyBrief) {
         && brief.counts.resolved == 0
         && brief.counts.candidates == 0
         && brief.counts.patterns == 0
+        && brief.counts.proposals == 0
     {
         println!("(empty — no commitments yet. try `tracemind commit` or capture some text.)");
     }

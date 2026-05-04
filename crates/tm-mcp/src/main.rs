@@ -325,6 +325,39 @@ fn tools_list() -> Value {
                         "all":        {"type": "boolean", "description": "Skip the out-of-sample filter and score every completed row, including rows the model trained on. Off by default.", "default": false}
                     }
                 }
+            },
+            {
+                "name": "memory_outcome_proposals",
+                "description": "List active (pending, unexpired) outcome proposals — persisted suggestions from the implicit text matcher (`docs/INTENT_SYSTEM.md` §4.2) that a fresh capture may have described what happened to an open commitment. The brief shows these too; this tool gives agents a programmatic surface. Returns proposal id, commitment id + statement snapshot, proposed_polarity, description, similarity, proposed_at, expires_at.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "limit": {"type": "integer", "description": "Cap on proposals returned (default 20).", "default": 20}
+                    }
+                }
+            },
+            {
+                "name": "memory_outcome_accept",
+                "description": "Accept an outcome proposal — promotes it into a real `Outcome` row, transitions the underlying commitment to Completed, and links the proposal to the new outcome id. Idempotent: a non-pending proposal returns an error rather than re-resolving.",
+                "inputSchema": {
+                    "type": "object",
+                    "required": ["proposal_id"],
+                    "properties": {
+                        "proposal_id": {"type": "string", "description": "Proposal UUID from memory_outcome_proposals."},
+                        "note":        {"type": "string", "description": "Optional free-text user note attached to the resulting Outcome."}
+                    }
+                }
+            },
+            {
+                "name": "memory_outcome_dismiss",
+                "description": "Dismiss an outcome proposal — marks it terminal so the brief stops surfacing it. Does not touch the underlying commitment.",
+                "inputSchema": {
+                    "type": "object",
+                    "required": ["proposal_id"],
+                    "properties": {
+                        "proposal_id": {"type": "string", "description": "Proposal UUID from memory_outcome_proposals."}
+                    }
+                }
             }
         ]
     })
@@ -450,14 +483,62 @@ async fn handle_memory_store(
                 // Sprint D / INTENT_SYSTEM.md §4.2 — implicit outcome
                 // matching. Score the new text against open
                 // commitments; surface proposals so the agent can
-                // choose to call `memory_resolve`.
+                // choose to call `memory_resolve`. Per TM-INTENT-009
+                // we *also persist* every polarity-hinted proposal
+                // into `outcome_proposals` so the daily brief can
+                // carry it forward — the inline JSON response is
+                // ephemeral, the persisted row is the source of
+                // truth for "what happened with X?"
                 let proposals = match store.list_open(50) {
                     Ok(opens) => {
                         let cfg = tm_reflect::MatcherConfig::default();
+                        let now = chrono::Utc::now();
+                        // 30d expiry mirrors `outcome_proposals.expires_at`
+                        // doc on the schema; matches the §4.2 "fade if
+                        // not acted on" rule.
+                        let expiry = now + chrono::Duration::days(30);
                         tm_reflect::propose_outcomes(text, &opens, &cfg)
                             .into_iter()
                             .map(|p| {
+                                // Persist if we have a polarity hint
+                                // (no hint = the user must label, so
+                                // there's no cell_key to dedup against
+                                // and no actionable proposal yet).
+                                let persisted_id = match p.polarity_hint {
+                                    Some(polarity) => {
+                                        let record = tm_intent::OutcomeProposal {
+                                            id: Uuid::new_v4(),
+                                            commitment_id: p.commitment_id,
+                                            cell_key: tm_intent::OutcomeProposal::cell_key_for(
+                                                p.commitment_id,
+                                                polarity,
+                                            ),
+                                            proposed_polarity: polarity,
+                                            description: p.reason.clone(),
+                                            similarity: p.score,
+                                            source_trace_id: None,
+                                            proposed_at: now,
+                                            expires_at: expiry,
+                                            status: "pending".into(),
+                                            resolved_at: None,
+                                            resolved_outcome_id: None,
+                                        };
+                                        let id = record.id;
+                                        match store.insert_outcome_proposal(&record) {
+                                            Ok(true) => Some(id.to_string()),
+                                            Ok(false) => None,
+                                            Err(e) => {
+                                                tracing::debug!(
+                                                    "[mcp/matcher] persist proposal failed: {e}"
+                                                );
+                                                None
+                                            }
+                                        }
+                                    }
+                                    None => None,
+                                };
                                 json!({
+                                    "id": persisted_id,
                                     "commitment_id": p.commitment_id.to_string(),
                                     "commitment_statement": p.commitment_statement,
                                     "score": p.score,
@@ -1598,6 +1679,169 @@ fn handle_memory_world_calibration(
     serde_json::to_value(&report).map_err(|e| format!("serialize CalibrationReport: {e}"))
 }
 
+/// `memory_outcome_proposals` — list active proposals for the agent
+/// surface. Mirrors `tracemind outcomes list --json` so the same
+/// rows show up in CLI + MCP. TM-INTENT-009.
+fn handle_memory_outcome_proposals(
+    params: &Value,
+    intents_path: &str,
+) -> Result<Value, String> {
+    use tm_intent::IntentStore;
+
+    let limit = params
+        .get("limit")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as usize)
+        .unwrap_or(20);
+
+    let store = IntentStore::open(intents_path)
+        .map_err(|e| format!("failed to open intent store: {e}"))?;
+    let now = chrono::Utc::now();
+    // Best-effort sweep so callers see fresh state without a brief.
+    let _ = store.expire_outcome_proposals(now);
+    let rows = store
+        .list_active_outcome_proposals(now, limit)
+        .map_err(|e| format!("list_active_outcome_proposals: {e}"))?;
+
+    let proposals: Vec<Value> = rows
+        .into_iter()
+        .map(|p| {
+            // Snapshot the open commitment statement so the MCP
+            // response is self-contained — agents shouldn't need a
+            // second call just to render the row.
+            let stmt = store
+                .get_commitment(p.commitment_id)
+                .ok()
+                .flatten()
+                .map(|c| c.statement)
+                .unwrap_or_default();
+            json!({
+                "id": p.id.to_string(),
+                "commitment_id": p.commitment_id.to_string(),
+                "commitment_statement": stmt,
+                "proposed_polarity": match p.proposed_polarity {
+                    tm_intent::Polarity::Better => "better",
+                    tm_intent::Polarity::AsExpected => "as_expected",
+                    tm_intent::Polarity::Worse => "worse",
+                    tm_intent::Polarity::Mixed => "mixed",
+                    tm_intent::Polarity::NoOutcome => "no_outcome",
+                },
+                "description": p.description,
+                "similarity": p.similarity,
+                "proposed_at": p.proposed_at.to_rfc3339(),
+                "expires_at": p.expires_at.to_rfc3339(),
+            })
+        })
+        .collect();
+
+    Ok(json!({ "proposals": proposals, "count": proposals.len() }))
+}
+
+/// `memory_outcome_accept` — promote a pending proposal into a real
+/// `Outcome` row, walk the commitment to Completed, link the new
+/// outcome id back onto the proposal. TM-INTENT-009.
+fn handle_memory_outcome_accept(params: &Value, intents_path: &str) -> Result<Value, String> {
+    use tm_intent::{state::transition, IntentStore, Outcome, OutcomeSource, State};
+
+    let pid_s = params
+        .get("proposal_id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "missing required parameter: proposal_id".to_string())?;
+    let pid = Uuid::parse_str(pid_s)
+        .map_err(|e| format!("invalid proposal_id '{pid_s}': {e}"))?;
+    let note = params
+        .get("note")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    let store = IntentStore::open(intents_path)
+        .map_err(|e| format!("failed to open intent store: {e}"))?;
+
+    let proposal = store
+        .get_outcome_proposal(pid)
+        .map_err(|e| format!("lookup failed: {e}"))?
+        .ok_or_else(|| format!("no proposal with id {pid}"))?;
+    if proposal.status != "pending" {
+        return Err(format!(
+            "proposal {pid} is already {} (no-op)",
+            proposal.status
+        ));
+    }
+
+    let mut commitment = store
+        .get_commitment(proposal.commitment_id)
+        .map_err(|e| format!("commitment lookup failed: {e}"))?
+        .ok_or_else(|| {
+            format!(
+                "commitment {} not found (proposal references a stale row)",
+                proposal.commitment_id
+            )
+        })?;
+
+    let mut outcome = Outcome::new(
+        commitment.id,
+        proposal.proposed_polarity,
+        &proposal.description,
+        OutcomeSource::ImplicitMatched,
+    );
+    if let Some(n) = note {
+        outcome.user_note = Some(n);
+    }
+    transition(&mut commitment, State::Completed, Some(&outcome))
+        .map_err(|e| format!("state transition rejected: {e}"))?;
+    store
+        .insert_outcome(&outcome)
+        .map_err(|e| format!("failed to persist outcome: {e}"))?;
+    store
+        .update_state(commitment.id, commitment.state, commitment.outcome_id)
+        .map_err(|e| format!("failed to update commitment state: {e}"))?;
+    let now = chrono::Utc::now();
+    if let Err(e) = store.mark_outcome_proposal_accepted(pid, outcome.id, now) {
+        // Outcome already landed; surface the bookkeeping error
+        // separately rather than rolling back, since the user-visible
+        // resolution stuck.
+        return Ok(json!({
+            "accepted": true,
+            "proposal_id": pid.to_string(),
+            "commitment_id": commitment.id.to_string(),
+            "outcome_id": outcome.id.to_string(),
+            "warning": format!("proposal mark-accept failed: {e}"),
+        }));
+    }
+    Ok(json!({
+        "accepted": true,
+        "proposal_id": pid.to_string(),
+        "commitment_id": commitment.id.to_string(),
+        "outcome_id": outcome.id.to_string(),
+    }))
+}
+
+/// `memory_outcome_dismiss` — mark a pending proposal terminal so
+/// the brief stops surfacing it. TM-INTENT-009.
+fn handle_memory_outcome_dismiss(params: &Value, intents_path: &str) -> Result<Value, String> {
+    use tm_intent::IntentStore;
+
+    let pid_s = params
+        .get("proposal_id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "missing required parameter: proposal_id".to_string())?;
+    let pid = Uuid::parse_str(pid_s)
+        .map_err(|e| format!("invalid proposal_id '{pid_s}': {e}"))?;
+
+    let store = IntentStore::open(intents_path)
+        .map_err(|e| format!("failed to open intent store: {e}"))?;
+    let now = chrono::Utc::now();
+    let dismissed = store
+        .mark_outcome_proposal_dismissed(pid, now)
+        .map_err(|e| format!("dismiss failed: {e}"))?;
+    if !dismissed {
+        return Err(format!(
+            "proposal {pid} is not pending (already terminal or unknown)"
+        ));
+    }
+    Ok(json!({ "dismissed": true, "proposal_id": pid.to_string() }))
+}
+
 // ---------------------------------------------------------------------------
 // Request dispatcher
 // ---------------------------------------------------------------------------
@@ -1712,6 +1956,18 @@ async fn handle_request(
                 }
                 "memory_world_calibration" => {
                     handle_memory_world_calibration(&args, intents_path)
+                        .map_err(|e| anyhow::anyhow!(e))?
+                }
+                "memory_outcome_proposals" => {
+                    handle_memory_outcome_proposals(&args, intents_path)
+                        .map_err(|e| anyhow::anyhow!(e))?
+                }
+                "memory_outcome_accept" => {
+                    handle_memory_outcome_accept(&args, intents_path)
+                        .map_err(|e| anyhow::anyhow!(e))?
+                }
+                "memory_outcome_dismiss" => {
+                    handle_memory_outcome_dismiss(&args, intents_path)
                         .map_err(|e| anyhow::anyhow!(e))?
                 }
                 unknown => {
@@ -2994,6 +3250,169 @@ mod tests {
             report["accuracy"]
         );
         assert!(report["trained_at"].is_string());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// TM-INTENT-009 — capture text that overlaps an open commitment
+    /// must persist a proposal that surfaces in `memory_outcome_proposals`.
+    #[tokio::test]
+    async fn memory_outcome_proposals_round_trips_via_capture() {
+        let dir = std::env::temp_dir().join(format!("tm_mcp_proposals_{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("memory.db").to_str().unwrap().to_string();
+        let trace_path = dir.join("traces.jsonl").to_str().unwrap().to_string();
+        let intents_path = dir.join("intents.db").to_str().unwrap().to_string();
+
+        let _ = GraphStore::open(&db_path).expect("graph open");
+        let ingest = Arc::new(Mutex::new(
+            IngestPipeline::open(&db_path, true).expect("ingest open"),
+        ));
+        let retrieval = Arc::new(Mutex::new(
+            RetrievalEngine::open(&db_path, &trace_path, true).expect("retrieval open"),
+        ));
+        let traces = Arc::new(Mutex::new(
+            TraceStore::open(&trace_path).expect("traces open"),
+        ));
+        let recent = Arc::new(Mutex::new(
+            RecentStore::open(&dir.join("recent.jsonl")).expect("recent open"),
+        ));
+        let session = Uuid::new_v4();
+
+        // Open a commitment via memory_commit so the matcher has a
+        // target. Statement crafted to share content tokens with the
+        // capture below.
+        let commit = handle_memory_commit(
+            &json!({"kind": "intent", "statement": "ship the locomo report by friday"}),
+            &intents_path,
+        )
+        .await
+        .expect("commit ok");
+        let cid = commit["commitment_id"].as_str().unwrap().to_string();
+
+        // Capture text that overlaps + carries a polarity phrase.
+        let store_resp = handle_memory_store(
+            &json!({"text": "shipped the locomo report this morning, sent to the team"}),
+            &ingest,
+            &retrieval,
+            &traces,
+            &recent,
+            session,
+            &intents_path,
+        )
+        .await
+        .expect("memory_store ok");
+
+        let inline = store_resp["outcome_proposals"]
+            .as_array()
+            .expect("outcome_proposals is an array");
+        assert!(!inline.is_empty(), "expected at least one proposal: {store_resp}");
+        // Inline proposal carries the persisted id when we had a polarity hint.
+        let inline_first = &inline[0];
+        assert_eq!(inline_first["polarity_hint"], json!("better"));
+        assert!(inline_first["id"].is_string(), "persisted proposal must include id");
+
+        // memory_outcome_proposals returns the same row.
+        let listed =
+            handle_memory_outcome_proposals(&json!({}), &intents_path).expect("list ok");
+        let proposals = listed["proposals"]
+            .as_array()
+            .expect("proposals array");
+        assert_eq!(proposals.len(), 1);
+        let row = &proposals[0];
+        assert_eq!(row["commitment_id"].as_str().unwrap(), cid);
+        assert_eq!(row["proposed_polarity"], json!("better"));
+
+        let pid = row["id"].as_str().unwrap().to_string();
+
+        // Accept it: outcome row created, proposal becomes terminal,
+        // commitment goes to Completed.
+        let accepted =
+            handle_memory_outcome_accept(&json!({"proposal_id": pid}), &intents_path)
+                .expect("accept ok");
+        assert_eq!(accepted["accepted"], json!(true));
+        assert!(accepted["outcome_id"].is_string());
+
+        // Active list is now empty.
+        let after =
+            handle_memory_outcome_proposals(&json!({}), &intents_path).expect("list ok");
+        assert_eq!(after["count"], json!(0));
+
+        // Re-accept on terminal proposal must error.
+        assert!(
+            handle_memory_outcome_accept(&json!({"proposal_id": pid}), &intents_path).is_err(),
+            "second accept on terminal proposal should error"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// TM-INTENT-009 — dismiss removes a proposal from the active
+    /// list without touching the underlying commitment.
+    #[tokio::test]
+    async fn memory_outcome_dismiss_marks_terminal_only() {
+        let dir = std::env::temp_dir().join(format!("tm_mcp_dismiss_{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("memory.db").to_str().unwrap().to_string();
+        let trace_path = dir.join("traces.jsonl").to_str().unwrap().to_string();
+        let intents_path = dir.join("intents.db").to_str().unwrap().to_string();
+
+        let _ = GraphStore::open(&db_path).expect("graph open");
+        let ingest = Arc::new(Mutex::new(
+            IngestPipeline::open(&db_path, true).expect("ingest open"),
+        ));
+        let retrieval = Arc::new(Mutex::new(
+            RetrievalEngine::open(&db_path, &trace_path, true).expect("retrieval open"),
+        ));
+        let traces = Arc::new(Mutex::new(
+            TraceStore::open(&trace_path).expect("traces open"),
+        ));
+        let recent = Arc::new(Mutex::new(
+            RecentStore::open(&dir.join("recent.jsonl")).expect("recent open"),
+        ));
+        let session = Uuid::new_v4();
+
+        let commit = handle_memory_commit(
+            &json!({"kind": "intent", "statement": "ship the locomo report this week"}),
+            &intents_path,
+        )
+        .await
+        .expect("commit ok");
+        let cid = commit["commitment_id"].as_str().unwrap().to_string();
+
+        let _ = handle_memory_store(
+            &json!({"text": "shipped the locomo report finally"}),
+            &ingest,
+            &retrieval,
+            &traces,
+            &recent,
+            session,
+            &intents_path,
+        )
+        .await
+        .expect("memory_store ok");
+
+        let listed =
+            handle_memory_outcome_proposals(&json!({}), &intents_path).expect("list ok");
+        let pid = listed["proposals"][0]["id"].as_str().unwrap().to_string();
+
+        let dismissed =
+            handle_memory_outcome_dismiss(&json!({"proposal_id": pid}), &intents_path)
+                .expect("dismiss ok");
+        assert_eq!(dismissed["dismissed"], json!(true));
+
+        // Active list now empty.
+        let after =
+            handle_memory_outcome_proposals(&json!({}), &intents_path).expect("list ok");
+        assert_eq!(after["count"], json!(0));
+
+        // Commitment should still be Open (dismiss doesn't resolve).
+        let store = tm_intent::IntentStore::open(&intents_path).expect("open intents");
+        let c = store
+            .get_commitment(Uuid::parse_str(&cid).unwrap())
+            .unwrap()
+            .unwrap();
+        assert!(matches!(c.state, tm_intent::State::Open));
 
         std::fs::remove_dir_all(&dir).ok();
     }

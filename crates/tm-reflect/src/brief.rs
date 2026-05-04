@@ -32,6 +32,10 @@ pub struct BriefConfig {
     pub limit_overdue: usize,
     pub limit_resolved: usize,
     pub limit_candidates: usize,
+    /// Cap on outcome proposals surfaced. Default 10 — small because
+    /// the brief is meant to show *attention-worthy* proposals, not a
+    /// flood. The full list lives in `tracemind outcomes list`.
+    pub limit_proposals: usize,
     /// Pattern-detector config. Defaults match `INTENT_SYSTEM.md`
     /// §5.1.3 (n ≥ 6, |lift| ≥ 0.25, etc.).
     pub patterns: PatternConfig,
@@ -58,6 +62,7 @@ impl Default for BriefConfig {
             limit_overdue: 20,
             limit_resolved: 10,
             limit_candidates: 10,
+            limit_proposals: 10,
             patterns: PatternConfig::default(),
             patterns_window: Duration::days(365),
             patterns_scan_limit: 2000,
@@ -161,6 +166,30 @@ pub struct CandidateBriefRow {
     pub created_at: DateTime<Utc>,
 }
 
+/// One persisted outcome proposal surfaced in the brief — the
+/// implicit text matcher saw a fresh capture that may have
+/// described what happened to an open commitment, and the user
+/// hasn't accepted/dismissed it yet. INTENT_SYSTEM.md §4.2 +
+/// TM-INTENT-009. The brief uses this to ask "what happened with
+/// X?" days after the capture moment.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct OutcomeProposalBriefRow {
+    /// Proposal UUID — pass to `tracemind outcomes accept|dismiss`.
+    pub id: Uuid,
+    pub commitment_id: Uuid,
+    /// Snapshot of the open commitment's statement so the brief
+    /// can render the row without a second store hit.
+    pub commitment_statement: String,
+    pub proposed_polarity: Polarity,
+    /// Short human description of *what fired the match* — usually
+    /// the first ~80 chars of the originating capture text.
+    pub description: String,
+    /// 0.0 .. 1.0 — token-Jaccard score from the matcher.
+    pub similarity: f32,
+    pub proposed_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+}
+
 /// One detected pattern row, surfaced in §9.1 of `INTENT_SYSTEM.md`.
 /// Carries the deterministic template render plus structured fields
 /// the calibration panel uses to score the pattern detector itself.
@@ -228,6 +257,12 @@ pub struct DailyBrief {
     /// §6.2 generalised to row-level "what's surprising".
     #[serde(default)]
     pub insights: Vec<InsightBriefRow>,
+    /// Persistent outcome proposals — the implicit text matcher
+    /// suspected a fresh capture closed an open commitment, and the
+    /// user hasn't acted yet. Newest first. Empty when nothing is
+    /// pending. TM-INTENT-009.
+    #[serde(default)]
+    pub proposals: Vec<OutcomeProposalBriefRow>,
     /// Section counts for quick rendering of section headers.
     pub counts: BriefCounts,
 }
@@ -241,6 +276,8 @@ pub struct BriefCounts {
     pub patterns: usize,
     #[serde(default)]
     pub insights: usize,
+    #[serde(default)]
+    pub proposals: usize,
 }
 
 pub struct BriefBuilder<'a> {
@@ -415,6 +452,44 @@ impl<'a> BriefBuilder<'a> {
             Vec::new()
         };
 
+        // Persisted outcome proposals (TM-INTENT-009 / §4.2). Best-
+        // effort flush of stale rows first so the brief's view stays
+        // accurate even when no nightly job runs. Soft-fail: if the
+        // proposals query errors we drop the section rather than
+        // block the rest of the brief.
+        let _ = self.store.expire_outcome_proposals(now);
+        let proposals: Vec<OutcomeProposalBriefRow> = match self
+            .store
+            .list_active_outcome_proposals(now, cfg.limit_proposals)
+        {
+            Ok(rows) => rows
+                .into_iter()
+                .filter_map(|p| {
+                    // Snapshot the commitment statement so the brief
+                    // row is self-contained. If the commitment was
+                    // deleted out from under us, drop the proposal —
+                    // can't render it usefully.
+                    let stmt = self
+                        .store
+                        .get_commitment(p.commitment_id)
+                        .ok()
+                        .flatten()
+                        .map(|c| c.statement)?;
+                    Some(OutcomeProposalBriefRow {
+                        id: p.id,
+                        commitment_id: p.commitment_id,
+                        commitment_statement: stmt,
+                        proposed_polarity: p.proposed_polarity,
+                        description: p.description,
+                        similarity: p.similarity,
+                        proposed_at: p.proposed_at,
+                        expires_at: p.expires_at,
+                    })
+                })
+                .collect(),
+            Err(_) => Vec::new(),
+        };
+
         let counts = BriefCounts {
             overdue: overdue.len(),
             open: open.len(),
@@ -422,6 +497,7 @@ impl<'a> BriefBuilder<'a> {
             candidates: candidates.len(),
             patterns: patterns.len(),
             insights: insights.len(),
+            proposals: proposals.len(),
         };
 
         Ok(DailyBrief {
@@ -432,6 +508,7 @@ impl<'a> BriefBuilder<'a> {
             candidates,
             patterns,
             insights,
+            proposals,
             counts,
         })
     }
