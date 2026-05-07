@@ -931,8 +931,8 @@ If approved:
 3. Add the implicit miner stub to `tm-capture` (regex pass + brief
    surfacing of candidates).
 4. Stub `tm-reflect` with the daily-brief generator + horizon prompts.
-5. Update `ROADMAP.md` to the seven-sprint shape, with this doc as
-   the canonical wedge spec.
+5. Treat this doc (§10) as the canonical roadmap for the seven-sprint
+   shape; older roadmap files have been retired.
 
 Sprint A is a precondition for everything in B onward. The order
 matters; B's value depends on Tier-1 prose answers from A.

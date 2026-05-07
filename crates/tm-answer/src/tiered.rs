@@ -1,6 +1,6 @@
 //! [`TieredAnswerer`] — dispatches requests to the best available tier.
 //!
-//! Selection policy (see `docs/PHASE3.md §1`):
+//! Selection policy:
 //! 1. If `req.preferred_tier` is set and that backend is `Ready`, use it.
 //! 2. If task is structured ([`TaskKind::is_structured`]) and Tier 1 is
 //!    `Ready`, prefer Tier 1 (cheaper than FM, equally accurate for

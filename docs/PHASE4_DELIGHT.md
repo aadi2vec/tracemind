@@ -3,7 +3,7 @@
 **Status**: ✅ **APPROVED & ACTIVE 2026-04-27** — canonical sprint plan now lives in `docs/INTENT_SYSTEM.md` §10 (seven sprints A–G).
 **Date**: 2026-04-26 (delight reset) → 2026-04-27 (system-of-intents wedge confirmed)
 **Author**: working session with Aaditya
-**Predecessor**: `docs/PHASE3.md` (tiered answers — completed)
+**Predecessor**: Phase 3 — tiered answers (completed; predecessor doc retired)
 **Companion**: `docs/INTENT_SYSTEM.md` (the wedge spec — read this first)
 **Successor**: TBD
 
@@ -382,7 +382,149 @@ the intent substrate, not as the substrate itself.
    *nothing public*. Phase 3 was infra. Phase 4 is the product.
    Don't launch a 25-F1 CLI to Hacker News. Wait.
 
-## 9. Closing
+## 9. Cognition improvement roadmap (added 2026-05-06)
+
+Investor-grade question: *"how do you improve cognition?"* This section is
+the answer. The brain (`docs/BRAIN_ARCHITECTURE.md` §1.2) lists ten
+cognitive operations spread across `tm-controller`, `tm-retrieval`,
+`tm-reason`, and `tm-reflect`. They all exist. They are all weaker than
+they should be. This section is the ordered list of moves that actually
+shift end-to-end quality, ranked by impact / effort.
+
+### 9.1 Tier 1 — biggest unlocks (do these first)
+
+**1. Ship Tier-1 synthesis (`tm-answer` Tier 1, Qwen 2.5 1.5B Q4)**
+Today every "answer" is templated extractive. The bandit, chains, and
+analogies retrieve good evidence and a stubby Tier-0 stitcher makes it
+look basic. Drop in a real LLM and *every* downstream cognition op
+looks 3× smarter for free. ~900 MB cost, llama.cpp shim already
+scaffolded in `tm-answer`.
+- *Effort:* small (wire weights + prompt templates)
+- *Impact:* massive — this is the single biggest lever in the codebase
+- *Owner:* part of Sprint absorbed by §6′ (Tier-1 default-on)
+
+**2. Real reward signal into the bandit**
+`LinUcbBandit::register_reward` is fed weak proxies (recency, hit
+count). Add an explicit "was this useful?" — a single keypress in the
+brief, or capture-whether-the-user-kept-reading-vs-bounced. The bandit
+is starving; feed it.
+- *Effort:* small UI + plumbing
+- *Impact:* compounds over weeks of usage
+
+**3. Query rewriting before recall**
+Today the user's raw question hits BGE directly. A Tier-1 step that
+expands the question into 3 paraphrased queries, runs all three, fuses
+with RRA — that's where LoCoMo F1 jumps. Multi-query retrieval, ColEval
+style.
+- *Effort:* small (50-line prompt template + parallel retrieval)
+- *Impact:* ~5–8 F1 points on multi-hop
+
+### 9.2 Tier 2 — structural fixes
+
+**4. Surprisal-gated ingestion**
+`tm-reflect` already computes a surprisal score. It is not gating
+writes. Use it: skip low-info ingests entirely (or downweight). Fewer
+haystack needles, sharper recall, smaller index.
+- *Effort:* medium
+- *Impact:* better signal-to-noise across every later cognition op
+
+**5. Reasoning chains with beam search, not greedy**
+`ChainBuilder` is roughly greedy 1-best at each hop. Beam-3 with a
+learned hop-quality scorer (Tier-1 LLM as judge, distilled later)
+catches multi-hop questions where the obvious next hop is wrong.
+- *Effort:* medium
+- *Impact:* targeted to multi-hop category — biggest LoCoMo gap today
+
+**6. Calibration via Platt scaling on world model**
+Logistic regression in `tm-world-model` outputs raw probabilities.
+They are not calibrated. Platt scaling (or isotonic on more data)
+makes "67%" actually mean 67%. Investors and users punish
+miscalibration harder than they punish low confidence.
+- *Effort:* tiny
+- *Impact:* directly improves the trust-loop story Act 4 of the demo tells
+
+### 9.3 Tier 3 — moat work, longer horizon
+
+**7. Replace WL-kernel association with learned graph embeddings**
+`tm-reason::AnalogySolver` uses Weisfeiler-Lehman — fast, but blind to
+semantics. A small GNN (GraphSAGE-tier, ~5 MB) trained on the user's
+own graph gives "this commitment-pattern reminds me of that one" with
+actual semantic teeth.
+- *Effort:* large
+- *Impact:* this is what makes "the brain noticed something you'd miss" possible
+
+**8. Consolidation as community detection, not just decay**
+`tm-reason::Consolidator` does decay + pairwise merge. Real
+consolidation = run Louvain/Leiden on the entity graph nightly, name
+the communities (Tier-1 LLM does this in 100 ms), demote the noisy
+ones. This is sleep-driven memory consolidation in the brain analogy.
+- *Effort:* medium
+- *Impact:* long-tail; quality compounds over months
+
+**9. Pattern detector → learned interactions**
+`tm-reflect::PatternDetector` is `(kind × stakes × tags)` cells with
+frequencies. A small interaction model (factorization machine or
+shallow MLP) catches cross-cell patterns the cell decomposition
+misses. World model already has the feature pipeline; share it.
+- *Effort:* medium
+- *Impact:* better L2/L3 anticipations → better daily brief
+
+**10. Working memory ring (Sprint B, currently planned)**
+A real `tm-types::WorkingMemory` ring buffer of the last N turns +
+last N retrievals, fed back into the next query as context. Today
+every query starts cold. Brain doesn't.
+- *Effort:* small
+- *Impact:* makes follow-up questions ("and what about X?") actually work
+
+### 9.4 The one to pick if you only get one
+
+**Tier-1 synthesis (#1).** Everything else is multipliers on a base.
+Without Tier 1 the base is templates. With Tier 1, every other op above
+pays out 2–3× harder because the user actually *sees* the cognition
+instead of inferring it from a triple list.
+
+### 9.5 Why this list, not others
+
+What's *not* on this list, deliberately:
+
+- **Bigger embedder (BGE-large, 1.3 GB).** Marginal F1 gain, blows the
+  laptop footprint budget. Stay on BGE-small until we have evidence the
+  embedder is the bottleneck (it isn't — synthesis is).
+- **Fine-tuning the GLiNER NER on TraceMind-specific entities.** Nice
+  to have, doesn't move LoCoMo F1, costs labelling effort.
+- **Rewriting the bandit as a deep-RL policy.** LinUCB works fine. The
+  reward signal is the bottleneck (#2), not the policy class.
+- **More LoCoMo categories.** The 5 we have are enough to detect
+  regressions. Spending engineering effort on harness expansion before
+  we move the F1 number is order-of-operations wrong.
+
+### 9.6 How this composes with §6′ sprints
+
+The §6′ sprint plan (Sprints A–G in `INTENT_SYSTEM.md` §10) covers
+*surfaces* — daily brief, intent system, world model, calibration.
+This §9 list covers *cognition* — what makes those surfaces feel
+intelligent. The mapping:
+
+| §9 item | §6′ sprint that absorbs it       | Notes                                       |
+|----------|----------------------------------|---------------------------------------------|
+| #1 Tier 1 | Sprint that defaults Tier 1 on  | Already on the canonical plan               |
+| #2 reward | Sprint with brief UX            | Fold "was this useful?" into the brief      |
+| #3 query rewrite | New — slot into Sprint after Tier 1 | Tier-1 dependency |
+| #4 surprisal gate | Tier 3 dreaming sprint     | Already partially scoped under `tm-reflect` |
+| #5 beam search | New — post-canonical            | Multi-hop quality push                      |
+| #6 Platt | Tier 1 sprint                    | Tiny lift, ship with calibration view       |
+| #7 GNN  | Post-Phase 4                      | Moat work, not delight work                 |
+| #8 Louvain | Tier 3 dreaming sprint        | Same crate as #4                            |
+| #9 FM/MLP | Pattern-detector sprint        | After we have more `Completed` priors       |
+| #10 working mem | Sprint B (already planned) | Already on canonical plan                   |
+
+Items #1, #2, #6, #10 land inside the seven-sprint plan as-is.
+Items #3, #5, #7, #8, #9 are net-new and should be added to the
+post-Sprint-G backlog with the impact estimates above.
+
+---
+
+## 10. Closing
 
 The repo is good. The roadmap was incomplete. We were building a
 research artifact and forgot to build a product around it. The fix

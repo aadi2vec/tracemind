@@ -21,7 +21,7 @@
 //! - mmap'd via llama.cpp; the OS pages out clean pages under memory pressure
 //! - ~1.2 GB active RAM with KV cache, ~700 MB idle (mmap only after unload)
 //!
-//! See `docs/PHASE3.md §2` for the full strategy.
+//! See `docs/PHASE4_DELIGHT.md §9.1` for the current strategy.
 
 use async_trait::async_trait;
 use std::path::PathBuf;

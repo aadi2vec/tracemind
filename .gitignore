@@ -17,3 +17,9 @@ crates/tm-tauri/ui/bun.lock
 
 # Tauri build
 crates/tm-tauri/gen/
+
+# Demo recordings (large MOV files; regenerate via demo/record-clean.sh)
+demo/recordings/
+
+# Local Claude Code state (per-user, not for the repo)
+.claude/

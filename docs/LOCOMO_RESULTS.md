@@ -225,10 +225,10 @@ cargo build -p tm-bench-locomo --features tracemind --release
   --tolerance 0.5
 ```
 
-## 8. Where this fits in PHASE 3
+## 8. Where this fits in the roadmap
 
-This run is the second milestone for the
-`docs/PHASE3.md §10` quality gate. v0.1 set the floor (12.78); v0.2
+This run is the second milestone for the LoCoMo quality gate (now
+tracked in `docs/PHASE4_DELIGHT.md`). v0.1 set the floor (12.78); v0.2
 shows the floor was synthesis, not retrieval. The ≥85 F1 north-star
 remains gated on Tier-1 (TM-5.2-002), but the next intermediate gate
 should be **45 F1 on the mini fixture, Tier-0 only**, achievable from

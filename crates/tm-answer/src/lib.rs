@@ -9,7 +9,7 @@
 //! | 2    | [`AppleFmBackend`]    | 0 MB on macOS 26 AS | Open-ended synthesis, long-context answers |
 //!
 //! [`TieredAnswerer`] composes all three and dispatches by task kind + availability.
-//! See `docs/PHASE3.md` for the full strategy.
+//! See `docs/PHASE4_DELIGHT.md` for the current strategy (Phase 3 completed; superseded).
 
 pub mod backend;
 pub mod extractive;

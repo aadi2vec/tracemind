@@ -355,4 +355,4 @@ target/release/tracemind-capture  2.8 MB
 
 ---
 
-*For agent handoff context, see [CONTEXT.md](CONTEXT.md).*
+*For agent handoff context, see [CLAUDE.md](CLAUDE.md) and the canonical roadmap in [docs/PHASE4_DELIGHT.md](docs/PHASE4_DELIGHT.md).*

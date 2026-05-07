@@ -4,7 +4,7 @@
 **Date**: 2026-04-27 (updated)
 **Predecessor**: `docs/PHASE4_DELIGHT.md`
 **Companion (canonical wedge spec)**: `docs/INTENT_SYSTEM.md`
-**Replaces (in spirit)**: the size-capped, F1-chasing parts of `ROADMAP.md`
+**Replaces (in spirit)**: the size-capped, F1-chasing roadmap that preceded the brain-shaped pivot
 
 > **Wedge update 2026-04-27:** TraceMind is a **system of intents** —
 > it captures what you commit to, the context you had when you

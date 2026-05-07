@@ -21,7 +21,7 @@
 //! - [`report`] — per-category breakdown + overall score + JSON serialization
 //!
 //! The CLI binary wires it all together and is CI-gated: any PR that drops
-//! LoCoMo >0.5 points fails to merge. See `docs/PHASE3.md §7`.
+//! LoCoMo >0.5 points fails to merge. See `docs/LOCOMO_RESULTS.md`.
 
 pub mod dataset;
 pub mod report;
