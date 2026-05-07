@@ -33,7 +33,8 @@ pub mod types;
 pub use calibration::{evaluate, split_out_of_sample, CalibrationReport, PerClass};
 pub use features::{extract, feature_dim, normalize_tag, TagVocab, FIXED_FEATURES};
 pub use predictor::{
-    explain_top_k, softmax, FeatureContribution, OutcomeModel, N_CLASSES, SCHEMA_VERSION,
+    explain_top_k, softmax, Architecture, FeatureContribution, OutcomeModel, DEFAULT_MLP_HIDDEN,
+    N_CLASSES, SCHEMA_VERSION,
 };
 pub use store::{default_path, load, save, StoreError, DEFAULT_FILENAME};
 pub use trainer::{from_pairs, train, Example, TrainReport, TrainerConfig};
