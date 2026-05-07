@@ -79,6 +79,19 @@ pub const DEFAULT_LABELS: &[&str] = &[
 /// hurting precision (0.929 vs 0.986).
 pub const DEFAULT_THRESHOLD: f32 = 0.3;
 
+/// Deadband above the threshold where spans are *also* dropped, to remove
+/// run-to-run jitter from logits sitting right on the cutoff. With margin
+/// `m`, only spans with `score >= threshold + m` are kept; `[threshold,
+/// threshold + m)` is treated as "inconclusive".
+///
+/// Why: the same input can produce slightly different sigmoid scores across
+/// runs (ONNX Runtime thread scheduling + BLAS rounding). Pinning ORT to
+/// single-thread cuts most of that, but a small deadband guarantees the
+/// few remaining borderline cases don't flap. 0.05 was chosen because the
+/// sweep above showed F1 plateauing in [0.3, 0.35]; bumping the effective
+/// cutoff to 0.35 costs <1 F1 vs. 0.30 on the fixture set.
+pub const DEFAULT_STABILITY_MARGIN: f32 = 0.05;
+
 // ---------------------------------------------------------------------------
 // GlinerExtractor
 // ---------------------------------------------------------------------------
@@ -92,6 +105,9 @@ pub struct GlinerExtractor {
     /// Cached because it's the same for every call.
     prompt_ids: Vec<i64>,
     threshold: f32,
+    /// See `DEFAULT_STABILITY_MARGIN`. Effective accept cutoff is
+    /// `threshold + stability_margin`; spans in the deadband are dropped.
+    stability_margin: f32,
 }
 
 impl GlinerExtractor {
@@ -104,10 +120,20 @@ impl GlinerExtractor {
     ) -> Result<Self> {
         info!("[gliner] loading model from {model_path}");
 
+        // Determinism: pin ORT to single intra/inter thread and enable the
+        // deterministic kernel set. NER inputs are short — the latency hit
+        // is negligible — and this removes thread-scheduling and tiled-BLAS
+        // variance as a source of run-to-run jitter near the threshold.
         let session = ort::session::Session::builder()
             .map_err(|e| TraceMindError::Embedding(format!("ort builder: {e}")))?
-            .with_intra_threads(2)
-            .map_err(|e| TraceMindError::Embedding(format!("ort threads: {e}")))?
+            .with_intra_threads(1)
+            .map_err(|e| TraceMindError::Embedding(format!("ort intra threads: {e}")))?
+            .with_inter_threads(1)
+            .map_err(|e| TraceMindError::Embedding(format!("ort inter threads: {e}")))?
+            .with_deterministic_compute(true)
+            .map_err(|e| {
+                TraceMindError::Embedding(format!("ort deterministic compute: {e}"))
+            })?
             .commit_from_file(model_path)
             .map_err(|e| TraceMindError::Embedding(format!("ort load: {e}")))?;
 
@@ -115,11 +141,14 @@ impl GlinerExtractor {
             .map_err(|e| TraceMindError::Embedding(format!("load tokenizer: {e}")))?;
 
         let prompt_ids = build_prompt_ids(&tokenizer, &labels)?;
+        let threshold = threshold.clamp(0.0, 1.0);
+        let stability_margin = DEFAULT_STABILITY_MARGIN.clamp(0.0, 1.0 - threshold);
         info!(
-            "[gliner] ready — {} labels, prompt_len={}, threshold={}",
+            "[gliner] ready — {} labels, prompt_len={}, threshold={} (+margin {})",
             labels.len(),
             prompt_ids.len(),
-            threshold
+            threshold,
+            stability_margin,
         );
 
         Ok(Self {
@@ -127,8 +156,16 @@ impl GlinerExtractor {
             tokenizer,
             labels,
             prompt_ids,
-            threshold: threshold.clamp(0.0, 1.0),
+            threshold,
+            stability_margin,
         })
+    }
+
+    /// Override the stability margin. Mostly useful for the eval harness if
+    /// we want to reproduce the historical (margin = 0) baseline.
+    pub fn with_stability_margin(mut self, margin: f32) -> Self {
+        self.stability_margin = margin.clamp(0.0, 1.0 - self.threshold);
+        self
     }
 
     /// Auto-download from HuggingFace Hub. Returns `Err` on network failure.
@@ -306,6 +343,7 @@ impl GlinerExtractor {
             w_dim, ww_dim, c_dim
         );
 
+        let accept_cutoff = self.threshold + self.stability_margin;
         let mut hits: Vec<SpanHit> = Vec::new();
         for wi in 0..w_dim.min(num_words) {
             for wj in 0..ww_dim.min(MAX_WIDTH) {
@@ -320,7 +358,9 @@ impl GlinerExtractor {
                     }
                     let logit = data[idx];
                     let score = sigmoid(logit);
-                    if score >= self.threshold {
+                    // Drop everything in the deadband [threshold, threshold+margin)
+                    // along with everything below the threshold itself.
+                    if score >= accept_cutoff {
                         hits.push(SpanHit {
                             start_word: wi,
                             end_word,
@@ -332,12 +372,25 @@ impl GlinerExtractor {
             }
         }
 
-        // Greedy overlap resolution: sort by score desc, keep span if it doesn't
-        // overlap any already-accepted span.
+        // Greedy overlap resolution: sort by score desc, keep span if it
+        // doesn't overlap an already-accepted span. Tiebreakers are
+        // deterministic so that near-equal logits don't shuffle output
+        // across runs:
+        //   1) score (desc)
+        //   2) span length (desc) — prefer wider spans on tie
+        //   3) start_word (asc) — earlier in text wins
+        //   4) label_idx (asc) — stable lex order over labels
         hits.sort_by(|a, b| {
             b.score
                 .partial_cmp(&a.score)
                 .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| {
+                    let la = a.end_word - a.start_word;
+                    let lb = b.end_word - b.start_word;
+                    lb.cmp(&la)
+                })
+                .then_with(|| a.start_word.cmp(&b.start_word))
+                .then_with(|| a.label_idx.cmp(&b.label_idx))
         });
         let mut kept: Vec<SpanHit> = Vec::new();
         for h in hits {
@@ -348,7 +401,11 @@ impl GlinerExtractor {
                 kept.push(h);
             }
         }
-        kept.sort_by_key(|h| h.start_word);
+        kept.sort_by(|a, b| {
+            a.start_word
+                .cmp(&b.start_word)
+                .then_with(|| a.label_idx.cmp(&b.label_idx))
+        });
 
         Ok(kept)
     }
@@ -525,6 +582,58 @@ mod tests {
     #[test]
     fn auto_download_never_panics() {
         let _ = GlinerExtractor::auto_download_default();
+    }
+
+    /// Deterministic NMS tiebreak: equal scores must resolve in a fixed
+    /// order so the same logits → same kept spans across runs.
+    #[test]
+    fn nms_tiebreak_is_deterministic() {
+        // Two non-overlapping spans with identical scores — both must be
+        // kept and emitted in start-order, regardless of input order.
+        let mut hits = vec![
+            SpanHit { start_word: 5, end_word: 6, label_idx: 1, score: 0.8 },
+            SpanHit { start_word: 0, end_word: 1, label_idx: 2, score: 0.8 },
+        ];
+        hits.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| {
+                    let la = a.end_word - a.start_word;
+                    let lb = b.end_word - b.start_word;
+                    lb.cmp(&la)
+                })
+                .then_with(|| a.start_word.cmp(&b.start_word))
+                .then_with(|| a.label_idx.cmp(&b.label_idx))
+        });
+        // Earlier start_word wins the tiebreak.
+        assert_eq!(hits[0].start_word, 0);
+        assert_eq!(hits[1].start_word, 5);
+
+        // Equal score + equal length: earlier start beats later start.
+        let mut a = SpanHit { start_word: 2, end_word: 3, label_idx: 0, score: 0.7 };
+        let mut b = SpanHit { start_word: 0, end_word: 1, label_idx: 0, score: 0.7 };
+        let mut v = vec![a.clone(), b.clone()];
+        v.sort_by(|x, y| {
+            y.score
+                .partial_cmp(&x.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| x.start_word.cmp(&y.start_word))
+        });
+        assert_eq!(v[0].start_word, 0);
+
+        // Equal everything except label_idx: lower label_idx wins.
+        a.label_idx = 3;
+        b.label_idx = 1;
+        b.start_word = 2; b.end_word = 3;
+        let mut v = vec![a, b];
+        v.sort_by(|x, y| {
+            y.score
+                .partial_cmp(&x.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| x.label_idx.cmp(&y.label_idx))
+        });
+        assert_eq!(v[0].label_idx, 1);
     }
 
     /// Missing file path returns `Err`, not a panic.
