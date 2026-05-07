@@ -302,6 +302,20 @@ enum WorldAction {
         /// Cap on rows fetched from the intent store.
         #[arg(long, default_value = "5000")]
         limit: usize,
+        /// Architecture: `linear` (default) or `mlp` / `mlp:N` for a
+        /// 1-hidden-layer ReLU MLP with hidden width N (default 8).
+        #[arg(long, default_value = "linear")]
+        arch: String,
+        /// Fraction held out for validation. `0.0` disables the split.
+        #[arg(long, default_value = "0.2")]
+        validation_split: f32,
+        /// Stop early after this many epochs without val-loss
+        /// improvement. `0` disables early stopping.
+        #[arg(long, default_value = "25")]
+        patience: usize,
+        /// Seed for the deterministic train/val shuffle.
+        #[arg(long, default_value = "661466")]
+        seed: u64,
         /// Emit the TrainReport as JSON.
         #[arg(long)]
         json: bool,
@@ -2639,7 +2653,8 @@ fn print_outlook_line(outlook: Option<&tm_reflect::CommitmentOutlook>) {
 fn cmd_world(intents_path: &str, world_path: &std::path::Path, action: WorldAction) {
     use tm_intent::IntentStore;
     use tm_world_model::{
-        explain_top_k, from_pairs, load, save, train, OutcomeModel, TrainerConfig,
+        explain_top_k, from_pairs, load, save, train, Architecture, OutcomeModel, TrainerConfig,
+        DEFAULT_MLP_HIDDEN,
     };
 
     match action {
@@ -2651,6 +2666,10 @@ fn cmd_world(intents_path: &str, world_path: &std::path::Path, action: WorldActi
             vocab,
             min_examples,
             limit,
+            arch,
+            validation_split,
+            patience,
+            seed,
             json,
         } => {
             let store = match IntentStore::open(intents_path) {
@@ -2671,15 +2690,53 @@ fn cmd_world(intents_path: &str, world_path: &std::path::Path, action: WorldActi
             let total_completed = rows.len();
             let (examples, skipped) = from_pairs(rows);
 
+            let architecture = match parse_arch(&arch) {
+                Ok(a) => a,
+                Err(msg) => {
+                    eprintln!("invalid --arch: {msg}");
+                    std::process::exit(2);
+                }
+            };
+            if !(0.0..1.0).contains(&validation_split) {
+                eprintln!("--validation-split must be in [0.0, 1.0), got {validation_split}");
+                std::process::exit(2);
+            }
+
             let cfg = TrainerConfig {
                 epochs,
                 lr,
                 l2,
                 tag_vocab_size: vocab,
                 min_examples,
+                architecture,
+                validation_split,
+                early_stop_patience: patience,
+                seed,
             };
             let (model, mut report) = train(&examples, &cfg);
             report.skipped_no_outcome = skipped;
+
+            fn parse_arch(s: &str) -> Result<Architecture, String> {
+                let trimmed = s.trim().to_lowercase();
+                if trimmed == "linear" {
+                    return Ok(Architecture::Linear);
+                }
+                if trimmed == "mlp" {
+                    return Ok(Architecture::Mlp { hidden_dim: DEFAULT_MLP_HIDDEN });
+                }
+                if let Some(rest) = trimmed.strip_prefix("mlp:") {
+                    let h: usize = rest.parse().map_err(|_| {
+                        format!("could not parse hidden width from `mlp:{rest}`")
+                    })?;
+                    if h == 0 {
+                        return Err("mlp hidden width must be > 0".into());
+                    }
+                    return Ok(Architecture::Mlp { hidden_dim: h });
+                }
+                Err(format!(
+                    "{s} (expected `linear`, `mlp`, or `mlp:N` for hidden width N)"
+                ))
+            }
 
             if let Err(e) = save(&model, world_path) {
                 eprintln!("failed to persist world model to {}: {e}", world_path.display());
@@ -2698,20 +2755,31 @@ fn cmd_world(intents_path: &str, world_path: &std::path::Path, action: WorldActi
             }
 
             println!("world model trained → {}", world_path.display());
+            println!("  architecture   : {}", report.architecture);
             println!(
                 "  examples       : {} (from {} completed; {} skipped no-outcome)",
                 report.n_examples, total_completed, report.skipped_no_outcome
             );
+            if report.n_validation > 0 {
+                println!("  held out       : {}", report.n_validation);
+            }
             println!("  classes seen   : {}/4", report.n_classes_seen);
             println!("  feature dim    : {} ({} fixed + {} tags)",
                 report.feature_dim,
                 tm_world_model::FIXED_FEATURES,
                 report.vocab_size,
             );
-            println!("  epochs run     : {}", report.epochs_run);
+            println!("  epochs run     : {}{}",
+                report.epochs_run,
+                if report.early_stopped { " (early stopped)" } else { "" },
+            );
             if report.epochs_run > 0 {
                 println!("  final loss     : {:.4}", report.final_loss);
                 println!("  final accuracy : {:.1}%", report.final_accuracy * 100.0);
+                if let (Some(vl), Some(va)) = (report.val_loss, report.val_accuracy) {
+                    println!("  val loss       : {:.4}", vl);
+                    println!("  val accuracy   : {:.1}%", va * 100.0);
+                }
             } else {
                 println!(
                     "  (dormant — need ≥{} usable examples; have {}.)",
@@ -2975,6 +3043,8 @@ fn cmd_world(intents_path: &str, world_path: &std::path::Path, action: WorldActi
                     path: String,
                     present: bool,
                     schema_version: Option<u32>,
+                    architecture: Option<String>,
+                    hidden_dim: Option<usize>,
                     n_train_examples: Option<usize>,
                     trained_at: Option<String>,
                     feature_dim: Option<usize>,
@@ -2985,6 +3055,11 @@ fn cmd_world(intents_path: &str, world_path: &std::path::Path, action: WorldActi
                         path: world_path.display().to_string(),
                         present: true,
                         schema_version: Some(m.schema_version),
+                        architecture: Some(m.architecture.label()),
+                        hidden_dim: match m.architecture {
+                            Architecture::Linear => None,
+                            Architecture::Mlp { hidden_dim } => Some(hidden_dim),
+                        },
                         n_train_examples: Some(m.n_train_examples),
                         trained_at: m.trained_at.clone(),
                         feature_dim: Some(m.feature_dim()),
@@ -2994,6 +3069,8 @@ fn cmd_world(intents_path: &str, world_path: &std::path::Path, action: WorldActi
                         path: world_path.display().to_string(),
                         present: false,
                         schema_version: None,
+                        architecture: None,
+                        hidden_dim: None,
                         n_train_examples: None,
                         trained_at: None,
                         feature_dim: None,
@@ -3020,6 +3097,7 @@ fn cmd_world(intents_path: &str, world_path: &std::path::Path, action: WorldActi
                     println!("world model:");
                     println!("  path           : {}", world_path.display());
                     println!("  schema version : v{}", m.schema_version);
+                    println!("  architecture   : {}", m.architecture.label());
                     println!("  trained        : {}", m.is_trained());
                     println!("  n_train        : {}", m.n_train_examples);
                     println!(

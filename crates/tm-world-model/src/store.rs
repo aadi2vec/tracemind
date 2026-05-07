@@ -91,18 +91,41 @@ mod tests {
     use crate::features::TagVocab;
 
     #[test]
+    fn save_load_round_trip_mlp() {
+        use crate::predictor::Architecture;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wm_mlp.json");
+
+        let mut model = OutcomeModel::fresh_with(
+            TagVocab::default(),
+            Architecture::Mlp { hidden_dim: 6 },
+        );
+        model.n_train_examples = 3;
+        model.b1[2] = 0.7;
+        if let Some(ref mut w2) = model.w2 {
+            w2[5] = -0.25;
+        }
+
+        save(&model, &path).unwrap();
+        let loaded = load(&path).unwrap().expect("file should exist");
+        assert_eq!(loaded.architecture, Architecture::Mlp { hidden_dim: 6 });
+        assert!((loaded.b1[2] - 0.7).abs() < 1e-6);
+        assert_eq!(loaded.w2.as_ref().unwrap()[5], -0.25);
+    }
+
+    #[test]
     fn save_load_round_trip() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("wm.json");
 
         let mut model = OutcomeModel::fresh(TagVocab::default());
         model.n_train_examples = 7;
-        model.bias[0] = 0.42;
+        model.b1[0] = 0.42;
 
         save(&model, &path).unwrap();
         let loaded = load(&path).unwrap().expect("file should exist");
         assert_eq!(loaded.n_train_examples, 7);
-        assert!((loaded.bias[0] - 0.42).abs() < 1e-6);
+        assert!((loaded.b1[0] - 0.42).abs() < 1e-6);
     }
 
     #[test]
