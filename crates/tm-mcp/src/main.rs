@@ -16,6 +16,7 @@ use tm_retrieval::RetrievalEngine;
 use tm_types::RecentCapture;
 
 mod answerer;
+mod prefetch_orchestrator;
 
 // ---------------------------------------------------------------------------
 // Startup helpers
