@@ -17,6 +17,7 @@ use tm_intent::{
 };
 
 use crate::insights::{detect_insights, BaselineRate, InsightBriefRow, InsightConfig};
+use crate::outcome_prompt::{OutcomePrompt, OutcomePromptScheduler, PromptSchedulerConfig};
 use crate::pattern::{
     default_window_start, detect_patterns, CellKey, DetectedPattern, PatternConfig, PolarityDist,
 };
@@ -36,6 +37,11 @@ pub struct BriefConfig {
     /// the brief is meant to show *attention-worthy* proposals, not a
     /// flood. The full list lives in `tracemind outcomes list`.
     pub limit_proposals: usize,
+    /// Cap on time-triggered outcome prompts surfaced (`§4.1` of
+    /// INTENT_SYSTEM.md). Default 5 — meant to be small so the brief
+    /// stays manageable. The full list of overdue commitments lives
+    /// in the `overdue` section; this is the *active question* form.
+    pub limit_prompts: usize,
     /// Pattern-detector config. Defaults match `INTENT_SYSTEM.md`
     /// §5.1.3 (n ≥ 6, |lift| ≥ 0.25, etc.).
     pub patterns: PatternConfig,
@@ -120,6 +126,7 @@ impl Default for BriefConfig {
             limit_resolved: 10,
             limit_candidates: 10,
             limit_proposals: 10,
+            limit_prompts: 5,
             patterns: PatternConfig::default(),
             patterns_window: Duration::days(365),
             patterns_scan_limit: 2000,
@@ -321,6 +328,12 @@ pub struct DailyBrief {
     /// pending. TM-INTENT-009.
     #[serde(default)]
     pub proposals: Vec<OutcomeProposalBriefRow>,
+    /// Time-triggered outcome prompts (INTENT_SYSTEM.md §4.1) —
+    /// active "what happened with X?" questions for overdue
+    /// commitments not already covered by an outcome proposal.
+    /// Soonest-horizon-first.
+    #[serde(default)]
+    pub outcome_prompts: Vec<OutcomePrompt>,
     /// Section counts for quick rendering of section headers.
     pub counts: BriefCounts,
     /// Set when the calibration gate suppressed the insights panel.
@@ -343,6 +356,8 @@ pub struct BriefCounts {
     pub insights: usize,
     #[serde(default)]
     pub proposals: usize,
+    #[serde(default)]
+    pub outcome_prompts: usize,
 }
 
 pub struct BriefBuilder<'a> {
@@ -574,6 +589,17 @@ impl<'a> BriefBuilder<'a> {
             Err(_) => Vec::new(),
         };
 
+        // Time-triggered outcome prompts (§4.1). Soft-fail: a store
+        // hiccup here drops the prompts section but doesn't block the
+        // rest of the brief.
+        let prompt_cfg = PromptSchedulerConfig {
+            max_per_run: cfg.limit_prompts,
+            ..Default::default()
+        };
+        let outcome_prompts: Vec<OutcomePrompt> = OutcomePromptScheduler::new(self.store)
+            .due_prompts(now, prompt_cfg)
+            .unwrap_or_default();
+
         let counts = BriefCounts {
             overdue: overdue.len(),
             open: open.len(),
@@ -582,6 +608,7 @@ impl<'a> BriefBuilder<'a> {
             patterns: patterns.len(),
             insights: insights.len(),
             proposals: proposals.len(),
+            outcome_prompts: outcome_prompts.len(),
         };
 
         Ok(DailyBrief {
@@ -593,6 +620,7 @@ impl<'a> BriefBuilder<'a> {
             patterns,
             insights,
             proposals,
+            outcome_prompts,
             counts,
             model_quiet,
         })
@@ -1667,5 +1695,55 @@ mod tests {
         assert!(row.get("outlook").is_some(), "outlook field present in JSON");
         assert_eq!(row["outlook"]["argmax"], "better");
         assert_eq!(row["outlook"]["tone"], "tailwind");
+    }
+
+    #[test]
+    fn brief_surfaces_outcome_prompt_for_overdue_commitment() {
+        let store = fresh_store();
+        let now = Utc::now();
+
+        // Overdue Open commitment with no covering proposal — should
+        // appear both in brief.overdue and brief.outcome_prompts.
+        let mut c = Commitment::new(CommitmentKind::Intent, "ship v2", Source::Manual);
+        c.horizon = Some(now - Duration::hours(3));
+        store.insert_commitment(&c).unwrap();
+
+        let brief = BriefBuilder::new(&store).build(now).unwrap();
+
+        assert_eq!(brief.outcome_prompts.len(), 1);
+        assert_eq!(brief.counts.outcome_prompts, 1);
+        let p = &brief.outcome_prompts[0];
+        assert_eq!(p.commitment_id, c.id);
+        assert_eq!(p.statement, "ship v2");
+        assert_eq!(p.urgency, crate::outcome_prompt::PromptUrgency::Due);
+
+        // Round-trip serialization keeps the field reachable.
+        let json = serde_json::to_value(&brief).unwrap();
+        assert_eq!(json["outcome_prompts"].as_array().unwrap().len(), 1);
+        assert_eq!(json["outcome_prompts"][0]["statement"], "ship v2");
+        assert_eq!(json["counts"]["outcome_prompts"], 1);
+    }
+
+    #[test]
+    fn brief_outcome_prompts_respects_limit() {
+        let store = fresh_store();
+        let now = Utc::now();
+        for i in 1..=4_i64 {
+            let mut c =
+                Commitment::new(CommitmentKind::Intent, format!("c{i}"), Source::Manual);
+            c.horizon = Some(now - Duration::days(i));
+            store.insert_commitment(&c).unwrap();
+        }
+
+        let cfg = BriefConfig {
+            limit_prompts: 2,
+            ..Default::default()
+        };
+        let brief = BriefBuilder::new(&store).with_config(cfg).build(now).unwrap();
+        assert_eq!(brief.outcome_prompts.len(), 2);
+        assert_eq!(brief.counts.outcome_prompts, 2);
+        // Soonest-horizon-first → most overdue first: c4, c3.
+        assert_eq!(brief.outcome_prompts[0].statement, "c4");
+        assert_eq!(brief.outcome_prompts[1].statement, "c3");
     }
 }

@@ -13,6 +13,8 @@ use tm_vector::{Embedder, EmbedModel};
 use tracing::info;
 use uuid::Uuid;
 
+use crate::prefetch::{PrefetchCache, PrefetchStats};
+
 /// Recent query embedding cache for relevance gating and recommendations.
 struct RecentQueryCache {
     embeddings: VecDeque<Vec<f32>>,
@@ -174,6 +176,10 @@ pub struct RetrievalEngine {
     planner: QueryPlanner,
     procedure_store: Option<ProcedureStore>,
     trajectory_store: Option<TrajectoryStore>,
+    /// L1 prefetch cache (Phase 4 / Sprint B). Short-circuits the
+    /// SQLite kNN when a query has been pre-warmed by an upstream
+    /// `AnticipationKind::PrefetchQuery`.
+    prefetch: PrefetchCache,
 }
 
 #[derive(Debug)]
@@ -253,7 +259,41 @@ impl RetrievalEngine {
             planner: QueryPlanner::new(),
             procedure_store,
             trajectory_store,
+            prefetch: PrefetchCache::new(),
         })
+    }
+
+    /// Pre-warm the L1 prefetch cache with the kNN result for `text`.
+    ///
+    /// Called by an upstream orchestrator that has access to active
+    /// `AnticipationKind::PrefetchQuery` entries (typically
+    /// `tm-reflect`'s scheduler or the MCP layer holding both an
+    /// `IntentStore` and a `RetrievalEngine`). The next `query()` for
+    /// the same normalized string will skip both the embedder call
+    /// and the SQLite kNN.
+    ///
+    /// Honours `top_k` of bandit arm 1 (the default-medium arm) for
+    /// the warm pool. We deliberately don't take a top_k parameter:
+    /// the cache is meant to be a *hint*, not a tuning surface.
+    pub fn prime_prefetch(&mut self, text: &str) -> Result<()> {
+        let embedding = self.embedder.embed(text);
+        let warm_top_k = UcbBandit::params_for_arm(1).top_k.max(15);
+        let candidates = self.graph.search_vectors(&embedding, warm_top_k)?;
+        self.prefetch.prime(text, embedding, candidates);
+        Ok(())
+    }
+
+    /// Read-only view of L1 prefetch statistics. Surfaced by the CLI
+    /// `world status` and the brief so users can tell whether
+    /// anticipations are actually paying off.
+    pub fn prefetch_stats(&self) -> PrefetchStats {
+        self.prefetch.stats()
+    }
+
+    /// Drop every primed entry — useful at session boundaries
+    /// (logout, new project) and from tests.
+    pub fn clear_prefetch(&mut self) {
+        self.prefetch.clear();
     }
 
     /// Attach a ProcedureStore for procedural memory matching.
@@ -493,18 +533,32 @@ impl RetrievalEngine {
         // Record the arm_select phase
         ws.record_phase("arm_select", 0, arm_reason, arm_start);
 
-        // ── Phase: vector_search ──
+        // ── Phase: vector_search (or L1 prefetch hit) ──
         let vs_start = Instant::now();
         let search_k = if self.reranker.is_some() {
             params.top_k * 3
         } else {
             params.top_k
         };
-        ws.candidates = self.graph.search_vectors(&blended_embedding, search_k)?;
+        let prefetch_hit = self.prefetch.lookup(text);
+        let (phase_label, vs_decision) = if let Some(entry) = prefetch_hit {
+            // Cache hit — trust the warmed result and skip the kNN.
+            // We truncate to search_k if the entry is larger; if it's
+            // smaller we use what we have. The orchestrator that
+            // primed this entry is responsible for priming with the
+            // right top_k for the expected arm.
+            let take = entry.candidates.len().min(search_k);
+            let primed_query = entry.query.clone();
+            ws.candidates = entry.candidates.into_iter().take(take).collect();
+            ("l1_prefetch_hit",
+             format!("primed_for={:?}, used={}/{}", primed_query, ws.candidates.len(), search_k))
+        } else {
+            ws.candidates = self.graph.search_vectors(&blended_embedding, search_k)?;
+            ("vector_search",
+             format!("search_k={}, found={}", search_k, ws.candidates.len()))
+        };
+        ws.record_phase(phase_label, 0, vs_decision, vs_start);
         let vs_count = ws.candidates.len();
-        ws.record_phase("vector_search", 0,
-            format!("search_k={}, found={}", search_k, vs_count),
-            vs_start);
 
         // ── Phase: signal_search (hybrid — fresh unpromoted captures) ──
         // Runs in parallel-in-concept with vector_search: the graph has entities,
@@ -1806,6 +1860,7 @@ mod tests {
             planner: QueryPlanner::new(),
             procedure_store: None,
             trajectory_store: None,
+            prefetch: PrefetchCache::new(),
         };
 
         let result = engine.query("hello world").unwrap();
@@ -1823,6 +1878,55 @@ mod tests {
         let stats2 = engine.bandit_stats();
         let total2: u64 = stats2.iter().map(|(c, _)| c).sum();
         assert_eq!(total2, 2);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn prefetch_hit_takes_l1_path_and_records_phase() {
+        let dir = std::env::temp_dir().join(format!("tm_ret_pf_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("test.db").to_str().unwrap().to_string();
+        let traces = dir.join("traces.jsonl").to_str().unwrap().to_string();
+        let bandit_path = dir.join("bandit.json");
+        let linucb_path = dir.join("linucb.json");
+        let mut engine = RetrievalEngine {
+            graph: GraphStore::open(&db).unwrap(),
+            trace_store: TraceStore::open(&traces).unwrap(),
+            embedder: Embedder::new_hash(),
+            bandit: UcbBandit::new(),
+            bandit_path,
+            linucb: LinUcbBandit::new(),
+            linucb_path,
+            reranker: None,
+            query_cache: RecentQueryCache::new(10),
+            pending_reward: None,
+            planner: QueryPlanner::new(),
+            procedure_store: None,
+            trajectory_store: None,
+            prefetch: PrefetchCache::new(),
+        };
+
+        // Prime an entry for "hello world" — even on an empty graph
+        // this proves the cache shortcut is taken.
+        engine.prime_prefetch("hello world").unwrap();
+        assert_eq!(engine.prefetch_stats().primes, 1);
+
+        let result = engine.query("hello world").unwrap();
+
+        // The vector_search phase should be replaced by l1_prefetch_hit.
+        let took_l1 = result.phases.iter().any(|p| p.phase == "l1_prefetch_hit");
+        let took_vs = result.phases.iter().any(|p| p.phase == "vector_search");
+        assert!(took_l1, "expected l1_prefetch_hit phase, got: {:?}",
+                result.phases.iter().map(|p| p.phase).collect::<Vec<_>>());
+        assert!(!took_vs, "vector_search should have been short-circuited");
+        assert_eq!(engine.prefetch_stats().hits, 1);
+
+        // A query for an unrelated string falls back to vector_search.
+        let other = engine.query("totally different string").unwrap();
+        let took_vs2 = other.phases.iter().any(|p| p.phase == "vector_search");
+        assert!(took_vs2);
+        assert_eq!(engine.prefetch_stats().misses, 1);
 
         std::fs::remove_dir_all(&dir).ok();
     }

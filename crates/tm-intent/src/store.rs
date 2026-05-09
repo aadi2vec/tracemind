@@ -1192,6 +1192,62 @@ impl IntentStore {
         Ok(())
     }
 
+    /// Return up to `limit` *active* L1 prefetch anticipations as
+    /// `(anticipation_id, query_string)` pairs, highest-confidence
+    /// first. "Active" means: kind is `prefetch_query`, not yet
+    /// expired, no `user_response`, no `eventual_match`. Anticipations
+    /// without a `predicted_commitment.statement` are skipped (no
+    /// query to warm).
+    ///
+    /// This is the read side of the L1 orchestrator loop —
+    /// `tm-mcp::prefetch_orchestrator::warm_l1` consumes these and
+    /// hands the strings to `RetrievalEngine::prime_prefetch`. Kept
+    /// here (not in `tm-retrieval`) so the cache stays
+    /// anticipation-agnostic per `prefetch.rs` module docs.
+    pub fn list_active_prefetch_queries(
+        &self,
+        now: chrono::DateTime<chrono::Utc>,
+        limit: usize,
+    ) -> Result<Vec<(Uuid, String)>> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT id, predicted_commitment
+              FROM anticipations
+             WHERE kind = 'prefetch_query'
+               AND expires_at > ?
+               AND user_response IS NULL
+               AND eventual_match IS NULL
+             ORDER BY confidence DESC
+             LIMIT ?
+            "#,
+        )?;
+        let rows = stmt.query_map(
+            params![now.to_rfc3339(), limit as i64],
+            |row| {
+                let id: String = row.get(0)?;
+                let pc: Option<String> = row.get(1)?;
+                Ok((id, pc))
+            },
+        )?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (id_str, pc_json) = row?;
+            let id = parse_uuid(&id_str, "anticipation_id")?;
+            let Some(pc_json) = pc_json else { continue };
+            // We only need `statement` from the CommitmentDraft. Deserialize
+            // generically so a future field add to CommitmentDraft doesn't
+            // cost us a parse error here.
+            let draft: serde_json::Value = serde_json::from_str(&pc_json)?;
+            if let Some(s) = draft.get("statement").and_then(|v| v.as_str()) {
+                let trimmed = s.trim();
+                if !trimmed.is_empty() {
+                    out.push((id, trimmed.to_string()));
+                }
+            }
+        }
+        Ok(out)
+    }
+
     // ----- candidates -----------------------------------------------------
 
     /// Insert one mined candidate. The id is generated server-side so
@@ -2485,5 +2541,168 @@ mod tests {
 
         // Re-running is a no-op for already-flipped rows.
         assert_eq!(store.expire_outcome_proposals(now).unwrap(), 0);
+    }
+
+    // ----- list_active_prefetch_queries -----------------------------------
+
+    fn mk_prefetch(
+        statement: &str,
+        confidence: f32,
+        expires_at: chrono::DateTime<chrono::Utc>,
+    ) -> Anticipation {
+        use crate::types::{
+            AnticipationKind, CommitmentDraft, CommitmentKind, Stakes, TriggerContext,
+        };
+        Anticipation {
+            id: Uuid::new_v4(),
+            generated_at: chrono::Utc::now(),
+            trigger: TriggerContext {
+                working_memory_hash: "wm-test".into(),
+                topic_centroid: vec![],
+                time_of_day: 9,
+                source_app: None,
+                matched_phrase: None,
+            },
+            kind: AnticipationKind::PrefetchQuery,
+            predicted_commitment: Some(CommitmentDraft {
+                kind: CommitmentKind::Intent,
+                statement: statement.into(),
+                options_considered: vec![],
+                horizon: None,
+                stakes: Stakes::Medium,
+                tags: vec![],
+            }),
+            grounded_in: vec![],
+            confidence,
+            surfaced_at: None,
+            user_response: None,
+            eventual_match: None,
+            expires_at,
+        }
+    }
+
+    #[test]
+    fn list_active_prefetch_returns_query_strings_high_confidence_first() {
+        let store = fresh_store();
+        let now = chrono::Utc::now();
+        let later = now + chrono::Duration::minutes(10);
+
+        store
+            .insert_anticipation(&mk_prefetch("look up tomorrow's calendar", 0.4, later))
+            .unwrap();
+        store
+            .insert_anticipation(&mk_prefetch("how did the postgres migration go", 0.9, later))
+            .unwrap();
+        store
+            .insert_anticipation(&mk_prefetch("notes on phase 4", 0.7, later))
+            .unwrap();
+
+        let got = store.list_active_prefetch_queries(now, 10).unwrap();
+        let queries: Vec<&str> = got.iter().map(|(_, q)| q.as_str()).collect();
+        assert_eq!(
+            queries,
+            vec![
+                "how did the postgres migration go",
+                "notes on phase 4",
+                "look up tomorrow's calendar",
+            ]
+        );
+    }
+
+    #[test]
+    fn list_active_prefetch_filters_expired_and_responded() {
+        let store = fresh_store();
+        let now = chrono::Utc::now();
+        let later = now + chrono::Duration::minutes(10);
+        let earlier = now - chrono::Duration::minutes(5);
+
+        // expired
+        store
+            .insert_anticipation(&mk_prefetch("expired query", 0.95, earlier))
+            .unwrap();
+
+        // responded
+        let mut responded = mk_prefetch("dismissed query", 0.95, later);
+        responded.user_response = Some(crate::types::UserResponse::Dismissed);
+        store.insert_anticipation(&responded).unwrap();
+
+        // matched
+        let mut matched = mk_prefetch("matched query", 0.95, later);
+        matched.eventual_match = Some(Uuid::new_v4());
+        store.insert_anticipation(&matched).unwrap();
+
+        // active
+        store
+            .insert_anticipation(&mk_prefetch("live query", 0.5, later))
+            .unwrap();
+
+        let got = store.list_active_prefetch_queries(now, 10).unwrap();
+        let queries: Vec<&str> = got.iter().map(|(_, q)| q.as_str()).collect();
+        assert_eq!(queries, vec!["live query"]);
+    }
+
+    #[test]
+    fn list_active_prefetch_skips_other_kinds() {
+        let store = fresh_store();
+        let now = chrono::Utc::now();
+        let later = now + chrono::Duration::minutes(10);
+
+        let mut a = mk_prefetch("pattern", 0.9, later);
+        a.kind = crate::types::AnticipationKind::PatternMatch;
+        store.insert_anticipation(&a).unwrap();
+
+        let mut b = mk_prefetch("recommendation", 0.9, later);
+        b.kind = crate::types::AnticipationKind::Recommendation;
+        store.insert_anticipation(&b).unwrap();
+
+        store
+            .insert_anticipation(&mk_prefetch("real prefetch", 0.5, later))
+            .unwrap();
+
+        let got = store.list_active_prefetch_queries(now, 10).unwrap();
+        let queries: Vec<&str> = got.iter().map(|(_, q)| q.as_str()).collect();
+        assert_eq!(queries, vec!["real prefetch"]);
+    }
+
+    #[test]
+    fn list_active_prefetch_skips_missing_or_blank_statements() {
+        let store = fresh_store();
+        let now = chrono::Utc::now();
+        let later = now + chrono::Duration::minutes(10);
+
+        let mut empty = mk_prefetch("   ", 0.99, later);
+        // blank statement (after trim) → must be skipped
+        empty.predicted_commitment.as_mut().unwrap().statement = "   ".into();
+        store.insert_anticipation(&empty).unwrap();
+
+        let mut absent = mk_prefetch("doesn't matter", 0.98, later);
+        absent.predicted_commitment = None;
+        store.insert_anticipation(&absent).unwrap();
+
+        store
+            .insert_anticipation(&mk_prefetch("kept", 0.5, later))
+            .unwrap();
+
+        let got = store.list_active_prefetch_queries(now, 10).unwrap();
+        let queries: Vec<&str> = got.iter().map(|(_, q)| q.as_str()).collect();
+        assert_eq!(queries, vec!["kept"]);
+    }
+
+    #[test]
+    fn list_active_prefetch_respects_limit() {
+        let store = fresh_store();
+        let now = chrono::Utc::now();
+        let later = now + chrono::Duration::minutes(10);
+        for i in 0..5 {
+            let conf = 0.1 + (i as f32) * 0.1;
+            store
+                .insert_anticipation(&mk_prefetch(&format!("q{i}"), conf, later))
+                .unwrap();
+        }
+        let got = store.list_active_prefetch_queries(now, 2).unwrap();
+        assert_eq!(got.len(), 2);
+        // top-2 by confidence: q4 (0.5), q3 (0.4)
+        assert_eq!(got[0].1, "q4");
+        assert_eq!(got[1].1, "q3");
     }
 }

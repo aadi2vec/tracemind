@@ -28,6 +28,7 @@
 pub mod brief;
 pub mod insights;
 pub mod matcher;
+pub mod outcome_prompt;
 pub mod pattern;
 
 pub use brief::{
@@ -37,6 +38,9 @@ pub use brief::{
 };
 pub use insights::{detect_insights, BaselineRate, InsightBriefRow, InsightConfig};
 pub use matcher::{propose_outcomes, MatcherConfig, OutcomeProposal};
+pub use outcome_prompt::{
+    OutcomePrompt, OutcomePromptScheduler, PromptSchedulerConfig, PromptUrgency,
+};
 pub use pattern::{
     default_window_start, detect_patterns, wilson_lower_bound, CellKey, DetectedPattern,
     PatternConfig, PolarityDist, TimeBand,

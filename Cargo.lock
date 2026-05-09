@@ -6105,6 +6105,7 @@ name = "tm-types"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "seahash",
  "serde",
  "serde_json",
  "tempfile",
