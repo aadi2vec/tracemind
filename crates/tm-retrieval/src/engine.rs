@@ -568,7 +568,7 @@ impl RetrievalEngine {
         let signal_top_k = (params.top_k / 2).max(3);
         let raw_signal_hits = self
             .graph
-            .search_signals(&blended_embedding, signal_top_k, 0.4)
+            .search_signals(&blended_embedding, signal_top_k, 0.2)
             .unwrap_or_default();
         let raw_hit_count = raw_signal_hits.len();
         ws.signal_hits = raw_signal_hits

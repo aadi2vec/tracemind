@@ -1,0 +1,24 @@
+{
+  "version": "0.1.0",
+  "models": {
+    "bge-small-en-v1.5": {
+      "source": "huggingface",
+      "repo": "BAAI/bge-small-en-v1.5",
+      "dim": 384,
+      "auto_download": true
+    },
+    "mxbai-colbert": {
+      "source": "huggingface",
+      "repo": "mixedbread-ai/mxbai-colbert-large-v1",
+      "dim": 48,
+      "auto_download": true
+    },
+    "qwen2.5-1.5b-q4": {
+      "source": "huggingface",
+      "repo": "Qwen/Qwen2.5-1.5B-Instruct-GGUF",
+      "file": "qwen2.5-1.5b-instruct-q4_k_m.gguf",
+      "tier": 1,
+      "auto_download": false
+    }
+  }
+}

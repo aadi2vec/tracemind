@@ -37,7 +37,8 @@ pub use store::{
     CandidateRecord, InsightSilence, IntentStore, OutcomeProposal, PatternSilence,
 };
 pub use types::{
-    AmbientState, Anticipation, AnticipationKind, Commitment, CommitmentDraft, CommitmentKind,
-    ContextSnapshot, Outcome, OutcomeSource, Polarity, Source, Stakes, State, TriggerContext,
-    TurnRef, UserResponse,
+    Action, ActionModality, ActionSource, AmbientState, Anticipation, AnticipationKind, Belief,
+    Commitment, CommitmentDraft, CommitmentKind, ContextSnapshot, IntentArc, Need, NeedSource,
+    Outcome, OutcomeSource, Polarity, Sentiment, SentimentSource, SentimentTarget, Source, Stakes,
+    State, TriggerContext, TurnRef, UserResponse,
 };

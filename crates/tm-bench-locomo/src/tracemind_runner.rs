@@ -179,16 +179,26 @@ impl TraceMindRunner {
             let lower = strip_speaker_prefix(t).trim().to_lowercase();
             lower == needle || lower.ends_with(&needle) || needle.ends_with(&lower)
         })?;
-        self.ingested_turns.get(pos + 1).cloned()
+        // Window the Q→A adjacency to next 1–3 turns (not just next turn).
+        // Fixes cases like "What was Ethan's finish time?" where the answer
+        // came 2 turns later, not 1.
+        for offset in 1..=3 {
+            if let Some(turn) = self.ingested_turns.get(pos + offset) {
+                if !is_question_turn(turn) {
+                    return Some(turn.clone());
+                }
+            }
+        }
+        None
     }
 
     /// Token-overlap retrieval over the ingested turns.
     ///
     /// In v0.2 this is the primary retrieval path — the underlying
     /// `RetrievalEngine` returns empty signal/trace/entity sets for the
-    /// LoCoMo mini fixtures because the cosine threshold (0.4) and
-    /// confidence gate are too high for 15-turn conversational input
-    /// against a fresh DB. Token overlap on the small per-sample buffer
+    /// LoCoMo mini fixtures because the cosine threshold (lowered to 0.2
+    /// in v0.3) and confidence gate are high for 15-turn conversational
+    /// input against a fresh DB. Token overlap on the small per-sample buffer
     /// is fast and reliable; the engine path will start contributing
     /// once warm-up data accumulates.
     ///
@@ -240,7 +250,7 @@ impl TraceMindRunner {
         // If the winner is a question turn, return the next turn — the
         // answer in a Q→A dialogue. Skip further questions.
         if is_question_turn(turn) {
-            for next in self.ingested_turns.iter().skip(idx + 1) {
+            for next in self.ingested_turns.iter().skip(idx + 1).take(3) {
                 if !is_question_turn(next) {
                     return Some(next.clone());
                 }

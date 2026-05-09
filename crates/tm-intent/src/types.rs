@@ -317,6 +317,265 @@ pub struct AmbientState {
     // Explicitly NOT collected: location, emotion, biometrics — out of scope.
 }
 
+// ---------------------------------------------------------------------------
+// Intent Arc: Need → Sentiment → Commitment → Action → Outcome
+// ---------------------------------------------------------------------------
+
+/// A user need — the "why I care" that spawns commitments. Needs can be
+/// recurring (e.g. "stay healthy") or one-shot (e.g. "fix the auth bug").
+/// See `docs/PRODUCT_PORTFOLIO.md` §0.1.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Need {
+    pub id: Uuid,
+    pub statement: String,
+    /// 0.0 (low) to 1.0 (critical).
+    pub urgency: f32,
+    /// Recurring needs (health, learning) vs one-shot (fix a bug).
+    pub recurring: bool,
+    pub first_seen: DateTime<Utc>,
+    pub last_seen: DateTime<Utc>,
+    pub source: NeedSource,
+    /// Commitments spawned from this need.
+    pub linked_commitments: Vec<Uuid>,
+    pub tags: Vec<String>,
+}
+
+impl Need {
+    pub fn new(statement: impl Into<String>, source: NeedSource) -> Self {
+        let now = Utc::now();
+        Self {
+            id: Uuid::new_v4(),
+            statement: statement.into(),
+            urgency: 0.5,
+            recurring: false,
+            first_seen: now,
+            last_seen: now,
+            source,
+            linked_commitments: Vec::new(),
+            tags: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NeedSource {
+    /// Explicitly stated by the user.
+    Explicit,
+    /// Mined from capture text (e.g. "I need to", "problem is").
+    Mined,
+    /// Inferred from repeated commitment patterns.
+    Inferred,
+    /// Via MCP tool.
+    McpStructured,
+}
+
+/// Sentiment toward a target (commitment, entity, topic). Captures
+/// "how I feel about it" — the affective signal that weights decisions.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Sentiment {
+    pub id: Uuid,
+    /// What this sentiment is about (commitment, entity, need, etc).
+    pub target_id: Uuid,
+    pub target_type: SentimentTarget,
+    /// -1.0 (strongly negative) to +1.0 (strongly positive).
+    pub valence: f32,
+    /// 0.0 (barely noticeable) to 1.0 (overwhelming).
+    pub intensity: f32,
+    pub source: SentimentSource,
+    pub captured_at: DateTime<Utc>,
+    /// The text evidence that triggered this sentiment reading.
+    pub evidence_text: Option<String>,
+    /// Optional link to the originating trace.
+    pub evidence_trace: Option<Uuid>,
+}
+
+impl Sentiment {
+    pub fn new(
+        target_id: Uuid,
+        target_type: SentimentTarget,
+        valence: f32,
+        source: SentimentSource,
+    ) -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            target_id,
+            target_type,
+            valence: valence.clamp(-1.0, 1.0),
+            intensity: valence.abs(),
+            source,
+            captured_at: Utc::now(),
+            evidence_text: None,
+            evidence_trace: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SentimentTarget {
+    Commitment,
+    Need,
+    Entity,
+    Topic,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SentimentSource {
+    /// Heuristic valence scoring (keyword-based).
+    Heuristic,
+    /// Tier-1 LLM-assisted scoring.
+    LlmAssisted,
+    /// User explicitly provided.
+    UserProvided,
+    /// Via MCP tool.
+    McpStructured,
+}
+
+/// An action taken on or toward a commitment. Actions are the "what I did"
+/// that links commitments to outcomes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Action {
+    pub id: Uuid,
+    /// The commitment this action relates to (if any).
+    pub commitment_id: Option<Uuid>,
+    pub description: String,
+    pub taken_at: DateTime<Utc>,
+    /// Trace IDs that evidence this action.
+    pub evidence: Vec<Uuid>,
+    pub modality: ActionModality,
+    pub source: ActionSource,
+}
+
+impl Action {
+    pub fn new(description: impl Into<String>, source: ActionSource) -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            commitment_id: None,
+            description: description.into(),
+            taken_at: Utc::now(),
+            evidence: Vec::new(),
+            modality: ActionModality::Digital,
+            source,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ActionModality {
+    Digital,
+    Physical,
+    Communication,
+    Creation,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ActionSource {
+    /// Detected from capture stream (shell command, file edit, etc).
+    Detected,
+    /// User explicitly reported.
+    UserReported,
+    /// Via MCP tool.
+    McpStructured,
+    /// Matched via embedding similarity to open commitment.
+    EmbeddingMatched,
+}
+
+// ---------------------------------------------------------------------------
+// Belief trait — polymorphic interface for Engram SDK
+// ---------------------------------------------------------------------------
+
+/// The `Belief` trait defines the common interface that all intent-arc
+/// primitives share. This enables the Engram SDK to treat commitments,
+/// needs, sentiments, and actions uniformly as "beliefs" with confidence
+/// and temporal bounds. This is trait-based polymorphism — not inheritance.
+pub trait Belief {
+    fn belief_id(&self) -> Uuid;
+    fn statement(&self) -> &str;
+    fn confidence(&self) -> f32;
+    fn created_at(&self) -> DateTime<Utc>;
+}
+
+impl Belief for Commitment {
+    fn belief_id(&self) -> Uuid {
+        self.id
+    }
+    fn statement(&self) -> &str {
+        &self.statement
+    }
+    fn confidence(&self) -> f32 {
+        self.confidence
+    }
+    fn created_at(&self) -> DateTime<Utc> {
+        self.made_at
+    }
+}
+
+impl Belief for Need {
+    fn belief_id(&self) -> Uuid {
+        self.id
+    }
+    fn statement(&self) -> &str {
+        &self.statement
+    }
+    fn confidence(&self) -> f32 {
+        self.urgency
+    }
+    fn created_at(&self) -> DateTime<Utc> {
+        self.first_seen
+    }
+}
+
+impl Belief for Sentiment {
+    fn belief_id(&self) -> Uuid {
+        self.id
+    }
+    fn statement(&self) -> &str {
+        // Sentiments don't have a "statement" per se; return empty.
+        ""
+    }
+    fn confidence(&self) -> f32 {
+        self.intensity
+    }
+    fn created_at(&self) -> DateTime<Utc> {
+        self.captured_at
+    }
+}
+
+impl Belief for Action {
+    fn belief_id(&self) -> Uuid {
+        self.id
+    }
+    fn statement(&self) -> &str {
+        &self.description
+    }
+    fn confidence(&self) -> f32 {
+        1.0 // actions are factual
+    }
+    fn created_at(&self) -> DateTime<Utc> {
+        self.taken_at
+    }
+}
+
+// ---------------------------------------------------------------------------
+// IntentArc — the full Need→Sentiment→Commitment→Action→Outcome chain
+// ---------------------------------------------------------------------------
+
+/// A materialized view of the full intent arc for one commitment.
+/// Used by the daily brief, the Tauri visualization, and the
+/// `memory_arc` MCP tool.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IntentArc {
+    pub commitment: Commitment,
+    pub needs: Vec<Need>,
+    pub sentiments: Vec<Sentiment>,
+    pub actions: Vec<Action>,
+    pub outcome: Option<Outcome>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -359,11 +618,58 @@ mod tests {
 
     #[test]
     fn polarity_serde_uses_snake_case() {
-        // `as_expected` is the only multi-word case; this catches any
-        // accidental switch to `AsExpected` etc.
         let json = serde_json::to_string(&Polarity::AsExpected).unwrap();
         assert_eq!(json, "\"as_expected\"");
         let parsed: Polarity = serde_json::from_str("\"no_outcome\"").unwrap();
         assert_eq!(parsed, Polarity::NoOutcome);
+    }
+
+    #[test]
+    fn need_new_defaults() {
+        let n = Need::new("fix the auth bug", NeedSource::Explicit);
+        assert!(!n.recurring);
+        assert!((n.urgency - 0.5).abs() < f32::EPSILON);
+        assert!(n.linked_commitments.is_empty());
+    }
+
+    #[test]
+    fn sentiment_clamps_valence() {
+        let s = Sentiment::new(Uuid::new_v4(), SentimentTarget::Commitment, 2.0, SentimentSource::Heuristic);
+        assert!((s.valence - 1.0).abs() < f32::EPSILON);
+        let s2 = Sentiment::new(Uuid::new_v4(), SentimentTarget::Commitment, -5.0, SentimentSource::Heuristic);
+        assert!((s2.valence - (-1.0)).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn action_new_defaults() {
+        let a = Action::new("pushed the fix", ActionSource::Detected);
+        assert!(a.commitment_id.is_none());
+        assert_eq!(a.modality, ActionModality::Digital);
+        assert!(a.evidence.is_empty());
+    }
+
+    #[test]
+    fn belief_trait_on_commitment() {
+        let c = Commitment::new(CommitmentKind::Intent, "ship v2", Source::Manual);
+        assert_eq!(Belief::statement(&c), "ship v2");
+        assert!((Belief::confidence(&c) - 0.7).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn need_source_serde() {
+        let json = serde_json::to_string(&NeedSource::Mined).unwrap();
+        assert_eq!(json, "\"mined\"");
+    }
+
+    #[test]
+    fn sentiment_source_serde() {
+        let json = serde_json::to_string(&SentimentSource::LlmAssisted).unwrap();
+        assert_eq!(json, "\"llm_assisted\"");
+    }
+
+    #[test]
+    fn action_modality_serde() {
+        let json = serde_json::to_string(&ActionModality::Communication).unwrap();
+        assert_eq!(json, "\"communication\"");
     }
 }
