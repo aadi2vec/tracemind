@@ -8,6 +8,8 @@ Legend: `[x]` done, `[-]` in progress / partial, `[ ]` not started. Est. = estim
 
 ## Shipped (reference)
 
+- [x] Phase 4 / Sprint C-1: bitemporal substrate (tm-temporal embedded into tm-graph; query_at / history; entities + triples backfilled)
+- [x] Phase 4 / Sprint C-2: TMS-backed confidence (BeliefStore wraps tm-tms; contradictions surfaced in brief; effective_confidence policy)
 - [x] 24-crate Rust workspace compiles and tests pass
 - [x] Intent arc types: Need, Sentiment, Action + Belief trait (`tm-intent`)
 - [x] Intent arc persistence: SQLite tables + store methods for needs/sentiments/actions
@@ -37,6 +39,21 @@ Legend: `[x]` done, `[-]` in progress / partial, `[ ]` not started. Est. = estim
 
 ---
 
+## Priority 0 — Recordable demo (gates everything else)
+
+Sprint C-2 unlocked the *retraction beat* (the demo's hook). Now ship a clean recordable demo before any further engine work. Items are sequential — do not parallelize without explicit redirect.
+
+- [ ] **D-1: 3-minute "day in the life" script** — replace the 5-act CLI walkthrough. Lead with the morning brief, an overdue commitment, and a *retraction beat* (only believable now that contradictions surface). Living script: `docs/DEMO_SCRIPT.md`.
+- [ ] **D-2: Pre-warmed demo fixture** — deterministic `~/.tracemind/` snapshot (~50–80 triples, one ready contradiction, two due commitments, two stale ones). Restore via `tracemind demo restore`. Fixture lives in `crates/tm-cli/fixtures/demo/`.
+- [ ] **D-3: Real ambient capture in demo path** — clipboard or shell-history watcher running silently for 30s before the brief renders, so the brief is grounded in just-captured signals.
+- [ ] **D-4: Brief renders in the Tauri app, not stdout** — wire `BriefBuilder` into the existing Tauri shell. Fix the unfixed `models/**/*` glob blocking `cargo build -p tm-tauri`.
+- [ ] **D-5: Single-binary install** — `curl … | sh` drops `tracemind`, `tm-mcp`, capture daemon, `~/.tracemind/models/` seed. No "build from source" demo prologue.
+- [ ] **D-6: One-screen product close** — three products sharing one engine (TraceMind / Engram / Rosetta).
+
+**Why P0:** items 1–4 unlock the recorded demo. 5–6 are needed before screen-sharing to anyone outside.
+
+---
+
 ## Priority 1 — Quality (highest F1 impact, pure code work)
 
 ### LoCoMo Tier-0 remaining fixes
@@ -54,22 +71,22 @@ Legend: `[x]` done, `[-]` in progress / partial, `[ ]` not started. Est. = estim
 
 ## Priority 2 — Wire isolated crates into the pipeline
 
-### Wire tm-tms into ingest + retrieval
+### Wire tm-tms into ingest + retrieval (Sprint C-2 — mostly shipped)
 
-- [ ] Call `TmsEngine.assert_belief()` at ingest time when entities/triples are upserted
-- [ ] Contradiction detection at ingest: explicit negation (cosine < -0.8), schema constraints, temporal overlap
-- [ ] Belief-aware retrieval ranking: boost `In` beliefs, demote `Contradicted`, hide `Out`
-- [ ] Surface contradictions in daily brief via tm-reflect
-- [ ] Persist TMS state (currently in-memory only)
+- [x] Call `TmsEngine.assert_belief()` at ingest time when entities/triples are upserted
+- [x] Contradiction detection at ingest (cosine < -0.8 via tm-tms threshold; schema/temporal triggers still pending)
+- [x] Belief-aware retrieval ranking: hide `Out`, downrank `Contradicted` via `effective_confidence`
+- [x] Surface contradictions in daily brief via tm-reflect
+- [ ] Schema-constraint and temporal-overlap contradiction triggers (in addition to cosine)
+- [ ] Persist TMS state across restarts (currently rebuilt from live triples)
 
-### Wire tm-temporal into tm-graph
+### Wire tm-temporal into tm-graph (Sprint C-1 — shipped)
 
-- [ ] Add bitemporal columns to `entities` table: `valid_from`, `valid_to`, `superseded_by` (nullable, backwards-compatible)
-- [ ] Add bitemporal columns to `relations` table: `valid_from`, `valid_to`, `retracted_at`, `retracted_by`, `retraction_reason`
-- [ ] Add `belief_revisions` table: id, original_id, revision_type, evidence, reason, txn_at, valid_at
-- [ ] Implement `GraphStore::query_at(TemporalQuery)`, `history_of(id)`, `diff(from, to)`
-- [ ] One-time migration backfilling `valid_from` from `created_at`
+- [x] Bitemporal substrate via embedded `TemporalStore` (sibling DB); write-through on every entity/triple upsert
+- [x] `GraphStore::entity_at`, `triple_at`, `entity_history`, `triple_history`
+- [ ] `belief_revisions` table for explicit retraction provenance (separate from JTMS retractions)
 - [ ] Time-machine queries in CLI + MCP: "what was I thinking in March?"
+- [ ] `GraphStore::diff(from, to)` for change inspection
 
 ---
 
@@ -216,3 +233,27 @@ Legend: `[x]` done, `[-]` in progress / partial, `[ ]` not started. Est. = estim
 - [ ] Intent preservation eval: 100 labeled before/after refactoring pairs
 - [ ] Belief consistency eval: formal JTMS spec compliance
 - [ ] Performance benchmarking: idle RAM, active RAM, cold-query latency, Tier-1 hot-query latency
+
+---
+
+## Priority 11 — LLM packaging + on-device personalization (deferred)
+
+Lower-priority phase queued behind the recordable demo and the existing P1–P10 work. Two layers:
+
+### L1 — `tm-llm` packaging crate
+
+- [ ] New `tm-llm` crate: `ModelManifest` (sha256, size, prompt template, tokenizer hash, license) + `ModelRegistry` reading `~/.tracemind/models/manifest.toml`
+- [ ] First-run model fetch with checksum verification + atomic install (no half-downloaded weights)
+- [ ] LoRA adapter slot: `BaseModel + Vec<AdapterSpec>` with hot-swap at the `LocalLlmBackend` boundary
+- [ ] CLI surface: `tracemind models list / install / remove / verify`
+- [ ] MCP surface: `model_status` returning manifest + adapter state
+
+### L2 — Resource-constrained on-device finetune
+
+- [ ] Python sidecar (`tools/finetune/`) using transformers + peft + bitsandbytes (Linux/Win) or MLX-LM (macOS) for QLoRA
+- [ ] Three default LoRA roles: `summarizer-personal`, `extractor-personal`, `prefs-personal`
+- [ ] Training data builder: pulls from accepted/rejected edits in tm-trace + commitment outcome history
+- [ ] Nightly schedule: opt-in only, runs when on AC + idle, capped at 30min wall clock
+- [ ] LoRA weights stay in `~/.tracemind/adapters/` — never leave device, no telemetry
+- [ ] Lightweight TRL/Unsloth alternative path for low-RAM machines (8GB target)
+- [ ] CLI: `tracemind finetune status / start / stop / rollback`

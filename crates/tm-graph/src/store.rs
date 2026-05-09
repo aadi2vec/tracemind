@@ -60,6 +60,13 @@ pub struct GraphStore {
     /// retrieval / brief without persisting itself — rebuilt at
     /// `open()` from the live triple set.
     beliefs: BeliefStore,
+    /// Sidecar JSON path for persisted contradictions. The belief
+    /// engine itself rebuilds deterministically from live triples,
+    /// but contradictions need their cosine input to re-detect, which
+    /// the graph doesn't keep. Saving the contradiction list here
+    /// lets the brief surface them across CLI invocations.
+    /// `None` when the graph is in-memory (`:memory:`).
+    beliefs_path: Option<std::path::PathBuf>,
 }
 
 /// String tag stored in `temporal_facts.fact_type` for entity revisions.
@@ -235,12 +242,21 @@ impl GraphStore {
         let temporal = tm_temporal::TemporalStore::open(&temporal_path)
             .map_err(|e| TraceMindError::Storage(format!("temporal open: {e}")))?;
 
+        // Sidecar where contradictions are persisted across restarts.
+        // None for `:memory:` — ephemeral stores never persist anything.
+        let beliefs_path = if path == ":memory:" {
+            None
+        } else {
+            Some(std::path::PathBuf::from(format!("{path}.contradictions.json")))
+        };
+
         let store = Self {
             kg,
             entity_map: RefCell::new(entity_map),
             triple_map: RefCell::new(triple_map),
             temporal,
             beliefs: BeliefStore::new(),
+            beliefs_path,
         };
 
         // One-time backfill: emit a temporal fact for any entity / triple
@@ -248,15 +264,45 @@ impl GraphStore {
         // anything already tracked. Cheap (linear in #rows missing a fact).
         store.backfill_temporal()?;
 
-        // Sprint C-2: rebuild the in-memory belief engine from live triples.
-        // Cheap (linear in #triples) and avoids persisting JTMS state
-        // separately. Contradictions detected at runtime are *not*
-        // restored across restarts — they re-detect when the same
-        // embedding pair is seen again. (Acceptable for v0; we'll
-        // persist contradictions in a follow-up if it matters.)
+        // Sprint C-2: rebuild the in-memory belief engine from live triples,
+        // then replay any persisted contradictions so the brief surfaces
+        // them across CLI invocations. Belief assertions are deterministic
+        // from live triples; contradictions need a sidecar because the
+        // cosine input that drove detection isn't recoverable from the graph.
         store.rebuild_beliefs()?;
+        if let Some(ref p) = store.beliefs_path {
+            if let Ok(n) = store.beliefs.replay_contradictions(p) {
+                if n > 0 {
+                    info!("[graph] belief engine: {n} contradictions replayed");
+                }
+            }
+        }
 
         Ok(store)
+    }
+
+    /// Detect a contradiction between two triples and persist it so it
+    /// survives across CLI restarts. Wraps `BeliefStore::detect_contradiction`
+    /// + `save_contradictions`. Use this from any caller (ingest pipeline,
+    /// demo fixture) that has the cosine on hand and wants the brief to
+    /// remember the pair.
+    pub fn record_contradiction(
+        &self,
+        triple_a: Uuid,
+        triple_b: Uuid,
+        cosine_sim: f32,
+    ) -> Option<ContradictionView> {
+        let view = self.beliefs.detect_contradiction(triple_a, triple_b, cosine_sim)?;
+        if let Some(ref p) = self.beliefs_path {
+            // Best-effort save — if the disk is full or read-only, the
+            // in-memory contradiction is still surfaceable for the rest
+            // of this process. We log instead of bubbling so callers
+            // (ingest, demo restore) don't fail on a sidecar issue.
+            if let Err(e) = self.beliefs.save_contradictions(p) {
+                tracing::warn!("[graph] failed to persist contradictions: {e}");
+            }
+        }
+        Some(view)
     }
 
     /// Walk every live triple and assert it into the belief engine.

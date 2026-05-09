@@ -22,7 +22,7 @@ tm-world-model = { workspace = true }
 chrono = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-uuid = { workspace = true }
+uuid = { workspace = true, features = ["v5"] }
 tokio = { workspace = true }
 clap = { workspace = true }
 thiserror = { workspace = true }

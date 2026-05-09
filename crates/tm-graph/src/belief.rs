@@ -190,6 +190,52 @@ impl BeliefStore {
     pub fn belief_count(&self) -> usize {
         self.triple_to_belief.borrow().len()
     }
+
+    /// Persist the current contradiction list to `path` as JSON.
+    /// We persist contradictions but *not* the engine's belief graph —
+    /// beliefs rebuild deterministically from live triples on
+    /// `GraphStore::open`, but contradictions need their cosine input
+    /// to re-detect, which the graph doesn't keep around. Saving the
+    /// `Vec<ContradictionView>` is the cheapest fix.
+    pub fn save_contradictions(&self, path: &std::path::Path) -> std::io::Result<()> {
+        let rows = self.contradictions();
+        let bytes = serde_json::to_vec_pretty(&rows)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        // Write atomically — write to a tmp sibling, fsync, rename.
+        let tmp = path.with_extension("json.tmp");
+        std::fs::write(&tmp, &bytes)?;
+        std::fs::rename(tmp, path)?;
+        Ok(())
+    }
+
+    /// Load contradictions from `path` and replay each via
+    /// `detect_contradiction` so the engine ends up in the same
+    /// `Contradicted` state as before the restart. Missing file is
+    /// not an error — it just means there's nothing to replay
+    /// (first-run installs / fresh dirs).
+    ///
+    /// Returns the number of rows replayed. Rows whose triples are
+    /// unknown (e.g. the triple was hard-deleted between restarts)
+    /// are silently skipped.
+    pub fn replay_contradictions(&self, path: &std::path::Path) -> std::io::Result<usize> {
+        let bytes = match std::fs::read(path) {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(e) => return Err(e),
+        };
+        let rows: Vec<ContradictionView> = serde_json::from_slice(&bytes)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        let mut replayed = 0usize;
+        for r in rows {
+            if self
+                .detect_contradiction(r.triple_a, r.triple_b, r.cosine_similarity)
+                .is_some()
+            {
+                replayed += 1;
+            }
+        }
+        Ok(replayed)
+    }
 }
 
 /// Collapse `(numeric_confidence, BeliefStatus)` into a single trust
