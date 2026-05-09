@@ -1092,6 +1092,7 @@ async fn handle_memory_query(
     retrieval: &Arc<Mutex<RetrievalEngine>>,
     answerer: &Arc<TieredAnswerer>,
     db_path: &str,
+    intents_path: &str,
 ) -> Result<Value, String> {
     let text = params
         .get("text")
@@ -1103,6 +1104,24 @@ async fn handle_memory_query(
     // is stale relative to writes from the ingest-side GraphStore in a
     // long-running MCP session. See TM-UX-001 Phase C.
     let _ = engine.refresh_graph();
+
+    // Phase 4 / Sprint B: warm L1 prefetch from active anticipations.
+    // The orchestrator pass is cheap (kNN per query, capped) and
+    // idempotent (cache.prime overwrites in place), so running it
+    // before each query is safe. Per docs/INTENT_SYSTEM.md §6.1, the
+    // L1 layer fires "any time the user starts an interaction" — a
+    // memory_query call is exactly that trigger.
+    if let Ok(intent_store) = tm_intent::IntentStore::open(intents_path) {
+        let _ = prefetch_orchestrator::warm_l1(
+            &mut engine,
+            &intent_store,
+            chrono::Utc::now(),
+            8,
+        );
+        // Failures here are non-fatal — the WarmReport already
+        // records them; we just don't surface them on this path.
+    }
+
     let result = engine.query(text).map_err(|e| e.to_string())?;
     drop(engine);
 
@@ -1895,7 +1914,7 @@ async fn handle_request(
                         .map_err(|e| anyhow::anyhow!(e))?
                 }
                 "memory_query" => {
-                    handle_memory_query(&args, retrieval, answerer, db_path)
+                    handle_memory_query(&args, retrieval, answerer, db_path, intents_path)
                         .await
                         .map_err(|e| anyhow::anyhow!(e))?
                 }
