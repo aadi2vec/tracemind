@@ -137,8 +137,8 @@ Selection: structured tasks prefer Tier 1; open-ended prefers Tier 2 → Tier 1 
 - **SQLite only**: both `tm-graph` and `tm-vector` use `rusqlite` (bundled).
 - **Stdlib-only PII**: `tm-governance` uses regex only — no NLP libraries.
 - **Trace provenance**: every ingest + query produces a `Trace` (UUID, timestamp, content hash, entity IDs) logged to `~/.tracemind/traces.jsonl` — immutable audit trail.
-- **Footprint (revised 2026-04-26 — no hard cap above Tier 0)**: per-platform tiers — laptop ~1.6GB active with Tier-1 (Qwen 2.5 1.5B Q4); mobile ~600MB with Qwen 0.5B Q4; iOS 26+ via Apple FoundationModels (OS-managed); Tier-0 fallback stays under 200MB idle for browser / low-end. See `docs/BRAIN_ARCHITECTURE.md` §4.1.
-- **Local-only by default**: no network in the request path. Network is used only for opt-in model downloads and the *opt-in encrypted-cloud Tier* (low-end devices only, off by default, user-toggleable). See `docs/BRAIN_ARCHITECTURE.md` §4.1.
+- **Footprint (revised 2026-04-26 — no hard cap above Tier 0)**: per-platform tiers — laptop ~1.6GB active with Tier-1 (Qwen 2.5 1.5B Q4); mobile ~600MB with Qwen 0.5B Q4; iOS 26+ via Apple FoundationModels (OS-managed); Tier-0 fallback stays under 200MB idle for browser / low-end. See `docs/DESIGN.md` §3.7.
+- **Local-only by default**: no network in the request path. Network is used only for opt-in model downloads and the *opt-in encrypted-cloud Tier* (low-end devices only, off by default, user-toggleable). See `docs/DESIGN.md` §4.
 
 ### MCP tools (`tm-mcp`, JSON-RPC 2.0 over stdio)
 
@@ -173,11 +173,8 @@ Selection: structured tasks prefer Tier 1; open-ended prefers Tier 2 → Tier 1 
 - **`tm-bench`** — ingest + retrieval microbenchmarks
 - **`tm-bench-ner`** — GLiNER NER quality eval against labeled sets
 - **`tm-bench-ner-e2e`** — end-to-end round-trip
-- **`tm-bench-locomo`** — published LoCoMo scoring harness (token F1 + EM, 5 categories: single_hop / multi_hop / temporal / open_domain / adversarial). CI gate fails any PR that drops > 0.5 F1. Current mini-set baseline: **F1 25.70 BGE / 25.70 hash** (v0.2, 2026-04-26). See `docs/LOCOMO_RESULTS.md`.
+- **`tm-bench-locomo`** — published LoCoMo scoring harness (token F1 + EM, 5 categories: single_hop / multi_hop / temporal / open_domain / adversarial). CI gate fails any PR that drops > 0.5 F1. Current mini-set baseline: **F1 25.70 BGE / 25.70 hash** (v0.2, 2026-04-26). See `docs/DESIGN.md` §13.
 
-### Roadmap phases
+### Roadmap
 
-- **Phase 3** (in flight): tiered answer layer (`tm-answer`) — Tier 0 shipped, Tier 1 + Tier 2 scaffolded. Quality north-star: ≥85 F1 on full LoCoMo.
-- **Phase 4** (proposed): companion-grade UX (daily brief, proactive insight engine, voice in/out, narrative generator). See `docs/PHASE4_DELIGHT.md`.
-- **Phase 5**: JEPA encoder, world model, surprise-based ingestion, SSM/Mamba history compression.
-- **Phase 6**: Docker Compose, multi-user ACL, REST API, Tauri packaging hardening.
+See `docs/DESIGN.md` for architecture and decisions, `docs/TASKS.md` for the prioritized implementation task list.

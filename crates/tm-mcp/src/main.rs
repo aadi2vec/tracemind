@@ -358,6 +358,64 @@ fn tools_list() -> Value {
                         "proposal_id": {"type": "string", "description": "Proposal UUID from memory_outcome_proposals."}
                     }
                 }
+            },
+            {
+                "name": "memory_need",
+                "description": "Record a user need — the 'why' behind commitments. Needs drive the intent arc: Need → Sentiment → Commitment → Action → Outcome. Returns the need_id for linking to commitments later.",
+                "inputSchema": {
+                    "type": "object",
+                    "required": ["statement"],
+                    "properties": {
+                        "statement":  {"type": "string", "description": "What the user needs (e.g. 'ship v2 by Friday', 'learn Rust async')."},
+                        "urgency":    {"type": "number", "description": "0.0 (low) to 1.0 (critical). Default 0.5."},
+                        "recurring":  {"type": "boolean", "description": "True for ongoing needs (health, learning); false for one-shot. Default false."},
+                        "tags":       {"type": "array", "items": {"type": "string"}, "description": "Optional tags for grouping."},
+                        "link_commitment": {"type": "string", "description": "Optional commitment UUID to link this need to."}
+                    }
+                }
+            },
+            {
+                "name": "memory_sentiment",
+                "description": "Record sentiment toward a target (commitment, need, entity, or topic). Captures affective signal that weights decisions in the intent arc.",
+                "inputSchema": {
+                    "type": "object",
+                    "required": ["target_id", "target_type", "valence"],
+                    "properties": {
+                        "target_id":     {"type": "string", "description": "UUID of the target (commitment, need, etc)."},
+                        "target_type":   {"type": "string", "enum": ["commitment", "need", "entity", "topic"], "description": "What kind of thing the target is."},
+                        "valence":       {"type": "number", "description": "-1.0 (strongly negative) to +1.0 (strongly positive)."},
+                        "intensity":     {"type": "number", "description": "0.0 (barely noticeable) to 1.0 (overwhelming). Defaults to abs(valence)."},
+                        "evidence_text": {"type": "string", "description": "The text that triggered this sentiment reading."},
+                        "evidence_trace":{"type": "string", "description": "Optional trace UUID linking to the originating trace."}
+                    }
+                }
+            },
+            {
+                "name": "memory_action",
+                "description": "Record an action taken toward a commitment. Actions are the 'what I did' that links commitments to outcomes in the intent arc.",
+                "inputSchema": {
+                    "type": "object",
+                    "required": ["description"],
+                    "properties": {
+                        "description":   {"type": "string", "description": "What was done (e.g. 'merged PR #42', 'called the dentist')."},
+                        "commitment_id": {"type": "string", "description": "Optional commitment UUID this action relates to."},
+                        "modality":      {"type": "string", "enum": ["digital", "physical", "communication", "creation"], "description": "Action modality. Default 'digital'."},
+                        "evidence":      {"type": "array", "items": {"type": "string"}, "description": "Optional trace UUIDs evidencing this action."}
+                    }
+                }
+            },
+            {
+                "name": "memory_arc",
+                "description": "Retrieve the full intent arc for a commitment — the materialized view showing Need → Sentiment → Commitment → Action → Outcome. Returns the commitment with all linked needs, sentiments, actions, and outcome.",
+                "inputSchema": {
+                    "type": "object",
+                    "required": ["commitment_id"],
+                    "properties": {
+                        "commitment_id": {"type": "string", "description": "Commitment UUID to build the arc for."},
+                        "sentiment_limit": {"type": "integer", "description": "Max sentiments to include (default 10).", "default": 10},
+                        "action_limit":    {"type": "integer", "description": "Max actions to include (default 20).", "default": 20}
+                    }
+                }
             }
         ]
     })
@@ -1843,6 +1901,286 @@ fn handle_memory_outcome_dismiss(params: &Value, intents_path: &str) -> Result<V
 }
 
 // ---------------------------------------------------------------------------
+// Intent arc handlers (Need / Sentiment / Action / Arc)
+// ---------------------------------------------------------------------------
+
+fn handle_memory_need(params: &Value, intents_path: &str) -> Result<Value, String> {
+    use tm_intent::{IntentStore, Need, NeedSource};
+
+    let statement = params
+        .get("statement")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "missing required parameter: statement".to_string())?
+        .trim()
+        .to_string();
+    if statement.is_empty() {
+        return Err("statement must be non-empty".to_string());
+    }
+
+    let mut need = Need::new(statement, NeedSource::McpStructured);
+
+    if let Some(u) = params.get("urgency").and_then(|v| v.as_f64()) {
+        if !(0.0..=1.0).contains(&u) {
+            return Err(format!("urgency must be in [0,1], got {u}"));
+        }
+        need.urgency = u as f32;
+    }
+    if let Some(r) = params.get("recurring").and_then(|v| v.as_bool()) {
+        need.recurring = r;
+    }
+    if let Some(tags) = params.get("tags").and_then(|v| v.as_array()) {
+        need.tags = tags
+            .iter()
+            .filter_map(|t| t.as_str().map(|s| s.to_string()))
+            .collect();
+    }
+
+    let store = IntentStore::open(intents_path)
+        .map_err(|e| format!("failed to open intent store: {e}"))?;
+    store.insert_need(&need).map_err(|e| format!("insert_need: {e}"))?;
+
+    if let Some(cid_s) = params.get("link_commitment").and_then(|v| v.as_str()) {
+        let cid = Uuid::parse_str(cid_s)
+            .map_err(|e| format!("invalid link_commitment '{cid_s}': {e}"))?;
+        store
+            .link_need_to_commitment(need.id, cid)
+            .map_err(|e| format!("link_need_to_commitment: {e}"))?;
+    }
+
+    Ok(json!({
+        "need_id": need.id.to_string(),
+        "statement": need.statement,
+        "urgency": need.urgency,
+        "recurring": need.recurring,
+    }))
+}
+
+fn handle_memory_sentiment(params: &Value, intents_path: &str) -> Result<Value, String> {
+    use tm_intent::{IntentStore, Sentiment, SentimentSource, SentimentTarget};
+
+    let target_id_s = params
+        .get("target_id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "missing required parameter: target_id".to_string())?;
+    let target_id = Uuid::parse_str(target_id_s)
+        .map_err(|e| format!("invalid target_id '{target_id_s}': {e}"))?;
+
+    let target_type = match params
+        .get("target_type")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "missing required parameter: target_type".to_string())?
+    {
+        "commitment" => SentimentTarget::Commitment,
+        "need" => SentimentTarget::Need,
+        "entity" => SentimentTarget::Entity,
+        "topic" => SentimentTarget::Topic,
+        other => return Err(format!("invalid target_type: {other}")),
+    };
+
+    let valence = params
+        .get("valence")
+        .and_then(|v| v.as_f64())
+        .ok_or_else(|| "missing required parameter: valence".to_string())? as f32;
+    if !(-1.0..=1.0).contains(&valence) {
+        return Err(format!("valence must be in [-1,1], got {valence}"));
+    }
+
+    let mut sentiment = Sentiment::new(target_id, target_type, valence, SentimentSource::McpStructured);
+
+    if let Some(i) = params.get("intensity").and_then(|v| v.as_f64()) {
+        if !(0.0..=1.0).contains(&i) {
+            return Err(format!("intensity must be in [0,1], got {i}"));
+        }
+        sentiment.intensity = i as f32;
+    }
+    if let Some(et) = params.get("evidence_text").and_then(|v| v.as_str()) {
+        sentiment.evidence_text = Some(et.to_string());
+    }
+    if let Some(tr) = params.get("evidence_trace").and_then(|v| v.as_str()) {
+        sentiment.evidence_trace = Some(
+            Uuid::parse_str(tr).map_err(|e| format!("invalid evidence_trace '{tr}': {e}"))?,
+        );
+    }
+
+    let store = IntentStore::open(intents_path)
+        .map_err(|e| format!("failed to open intent store: {e}"))?;
+    store
+        .insert_sentiment(&sentiment)
+        .map_err(|e| format!("insert_sentiment: {e}"))?;
+
+    Ok(json!({
+        "sentiment_id": sentiment.id.to_string(),
+        "target_id": target_id.to_string(),
+        "valence": sentiment.valence,
+        "intensity": sentiment.intensity,
+    }))
+}
+
+fn handle_memory_action(params: &Value, intents_path: &str) -> Result<Value, String> {
+    use tm_intent::{Action, ActionModality, ActionSource, IntentStore};
+
+    let description = params
+        .get("description")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "missing required parameter: description".to_string())?
+        .trim()
+        .to_string();
+    if description.is_empty() {
+        return Err("description must be non-empty".to_string());
+    }
+
+    let mut action = Action::new(description.clone(), ActionSource::McpStructured);
+
+    if let Some(cid_s) = params.get("commitment_id").and_then(|v| v.as_str()) {
+        action.commitment_id = Some(
+            Uuid::parse_str(cid_s)
+                .map_err(|e| format!("invalid commitment_id '{cid_s}': {e}"))?,
+        );
+    }
+    if let Some(m) = params.get("modality").and_then(|v| v.as_str()) {
+        action.modality = match m {
+            "digital" => ActionModality::Digital,
+            "physical" => ActionModality::Physical,
+            "communication" => ActionModality::Communication,
+            "creation" => ActionModality::Creation,
+            other => return Err(format!("invalid modality: {other}")),
+        };
+    }
+    if let Some(ev) = params.get("evidence").and_then(|v| v.as_array()) {
+        let mut parsed = Vec::with_capacity(ev.len());
+        for e in ev {
+            let s = e
+                .as_str()
+                .ok_or_else(|| "evidence entries must be UUID strings".to_string())?;
+            parsed.push(
+                Uuid::parse_str(s).map_err(|e| format!("invalid evidence uuid '{s}': {e}"))?,
+            );
+        }
+        action.evidence = parsed;
+    }
+
+    let store = IntentStore::open(intents_path)
+        .map_err(|e| format!("failed to open intent store: {e}"))?;
+    store
+        .insert_action(&action)
+        .map_err(|e| format!("insert_action: {e}"))?;
+
+    Ok(json!({
+        "action_id": action.id.to_string(),
+        "description": action.description,
+        "commitment_id": action.commitment_id.map(|u| u.to_string()),
+        "modality": format!("{:?}", action.modality).to_lowercase(),
+    }))
+}
+
+fn handle_memory_arc(params: &Value, intents_path: &str) -> Result<Value, String> {
+    use tm_intent::IntentStore;
+
+    let cid_s = params
+        .get("commitment_id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "missing required parameter: commitment_id".to_string())?;
+    let cid = Uuid::parse_str(cid_s)
+        .map_err(|e| format!("invalid commitment_id '{cid_s}': {e}"))?;
+
+    let sentiment_limit = params
+        .get("sentiment_limit")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as usize)
+        .unwrap_or(10);
+    let action_limit = params
+        .get("action_limit")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as usize)
+        .unwrap_or(20);
+
+    let store = IntentStore::open(intents_path)
+        .map_err(|e| format!("failed to open intent store: {e}"))?;
+
+    let commitment = store
+        .get_commitment(cid)
+        .map_err(|e| format!("get_commitment: {e}"))?
+        .ok_or_else(|| format!("commitment {cid} not found"))?;
+
+    // Gather linked needs
+    let all_needs = store.list_needs(500).map_err(|e| format!("list_needs: {e}"))?;
+    let linked_needs: Vec<Value> = all_needs
+        .into_iter()
+        .filter(|n| n.linked_commitments.contains(&cid))
+        .map(|n| {
+            json!({
+                "need_id": n.id.to_string(),
+                "statement": n.statement,
+                "urgency": n.urgency,
+                "recurring": n.recurring,
+                "first_seen": n.first_seen.to_rfc3339(),
+                "last_seen": n.last_seen.to_rfc3339(),
+            })
+        })
+        .collect();
+
+    // Sentiments on this commitment
+    let sentiments: Vec<Value> = store
+        .list_sentiments_for(cid, sentiment_limit)
+        .map_err(|e| format!("list_sentiments_for: {e}"))?
+        .into_iter()
+        .map(|s| {
+            json!({
+                "sentiment_id": s.id.to_string(),
+                "valence": s.valence,
+                "intensity": s.intensity,
+                "captured_at": s.captured_at.to_rfc3339(),
+                "evidence_text": s.evidence_text,
+            })
+        })
+        .collect();
+
+    // Actions linked to this commitment
+    let actions: Vec<Value> = store
+        .list_actions_for_commitment(cid, action_limit)
+        .map_err(|e| format!("list_actions_for_commitment: {e}"))?
+        .into_iter()
+        .map(|a| {
+            json!({
+                "action_id": a.id.to_string(),
+                "description": a.description,
+                "taken_at": a.taken_at.to_rfc3339(),
+                "modality": format!("{:?}", a.modality).to_lowercase(),
+            })
+        })
+        .collect();
+
+    // Outcome if resolved
+    let outcome = commitment
+        .outcome_id
+        .and_then(|oid| store.get_outcome(oid).ok().flatten())
+        .map(|o| {
+            json!({
+                "outcome_id": o.id.to_string(),
+                "polarity": format!("{:?}", o.polarity).to_lowercase(),
+                "description": o.description,
+                "observed_at": o.observed_at.to_rfc3339(),
+            })
+        });
+
+    Ok(json!({
+        "commitment": {
+            "id": commitment.id.to_string(),
+            "kind": format!("{:?}", commitment.kind).to_lowercase(),
+            "statement": commitment.statement,
+            "state": format!("{:?}", commitment.state).to_lowercase(),
+            "confidence": commitment.confidence,
+            "made_at": commitment.made_at.to_rfc3339(),
+            "horizon": commitment.horizon.map(|h| h.to_rfc3339()),
+        },
+        "needs": linked_needs,
+        "sentiments": sentiments,
+        "actions": actions,
+        "outcome": outcome,
+    }))
+}
+
+// ---------------------------------------------------------------------------
 // Request dispatcher
 // ---------------------------------------------------------------------------
 
@@ -1968,6 +2306,22 @@ async fn handle_request(
                 }
                 "memory_outcome_dismiss" => {
                     handle_memory_outcome_dismiss(&args, intents_path)
+                        .map_err(|e| anyhow::anyhow!(e))?
+                }
+                "memory_need" => {
+                    handle_memory_need(&args, intents_path)
+                        .map_err(|e| anyhow::anyhow!(e))?
+                }
+                "memory_sentiment" => {
+                    handle_memory_sentiment(&args, intents_path)
+                        .map_err(|e| anyhow::anyhow!(e))?
+                }
+                "memory_action" => {
+                    handle_memory_action(&args, intents_path)
+                        .map_err(|e| anyhow::anyhow!(e))?
+                }
+                "memory_arc" => {
+                    handle_memory_arc(&args, intents_path)
                         .map_err(|e| anyhow::anyhow!(e))?
                 }
                 unknown => {
