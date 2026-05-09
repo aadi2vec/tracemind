@@ -44,6 +44,26 @@ pub struct GraphStore {
     entity_map: RefCell<HashMap<Uuid, i64>>,
     /// TraceMind Triple UUID → skg i64 relation ID.
     triple_map: RefCell<HashMap<Uuid, i64>>,
+    /// Bitemporal revision history for entities and triples (Sprint C-1).
+    /// Live state lives in `kg_entities` / `kg_relations`; this records
+    /// every assertion + supersession so we can answer
+    /// `entity_at(t)` / `triple_at(t)` and `*_history(id)`.
+    /// Separate SQLite connection on the same DB file (or a separate
+    /// `:memory:` instance for tests). See `temporal_facts` schema in
+    /// `tm-temporal`.
+    temporal: tm_temporal::TemporalStore,
+}
+
+/// String tag stored in `temporal_facts.fact_type` for entity revisions.
+const FACT_TYPE_ENTITY: &str = "graph_entity";
+/// String tag stored in `temporal_facts.fact_type` for triple revisions.
+const FACT_TYPE_TRIPLE: &str = "graph_triple";
+
+/// Map a `tm_temporal::StoreError` into `TraceMindError::Storage` so the
+/// graph-side `Result` chain stays homogeneous. Used everywhere the
+/// bitemporal substrate is touched from `GraphStore`.
+fn temporal_err(e: tm_temporal::StoreError) -> TraceMindError {
+    TraceMindError::Storage(format!("temporal: {e}"))
 }
 
 impl GraphStore {
@@ -193,11 +213,89 @@ impl GraphStore {
             );
         }
 
-        Ok(Self {
+        // Sprint C-1: open the bitemporal store. For on-disk graph DBs we
+        // co-locate `temporal_facts` in a sibling file (`<path>.temporal`)
+        // — two SQLite connections on the *same* file is technically safe
+        // but stays in WAL contention; a sibling file is simpler and keeps
+        // skg's schema completely untouched. For `:memory:` we get a fresh
+        // ephemeral store, which is the correct test behaviour.
+        let temporal_path = if path == ":memory:" {
+            ":memory:".to_string()
+        } else {
+            format!("{path}.temporal")
+        };
+        let temporal = tm_temporal::TemporalStore::open(&temporal_path)
+            .map_err(|e| TraceMindError::Storage(format!("temporal open: {e}")))?;
+
+        let store = Self {
             kg,
             entity_map: RefCell::new(entity_map),
             triple_map: RefCell::new(triple_map),
-        })
+            temporal,
+        };
+
+        // One-time backfill: emit a temporal fact for any entity / triple
+        // that doesn't yet have one. Idempotent — `current_fact_id` skips
+        // anything already tracked. Cheap (linear in #rows missing a fact).
+        store.backfill_temporal()?;
+
+        Ok(store)
+    }
+
+    /// Walk live `kg_entities` and `kg_relations` and emit a temporal fact
+    /// for any UUID that doesn't yet have one. Safe to call repeatedly:
+    /// rows that already have an active temporal fact are skipped.
+    fn backfill_temporal(&self) -> Result<()> {
+        let entity_uuids: Vec<Uuid> = self.entity_map.borrow().keys().copied().collect();
+        let mut filled_entities = 0usize;
+        for uuid in entity_uuids {
+            if self
+                .temporal
+                .current_fact_id(uuid, FACT_TYPE_ENTITY)
+                .map_err(temporal_err)?
+                .is_some()
+            {
+                continue;
+            }
+            // Read the live state and use its created_at as valid_from.
+            if let Some(entity) = self.find_entity_by_id(uuid)? {
+                let json = serde_json::to_string(&entity)
+                    .map_err(|e| TraceMindError::Storage(e.to_string()))?;
+                self.temporal
+                    .insert_fact(uuid, FACT_TYPE_ENTITY, &json, entity.created_at, None)
+                    .map_err(temporal_err)?;
+                filled_entities += 1;
+            }
+        }
+
+        let triple_uuids: Vec<Uuid> = self.triple_map.borrow().keys().copied().collect();
+        let mut filled_triples = 0usize;
+        for uuid in triple_uuids {
+            if self
+                .temporal
+                .current_fact_id(uuid, FACT_TYPE_TRIPLE)
+                .map_err(temporal_err)?
+                .is_some()
+            {
+                continue;
+            }
+            if let Some(triple) = self.find_triple_by_id(uuid)? {
+                let json = serde_json::to_string(&triple)
+                    .map_err(|e| TraceMindError::Storage(e.to_string()))?;
+                self.temporal
+                    .insert_fact(uuid, FACT_TYPE_TRIPLE, &json, triple.created_at, None)
+                    .map_err(temporal_err)?;
+                filled_triples += 1;
+            }
+        }
+
+        if filled_entities > 0 || filled_triples > 0 {
+            info!(
+                "[graph] temporal backfill: {filled_entities} entities, \
+                 {filled_triples} triples"
+            );
+        }
+        Ok(())
     }
 
     /// Re-scan the underlying SQLite store and rebuild the UUID ↔ skg-id
@@ -265,6 +363,7 @@ impl GraphStore {
 
         let mut map = self.entity_map.borrow_mut();
 
+        let is_new = !map.contains_key(&entity.id);
         if let Some(&skg_id) = map.get(&entity.id) {
             // Update existing.
             let mut skg_ent = self
@@ -273,7 +372,7 @@ impl GraphStore {
                 .map_err(|e| TraceMindError::Storage(format!("skg get_entity: {e}")))?;
 
             skg_ent.name = entity.name.clone();
-            skg_ent.entity_type = etype_json;
+            skg_ent.entity_type = etype_json.clone();
             set_entity_props(&mut skg_ent, entity);
 
             self.kg
@@ -290,6 +389,51 @@ impl GraphStore {
                 .map_err(|e| TraceMindError::Storage(format!("skg insert_entity: {e}")))?;
 
             map.insert(entity.id, skg_id);
+        }
+        drop(map);
+
+        // Sprint C-1: mirror this assertion into the bitemporal store so we
+        // can answer `entity_at(t)` / `entity_history(id)`. We serialize the
+        // *whole* live entity (including name, type, confidence) — JSON is
+        // small and lets the temporal layer stay schema-agnostic.
+        let json = serde_json::to_string(entity)
+            .map_err(|e| TraceMindError::Storage(e.to_string()))?;
+        if is_new {
+            self.temporal
+                .insert_fact(
+                    entity.id,
+                    FACT_TYPE_ENTITY,
+                    &json,
+                    entity.created_at,
+                    None,
+                )
+                .map_err(temporal_err)?;
+        } else if let Some(old_id) = self
+            .temporal
+            .current_fact_id(entity.id, FACT_TYPE_ENTITY)
+            .map_err(temporal_err)?
+        {
+            // Update: closes the old fact and opens a new one valid from
+            // `entity.updated_at`. If the caller never bumped updated_at,
+            // we still record a new transaction-time row (so tx-time
+            // history stays complete) but valid_from collapses to the
+            // existing timestamp — the temporal store handles the
+            // supersession chain.
+            self.temporal
+                .update_fact(old_id, &json, entity.updated_at, None)
+                .map_err(temporal_err)?;
+        } else {
+            // Edge case: entity is in the live map but has no temporal
+            // row (e.g. backfill missed it). Treat as a fresh insert.
+            self.temporal
+                .insert_fact(
+                    entity.id,
+                    FACT_TYPE_ENTITY,
+                    &json,
+                    entity.created_at,
+                    None,
+                )
+                .map_err(temporal_err)?;
         }
 
         debug!("[graph] upserted entity id={} name={}", entity.id, entity.name);
@@ -338,6 +482,67 @@ impl GraphStore {
                     serde_json::from_str(&props_str).unwrap_or_default();
                 let entity = props_to_tm_entity(&etype_str, &name, &props)?;
                 Ok(Some(entity))
+            }
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(TraceMindError::Storage(e.to_string())),
+        }
+    }
+
+    /// Look up a triple by its TraceMind UUID. Returns `None` if the
+    /// triple is not in the live `kg_relations` table (either never
+    /// inserted, or pruned). Used by `backfill_temporal` and the
+    /// bitemporal read APIs.
+    pub fn find_triple_by_id(&self, id: Uuid) -> Result<Option<Triple>> {
+        let tmap = self.triple_map.borrow();
+        let skg_id = match tmap.get(&id) {
+            Some(&sid) => sid,
+            None => return Ok(None),
+        };
+        // Pull the row + reverse-lookup the subject/object UUIDs.
+        let entity_map = self.entity_map.borrow();
+        let reverse: HashMap<i64, Uuid> =
+            entity_map.iter().map(|(&uuid, &sid)| (sid, uuid)).collect();
+        drop(entity_map);
+        drop(tmap);
+
+        let conn = self.kg.connection();
+        let result = conn.query_row(
+            "SELECT source_id, target_id, rel_type, weight, properties \
+             FROM kg_relations WHERE id = ?1",
+            params![skg_id],
+            |row| {
+                let source_id: i64 = row.get(0)?;
+                let target_id: i64 = row.get(1)?;
+                let rel_type: String = row.get(2)?;
+                let weight: f64 = row.get(3)?;
+                let props_str: String = row.get(4)?;
+                Ok((source_id, target_id, rel_type, weight, props_str))
+            },
+        );
+
+        match result {
+            Ok((src_skg, tgt_skg, rel_type, weight, props_str)) => {
+                let props: HashMap<String, serde_json::Value> =
+                    serde_json::from_str(&props_str).unwrap_or_default();
+                let subject_id =
+                    reverse.get(&src_skg).copied().unwrap_or_else(Uuid::new_v4);
+                let object_id =
+                    reverse.get(&tgt_skg).copied().unwrap_or_else(Uuid::new_v4);
+                let predicate: Predicate =
+                    serde_json::from_str(&rel_type).unwrap_or(Predicate::RelatedTo);
+                let source_id = prop_string(props.get("source_id"));
+                let created_at = prop_datetime(props.get("created_at"));
+                let updated_at = prop_datetime(props.get("updated_at"));
+                Ok(Some(Triple {
+                    id,
+                    subject_id,
+                    predicate,
+                    object_id,
+                    confidence: weight,
+                    source_id,
+                    created_at,
+                    updated_at,
+                }))
             }
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(TraceMindError::Storage(e.to_string())),
@@ -487,6 +692,7 @@ impl GraphStore {
 
         let mut tmap = self.triple_map.borrow_mut();
 
+        let is_new = !tmap.contains_key(&triple.id);
         if let Some(&skg_id) = tmap.get(&triple.id) {
             // Update via raw SQL (skg has no update_relation).
             let props = triple_props(triple, &predicate_str);
@@ -513,12 +719,161 @@ impl GraphStore {
                 .map_err(|e| TraceMindError::Storage(format!("skg insert_relation: {e}")))?;
             tmap.insert(triple.id, skg_id);
         }
+        drop(tmap);
+
+        // Sprint C-1: mirror into the bitemporal store. Same pattern as
+        // entities — confidence becomes a derived view of belief revisions
+        // once tm-tms is wired (Sprint C-2), but the substrate already
+        // carries the data we'll need then.
+        let json = serde_json::to_string(triple)
+            .map_err(|e| TraceMindError::Storage(e.to_string()))?;
+        if is_new {
+            self.temporal
+                .insert_fact(
+                    triple.id,
+                    FACT_TYPE_TRIPLE,
+                    &json,
+                    triple.created_at,
+                    None,
+                )
+                .map_err(temporal_err)?;
+        } else if let Some(old_id) = self
+            .temporal
+            .current_fact_id(triple.id, FACT_TYPE_TRIPLE)
+            .map_err(temporal_err)?
+        {
+            self.temporal
+                .update_fact(old_id, &json, triple.updated_at, None)
+                .map_err(temporal_err)?;
+        } else {
+            self.temporal
+                .insert_fact(
+                    triple.id,
+                    FACT_TYPE_TRIPLE,
+                    &json,
+                    triple.created_at,
+                    None,
+                )
+                .map_err(temporal_err)?;
+        }
 
         debug!(
             "[graph] upserted triple id={} ({} -> {})",
             triple.id, triple.subject_id, triple.object_id
         );
         Ok(())
+    }
+
+    // ─── Bitemporal reads (Sprint C-1) ──────────────────────────────────
+
+    /// Reconstruct an entity as it appeared at valid-time `as_of`, given
+    /// the full recorded history. Walks `history()` and picks the most
+    /// recently *recorded* assertion whose valid interval contains
+    /// `as_of`. Returns `None` if no version was valid then.
+    ///
+    /// Why not `temporal.query_at`: `update_fact` only marks the old row
+    /// as superseded (transaction-time), it does *not* close its
+    /// valid-time interval. So a strict `query_at(as_of, now)` filters
+    /// the old row out as superseded and the new row out by valid_from,
+    /// returning empty for an in-between `as_of`. Walking history with
+    /// "most-recently-recorded among those whose valid_from ≤ as_of"
+    /// gives the natural "what was true at t" answer.
+    pub fn entity_at(&self, id: Uuid, as_of: DateTime<Utc>) -> Result<Option<Entity>> {
+        let history = self
+            .temporal
+            .history(id, FACT_TYPE_ENTITY)
+            .map_err(temporal_err)?;
+        let mut chosen: Option<Entity> = None;
+        for fact in history {
+            if fact.valid_time.from > as_of {
+                continue;
+            }
+            if let Some(to) = fact.valid_time.to {
+                if to <= as_of {
+                    continue;
+                }
+            }
+            if let Ok(parsed) = serde_json::from_value::<Entity>(fact.fact) {
+                // history() is ordered by recorded_at ASC, so each later
+                // matching fact overrides earlier ones — last write wins.
+                chosen = Some(parsed);
+            }
+        }
+        Ok(chosen)
+    }
+
+    /// Reconstruct a triple as it appeared at valid-time `as_of`. See
+    /// `entity_at` for the chosen-version semantics.
+    pub fn triple_at(&self, id: Uuid, as_of: DateTime<Utc>) -> Result<Option<Triple>> {
+        let history = self
+            .temporal
+            .history(id, FACT_TYPE_TRIPLE)
+            .map_err(temporal_err)?;
+        let mut chosen: Option<Triple> = None;
+        for fact in history {
+            if fact.valid_time.from > as_of {
+                continue;
+            }
+            if let Some(to) = fact.valid_time.to {
+                if to <= as_of {
+                    continue;
+                }
+            }
+            if let Ok(parsed) = serde_json::from_value::<Triple>(fact.fact) {
+                chosen = Some(parsed);
+            }
+        }
+        Ok(chosen)
+    }
+
+    /// Return every recorded version of an entity, oldest first. Each
+    /// element is `(version, valid_from, recorded_at, superseded_at)` —
+    /// callers that need the full bitemporal envelope should use
+    /// `tm_temporal::TemporalStore::history` directly.
+    pub fn entity_history(
+        &self,
+        id: Uuid,
+    ) -> Result<Vec<(Entity, DateTime<Utc>, DateTime<Utc>, Option<DateTime<Utc>>)>> {
+        let facts = self
+            .temporal
+            .history(id, FACT_TYPE_ENTITY)
+            .map_err(temporal_err)?;
+        let mut out = Vec::with_capacity(facts.len());
+        for fact in facts {
+            if let Ok(parsed) = serde_json::from_value::<Entity>(fact.fact.clone()) {
+                out.push((
+                    parsed,
+                    fact.valid_time.from,
+                    fact.tx_time.recorded_at,
+                    fact.tx_time.superseded_at,
+                ));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Return every recorded version of a triple, oldest first. See
+    /// `entity_history`.
+    pub fn triple_history(
+        &self,
+        id: Uuid,
+    ) -> Result<Vec<(Triple, DateTime<Utc>, DateTime<Utc>, Option<DateTime<Utc>>)>> {
+        let facts = self
+            .temporal
+            .history(id, FACT_TYPE_TRIPLE)
+            .map_err(temporal_err)?;
+        let mut out = Vec::with_capacity(facts.len());
+        for fact in facts {
+            if let Ok(parsed) = serde_json::from_value::<Triple>(fact.fact.clone()) {
+                out.push((
+                    parsed,
+                    fact.valid_time.from,
+                    fact.tx_time.recorded_at,
+                    fact.tx_time.superseded_at,
+                ));
+            }
+        }
+        Ok(out)
     }
 
     pub fn get_triples_for_entity(&self, entity_id: Uuid) -> Result<Vec<Triple>> {
@@ -1932,5 +2287,124 @@ mod tests {
         let batch = store.batch_colbert_tokens(&[entity_id, Uuid::new_v4()]);
         assert_eq!(batch.len(), 1);
         assert!(batch.contains_key(&entity_id));
+    }
+
+    // ─── Sprint C-1: bitemporal substrate ───────────────────────────────
+
+    #[test]
+    fn bitemporal_entity_round_trip() {
+        // Insert → entity_at(now) returns it; entity_at(before-creation)
+        // returns None.
+        let store = GraphStore::open(":memory:").unwrap();
+        let mut e = make_entity("Dana", EntityType::Person);
+        let t0 = Utc::now() - chrono::Duration::seconds(30);
+        e.created_at = t0;
+        e.updated_at = t0;
+        store.upsert_entity(&e).unwrap();
+
+        let now = Utc::now();
+        let live = store.entity_at(e.id, now).unwrap();
+        assert!(live.is_some(), "entity should be visible at now");
+        assert_eq!(live.unwrap().name, "Dana");
+
+        let before = store
+            .entity_at(e.id, t0 - chrono::Duration::seconds(60))
+            .unwrap();
+        assert!(before.is_none(), "entity should not exist before t0");
+    }
+
+    #[test]
+    fn bitemporal_entity_update_creates_supersedes_chain() {
+        let store = GraphStore::open(":memory:").unwrap();
+        let mut e = make_entity("Erin", EntityType::Person);
+        let t0 = Utc::now() - chrono::Duration::seconds(60);
+        e.created_at = t0;
+        e.updated_at = t0;
+        store.upsert_entity(&e).unwrap();
+
+        // Mutate name + bump confidence at t1.
+        let t1 = t0 + chrono::Duration::seconds(30);
+        e.name = "Erin Updated".into();
+        e.confidence = 0.42;
+        e.updated_at = t1;
+        store.upsert_entity(&e).unwrap();
+
+        // History has both versions in chronological order.
+        let history = store.entity_history(e.id).unwrap();
+        assert_eq!(history.len(), 2, "expected two revisions in history");
+        assert_eq!(history[0].0.name, "Erin");
+        assert_eq!(history[1].0.name, "Erin Updated");
+        // First revision must be superseded; second must still be live.
+        assert!(history[0].3.is_some(), "first revision should be superseded");
+        assert!(history[1].3.is_none(), "second revision should be live");
+
+        // Querying at t0 should give old name; at t1 should give new.
+        let at_t0 = store
+            .entity_at(e.id, t0 + chrono::Duration::seconds(1))
+            .unwrap()
+            .expect("entity at t0");
+        assert_eq!(at_t0.name, "Erin");
+
+        let at_t1 = store
+            .entity_at(e.id, t1 + chrono::Duration::seconds(1))
+            .unwrap()
+            .expect("entity at t1");
+        assert_eq!(at_t1.name, "Erin Updated");
+        assert!((at_t1.confidence - 0.42).abs() < 1e-9);
+    }
+
+    #[test]
+    fn bitemporal_triple_round_trip() {
+        let store = GraphStore::open(":memory:").unwrap();
+        let a = make_entity("Frank", EntityType::Person);
+        let b = make_entity("Gina", EntityType::Person);
+        store.upsert_entity(&a).unwrap();
+        store.upsert_entity(&b).unwrap();
+
+        let t0 = Utc::now() - chrono::Duration::seconds(60);
+        let mut t = Triple {
+            id: Uuid::new_v4(),
+            subject_id: a.id,
+            predicate: Predicate::RelatedTo,
+            object_id: b.id,
+            confidence: 0.7,
+            source_id: None,
+            created_at: t0,
+            updated_at: t0,
+        };
+        store.upsert_triple(&t).unwrap();
+
+        // Bump confidence at t1.
+        let t1 = t0 + chrono::Duration::seconds(30);
+        t.confidence = 0.95;
+        t.updated_at = t1;
+        store.upsert_triple(&t).unwrap();
+
+        let history = store.triple_history(t.id).unwrap();
+        assert_eq!(history.len(), 2);
+        assert!((history[0].0.confidence - 0.7).abs() < 1e-9);
+        assert!((history[1].0.confidence - 0.95).abs() < 1e-9);
+
+        let at_t0 = store
+            .triple_at(t.id, t0 + chrono::Duration::seconds(1))
+            .unwrap()
+            .expect("triple at t0");
+        assert!((at_t0.confidence - 0.7).abs() < 1e-9);
+
+        let at_t1 = store
+            .triple_at(t.id, t1 + chrono::Duration::seconds(1))
+            .unwrap()
+            .expect("triple at t1");
+        assert!((at_t1.confidence - 0.95).abs() < 1e-9);
+    }
+
+    #[test]
+    fn bitemporal_history_missing_id_is_empty() {
+        let store = GraphStore::open(":memory:").unwrap();
+        let unknown = Uuid::new_v4();
+        assert!(store.entity_history(unknown).unwrap().is_empty());
+        assert!(store.triple_history(unknown).unwrap().is_empty());
+        assert!(store.entity_at(unknown, Utc::now()).unwrap().is_none());
+        assert!(store.triple_at(unknown, Utc::now()).unwrap().is_none());
     }
 }

@@ -5907,6 +5907,7 @@ dependencies = [
  "serde_json",
  "sqlite-knowledge-graph",
  "thiserror 1.0.69",
+ "tm-temporal",
  "tm-types",
  "tracing",
  "uuid",
