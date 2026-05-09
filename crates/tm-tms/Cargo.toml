@@ -1,0 +1,15 @@
+[package]
+name = "tm-tms"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+
+[dependencies]
+tm-types = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]

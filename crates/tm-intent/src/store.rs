@@ -24,8 +24,9 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::types::{
-    Anticipation, AnticipationKind, Commitment, CommitmentKind, ContextSnapshot, Outcome,
-    OutcomeSource, Polarity, Source, Stakes, State, UserResponse,
+    Action, ActionModality, ActionSource, Anticipation, AnticipationKind, Commitment,
+    CommitmentKind, ContextSnapshot, Need, NeedSource, Outcome, OutcomeSource, Polarity,
+    Sentiment, SentimentSource, SentimentTarget, Source, Stakes, State, UserResponse,
 };
 
 #[derive(Debug, Error)]
@@ -237,6 +238,52 @@ impl IntentStore {
             CREATE INDEX IF NOT EXISTS idx_proposals_commitment  ON outcome_proposals(commitment_id);
             CREATE INDEX IF NOT EXISTS idx_proposals_cell_key    ON outcome_proposals(cell_key);
             CREATE INDEX IF NOT EXISTS idx_proposals_expires     ON outcome_proposals(expires_at);
+
+            -- Intent arc: Needs
+            CREATE TABLE IF NOT EXISTS needs (
+                id                   TEXT PRIMARY KEY,
+                statement            TEXT NOT NULL,
+                urgency              REAL NOT NULL DEFAULT 0.5,
+                recurring            INTEGER NOT NULL DEFAULT 0,
+                first_seen           TEXT NOT NULL,
+                last_seen            TEXT NOT NULL,
+                source               TEXT NOT NULL,
+                linked_commitments   TEXT NOT NULL DEFAULT '[]',
+                tags                 TEXT NOT NULL DEFAULT '[]'
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_needs_source     ON needs(source);
+            CREATE INDEX IF NOT EXISTS idx_needs_last_seen  ON needs(last_seen);
+
+            -- Intent arc: Sentiments
+            CREATE TABLE IF NOT EXISTS sentiments (
+                id                   TEXT PRIMARY KEY,
+                target_id            TEXT NOT NULL,
+                target_type          TEXT NOT NULL,
+                valence              REAL NOT NULL,
+                intensity            REAL NOT NULL,
+                source               TEXT NOT NULL,
+                captured_at          TEXT NOT NULL,
+                evidence_text        TEXT,
+                evidence_trace       TEXT
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_sentiments_target     ON sentiments(target_id);
+            CREATE INDEX IF NOT EXISTS idx_sentiments_captured   ON sentiments(captured_at);
+
+            -- Intent arc: Actions
+            CREATE TABLE IF NOT EXISTS actions (
+                id                   TEXT PRIMARY KEY,
+                commitment_id        TEXT,
+                description          TEXT NOT NULL,
+                taken_at             TEXT NOT NULL,
+                evidence             TEXT NOT NULL DEFAULT '[]',
+                modality             TEXT NOT NULL DEFAULT 'digital',
+                source               TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_actions_commitment  ON actions(commitment_id);
+            CREATE INDEX IF NOT EXISTS idx_actions_taken_at     ON actions(taken_at);
             "#,
         )?;
         Ok(())
@@ -824,6 +871,226 @@ impl IntentStore {
             |r| r.get(0),
         )?;
         Ok(n as usize)
+    }
+
+    // ----- needs -----------------------------------------------------------
+
+    pub fn insert_need(&self, n: &Need) -> Result<()> {
+        self.conn.execute(
+            r#"
+            INSERT INTO needs (
+                id, statement, urgency, recurring, first_seen,
+                last_seen, source, linked_commitments, tags
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+            params![
+                n.id.to_string(),
+                n.statement,
+                n.urgency as f64,
+                n.recurring as i32,
+                n.first_seen.to_rfc3339(),
+                n.last_seen.to_rfc3339(),
+                need_source_to_str(n.source),
+                serde_json::to_string(&n.linked_commitments)?,
+                serde_json::to_string(&n.tags)?,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_need(&self, id: Uuid) -> Result<Option<Need>> {
+        self.conn
+            .query_row(
+                "SELECT id, statement, urgency, recurring, first_seen,
+                        last_seen, source, linked_commitments, tags
+                 FROM needs WHERE id = ?",
+                params![id.to_string()],
+                row_to_need,
+            )
+            .optional()
+            .map_err(StoreError::from)
+            .and_then(|opt| opt.transpose())
+    }
+
+    pub fn list_needs(&self, limit: usize) -> Result<Vec<Need>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, statement, urgency, recurring, first_seen,
+                    last_seen, source, linked_commitments, tags
+             FROM needs ORDER BY last_seen DESC LIMIT ?",
+        )?;
+        let rows = stmt.query_map(params![limit as i64], row_to_need)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r??);
+        }
+        Ok(out)
+    }
+
+    pub fn update_need_last_seen(&self, id: Uuid, last_seen: chrono::DateTime<chrono::Utc>) -> Result<()> {
+        let n = self.conn.execute(
+            "UPDATE needs SET last_seen = ? WHERE id = ?",
+            params![last_seen.to_rfc3339(), id.to_string()],
+        )?;
+        if n == 0 {
+            return Err(StoreError::NotFound { kind: "need", id });
+        }
+        Ok(())
+    }
+
+    pub fn link_need_to_commitment(&self, need_id: Uuid, commitment_id: Uuid) -> Result<()> {
+        let need = self.get_need(need_id)?.ok_or(StoreError::NotFound {
+            kind: "need",
+            id: need_id,
+        })?;
+        let mut linked = need.linked_commitments;
+        if !linked.contains(&commitment_id) {
+            linked.push(commitment_id);
+        }
+        self.conn.execute(
+            "UPDATE needs SET linked_commitments = ? WHERE id = ?",
+            params![serde_json::to_string(&linked)?, need_id.to_string()],
+        )?;
+        Ok(())
+    }
+
+    // ----- sentiments -------------------------------------------------------
+
+    pub fn insert_sentiment(&self, s: &Sentiment) -> Result<()> {
+        self.conn.execute(
+            r#"
+            INSERT INTO sentiments (
+                id, target_id, target_type, valence, intensity,
+                source, captured_at, evidence_text, evidence_trace
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+            params![
+                s.id.to_string(),
+                s.target_id.to_string(),
+                sentiment_target_to_str(s.target_type),
+                s.valence as f64,
+                s.intensity as f64,
+                sentiment_source_to_str(s.source),
+                s.captured_at.to_rfc3339(),
+                s.evidence_text,
+                s.evidence_trace.map(|u| u.to_string()),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_sentiment(&self, id: Uuid) -> Result<Option<Sentiment>> {
+        self.conn
+            .query_row(
+                "SELECT id, target_id, target_type, valence, intensity,
+                        source, captured_at, evidence_text, evidence_trace
+                 FROM sentiments WHERE id = ?",
+                params![id.to_string()],
+                row_to_sentiment,
+            )
+            .optional()
+            .map_err(StoreError::from)
+            .and_then(|opt| opt.transpose())
+    }
+
+    pub fn list_sentiments_for(&self, target_id: Uuid, limit: usize) -> Result<Vec<Sentiment>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, target_id, target_type, valence, intensity,
+                    source, captured_at, evidence_text, evidence_trace
+             FROM sentiments WHERE target_id = ?
+             ORDER BY captured_at DESC LIMIT ?",
+        )?;
+        let rows = stmt.query_map(
+            params![target_id.to_string(), limit as i64],
+            row_to_sentiment,
+        )?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r??);
+        }
+        Ok(out)
+    }
+
+    pub fn list_recent_sentiments(&self, limit: usize) -> Result<Vec<Sentiment>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, target_id, target_type, valence, intensity,
+                    source, captured_at, evidence_text, evidence_trace
+             FROM sentiments ORDER BY captured_at DESC LIMIT ?",
+        )?;
+        let rows = stmt.query_map(params![limit as i64], row_to_sentiment)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r??);
+        }
+        Ok(out)
+    }
+
+    // ----- actions -----------------------------------------------------------
+
+    pub fn insert_action(&self, a: &Action) -> Result<()> {
+        self.conn.execute(
+            r#"
+            INSERT INTO actions (
+                id, commitment_id, description, taken_at,
+                evidence, modality, source
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            "#,
+            params![
+                a.id.to_string(),
+                a.commitment_id.map(|u| u.to_string()),
+                a.description,
+                a.taken_at.to_rfc3339(),
+                serde_json::to_string(&a.evidence)?,
+                action_modality_to_str(a.modality),
+                action_source_to_str(a.source),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_action(&self, id: Uuid) -> Result<Option<Action>> {
+        self.conn
+            .query_row(
+                "SELECT id, commitment_id, description, taken_at,
+                        evidence, modality, source
+                 FROM actions WHERE id = ?",
+                params![id.to_string()],
+                row_to_action,
+            )
+            .optional()
+            .map_err(StoreError::from)
+            .and_then(|opt| opt.transpose())
+    }
+
+    pub fn list_actions_for_commitment(&self, commitment_id: Uuid, limit: usize) -> Result<Vec<Action>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, commitment_id, description, taken_at,
+                    evidence, modality, source
+             FROM actions WHERE commitment_id = ?
+             ORDER BY taken_at DESC LIMIT ?",
+        )?;
+        let rows = stmt.query_map(
+            params![commitment_id.to_string(), limit as i64],
+            row_to_action,
+        )?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r??);
+        }
+        Ok(out)
+    }
+
+    pub fn list_recent_actions(&self, limit: usize) -> Result<Vec<Action>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, commitment_id, description, taken_at,
+                    evidence, modality, source
+             FROM actions ORDER BY taken_at DESC LIMIT ?",
+        )?;
+        let rows = stmt.query_map(params![limit as i64], row_to_action)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r??);
+        }
+        Ok(out)
     }
 
     // ----- outcomes -------------------------------------------------------
@@ -1508,6 +1775,180 @@ fn parse_outcome_source(s: &str) -> Result<OutcomeSource> {
                 value: other.to_string(),
             })
         }
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Need / Sentiment / Action row converters + string lookups
+// ---------------------------------------------------------------------------
+
+fn row_to_need(row: &rusqlite::Row<'_>) -> rusqlite::Result<Result<Need>> {
+    let id_s: String = row.get(0)?;
+    let statement: String = row.get(1)?;
+    let urgency: f64 = row.get(2)?;
+    let recurring: i32 = row.get(3)?;
+    let first_seen_s: String = row.get(4)?;
+    let last_seen_s: String = row.get(5)?;
+    let source_s: String = row.get(6)?;
+    let linked_json: String = row.get(7)?;
+    let tags_json: String = row.get(8)?;
+
+    Ok((|| -> Result<Need> {
+        Ok(Need {
+            id: parse_uuid(&id_s, "needs.id")?,
+            statement,
+            urgency: urgency as f32,
+            recurring: recurring != 0,
+            first_seen: parse_dt(&first_seen_s, "needs.first_seen")?,
+            last_seen: parse_dt(&last_seen_s, "needs.last_seen")?,
+            source: parse_need_source(&source_s)?,
+            linked_commitments: serde_json::from_str(&linked_json)?,
+            tags: serde_json::from_str(&tags_json)?,
+        })
+    })())
+}
+
+fn row_to_sentiment(row: &rusqlite::Row<'_>) -> rusqlite::Result<Result<Sentiment>> {
+    let id_s: String = row.get(0)?;
+    let target_id_s: String = row.get(1)?;
+    let target_type_s: String = row.get(2)?;
+    let valence: f64 = row.get(3)?;
+    let intensity: f64 = row.get(4)?;
+    let source_s: String = row.get(5)?;
+    let captured_s: String = row.get(6)?;
+    let evidence_text: Option<String> = row.get(7)?;
+    let evidence_trace_s: Option<String> = row.get(8)?;
+
+    Ok((|| -> Result<Sentiment> {
+        Ok(Sentiment {
+            id: parse_uuid(&id_s, "sentiments.id")?,
+            target_id: parse_uuid(&target_id_s, "sentiments.target_id")?,
+            target_type: parse_sentiment_target(&target_type_s)?,
+            valence: valence as f32,
+            intensity: intensity as f32,
+            source: parse_sentiment_source(&source_s)?,
+            captured_at: parse_dt(&captured_s, "sentiments.captured_at")?,
+            evidence_text,
+            evidence_trace: evidence_trace_s
+                .as_deref()
+                .map(|s| parse_uuid(s, "sentiments.evidence_trace"))
+                .transpose()?,
+        })
+    })())
+}
+
+fn row_to_action(row: &rusqlite::Row<'_>) -> rusqlite::Result<Result<Action>> {
+    let id_s: String = row.get(0)?;
+    let commitment_s: Option<String> = row.get(1)?;
+    let description: String = row.get(2)?;
+    let taken_s: String = row.get(3)?;
+    let evidence_json: String = row.get(4)?;
+    let modality_s: String = row.get(5)?;
+    let source_s: String = row.get(6)?;
+
+    Ok((|| -> Result<Action> {
+        Ok(Action {
+            id: parse_uuid(&id_s, "actions.id")?,
+            commitment_id: commitment_s
+                .as_deref()
+                .map(|s| parse_uuid(s, "actions.commitment_id"))
+                .transpose()?,
+            description,
+            taken_at: parse_dt(&taken_s, "actions.taken_at")?,
+            evidence: serde_json::from_str(&evidence_json)?,
+            modality: parse_action_modality(&modality_s)?,
+            source: parse_action_source(&source_s)?,
+        })
+    })())
+}
+
+fn need_source_to_str(s: NeedSource) -> &'static str {
+    match s {
+        NeedSource::Explicit => "explicit",
+        NeedSource::Mined => "mined",
+        NeedSource::Inferred => "inferred",
+        NeedSource::McpStructured => "mcp_structured",
+    }
+}
+fn parse_need_source(s: &str) -> Result<NeedSource> {
+    Ok(match s {
+        "explicit" => NeedSource::Explicit,
+        "mined" => NeedSource::Mined,
+        "inferred" => NeedSource::Inferred,
+        "mcp_structured" => NeedSource::McpStructured,
+        other => return Err(StoreError::Invalid { field: "need_source", value: other.to_string() }),
+    })
+}
+
+fn sentiment_target_to_str(t: SentimentTarget) -> &'static str {
+    match t {
+        SentimentTarget::Commitment => "commitment",
+        SentimentTarget::Need => "need",
+        SentimentTarget::Entity => "entity",
+        SentimentTarget::Topic => "topic",
+    }
+}
+fn parse_sentiment_target(s: &str) -> Result<SentimentTarget> {
+    Ok(match s {
+        "commitment" => SentimentTarget::Commitment,
+        "need" => SentimentTarget::Need,
+        "entity" => SentimentTarget::Entity,
+        "topic" => SentimentTarget::Topic,
+        other => return Err(StoreError::Invalid { field: "sentiment_target", value: other.to_string() }),
+    })
+}
+
+fn sentiment_source_to_str(s: SentimentSource) -> &'static str {
+    match s {
+        SentimentSource::Heuristic => "heuristic",
+        SentimentSource::LlmAssisted => "llm_assisted",
+        SentimentSource::UserProvided => "user_provided",
+        SentimentSource::McpStructured => "mcp_structured",
+    }
+}
+fn parse_sentiment_source(s: &str) -> Result<SentimentSource> {
+    Ok(match s {
+        "heuristic" => SentimentSource::Heuristic,
+        "llm_assisted" => SentimentSource::LlmAssisted,
+        "user_provided" => SentimentSource::UserProvided,
+        "mcp_structured" => SentimentSource::McpStructured,
+        other => return Err(StoreError::Invalid { field: "sentiment_source", value: other.to_string() }),
+    })
+}
+
+fn action_modality_to_str(m: ActionModality) -> &'static str {
+    match m {
+        ActionModality::Digital => "digital",
+        ActionModality::Physical => "physical",
+        ActionModality::Communication => "communication",
+        ActionModality::Creation => "creation",
+    }
+}
+fn parse_action_modality(s: &str) -> Result<ActionModality> {
+    Ok(match s {
+        "digital" => ActionModality::Digital,
+        "physical" => ActionModality::Physical,
+        "communication" => ActionModality::Communication,
+        "creation" => ActionModality::Creation,
+        other => return Err(StoreError::Invalid { field: "action_modality", value: other.to_string() }),
+    })
+}
+
+fn action_source_to_str(s: ActionSource) -> &'static str {
+    match s {
+        ActionSource::Detected => "detected",
+        ActionSource::UserReported => "user_reported",
+        ActionSource::McpStructured => "mcp_structured",
+        ActionSource::EmbeddingMatched => "embedding_matched",
+    }
+}
+fn parse_action_source(s: &str) -> Result<ActionSource> {
+    Ok(match s {
+        "detected" => ActionSource::Detected,
+        "user_reported" => ActionSource::UserReported,
+        "mcp_structured" => ActionSource::McpStructured,
+        "embedding_matched" => ActionSource::EmbeddingMatched,
+        other => return Err(StoreError::Invalid { field: "action_source", value: other.to_string() }),
     })
 }
 

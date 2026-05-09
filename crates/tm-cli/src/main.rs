@@ -212,6 +212,57 @@ enum Commands {
         #[command(subcommand)]
         action: OutcomesAction,
     },
+    /// Record a Need — the 'why' behind commitments. Needs drive the
+    /// intent arc: Need → Sentiment → Commitment → Action → Outcome.
+    Need {
+        /// What the user needs.
+        statement: String,
+        /// Urgency 0.0 (low) to 1.0 (critical). Default 0.5.
+        #[arg(long)]
+        urgency: Option<f32>,
+        /// True for ongoing needs (health, learning).
+        #[arg(long)]
+        recurring: bool,
+        /// Comma-separated tags.
+        #[arg(long, default_value = "")]
+        tags: String,
+        /// Commitment UUID to link this need to.
+        #[arg(long)]
+        link: Option<String>,
+    },
+    /// Record sentiment toward a target (commitment, need, entity, topic).
+    Sentiment {
+        /// UUID of the target.
+        target_id: String,
+        /// Target type: commitment | need | entity | topic.
+        #[arg(long)]
+        target_type: String,
+        /// Valence from -1.0 (negative) to +1.0 (positive).
+        valence: f64,
+        /// Evidence text that triggered this sentiment.
+        #[arg(long)]
+        evidence: Option<String>,
+    },
+    /// Record an action taken toward a commitment.
+    Action {
+        /// What was done.
+        description: String,
+        /// Commitment UUID this action relates to.
+        #[arg(long)]
+        commitment_id: Option<String>,
+        /// Modality: digital | physical | communication | creation.
+        #[arg(long, default_value = "digital")]
+        modality: String,
+    },
+    /// Show the full intent arc for a commitment (Need → Sentiment →
+    /// Commitment → Action → Outcome).
+    Arc {
+        /// Commitment UUID.
+        commitment_id: String,
+        /// Emit JSON instead of formatted text.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(clap::Subcommand)]
@@ -980,6 +1031,40 @@ fn main() {
         Commands::Outcomes { action } => {
             let intents_path = dir.join("intents.db").to_str().unwrap().to_string();
             cmd_outcomes(&intents_path, action);
+        }
+        Commands::Need {
+            statement,
+            urgency,
+            recurring,
+            tags,
+            link,
+        } => {
+            let intents_path = dir.join("intents.db").to_str().unwrap().to_string();
+            cmd_need(&intents_path, &statement, urgency, recurring, &tags, link.as_deref());
+        }
+        Commands::Sentiment {
+            target_id,
+            target_type,
+            valence,
+            evidence,
+        } => {
+            let intents_path = dir.join("intents.db").to_str().unwrap().to_string();
+            cmd_sentiment(&intents_path, &target_id, &target_type, valence, evidence.as_deref());
+        }
+        Commands::Action {
+            description,
+            commitment_id,
+            modality,
+        } => {
+            let intents_path = dir.join("intents.db").to_str().unwrap().to_string();
+            cmd_action(&intents_path, &description, commitment_id.as_deref(), &modality);
+        }
+        Commands::Arc {
+            commitment_id,
+            json,
+        } => {
+            let intents_path = dir.join("intents.db").to_str().unwrap().to_string();
+            cmd_arc(&intents_path, &commitment_id, json);
         }
     }
 }
@@ -3041,5 +3126,288 @@ fn cmd_world(intents_path: &str, world_path: &std::path::Path, action: WorldActi
                 }
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Intent arc commands: need / sentiment / action / arc
+// ---------------------------------------------------------------------------
+
+fn cmd_need(
+    intents_path: &str,
+    statement: &str,
+    urgency: Option<f32>,
+    recurring: bool,
+    tags: &str,
+    link: Option<&str>,
+) {
+    use tm_intent::{IntentStore, Need, NeedSource};
+
+    let mut need = Need::new(statement, NeedSource::Explicit);
+    if let Some(u) = urgency {
+        if !(0.0..=1.0).contains(&u) {
+            eprintln!("urgency must be in [0,1], got {u}");
+            std::process::exit(1);
+        }
+        need.urgency = u;
+    }
+    need.recurring = recurring;
+    need.tags = tags
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .collect();
+
+    let store = IntentStore::open(intents_path).expect("open intent store");
+    store.insert_need(&need).expect("insert need");
+
+    if let Some(cid_s) = link {
+        let cid = Uuid::parse_str(cid_s).unwrap_or_else(|e| {
+            eprintln!("invalid --link UUID '{cid_s}': {e}");
+            std::process::exit(1);
+        });
+        store
+            .link_need_to_commitment(need.id, cid)
+            .unwrap_or_else(|e| {
+                eprintln!("link failed: {e}");
+                std::process::exit(1);
+            });
+        println!("Linked to commitment {cid}");
+    }
+
+    println!("Need recorded: {}", need.id);
+    println!("  statement: {}", need.statement);
+    println!("  urgency:   {:.1}", need.urgency);
+    println!("  recurring: {}", need.recurring);
+}
+
+fn cmd_sentiment(
+    intents_path: &str,
+    target_id_s: &str,
+    target_type_s: &str,
+    valence: f64,
+    evidence: Option<&str>,
+) {
+    use tm_intent::{IntentStore, Sentiment, SentimentSource, SentimentTarget};
+
+    let target_id = Uuid::parse_str(target_id_s).unwrap_or_else(|e| {
+        eprintln!("invalid target_id '{target_id_s}': {e}");
+        std::process::exit(1);
+    });
+    let target_type = match target_type_s {
+        "commitment" => SentimentTarget::Commitment,
+        "need" => SentimentTarget::Need,
+        "entity" => SentimentTarget::Entity,
+        "topic" => SentimentTarget::Topic,
+        other => {
+            eprintln!("invalid --target-type: {other} (must be commitment|need|entity|topic)");
+            std::process::exit(1);
+        }
+    };
+    if !(-1.0..=1.0).contains(&valence) {
+        eprintln!("valence must be in [-1,1], got {valence}");
+        std::process::exit(1);
+    }
+
+    let mut s = Sentiment::new(target_id, target_type, valence as f32, SentimentSource::UserProvided);
+    if let Some(ev) = evidence {
+        s.evidence_text = Some(ev.to_string());
+    }
+
+    let store = IntentStore::open(intents_path).expect("open intent store");
+    store.insert_sentiment(&s).expect("insert sentiment");
+
+    let sign = if s.valence >= 0.0 { "+" } else { "" };
+    println!("Sentiment recorded: {}", s.id);
+    println!("  target:    {} ({})", target_id_s, target_type_s);
+    println!("  valence:   {sign}{:.2}", s.valence);
+    println!("  intensity: {:.2}", s.intensity);
+}
+
+fn cmd_action(
+    intents_path: &str,
+    description: &str,
+    commitment_id: Option<&str>,
+    modality_s: &str,
+) {
+    use tm_intent::{Action, ActionModality, ActionSource, IntentStore};
+
+    let modality = match modality_s {
+        "digital" => ActionModality::Digital,
+        "physical" => ActionModality::Physical,
+        "communication" => ActionModality::Communication,
+        "creation" => ActionModality::Creation,
+        other => {
+            eprintln!("invalid --modality: {other} (must be digital|physical|communication|creation)");
+            std::process::exit(1);
+        }
+    };
+
+    let mut action = Action::new(description, ActionSource::UserReported);
+    action.modality = modality;
+    if let Some(cid_s) = commitment_id {
+        action.commitment_id = Some(Uuid::parse_str(cid_s).unwrap_or_else(|e| {
+            eprintln!("invalid --commitment-id '{cid_s}': {e}");
+            std::process::exit(1);
+        }));
+    }
+
+    let store = IntentStore::open(intents_path).expect("open intent store");
+    store.insert_action(&action).expect("insert action");
+
+    println!("Action recorded: {}", action.id);
+    println!("  description: {}", action.description);
+    println!("  modality:    {modality_s}");
+    if let Some(cid) = action.commitment_id {
+        println!("  commitment:  {cid}");
+    }
+}
+
+fn cmd_arc(intents_path: &str, commitment_id_s: &str, json: bool) {
+    use tm_intent::IntentStore;
+
+    let cid = Uuid::parse_str(commitment_id_s).unwrap_or_else(|e| {
+        eprintln!("invalid commitment_id '{commitment_id_s}': {e}");
+        std::process::exit(1);
+    });
+
+    let store = IntentStore::open(intents_path).expect("open intent store");
+    let commitment = store
+        .get_commitment(cid)
+        .expect("get_commitment")
+        .unwrap_or_else(|| {
+            eprintln!("commitment {cid} not found");
+            std::process::exit(1);
+        });
+
+    // Gather linked needs
+    let all_needs = store.list_needs(500).expect("list_needs");
+    let linked_needs: Vec<_> = all_needs
+        .into_iter()
+        .filter(|n| n.linked_commitments.contains(&cid))
+        .collect();
+
+    let sentiments = store
+        .list_sentiments_for(cid, 10)
+        .expect("list_sentiments_for");
+    let actions = store
+        .list_actions_for_commitment(cid, 20)
+        .expect("list_actions_for_commitment");
+    let outcome = commitment
+        .outcome_id
+        .and_then(|oid| store.get_outcome(oid).ok().flatten());
+
+    if json {
+        let needs_json: Vec<serde_json::Value> = linked_needs
+            .iter()
+            .map(|n| {
+                serde_json::json!({
+                    "id": n.id.to_string(),
+                    "statement": n.statement,
+                    "urgency": n.urgency,
+                })
+            })
+            .collect();
+        let sents_json: Vec<serde_json::Value> = sentiments
+            .iter()
+            .map(|s| {
+                serde_json::json!({
+                    "id": s.id.to_string(),
+                    "valence": s.valence,
+                    "intensity": s.intensity,
+                    "captured_at": s.captured_at.to_rfc3339(),
+                })
+            })
+            .collect();
+        let acts_json: Vec<serde_json::Value> = actions
+            .iter()
+            .map(|a| {
+                serde_json::json!({
+                    "id": a.id.to_string(),
+                    "description": a.description,
+                    "taken_at": a.taken_at.to_rfc3339(),
+                })
+            })
+            .collect();
+        let out_json = outcome.as_ref().map(|o| {
+            serde_json::json!({
+                "id": o.id.to_string(),
+                "polarity": format!("{:?}", o.polarity).to_lowercase(),
+                "description": o.description,
+            })
+        });
+        let arc = serde_json::json!({
+            "commitment": {
+                "id": commitment.id.to_string(),
+                "kind": format!("{:?}", commitment.kind).to_lowercase(),
+                "statement": commitment.statement,
+                "state": format!("{:?}", commitment.state).to_lowercase(),
+            },
+            "needs": needs_json,
+            "sentiments": sents_json,
+            "actions": acts_json,
+            "outcome": out_json,
+        });
+        println!("{}", serde_json::to_string_pretty(&arc).unwrap());
+        return;
+    }
+
+    // Formatted text output
+    println!("═══ Intent Arc ═══");
+    println!(
+        "Commitment: {} [{}] ({})",
+        commitment.statement,
+        format!("{:?}", commitment.kind).to_lowercase(),
+        format!("{:?}", commitment.state).to_lowercase(),
+    );
+    println!("  id: {cid}");
+
+    if !linked_needs.is_empty() {
+        println!("\n── Needs ──");
+        for n in &linked_needs {
+            println!(
+                "  • {} (urgency {:.1}{})",
+                n.statement,
+                n.urgency,
+                if n.recurring { ", recurring" } else { "" },
+            );
+        }
+    }
+
+    if !sentiments.is_empty() {
+        println!("\n── Sentiments ──");
+        for s in &sentiments {
+            let sign = if s.valence >= 0.0 { "+" } else { "" };
+            println!(
+                "  {} {sign}{:.2} (intensity {:.2}) — {}",
+                s.captured_at.format("%Y-%m-%d"),
+                s.valence,
+                s.intensity,
+                s.evidence_text.as_deref().unwrap_or("—"),
+            );
+        }
+    }
+
+    if !actions.is_empty() {
+        println!("\n── Actions ──");
+        for a in &actions {
+            println!(
+                "  {} {} [{}]",
+                a.taken_at.format("%Y-%m-%d"),
+                a.description,
+                format!("{:?}", a.modality).to_lowercase(),
+            );
+        }
+    }
+
+    if let Some(o) = &outcome {
+        println!("\n── Outcome ──");
+        println!(
+            "  {} — {} ({})",
+            o.observed_at.format("%Y-%m-%d"),
+            o.description,
+            format!("{:?}", o.polarity).to_lowercase(),
+        );
     }
 }
