@@ -6,6 +6,7 @@ edition.workspace = true
 [dependencies]
 tm-types = { workspace = true }
 tm-temporal = { workspace = true }
+tm-tms = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 uuid = { workspace = true }

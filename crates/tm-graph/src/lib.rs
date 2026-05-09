@@ -1,4 +1,7 @@
+pub mod belief;
 pub mod store;
+
+pub use belief::{effective_confidence, BeliefStore, ContradictionView};
 pub use store::{CapturedSignal, GraphStore};
 
 use tm_types::Predicate;

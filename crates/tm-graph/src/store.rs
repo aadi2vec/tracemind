@@ -16,9 +16,12 @@ use serde_json::json;
 use sqlite_knowledge_graph::{
     Entity as SkgEntity, KnowledgeGraph, Relation as SkgRelation,
 };
+use tm_tms::BeliefStatus;
 use tm_types::{Entity, EntityType, Predicate, Result, TraceMindError, Triple};
 use tracing::{debug, info};
 use uuid::Uuid;
+
+use crate::belief::{BeliefStore, ContradictionView};
 
 /// A raw captured signal from the fast-path ingestion pipeline.
 /// Signals are stored with their embedding but without NER/triple extraction.
@@ -52,6 +55,11 @@ pub struct GraphStore {
     /// `:memory:` instance for tests). See `temporal_facts` schema in
     /// `tm-temporal`.
     temporal: tm_temporal::TemporalStore,
+    /// JTMS-backed belief store (Sprint C-2). Mirrors every triple
+    /// upsert as a belief assertion; surfaces `BeliefStatus` to
+    /// retrieval / brief without persisting itself — rebuilt at
+    /// `open()` from the live triple set.
+    beliefs: BeliefStore,
 }
 
 /// String tag stored in `temporal_facts.fact_type` for entity revisions.
@@ -232,6 +240,7 @@ impl GraphStore {
             entity_map: RefCell::new(entity_map),
             triple_map: RefCell::new(triple_map),
             temporal,
+            beliefs: BeliefStore::new(),
         };
 
         // One-time backfill: emit a temporal fact for any entity / triple
@@ -239,7 +248,41 @@ impl GraphStore {
         // anything already tracked. Cheap (linear in #rows missing a fact).
         store.backfill_temporal()?;
 
+        // Sprint C-2: rebuild the in-memory belief engine from live triples.
+        // Cheap (linear in #triples) and avoids persisting JTMS state
+        // separately. Contradictions detected at runtime are *not*
+        // restored across restarts — they re-detect when the same
+        // embedding pair is seen again. (Acceptable for v0; we'll
+        // persist contradictions in a follow-up if it matters.)
+        store.rebuild_beliefs()?;
+
         Ok(store)
+    }
+
+    /// Walk every live triple and assert it into the belief engine.
+    /// Idempotent — `BeliefStore::assert_for_triple` returns the
+    /// existing belief id if one already exists.
+    fn rebuild_beliefs(&self) -> Result<()> {
+        let triple_uuids: Vec<Uuid> = self.triple_map.borrow().keys().copied().collect();
+        let mut count = 0usize;
+        for uuid in triple_uuids {
+            if let Some(triple) = self.find_triple_by_id(uuid)? {
+                let pred_str = serde_json::to_string(&triple.predicate)
+                    .unwrap_or_else(|_| "unknown".to_string());
+                self.beliefs.assert_for_triple(
+                    triple.id,
+                    triple.subject_id,
+                    &pred_str,
+                    triple.object_id,
+                    triple.confidence as f32,
+                );
+                count += 1;
+            }
+        }
+        if count > 0 {
+            info!("[graph] belief engine rebuilt: {count} triples asserted");
+        }
+        Ok(())
     }
 
     /// Walk live `kg_entities` and `kg_relations` and emit a temporal fact
@@ -757,11 +800,44 @@ impl GraphStore {
                 .map_err(temporal_err)?;
         }
 
+        // Sprint C-2: mirror as a JTMS belief. Idempotent — re-asserting
+        // the same triple just returns the existing belief id (and
+        // revives it if it was previously `Out`).
+        self.beliefs.assert_for_triple(
+            triple.id,
+            triple.subject_id,
+            &predicate_str,
+            triple.object_id,
+            weight as f32,
+        );
+
         debug!(
             "[graph] upserted triple id={} ({} -> {})",
             triple.id, triple.subject_id, triple.object_id
         );
         Ok(())
+    }
+
+    // ─── Belief APIs (Sprint C-2) ───────────────────────────────────────
+
+    /// Borrow the JTMS-backed belief store. Use this to call
+    /// `detect_contradiction` from the ingest pipeline (which has
+    /// the embeddings needed to compute cosine similarity).
+    pub fn beliefs(&self) -> &BeliefStore {
+        &self.beliefs
+    }
+
+    /// Current `BeliefStatus` for `triple_id`. `None` means the triple
+    /// has no belief recorded (shouldn't happen for triples that went
+    /// through `upsert_triple` — only legacy data would).
+    pub fn belief_status_for(&self, triple_id: Uuid) -> Option<BeliefStatus> {
+        self.beliefs.status_for(triple_id)
+    }
+
+    /// All contradictions recorded so far, projected into triple-id
+    /// space. Used by the daily brief.
+    pub fn contradictions(&self) -> Vec<ContradictionView> {
+        self.beliefs.contradictions()
     }
 
     // ─── Bitemporal reads (Sprint C-1) ──────────────────────────────────
@@ -923,6 +999,17 @@ impl GraphStore {
             let source_id = prop_string(props.get("source_id"));
             let created_at = prop_datetime(props.get("created_at"));
             let updated_at = prop_datetime(props.get("updated_at"));
+
+            // Sprint C-2: skip triples whose JTMS belief is `Out`
+            // (explicitly retracted). `Contradicted` triples remain
+            // visible — the brief surfaces them and downstream consumers
+            // can apply `effective_confidence` to downrank.
+            if matches!(
+                self.beliefs.status_for(triple_uuid),
+                Some(BeliefStatus::Out)
+            ) {
+                continue;
+            }
 
             triples.push(Triple {
                 id: triple_uuid,
