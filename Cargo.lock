@@ -5912,6 +5912,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sqlite-knowledge-graph",
+ "tempfile",
  "thiserror 1.0.69",
  "tm-temporal",
  "tm-tms",

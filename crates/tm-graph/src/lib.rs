@@ -1,8 +1,8 @@
 pub mod belief;
 pub mod store;
 
-pub use belief::{effective_confidence, BeliefStore, ContradictionView};
-pub use store::{CapturedSignal, GraphStore};
+pub use belief::{effective_confidence, BeliefStore, ContradictionView, ResolveChoice};
+pub use store::{CapturedSignal, GraphStore, TripleDetail};
 
 use tm_types::Predicate;
 use uuid::Uuid;

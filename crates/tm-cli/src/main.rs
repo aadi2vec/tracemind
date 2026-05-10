@@ -269,6 +269,37 @@ enum Commands {
         #[command(subcommand)]
         action: DemoAction,
     },
+    /// JTMS contradictions surface — list outstanding rows + resolve
+    /// them. Mirrors the Tauri brief drawer (Shot 2 of the demo) so
+    /// the same retraction beat works without the desktop app.
+    Contradictions {
+        #[command(subcommand)]
+        action: ContradictionsAction,
+    },
+}
+
+#[derive(clap::Subcommand)]
+enum ContradictionsAction {
+    /// List outstanding contradictions (resolved ones are filtered out).
+    List {
+        /// Emit JSON instead of formatted text.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Resolve a contradiction by triple-pair. Use the triple UUIDs
+    /// from `contradictions list` (or the brief). The choice maps to:
+    ///
+    /// - `keep-a`     → retract triple B
+    /// - `keep-b`     → retract triple A
+    /// - `keep-both`  → neither retracted; mark resolved
+    Resolve {
+        /// First triple UUID (the "A" side).
+        triple_a: String,
+        /// Second triple UUID (the "B" side).
+        triple_b: String,
+        /// One of: keep-a | keep-b | keep-both.
+        choice: String,
+    },
 }
 
 #[derive(clap::Subcommand)]
@@ -1122,6 +1153,10 @@ fn main() {
         }
         Commands::Demo { action } => {
             cmd_demo(&dir, action);
+        }
+        Commands::Contradictions { action } => {
+            let db_path = dir.join("memory.db").to_str().unwrap().to_string();
+            cmd_contradictions(&db_path, action);
         }
     }
 }
@@ -3588,6 +3623,110 @@ fn cmd_demo(dir: &PathBuf, action: DemoAction) {
     match action {
         DemoAction::Restore { force } => cmd_demo_restore(dir, force),
         DemoAction::Preroll { seconds, verbose } => cmd_demo_preroll(dir, seconds, verbose),
+    }
+}
+
+/// `tracemind contradictions list | resolve` — terminal mirror of the
+/// Tauri brief drawer. Same `BeliefStore::resolve_by_triples` path as
+/// the desktop app, so a sidecar saved here replays correctly when
+/// the user later opens the GUI.
+fn cmd_contradictions(db_path: &str, action: ContradictionsAction) {
+    use tm_graph::{GraphStore, ResolveChoice};
+
+    let graph = match GraphStore::open(db_path) {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("failed to open graph at {db_path}: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    match action {
+        ContradictionsAction::List { json } => {
+            let rows: Vec<_> = graph
+                .contradictions()
+                .into_iter()
+                .filter(|r| r.resolution.is_none())
+                .collect();
+            if json {
+                let out = serde_json::to_string_pretty(&rows)
+                    .unwrap_or_else(|_| "[]".to_string());
+                println!("{out}");
+            } else if rows.is_empty() {
+                println!("no outstanding contradictions");
+            } else {
+                println!("{} outstanding contradiction(s):\n", rows.len());
+                for r in &rows {
+                    let a = graph
+                        .triple_detail(r.triple_a)
+                        .ok()
+                        .flatten()
+                        .map(|d| format!("{} {} {}", d.subject_name, d.predicate, d.object_name))
+                        .unwrap_or_else(|| r.triple_a.to_string());
+                    let b = graph
+                        .triple_detail(r.triple_b)
+                        .ok()
+                        .flatten()
+                        .map(|d| format!("{} {} {}", d.subject_name, d.predicate, d.object_name))
+                        .unwrap_or_else(|| r.triple_b.to_string());
+                    println!(
+                        "  {}  cosine {:+.2}",
+                        r.detected_at.format("%Y-%m-%d %H:%M"),
+                        r.cosine_similarity,
+                    );
+                    println!("    A  {}  ({})", a, &r.triple_a.to_string()[..8]);
+                    println!("    B  {}  ({})", b, &r.triple_b.to_string()[..8]);
+                    println!();
+                }
+                println!(
+                    "resolve with: tracemind contradictions resolve <triple_a> <triple_b> <keep-a|keep-b|keep-both>",
+                );
+            }
+        }
+        ContradictionsAction::Resolve {
+            triple_a,
+            triple_b,
+            choice,
+        } => {
+            let ta = match uuid::Uuid::parse_str(&triple_a) {
+                Ok(u) => u,
+                Err(e) => {
+                    eprintln!("bad triple_a uuid: {e}");
+                    std::process::exit(2);
+                }
+            };
+            let tb = match uuid::Uuid::parse_str(&triple_b) {
+                Ok(u) => u,
+                Err(e) => {
+                    eprintln!("bad triple_b uuid: {e}");
+                    std::process::exit(2);
+                }
+            };
+            let ch = match choice.to_lowercase().replace('_', "-").as_str() {
+                "keep-a" => ResolveChoice::KeepA,
+                "keep-b" => ResolveChoice::KeepB,
+                "keep-both" => ResolveChoice::KeepBoth,
+                other => {
+                    eprintln!("unknown choice {other:?}; expected keep-a | keep-b | keep-both");
+                    std::process::exit(2);
+                }
+            };
+            match graph.resolve_contradiction_by_triples(ta, tb, ch) {
+                Some((retracted, kept)) => {
+                    println!("resolved: {} retracted, {} kept", retracted.len(), kept.len());
+                    for u in retracted {
+                        println!("  retracted {}", u);
+                    }
+                    for u in kept {
+                        println!("  kept      {}", u);
+                    }
+                }
+                None => {
+                    eprintln!("no matching contradiction for that triple pair");
+                    std::process::exit(1);
+                }
+            }
+        }
     }
 }
 

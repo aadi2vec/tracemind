@@ -27,13 +27,53 @@ use std::collections::HashMap;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use tm_tms::{BeliefStatus, Contradiction, TmsEngine};
+use tm_tms::{BeliefStatus, Contradiction, ContradictionResolution, TmsEngine};
 use uuid::Uuid;
+
+/// User-facing resolution choice from the brief drawer. Maps onto
+/// [`tm_tms::ContradictionResolution`] but in *triple-id space* and
+/// adds a `KeepBoth` semantic the JTMS doesn't natively have ("these
+/// aren't actually contradictory — likely about different times").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ResolveChoice {
+    /// Keep `triple_a`, retract `triple_b` (mark `Out` in JTMS).
+    KeepA,
+    /// Keep `triple_b`, retract `triple_a` (mark `Out` in JTMS).
+    KeepB,
+    /// Both stay `In`. The contradiction is marked resolved (so the
+    /// brief stops surfacing it) but neither triple is retracted.
+    /// Used when the human reviewer judges the two triples as
+    /// referring to different time periods or contexts.
+    KeepBoth,
+}
+
+/// Project the engine's resolution back into triple-space. Returns
+/// `None` for unresolved contradictions and for `RetractBoth`, which
+/// `BeliefStore` never emits via its public API (so we treat it as
+/// "unmapped" rather than inventing a new variant).
+fn project_resolution(r: Option<ContradictionResolution>) -> Option<ResolveChoice> {
+    match r? {
+        ContradictionResolution::RetractA => Some(ResolveChoice::KeepB),
+        ContradictionResolution::RetractB => Some(ResolveChoice::KeepA),
+        // The only path that reaches `UserOverride` from BeliefStore
+        // is `KeepBoth` (we use it as a sentinel and then force the
+        // other belief back to `In`). Anything else came from a
+        // direct caller of the engine — treat as KeepBoth too.
+        ContradictionResolution::UserOverride(_) => Some(ResolveChoice::KeepBoth),
+        ContradictionResolution::RetractBoth => None,
+    }
+}
 
 /// A contradiction reported back to callers in *triple-id* space.
 /// Mirrors `tm_tms::Contradiction` but replaces `belief_a/b` with the
 /// originating triple UUIDs so the brief / UI never needs to know
 /// belief ids exist.
+///
+/// `resolution` is `None` while the contradiction is still
+/// outstanding (the brief surfaces it as a row to act on). After the
+/// user resolves it via the drawer, the sidecar persists the choice
+/// so the next process start can replay the resolution and the brief
+/// stops showing the row.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContradictionView {
     pub id: Uuid,
@@ -41,6 +81,10 @@ pub struct ContradictionView {
     pub triple_b: Uuid,
     pub detected_at: DateTime<Utc>,
     pub cosine_similarity: f32,
+    /// `None` while outstanding; set to a `ResolveChoice` once the
+    /// human acted. Persisted so resolutions survive restarts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolution: Option<ResolveChoice>,
 }
 
 /// Builds a deterministic statement string for a triple. Uses raw
@@ -153,6 +197,7 @@ impl BeliefStore {
             triple_b,
             detected_at: raw.detected_at,
             cosine_similarity: raw.cosine_similarity,
+            resolution: project_resolution(raw.resolution),
         })
     }
 
@@ -180,6 +225,7 @@ impl BeliefStore {
                     triple_b,
                     detected_at: c.detected_at,
                     cosine_similarity: c.cosine_similarity,
+                    resolution: project_resolution(c.resolution),
                 })
             })
             .collect()
@@ -189,6 +235,122 @@ impl BeliefStore {
     /// rebuild diagnostics.
     pub fn belief_count(&self) -> usize {
         self.triple_to_belief.borrow().len()
+    }
+
+    /// Resolve an outstanding contradiction by triple-id. Returns the
+    /// affected triple uuids `(retracted, kept)` so the caller can
+    /// invalidate caches / persist the new statuses. Returns `None`
+    /// if no matching contradiction exists.
+    ///
+    /// Mapping to the underlying JTMS:
+    /// - `KeepA`     → `RetractB`
+    /// - `KeepB`     → `RetractA`
+    /// - `KeepBoth`  → no JTMS retraction; we manually mark both
+    ///                 beliefs back to `In`, then mark the
+    ///                 contradiction as resolved with a sentinel
+    ///                 `UserOverride(belief_a)` (engine's resolution
+    ///                 type can't express "neither retracted", but
+    ///                 setting it to anything moves the row out of
+    ///                 the unresolved set the brief reads from).
+    pub fn resolve_contradiction(
+        &self,
+        contradiction_id: Uuid,
+        choice: ResolveChoice,
+    ) -> Option<(Vec<Uuid>, Vec<Uuid>)> {
+        // Look up triples + belief ids without holding mutable
+        // borrows while we call into the engine.
+        let (triple_a, triple_b, belief_a, belief_b) = {
+            let engine = self.engine.borrow();
+            let raw = engine.contradictions().iter().find(|c| c.id == contradiction_id)?.clone();
+            let b2t = self.belief_to_triple.borrow();
+            let ta = *b2t.get(&raw.belief_a)?;
+            let tb = *b2t.get(&raw.belief_b)?;
+            (ta, tb, raw.belief_a, raw.belief_b)
+        };
+
+        let (retracted, kept) = match choice {
+            ResolveChoice::KeepA => {
+                let _ = self
+                    .engine
+                    .borrow_mut()
+                    .resolve_contradiction(contradiction_id, ContradictionResolution::RetractB)
+                    .ok()?;
+                (vec![triple_b], vec![triple_a])
+            }
+            ResolveChoice::KeepB => {
+                let _ = self
+                    .engine
+                    .borrow_mut()
+                    .resolve_contradiction(contradiction_id, ContradictionResolution::RetractA)
+                    .ok()?;
+                (vec![triple_a], vec![triple_b])
+            }
+            ResolveChoice::KeepBoth => {
+                // Pin a sentinel resolution so the brief filter sees
+                // this row as resolved, then explicitly restore both
+                // beliefs to In (UserOverride only sets one to In).
+                let mut engine = self.engine.borrow_mut();
+                let _ = engine
+                    .resolve_contradiction(
+                        contradiction_id,
+                        ContradictionResolution::UserOverride(belief_a),
+                    )
+                    .ok()?;
+                // The UserOverride branch of resolve_contradiction
+                // sets `keep_id` to In and `retract_id` to Out — so
+                // belief_b is now Out. Force it back to In since the
+                // user said "keep both."
+                engine.force_status(belief_b, BeliefStatus::In);
+                (Vec::new(), vec![triple_a, triple_b])
+            }
+        };
+
+        Some((retracted, kept))
+    }
+
+    /// Resolve by the stable `(triple_a, triple_b)` pair instead of
+    /// the engine-assigned contradiction UUID. Necessary for clients
+    /// (Tauri / MCP / CLI) that receive a contradiction id from one
+    /// `GraphStore::open` and act on it from a fresh open — IDs
+    /// regenerate on every replay but the triple pair doesn't.
+    /// Order is direction-insensitive: (a, b) and (b, a) match the
+    /// same row, but the resulting `KeepA` / `KeepB` semantics are
+    /// applied as if the caller's `triple_a` is the "A" side.
+    pub fn resolve_by_triples(
+        &self,
+        triple_a: Uuid,
+        triple_b: Uuid,
+        choice: ResolveChoice,
+    ) -> Option<(Vec<Uuid>, Vec<Uuid>)> {
+        let (id, swapped) = {
+            let engine = self.engine.borrow();
+            let b2t = self.belief_to_triple.borrow();
+            let row = engine.contradictions().iter().find_map(|c| {
+                let ta = *b2t.get(&c.belief_a)?;
+                let tb = *b2t.get(&c.belief_b)?;
+                if ta == triple_a && tb == triple_b {
+                    Some((c.id, false))
+                } else if ta == triple_b && tb == triple_a {
+                    Some((c.id, true))
+                } else {
+                    None
+                }
+            })?;
+            row
+        };
+        // If the triples were stored in the opposite order from what
+        // the caller passed, flip the choice so KeepA still keeps the
+        // caller's `triple_a`.
+        let effective = if swapped {
+            match choice {
+                ResolveChoice::KeepA => ResolveChoice::KeepB,
+                ResolveChoice::KeepB => ResolveChoice::KeepA,
+                ResolveChoice::KeepBoth => ResolveChoice::KeepBoth,
+            }
+        } else {
+            choice
+        };
+        self.resolve_contradiction(id, effective)
     }
 
     /// Persist the current contradiction list to `path` as JSON.
@@ -227,10 +389,18 @@ impl BeliefStore {
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         let mut replayed = 0usize;
         for r in rows {
-            if self
-                .detect_contradiction(r.triple_a, r.triple_b, r.cosine_similarity)
-                .is_some()
+            // Re-detect rebuilds the contradiction in the engine with
+            // a fresh id. If the persisted row had a resolution, we
+            // re-apply it against that fresh id so the engine ends up
+            // in the same `(Contradicted | resolved)` state as before
+            // the restart — otherwise resolved rows would resurrect
+            // unresolved on every process start.
+            if let Some(view) =
+                self.detect_contradiction(r.triple_a, r.triple_b, r.cosine_similarity)
             {
+                if let Some(choice) = r.resolution {
+                    let _ = self.resolve_contradiction(view.id, choice);
+                }
                 replayed += 1;
             }
         }
@@ -319,6 +489,103 @@ mod tests {
         // Clamping
         assert_eq!(effective_confidence(2.0, BeliefStatus::In), 1.0);
         assert_eq!(effective_confidence(-0.5, BeliefStatus::In), 0.0);
+    }
+
+    #[test]
+    fn resolve_keep_a_retracts_b() {
+        let (store, _, _, t1, t2) = fresh();
+        let c = store.detect_contradiction(t1, t2, -0.95).unwrap();
+        let (retracted, kept) = store
+            .resolve_contradiction(c.id, ResolveChoice::KeepA)
+            .unwrap();
+        assert_eq!(retracted, vec![t2]);
+        assert_eq!(kept, vec![t1]);
+        assert_eq!(store.status_for(t1), Some(BeliefStatus::In));
+        assert_eq!(store.status_for(t2), Some(BeliefStatus::Out));
+        // The brief filter looks at .resolution.is_none() — verify the
+        // engine now reports the contradiction as resolved.
+        let listed = store.contradictions();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].resolution, Some(ResolveChoice::KeepA));
+    }
+
+    #[test]
+    fn resolve_keep_b_retracts_a() {
+        let (store, _, _, t1, t2) = fresh();
+        let c = store.detect_contradiction(t1, t2, -0.95).unwrap();
+        let (retracted, kept) = store
+            .resolve_contradiction(c.id, ResolveChoice::KeepB)
+            .unwrap();
+        assert_eq!(retracted, vec![t1]);
+        assert_eq!(kept, vec![t2]);
+        assert_eq!(store.status_for(t1), Some(BeliefStatus::Out));
+        assert_eq!(store.status_for(t2), Some(BeliefStatus::In));
+    }
+
+    #[test]
+    fn resolve_by_triples_swaps_choice_when_pair_is_reversed() {
+        let (store, _, _, t1, t2) = fresh();
+        let _ = store.detect_contradiction(t1, t2, -0.95).unwrap();
+        // Caller passes (t2, t1) — engine stored (t1, t2). KeepA from
+        // the caller's perspective should keep t2.
+        let (retracted, kept) = store
+            .resolve_by_triples(t2, t1, ResolveChoice::KeepA)
+            .unwrap();
+        assert_eq!(retracted, vec![t1]);
+        assert_eq!(kept, vec![t2]);
+        assert_eq!(store.status_for(t1), Some(BeliefStatus::Out));
+        assert_eq!(store.status_for(t2), Some(BeliefStatus::In));
+    }
+
+    #[test]
+    fn resolve_keep_both_leaves_both_in() {
+        let (store, _, _, t1, t2) = fresh();
+        let c = store.detect_contradiction(t1, t2, -0.95).unwrap();
+        let (retracted, kept) = store
+            .resolve_contradiction(c.id, ResolveChoice::KeepBoth)
+            .unwrap();
+        assert!(retracted.is_empty());
+        assert_eq!(kept.len(), 2);
+        assert_eq!(store.status_for(t1), Some(BeliefStatus::In));
+        assert_eq!(store.status_for(t2), Some(BeliefStatus::In));
+        let listed = store.contradictions();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].resolution, Some(ResolveChoice::KeepBoth));
+    }
+
+    #[test]
+    fn resolution_round_trips_through_save_replay() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("contradictions.json");
+
+        // First store: detect, resolve, save.
+        let s = Uuid::new_v4();
+        let o = Uuid::new_v4();
+        let t1 = Uuid::new_v4();
+        let t2 = Uuid::new_v4();
+        {
+            let store = BeliefStore::new();
+            store.assert_for_triple(t1, s, "likes", o, 0.9);
+            store.assert_for_triple(t2, s, "dislikes", o, 0.85);
+            let c = store.detect_contradiction(t1, t2, -0.95).unwrap();
+            store
+                .resolve_contradiction(c.id, ResolveChoice::KeepA)
+                .unwrap();
+            store.save_contradictions(&path).unwrap();
+        }
+
+        // Second store: same triples, replay sidecar — resolution
+        // should re-apply so the contradiction is still resolved.
+        let store = BeliefStore::new();
+        store.assert_for_triple(t1, s, "likes", o, 0.9);
+        store.assert_for_triple(t2, s, "dislikes", o, 0.85);
+        let replayed = store.replay_contradictions(&path).unwrap();
+        assert_eq!(replayed, 1);
+        assert_eq!(store.status_for(t1), Some(BeliefStatus::In));
+        assert_eq!(store.status_for(t2), Some(BeliefStatus::Out));
+        let listed = store.contradictions();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].resolution, Some(ResolveChoice::KeepA));
     }
 
     #[test]

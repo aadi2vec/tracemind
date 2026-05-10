@@ -77,6 +77,26 @@ impl TmsEngine {
         self.beliefs.get(&id).map(|b| b.status)
     }
 
+    /// Direct status override. Used by callers that resolve a
+    /// contradiction with semantics the four `ContradictionResolution`
+    /// variants don't cover — e.g. "keep both, they're about
+    /// different times". Bumps `updated_at` so consumers can tell the
+    /// belief was touched.
+    ///
+    /// No propagation: dependencies of this belief keep their old
+    /// status. Use sparingly — JTMS invariants only hold for beliefs
+    /// whose status was set through `assert_belief` /
+    /// `retract_belief` / `resolve_contradiction`.
+    pub fn force_status(&mut self, id: Uuid, status: BeliefStatus) -> bool {
+        if let Some(b) = self.beliefs.get_mut(&id) {
+            b.status = status;
+            b.updated_at = Utc::now();
+            true
+        } else {
+            false
+        }
+    }
+
     /// All beliefs currently `In`.
     pub fn active_beliefs(&self) -> Vec<&Belief> {
         self.beliefs

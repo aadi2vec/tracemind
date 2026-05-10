@@ -37,6 +37,32 @@ pub struct CapturedSignal {
     pub created_at: DateTime<Utc>,
 }
 
+/// Human-readable projection of a triple, for the brief contradiction
+/// drawer. Combines the typed-triple row with both endpoint entity
+/// names + the current belief status. Built for UI consumption — the
+/// fields are flat and serializable so the Tauri/MCP layers can pass
+/// it straight through without any further reshaping.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct TripleDetail {
+    pub triple_id: Uuid,
+    pub subject_id: Uuid,
+    pub subject_name: String,
+    pub subject_type: String,
+    pub predicate: String,
+    pub object_id: Uuid,
+    pub object_name: String,
+    pub object_type: String,
+    pub confidence: f64,
+    /// Capture / trace id this triple originated from. May be `None`
+    /// for triples that were upserted without an attached source.
+    pub source_id: Option<String>,
+    pub ingested_at: DateTime<Utc>,
+    /// Current JTMS status — `In` / `Out` / `Contradicted`. `None`
+    /// means the belief engine hasn't been built yet (shouldn't
+    /// happen for live triples but worth surfacing for diagnostics).
+    pub status: Option<BeliefStatus>,
+}
+
 /// Knowledge-graph store backed by a single SQLite file (via sqlite-knowledge-graph).
 ///
 /// Provides entity/triple CRUD, k-hop traversal, vector search, PageRank, and
@@ -303,6 +329,95 @@ impl GraphStore {
             }
         }
         Some(view)
+    }
+
+    /// Resolve a previously detected contradiction. Drives the
+    /// retraction beat in the brief / Tauri drawer:
+    ///
+    /// - `KeepA`     → retract `triple_b` in JTMS (status `Out`,
+    ///                 `effective_confidence` returns 0 → never
+    ///                 surfaces in retrieval).
+    /// - `KeepB`     → symmetric.
+    /// - `KeepBoth`  → both stay `In`, contradiction marked resolved
+    ///                 so the brief stops surfacing it.
+    ///
+    /// Re-saves the sidecar after the resolution so the new statuses
+    /// survive a restart. The triples themselves are *not* hard-
+    /// deleted — `Out` is enough to filter them at retrieval and
+    /// keeps the bitemporal substrate honest about what was once
+    /// believed.
+    pub fn resolve_contradiction(
+        &self,
+        contradiction_id: Uuid,
+        choice: crate::belief::ResolveChoice,
+    ) -> Option<(Vec<Uuid>, Vec<Uuid>)> {
+        let res = self.beliefs.resolve_contradiction(contradiction_id, choice)?;
+        if let Some(ref p) = self.beliefs_path {
+            if let Err(e) = self.beliefs.save_contradictions(p) {
+                tracing::warn!("[graph] failed to persist contradictions after resolve: {e}");
+            }
+        }
+        Some(res)
+    }
+
+    /// Resolve by stable `(triple_a, triple_b)` pair. Use this from
+    /// IPC / CLI where the contradiction UUID seen by the user came
+    /// from a previous `GraphStore::open` and may not match the id
+    /// the freshly-opened engine assigned. Re-saves the sidecar so
+    /// the resolution survives the next restart.
+    pub fn resolve_contradiction_by_triples(
+        &self,
+        triple_a: Uuid,
+        triple_b: Uuid,
+        choice: crate::belief::ResolveChoice,
+    ) -> Option<(Vec<Uuid>, Vec<Uuid>)> {
+        let res = self.beliefs.resolve_by_triples(triple_a, triple_b, choice)?;
+        if let Some(ref p) = self.beliefs_path {
+            if let Err(e) = self.beliefs.save_contradictions(p) {
+                tracing::warn!("[graph] failed to persist contradictions after resolve: {e}");
+            }
+        }
+        Some(res)
+    }
+
+    /// Hydrate a triple into the human-readable form the brief drawer
+    /// renders: subject + predicate + object as names (not UUIDs),
+    /// the ingest timestamp, the originating capture / trace id, and
+    /// the current belief status. Returns `None` if the triple was
+    /// hard-deleted between sidecar save and load.
+    pub fn triple_detail(&self, triple_id: Uuid) -> Result<Option<TripleDetail>> {
+        let Some(triple) = self.find_triple_by_id(triple_id)? else {
+            return Ok(None);
+        };
+        let subject = self.get_entity(triple.subject_id).ok();
+        let object = self.get_entity(triple.object_id).ok();
+        let status = self.beliefs.status_for(triple_id);
+        Ok(Some(TripleDetail {
+            triple_id,
+            subject_id: triple.subject_id,
+            subject_name: subject
+                .as_ref()
+                .map(|e| e.name.clone())
+                .unwrap_or_else(|| triple.subject_id.to_string()),
+            subject_type: subject
+                .as_ref()
+                .map(|e| format!("{:?}", e.entity_type))
+                .unwrap_or_default(),
+            predicate: triple.predicate.to_string(),
+            object_id: triple.object_id,
+            object_name: object
+                .as_ref()
+                .map(|e| e.name.clone())
+                .unwrap_or_else(|| triple.object_id.to_string()),
+            object_type: object
+                .as_ref()
+                .map(|e| format!("{:?}", e.entity_type))
+                .unwrap_or_default(),
+            confidence: triple.confidence,
+            source_id: triple.source_id,
+            ingested_at: triple.created_at,
+            status,
+        }))
     }
 
     /// Walk every live triple and assert it into the belief engine.

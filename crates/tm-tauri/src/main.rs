@@ -1160,6 +1160,165 @@ fn cmd_brief(state: State<AppState>) -> Result<BriefView, String> {
 }
 
 // ---------------------------------------------------------------------------
+// Contradiction drawer — D-4 / E series
+// ---------------------------------------------------------------------------
+//
+// The brief surfaces a contradiction row; the user clicks it; the drawer
+// renders both triples with names + ingest dates, and offers the three
+// resolution buttons. These two commands back that drawer.
+
+#[derive(Serialize)]
+struct TripleDetailView {
+    triple_id: String,
+    subject_id: String,
+    subject_name: String,
+    subject_type: String,
+    predicate: String,
+    object_id: String,
+    object_name: String,
+    object_type: String,
+    confidence: f64,
+    source_id: Option<String>,
+    ingested_at: String,
+    status: Option<String>,
+}
+
+impl From<tm_graph::TripleDetail> for TripleDetailView {
+    fn from(d: tm_graph::TripleDetail) -> Self {
+        Self {
+            triple_id: d.triple_id.to_string(),
+            subject_id: d.subject_id.to_string(),
+            subject_name: d.subject_name,
+            subject_type: d.subject_type,
+            predicate: d.predicate,
+            object_id: d.object_id.to_string(),
+            object_name: d.object_name,
+            object_type: d.object_type,
+            confidence: d.confidence,
+            source_id: d.source_id,
+            ingested_at: d.ingested_at.format("%Y-%m-%d %H:%M").to_string(),
+            status: d.status.map(|s| format!("{:?}", s)),
+        }
+    }
+}
+
+#[tauri::command]
+fn cmd_triple_detail(
+    state: State<AppState>,
+    triple_id: String,
+) -> Result<Option<TripleDetailView>, String> {
+    let id = uuid::Uuid::parse_str(&triple_id).map_err(|e| format!("bad uuid: {e}"))?;
+    let graph = GraphStore::open(&state.db_path).map_err(|e| e.to_string())?;
+    let detail = graph
+        .triple_detail(id)
+        .map_err(|e| format!("triple_detail: {e}"))?;
+    Ok(detail.map(TripleDetailView::from))
+}
+
+#[derive(Serialize)]
+struct ResolveContradictionResult {
+    retracted: Vec<String>,
+    kept: Vec<String>,
+}
+
+#[tauri::command]
+fn cmd_resolve_contradiction(
+    state: State<AppState>,
+    triple_a: String,
+    triple_b: String,
+    choice: String,
+) -> Result<ResolveContradictionResult, String> {
+    let ta = uuid::Uuid::parse_str(&triple_a).map_err(|e| format!("bad triple_a uuid: {e}"))?;
+    let tb = uuid::Uuid::parse_str(&triple_b).map_err(|e| format!("bad triple_b uuid: {e}"))?;
+    let ch = match choice.as_str() {
+        "keep_a" | "KeepA" => tm_graph::ResolveChoice::KeepA,
+        "keep_b" | "KeepB" => tm_graph::ResolveChoice::KeepB,
+        "keep_both" | "KeepBoth" => tm_graph::ResolveChoice::KeepBoth,
+        other => return Err(format!("unknown choice: {other}")),
+    };
+    let graph = GraphStore::open(&state.db_path).map_err(|e| e.to_string())?;
+    let (retracted, kept) = graph
+        .resolve_contradiction_by_triples(ta, tb, ch)
+        .ok_or_else(|| "no matching contradiction".to_string())?;
+    Ok(ResolveContradictionResult {
+        retracted: retracted.into_iter().map(|u| u.to_string()).collect(),
+        kept: kept.into_iter().map(|u| u.to_string()).collect(),
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Outcome-prompt drawer — D-4 / E series (Shot 4 of demo)
+// ---------------------------------------------------------------------------
+//
+// User clicks an overdue commitment in the brief, the drawer opens with
+// "Did you ship it? What was the outcome?" and the user picks completed +
+// polarity. We insert an Outcome and transition the commitment state, in
+// the same shape `tm-mcp::commit_outcome` uses.
+
+#[derive(Serialize)]
+struct RecordOutcomeResult {
+    outcome_id: String,
+    commitment_id: String,
+    commitment_state: String,
+    polarity: String,
+}
+
+#[tauri::command]
+fn cmd_record_outcome(
+    state: State<AppState>,
+    commitment_id: String,
+    polarity: String,
+    description: Option<String>,
+    user_note: Option<String>,
+) -> Result<RecordOutcomeResult, String> {
+    use tm_intent::{IntentStore, Outcome, OutcomeSource, Polarity, State as CState};
+    use tm_intent::state::transition;
+
+    let cid =
+        uuid::Uuid::parse_str(&commitment_id).map_err(|e| format!("bad commitment uuid: {e}"))?;
+    let polarity_norm = polarity.to_lowercase();
+    let pol = match polarity_norm.as_str() {
+        "better" | "positive" => Polarity::Better,
+        "as_expected" | "neutral" => Polarity::AsExpected,
+        "worse" | "negative" => Polarity::Worse,
+        "mixed" => Polarity::Mixed,
+        "no_outcome" => Polarity::NoOutcome,
+        other => return Err(format!("invalid polarity: {other}")),
+    };
+
+    let dir = data_dir(&state);
+    let intents_path = dir.join("intents.db");
+    let store = IntentStore::open(intents_path.to_str().unwrap_or_default())
+        .map_err(|e| format!("open intents: {e}"))?;
+    let mut commitment = store
+        .get_commitment(cid)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("commitment {cid} not found"))?;
+
+    let mut outcome = Outcome::new(
+        cid,
+        pol,
+        description.unwrap_or_default(),
+        OutcomeSource::UserPrompted,
+    );
+    outcome.user_note = user_note;
+
+    transition(&mut commitment, CState::Completed, Some(&outcome))
+        .map_err(|e| format!("state transition rejected: {e}"))?;
+    store.insert_outcome(&outcome).map_err(|e| e.to_string())?;
+    store
+        .update_state(commitment.id, commitment.state, commitment.outcome_id)
+        .map_err(|e| e.to_string())?;
+
+    Ok(RecordOutcomeResult {
+        outcome_id: outcome.id.to_string(),
+        commitment_id: commitment.id.to_string(),
+        commitment_state: format!("{:?}", commitment.state).to_lowercase(),
+        polarity: polarity_norm,
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
 
@@ -1251,6 +1410,9 @@ fn main() {
             cmd_find_analogies,
             cmd_consolidate,
             cmd_brief,
+            cmd_triple_detail,
+            cmd_resolve_contradiction,
+            cmd_record_outcome,
         ])
         .setup(move |app| {
             let handle = app.handle().clone();

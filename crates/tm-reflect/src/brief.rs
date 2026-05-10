@@ -641,6 +641,10 @@ impl<'a> BriefBuilder<'a> {
             .map(|g| {
                 g.contradictions()
                     .into_iter()
+                    // Only surface unresolved contradictions — once
+                    // the user has acted via the drawer (KeepA / KeepB
+                    // / KeepBoth) the row should leave the brief.
+                    .filter(|c| c.resolution.is_none())
                     .map(|c| ContradictionBriefRow {
                         id: c.id,
                         triple_a: c.triple_a,

@@ -280,3 +280,75 @@ export interface BriefView {
 export async function getBrief(): Promise<BriefView> {
   return invoke("cmd_brief");
 }
+
+// Contradiction drawer (E series)
+
+export interface TripleDetailView {
+  triple_id: string;
+  subject_id: string;
+  subject_name: string;
+  subject_type: string;
+  predicate: string;
+  object_id: string;
+  object_name: string;
+  object_type: string;
+  confidence: number;
+  source_id: string | null;
+  ingested_at: string;
+  status: string | null;
+}
+
+export type ResolveChoice = "keep_a" | "keep_b" | "keep_both";
+
+export interface ResolveContradictionResult {
+  retracted: string[];
+  kept: string[];
+}
+
+export async function getTripleDetail(
+  tripleId: string,
+): Promise<TripleDetailView | null> {
+  return invoke("cmd_triple_detail", { tripleId });
+}
+
+export async function resolveContradiction(
+  tripleA: string,
+  tripleB: string,
+  choice: ResolveChoice,
+): Promise<ResolveContradictionResult> {
+  return invoke("cmd_resolve_contradiction", {
+    tripleA,
+    tripleB,
+    choice,
+  });
+}
+
+// Outcome-prompt drawer (E series)
+
+export type OutcomePolarity =
+  | "better"
+  | "as_expected"
+  | "worse"
+  | "mixed"
+  | "no_outcome";
+
+export interface RecordOutcomeResult {
+  outcome_id: string;
+  commitment_id: string;
+  commitment_state: string;
+  polarity: string;
+}
+
+export async function recordOutcome(
+  commitmentId: string,
+  polarity: OutcomePolarity,
+  description?: string,
+  userNote?: string,
+): Promise<RecordOutcomeResult> {
+  return invoke("cmd_record_outcome", {
+    commitmentId,
+    polarity,
+    description,
+    userNote,
+  });
+}
