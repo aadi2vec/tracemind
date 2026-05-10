@@ -299,14 +299,26 @@ Wraps IntentStore + TmsEngine + TemporalStore. API: `assert_belief`, `retract`, 
 
 ## 13. Quality benchmarks
 
-### 13.1 LoCoMo results (v0.2, mini-set, 20 questions)
+### 13.1 LoCoMo results (v0.4, mini-set, 20 questions, 2026-05-09)
 
 | Config | F1 | EM |
 |---|---|---|
-| v0.2-bge (Tier-0) | 25.70 | 5.00 |
+| v0.2-bge (Tier-0, no extractors) | 25.70 | 5.00 |
+| v0.3-bge (Tier-0, threshold tuning) | 25.70 | 5.00 |
+| **v0.4-hash / v0.4-bge (Tier-0 + span extractors)** | **49.27** | **30.00** |
 | Competitor ceiling (Mem0, full LoCoMo) | 91.6 | — |
 
-Per-category: multi_hop 36.57, adversarial 25.07, single_hop 24.64, temporal 16.67 (regressed — no date extraction).
+Per-category v0.4 (both hash and BGE — extractors are deterministic post-retrieval):
+- temporal: 16.67 → **100.00** (recency cue + clock-time extractor)
+- adversarial: 25.07 → **73.33** (yes/no oracle with date/money/proper-noun mismatch)
+- single_hop: 24.64 → **37.06** (date + money span extraction)
+- multi_hop: 36.57 → **39.94** (mild lift from speaker-prefix stripping + Q→A windowing)
+
+The lift comes entirely from `tm-bench-locomo::extract` — a Tier-0 question
+classifier (`QKind::{YesNo, Date, Money, Time, Generic}`) and span extractors
+that compose tight short-form answers from the retrieved candidate text.
+SQuAD F1 punishes long predictions on precision; Tier-0 was returning whole
+turns. The extractors close that gap before truncation.
 
 ### 13.2 Quality targets
 

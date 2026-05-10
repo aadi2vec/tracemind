@@ -173,7 +173,7 @@ Selection: structured tasks prefer Tier 1; open-ended prefers Tier 2 → Tier 1 
 - **`tm-bench`** — ingest + retrieval microbenchmarks
 - **`tm-bench-ner`** — GLiNER NER quality eval against labeled sets
 - **`tm-bench-ner-e2e`** — end-to-end round-trip
-- **`tm-bench-locomo`** — published LoCoMo scoring harness (token F1 + EM, 5 categories: single_hop / multi_hop / temporal / open_domain / adversarial). CI gate fails any PR that drops > 0.5 F1. Current mini-set baseline: **F1 25.70 BGE / 25.70 hash** (v0.2, 2026-04-26). See `docs/DESIGN.md` §13.
+- **`tm-bench-locomo`** — published LoCoMo scoring harness (token F1 + EM, 5 categories: single_hop / multi_hop / temporal / open_domain / adversarial). CI gate fails any PR that drops > 0.5 F1. Current mini-set baseline: **F1 49.27 / EM 30.00** (v0.4, 2026-05-09, both BGE and hash; lift from `tm-bench-locomo::extract` Tier-0 span extractors). See `docs/DESIGN.md` §13.
 
 ### Roadmap
 

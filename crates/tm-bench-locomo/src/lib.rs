@@ -24,6 +24,7 @@
 //! LoCoMo >0.5 points fails to merge. See `docs/LOCOMO_RESULTS.md`.
 
 pub mod dataset;
+pub mod extract;
 pub mod report;
 pub mod runner;
 pub mod scoring;
