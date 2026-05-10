@@ -4121,7 +4121,7 @@ fn resolve_capture_bin() -> PathBuf {
 
 fn cmd_demo_restore(dir: &PathBuf, force: bool) {
     use chrono::{Duration, Utc};
-    use tm_graph::GraphStore;
+    use tm_graph::{GraphStore, context::Context};
     use tm_intent::{
         Commitment, CommitmentKind, IntentStore, Outcome, OutcomeSource, Polarity, Source,
         Stakes, State, state::transition,
@@ -4189,14 +4189,50 @@ fn cmd_demo_restore(dir: &PathBuf, force: bool) {
     let sprint_plan = mk_entity("Sprint C-2 plan", EntityType::Concept);
     let oncall_runbook = mk_entity("Oncall runbook", EntityType::File);
 
-    let entities = [
-        &alice, &bob, &carla, &priya, &mercury, &q1memo, &demo_proj,
-        &postgres, &sqlite, &onboarding, &pitch_deck, &calibration_plan,
-        &research_doc, &sprint_plan, &oncall_runbook,
+    // ── Contexts (UI-6) ────────────────────────────────────────────
+    // Two deterministic contexts so the demo recording can showcase
+    // context switching + scoped retrieval. UUIDs are UUIDv5 from the
+    // frozen demo namespace so the short-id callouts in the demo
+    // script never drift between recordings.
+    let mk_ctx = |name: &str, tags: &str| -> Context {
+        let id = Uuid::new_v5(&DEMO_NAMESPACE, format!("ctx:{name}").as_bytes());
+        Context {
+            id,
+            name: name.to_string(),
+            tags: tags.to_string(),
+            created_at: now - Duration::days(30),
+        }
+    };
+    let ctx_mercury = mk_ctx("Mercury work", "client,mercury,b2b");
+    let ctx_dev = mk_ctx("TraceMind dev", "internal,engineering,product");
+    graph.create_context(&ctx_mercury).expect("create ctx mercury");
+    graph.create_context(&ctx_dev).expect("create ctx dev");
+
+    // Cluster 1 — Mercury work. Customer-facing.
+    let mercury_entities = [
+        &alice, &bob, &carla, &priya, &mercury, &q1memo, &onboarding, &oncall_runbook,
     ];
-    for e in entities {
-        graph.upsert_entity(e).expect("upsert entity");
+    graph.set_active_context(Some(ctx_mercury.id));
+    for e in mercury_entities {
+        graph.upsert_entity(e).expect("upsert mercury entity");
     }
+
+    // Cluster 2 — TraceMind dev. Internal product/engineering.
+    let dev_entities = [
+        &demo_proj, &postgres, &sqlite, &pitch_deck,
+        &calibration_plan, &research_doc, &sprint_plan,
+    ];
+    graph.set_active_context(Some(ctx_dev.id));
+    for e in dev_entities {
+        graph.upsert_entity(e).expect("upsert dev entity");
+    }
+    // Reset to unscoped so subsequent triples can decide their own ctx.
+    graph.set_active_context(None);
+    let entities = mercury_entities
+        .iter()
+        .chain(dev_entities.iter())
+        .copied()
+        .collect::<Vec<_>>();
 
     // ── Triples ────────────────────────────────────────────────────
     let mk_triple = |label: &str, s: Uuid, p: Predicate, o: Uuid, conf: f64| -> Triple {
@@ -4206,48 +4242,54 @@ fn cmd_demo_restore(dir: &PathBuf, force: bool) {
         t
     };
 
-    let triples = vec![
+    // Mercury-context triples. Includes the loves/hates contradiction
+    // since both subjects (Alice, Bob) live in the Mercury cluster.
+    let mercury_triples = vec![
         mk_triple("alice-works-mercury", alice.id, Predicate::WorksAt, mercury.id, 0.95),
         mk_triple("bob-works-mercury", bob.id, Predicate::WorksAt, mercury.id, 0.92),
         mk_triple("carla-collab-alice", carla.id, Predicate::CollaboratesWith, alice.id, 0.88),
         mk_triple("priya-collab-bob", priya.id, Predicate::CollaboratesWith, bob.id, 0.84),
         mk_triple("alice-owns-q1memo", alice.id, Predicate::Owns, q1memo.id, 0.9),
         mk_triple("q1memo-references-mercury", q1memo.id, Predicate::References, mercury.id, 0.93),
+        mk_triple("onboarding-partof-mercury", onboarding.id, Predicate::PartOf, mercury.id, 0.86),
+        // The contradicting pair — same subject + object, opposing
+        // predicates. Detected explicitly below at cosine = -0.94.
+        mk_triple("alice-loves-bob", alice.id, Predicate::Custom("loves".into()), bob.id, 0.88),
+        mk_triple("alice-hates-bob", alice.id, Predicate::Custom("hates".into()), bob.id, 0.85),
+    ];
+    // Dev-context triples.
+    let dev_triples = vec![
         mk_triple("demo-depends-postgres", demo_proj.id, Predicate::DependsOn, postgres.id, 0.9),
         mk_triple("demo-depends-sqlite", demo_proj.id, Predicate::DependsOn, sqlite.id, 0.95),
-        mk_triple("onboarding-partof-mercury", onboarding.id, Predicate::PartOf, mercury.id, 0.86),
         mk_triple("pitch-references-demo", pitch_deck.id, Predicate::References, demo_proj.id, 0.91),
         mk_triple("calibration-related", calibration_plan.id, Predicate::RelatedTo, demo_proj.id, 0.8),
         mk_triple("research-references-locomo", research_doc.id, Predicate::References, demo_proj.id, 0.87),
         mk_triple("sprint-related-demo", sprint_plan.id, Predicate::RelatedTo, demo_proj.id, 0.83),
         mk_triple("oncall-references-postgres", oncall_runbook.id, Predicate::References, postgres.id, 0.81),
-        // The contradicting pair — same subject + object, opposing
-        // predicates. Detected explicitly below at cosine = -0.94.
-        mk_triple(
-            "alice-loves-bob",
-            alice.id,
-            Predicate::Custom("loves".into()),
-            bob.id,
-            0.88,
-        ),
-        mk_triple(
-            "alice-hates-bob",
-            alice.id,
-            Predicate::Custom("hates".into()),
-            bob.id,
-            0.85,
-        ),
     ];
-    for t in &triples {
-        graph.upsert_triple(t).expect("upsert triple");
+
+    graph.set_active_context(Some(ctx_mercury.id));
+    for t in &mercury_triples {
+        graph.upsert_triple(t).expect("upsert mercury triple");
     }
+    graph.set_active_context(Some(ctx_dev.id));
+    for t in &dev_triples {
+        graph.upsert_triple(t).expect("upsert dev triple");
+    }
+    graph.set_active_context(None);
+    let triples: Vec<Triple> = mercury_triples
+        .iter()
+        .chain(dev_triples.iter())
+        .cloned()
+        .collect();
 
     // Detect the contradiction so the brief surfaces it. The cosine
     // is hard-coded — the live pipeline computes it from embeddings,
     // but for the fixture we just want the JTMS to flip both beliefs
-    // to Contradicted.
-    let loves = triples[triples.len() - 2].id;
-    let hates = triples[triples.len() - 1].id;
+    // to Contradicted. The pair lives at the tail of the Mercury
+    // cluster (alice-loves-bob, alice-hates-bob).
+    let loves = mercury_triples[mercury_triples.len() - 2].id;
+    let hates = mercury_triples[mercury_triples.len() - 1].id;
     let _ = graph
         .record_contradiction(loves, hates, -0.94)
         .expect("contradiction recorded");
@@ -4348,8 +4390,11 @@ fn cmd_demo_restore(dir: &PathBuf, force: bool) {
     }
 
     println!("✓ demo fixture restored to {}", dir.display());
-    println!("  entities:        {}", entities.len());
-    println!("  triples:         {}", triples.len());
+    println!("  contexts:        2   (Mercury work, TraceMind dev)");
+    println!("  entities:        {}  ({} Mercury / {} TraceMind dev)",
+        entities.len(), mercury_entities.len(), dev_entities.len());
+    println!("  triples:         {}  ({} Mercury / {} TraceMind dev)",
+        triples.len(), mercury_triples.len(), dev_triples.len());
     println!("  contradictions:  1   (Alice loves Bob ↔ Alice hates Bob)");
     println!("  open commitments: 4  (1 due today, 1 overdue 3d, 2 stale)");
     println!("  resolved (7d):   {}", resolved_specs.len());

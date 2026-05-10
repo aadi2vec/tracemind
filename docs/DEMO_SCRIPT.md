@@ -54,11 +54,53 @@ TRACEMIND BRIEF                    Mon May 11, 8:42 AM
 
 ---
 
-## Shot 2 — The retraction beat (0:25 – 1:15)
+## Shot 2 — Context segmentation + feedback loop (0:25 – 1:00) — Sprint D / UI-7
 
-**Voiceover:** "It noticed I told it two contradicting things about Alice and Bob — once in March, once last week. It's been holding both, downranking them, and asking me which one is true."
+> **Why this is shot 2 now (2026-05-10):** the wedge is no longer "we remember things"
+> — that's table stakes. The wedge is *local machines have MORE context blur than cloud*
+> (one laptop hosts every venture, every personal thread), and TraceMind is the only
+> memory layer that segments + course-corrects without uploading. Investors see this
+> *before* the retraction beat so they know what they're looking at.
 
-**Action:** click the contradiction row → drawer opens with both source captures + the ingest dates.
+**Voiceover:** "On this laptop I do Mercury client work, TraceMind engineering, and
+personal stuff. A cloud product would ask me to switch accounts. TraceMind keeps it
+in one graph but never bridges contexts unless I tell it to."
+
+**Action:** in the sidebar `CONTEXT` switcher (bottom-left of the Tauri shell), pick
+**Mercury work**. The badge updates from *all contexts* to *Mercury work*. Every
+subsequent ingest + retrieval is scoped to this namespace.
+
+**Action:** open the Query view and ask *"who works at Mercury"*. The result list
+shows Alice / Bob / the Q1 board memo. The active-context pill on each row reads
+*Mercury work*.
+
+**Action:** hover over a row — three icon buttons appear: **👍 helpful**,
+**👎 not related**, **↗ wrong context**.
+
+- Click **👍** on the Alice row. The row dims and shows a *noted ✓* pill.
+  Behind the scenes, `cmd_helpful(query_id, alice.id, weight=0.3)` writes a row
+  to `positive_signals`. The reward composition (`finalize_pending_reward`) now
+  pushes the active arm's reward toward 1.0.
+- Click **↗ wrong context** on the Postgres row that leaked in from a stale
+  cross-context bridge. It dims with a *filed wrong-context* pill. A row lands
+  in `negative_signals(kind='cross_context_bridge')`; the next retrieval in this
+  scope downranks anything tagged with that context pair.
+
+**Action:** rerun the same query. The bandit now picks the wider arm; Postgres
+falls off the top results, the Q1 board memo moves up. Same engine, same DB,
+two clicks of correction.
+
+**Voiceover:** "Every click is local. Every signal trains the same retrieval stack.
+No cloud round-trip, and crucially — no model anywhere in the world is learning
+from this corpus except mine."
+
+---
+
+## Shot 3 — The retraction beat (1:00 – 1:45)
+
+**Voiceover:** "It also noticed I told it two contradicting things about Alice and Bob — once in March, once last week. It's been holding both, downranking them, and asking me which one is true."
+
+**Action:** back to the brief. Click the contradiction row → drawer opens with both source captures + the ingest dates.
 
 ```
 Alice loves Bob          ingested  Mar 14, from Slack DM with Priya
@@ -73,7 +115,7 @@ Alice hates Bob          ingested  May 6, from a meeting note
 
 ---
 
-## Shot 3 — Why the brief is grounded (1:15 – 1:50)
+## Shot 4 — Why the brief is grounded (1:45 – 2:15)
 
 **Voiceover:** "While we were talking, TraceMind was watching my clipboard."
 
@@ -85,7 +127,7 @@ A new row appears in the brief's *captured today* section — the just-captured 
 
 ---
 
-## Shot 4 — The overdue intent + outcome prompt (1:50 – 2:30)
+## Shot 5 — The overdue intent + outcome prompt (2:15 – 2:45)
 
 **Voiceover:** "Back to the brief. The 'file Q1 board memo with Carla' row is overdue."
 
@@ -97,7 +139,7 @@ A new row appears in the brief's *captured today* section — the just-captured 
 
 ---
 
-## Shot 5 — Product close (2:30 – 3:00)
+## Shot 6 — Product close (2:45 – 3:15)
 
 **Voiceover:** "One engine, three products."
 
@@ -117,10 +159,12 @@ ROSETTA       semantic code memory  →   what teams use over their repo
 
 ## Hard requirements for the recording
 
-- **D-2 fixture must restore deterministically** — same 60 entities, same contradiction, same horizons relative to *today*. Recording must be re-shootable.
+- **D-2 fixture must restore deterministically** — 15 entities, 16 triples, 2 contexts, same contradiction, same horizons relative to *today*. Recording must be re-shootable. Verified via `scripts/demo_smoke.sh`.
 - **D-3 capture pre-roll must be silent** — no terminal flicker, no permission prompts. Daemon already running before camera rolls.
 - **D-4 Tauri brief panel must surface the contradictions row** — CLI brief output is fallback only.
 - **D-5 install one-liner must be on the end card** — even if not yet live, it ships in the next sprint.
+- **UI-3 ContextSwitcher must show both seeded contexts** — *Mercury work* / *TraceMind dev*. Verified via `scripts/demo_smoke.sh` step `[2]`.
+- **UI-5 inline feedback buttons must produce `positive_signals` / `negative_signals` rows** — verified via `scripts/demo_smoke.sh` steps `[8]` and `[9]`.
 - Voice is Aaditya's, not synthesized. Fewer adjectives, fewer "imagine if" sentences.
 - One take. If a beat needs three takes, fix the product, not the script.
 
