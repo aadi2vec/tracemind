@@ -5,7 +5,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tm_controller::bandit::RetrievalParams;
 use tm_controller::{UcbBandit, LinUcbBandit, QueryPlanner, QueryPlan, PlanAction};
 use tm_episodic::{ProcedureStore, TraceStore, TrajectoryStore};
-use tm_graph::GraphStore;
+use tm_graph::{context::ActiveContext, GraphStore};
 use tm_reason::CausalTrace;
 use tm_rerank::{ColbertReranker, RerankCandidate};
 use tm_types::{Entity, Procedure, Result, Trace, TraceEventType, TraceMindError, Triple};
@@ -242,6 +242,16 @@ impl RetrievalEngine {
         let linucb_path = parent.join("linucb.json");
 
         let graph = GraphStore::open(db_path)?;
+
+        // Sprint C-0.10 — load the user's active context (if any) from
+        // disk so that the per-query scope filter and cross-context
+        // penalty actually fire for CLI / MCP / Tauri invocations.
+        // Mirrors the IngestPipeline::open behaviour from Sprint C-0.5.
+        let active_ctx_path = parent.join("active_context.json");
+        if let Ok(Some(active)) = ActiveContext::load(&active_ctx_path) {
+            graph.set_active_context(Some(active.id));
+        }
+
         let trace_store = TraceStore::open(trace_path)?;
         let embedder = if hash_embed {
             Embedder::new_hash()
