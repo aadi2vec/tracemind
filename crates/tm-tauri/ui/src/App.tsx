@@ -1,4 +1,5 @@
 import { useState } from "react";
+import BriefView from "./views/BriefView";
 import Dashboard from "./views/Dashboard";
 import QueryView from "./views/QueryView";
 import TracesView from "./views/TracesView";
@@ -6,9 +7,10 @@ import IngestView from "./views/IngestView";
 import GraphView from "./views/GraphView";
 import ReasonView from "./views/ReasonView";
 
-type View = "dashboard" | "query" | "ingest" | "traces" | "graph" | "reason";
+type View = "brief" | "dashboard" | "query" | "ingest" | "traces" | "graph" | "reason";
 
 const NAV_ITEMS: { id: View; label: string; icon: string }[] = [
+  { id: "brief", label: "Brief", icon: "brief" },
   { id: "dashboard", label: "Dashboard", icon: "grid" },
   { id: "query", label: "Query", icon: "search" },
   { id: "ingest", label: "Ingest", icon: "plus" },
@@ -19,6 +21,12 @@ const NAV_ITEMS: { id: View; label: string; icon: string }[] = [
 
 function NavIcon({ type }: { type: string }) {
   switch (type) {
+    case "brief":
+      return (
+        <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-6 9l2 2 4-4" />
+        </svg>
+      );
     case "grid":
       return (
         <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -64,7 +72,7 @@ function NavIcon({ type }: { type: string }) {
 }
 
 export default function App() {
-  const [view, setView] = useState<View>("dashboard");
+  const [view, setView] = useState<View>("brief");
 
   return (
     <div className="flex h-screen">
@@ -102,6 +110,7 @@ export default function App() {
 
       {/* Main content */}
       <main className="flex-1 overflow-y-auto bg-tm-bg p-6">
+        {view === "brief" && <BriefView />}
         {view === "dashboard" && <Dashboard />}
         {view === "query" && <QueryView />}
         {view === "ingest" && <IngestView />}

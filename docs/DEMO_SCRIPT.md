@@ -11,9 +11,15 @@ The demo's hook is the **retraction beat**: TraceMind shows the user a contradic
 
 ```bash
 tracemind demo restore       # D-2 — drops a deterministic ~/.tracemind/
-tracemind capture start &    # D-3 — capture daemon runs silently
-sleep 30                     # D-3 — 30s of clipboard / shell-history capture
+tracemind demo preroll       # D-3 — runs capture daemon silently for 30s
+                             #       (stdout/stderr suppressed; spawns
+                             #       tracemind-capture under the hood)
 ```
+
+`tracemind demo preroll` accepts `--seconds N` (default 30) and `--verbose` (off by
+default — keeps the recording free of terminal flicker). Resolves the daemon
+binary in this order: `$TM_CAPTURE_BIN` → sibling `tracemind-capture` next to
+the running CLI → `tracemind-capture` on `PATH`.
 
 The fixture (`crates/tm-cli/fixtures/demo/`) ships:
 
@@ -95,7 +101,7 @@ A new row appears in the brief's *captured today* section — the just-captured 
 
 **Voiceover:** "One engine, three products."
 
-**On screen** (D-6 one-pager):
+**On screen** (D-6 one-pager — full text in `docs/PRODUCT_CLOSE.md`):
 
 ```
 TRACEMIND     personal memory OS    →   the product on screen now

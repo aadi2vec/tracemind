@@ -1036,6 +1036,130 @@ end tell
 }
 
 // ---------------------------------------------------------------------------
+// Daily brief (D-4)
+// ---------------------------------------------------------------------------
+//
+// Surfaces the same DailyBrief the CLI / MCP renders, so the recordable
+// demo can show the "retraction beat" inside the Tauri shell instead of
+// a terminal. Mirrors the structure of cmd_brief in tm-cli but returns
+// JSON-friendly types so the React side can render directly.
+
+#[derive(Serialize)]
+struct BriefCountsView {
+    overdue: usize,
+    open: usize,
+    resolved: usize,
+    candidates: usize,
+    patterns: usize,
+    insights: usize,
+    proposals: usize,
+    outcome_prompts: usize,
+    contradictions: usize,
+}
+
+#[derive(Serialize)]
+struct BriefRowView {
+    id: String,
+    title: String,
+    horizon: Option<String>,
+    state: String,
+    polarity: Option<String>,
+    overdue_class: Option<String>,
+}
+
+#[derive(Serialize)]
+struct ContradictionRowView {
+    id: String,
+    triple_a: String,
+    triple_b: String,
+    detected_at: String,
+    cosine_similarity: f32,
+}
+
+#[derive(Serialize)]
+struct BriefView {
+    generated_at: String,
+    counts: BriefCountsView,
+    overdue: Vec<BriefRowView>,
+    open: Vec<BriefRowView>,
+    resolved: Vec<BriefRowView>,
+    contradictions: Vec<ContradictionRowView>,
+}
+
+fn data_dir(state: &AppState) -> PathBuf {
+    PathBuf::from(&state.db_path)
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+#[tauri::command]
+fn cmd_brief(state: State<AppState>) -> Result<BriefView, String> {
+    let dir = data_dir(&state);
+    let intents_path = dir.join("intents.db");
+    let intents = tm_intent::IntentStore::open(intents_path.to_str().unwrap_or_default())
+        .map_err(|e| format!("open intents: {e}"))?;
+
+    // Attach the graph for JTMS contradictions — this is what gives the
+    // brief its retraction-beat punch in the demo.
+    let graph = GraphStore::open(&state.db_path).ok();
+
+    let mut builder = tm_reflect::BriefBuilder::new(&intents);
+    if let Some(ref g) = graph {
+        builder = builder.with_graph(g);
+    }
+    let brief = builder
+        .build(chrono::Utc::now())
+        .map_err(|e| format!("build brief: {e}"))?;
+
+    let row_view = |r: &tm_reflect::CommitmentBriefRow| BriefRowView {
+        id: r.id.to_string(),
+        title: r.statement.clone(),
+        horizon: r.horizon.map(|h| h.format("%Y-%m-%d").to_string()),
+        state: format!("{:?}", r.state),
+        polarity: None,
+        overdue_class: r.overdue_class.map(|c| format!("{:?}", c)),
+    };
+    let resolved_view = |r: &tm_reflect::ResolvedBriefRow| BriefRowView {
+        id: r.id.to_string(),
+        title: r.statement.clone(),
+        horizon: None,
+        state: format!("{:?}", r.state),
+        polarity: r.polarity.map(|p| format!("{:?}", p)),
+        overdue_class: None,
+    };
+
+    Ok(BriefView {
+        generated_at: brief.generated_at.format("%Y-%m-%d %H:%M:%S").to_string(),
+        counts: BriefCountsView {
+            overdue: brief.counts.overdue,
+            open: brief.counts.open,
+            resolved: brief.counts.resolved,
+            candidates: brief.counts.candidates,
+            patterns: brief.counts.patterns,
+            insights: brief.counts.insights,
+            proposals: brief.counts.proposals,
+            outcome_prompts: brief.counts.outcome_prompts,
+            contradictions: brief.counts.contradictions,
+        },
+        overdue: brief.overdue.iter().map(row_view).collect(),
+        open: brief.open.iter().map(row_view).collect(),
+        resolved: brief.resolved.iter().map(resolved_view).collect(),
+        contradictions: brief
+            .contradictions
+            .iter()
+            .map(|c| ContradictionRowView {
+                id: c.id.to_string(),
+                triple_a: c.triple_a.to_string(),
+                triple_b: c.triple_b.to_string(),
+                detected_at: c.detected_at.format("%Y-%m-%d %H:%M").to_string(),
+                cosine_similarity: c.cosine_similarity,
+            })
+            .collect(),
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
 
@@ -1126,6 +1250,7 @@ fn main() {
             cmd_reason_explore,
             cmd_find_analogies,
             cmd_consolidate,
+            cmd_brief,
         ])
         .setup(move |app| {
             let handle = app.handle().clone();

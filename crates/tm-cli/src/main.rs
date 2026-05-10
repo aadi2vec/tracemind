@@ -285,6 +285,23 @@ enum DemoAction {
         #[arg(long)]
         force: bool,
     },
+    /// Run the ambient-capture daemon silently for N seconds. Used as
+    /// the off-camera pre-roll for the demo recording so the brief
+    /// already has fresh capture context when the camera rolls.
+    ///
+    /// Spawns `tracemind-capture` (or the path in `$TM_CAPTURE_BIN`)
+    /// as a child process with stdout/stderr fully suppressed,
+    /// waits, then sends SIGTERM and reaps it. No prompts, no
+    /// terminal flicker.
+    Preroll {
+        /// Pre-roll duration in seconds. Demo script default is 30s.
+        #[arg(long, default_value = "30")]
+        seconds: u64,
+        /// Print a one-line confirmation before/after instead of
+        /// staying fully silent. Off by default for the recording.
+        #[arg(long)]
+        verbose: bool,
+    },
 }
 
 #[derive(clap::Subcommand)]
@@ -3570,7 +3587,93 @@ fn cmd_arc(intents_path: &str, commitment_id_s: &str, json: bool) {
 fn cmd_demo(dir: &PathBuf, action: DemoAction) {
     match action {
         DemoAction::Restore { force } => cmd_demo_restore(dir, force),
+        DemoAction::Preroll { seconds, verbose } => cmd_demo_preroll(dir, seconds, verbose),
     }
+}
+
+/// Run the ambient capture daemon silently for `seconds`, then stop it.
+///
+/// We resolve the binary in this order:
+/// 1. `$TM_CAPTURE_BIN` if set (lets us point at a freshly-built
+///    `target/release/tracemind-capture` from a workspace that isn't
+///    on `PATH`).
+/// 2. A sibling `tracemind-capture` next to the current executable.
+/// 3. `tracemind-capture` on `PATH`.
+///
+/// stdin is closed; stdout + stderr are routed to /dev/null so the
+/// recording stays free of terminal flicker. We propagate
+/// `TM_DATA_DIR` to the child so the daemon writes to the same data
+/// dir that the rest of the CLI uses.
+fn cmd_demo_preroll(dir: &PathBuf, seconds: u64, verbose: bool) {
+    use std::process::{Command, Stdio};
+    use std::thread;
+    use std::time::Duration as StdDuration;
+
+    let bin = resolve_capture_bin();
+    if !bin.exists() && std::env::var_os("TM_CAPTURE_BIN").is_none() {
+        // Fall back to PATH lookup — let the OS resolve it.
+        // (`Command::new("tracemind-capture")` will work if it's on PATH.)
+    }
+
+    if verbose {
+        println!(
+            "demo preroll: spawning capture daemon for {seconds}s ({})",
+            bin.display()
+        );
+    }
+
+    // Build the command. If `bin` doesn't exist on disk we still try
+    // it by name so PATH resolution gets a shot.
+    let mut cmd = if bin.exists() {
+        Command::new(&bin)
+    } else {
+        Command::new("tracemind-capture")
+    };
+    cmd.env("TM_DATA_DIR", dir);
+    cmd.stdin(Stdio::null());
+    cmd.stdout(Stdio::null());
+    cmd.stderr(Stdio::null());
+
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!(
+                "demo preroll: failed to spawn capture daemon ({e}). \
+                 Set TM_CAPTURE_BIN or add tracemind-capture to PATH."
+            );
+            std::process::exit(1);
+        }
+    };
+
+    // Sleep for the pre-roll window. We could poll child.try_wait()
+    // for early death, but the demo recording flow doesn't need that
+    // sophistication — if the daemon crashes, the brief just won't
+    // have fresh captures and the recording will fail naturally.
+    thread::sleep(StdDuration::from_secs(seconds));
+
+    // Send SIGTERM (kill = SIGKILL on Unix from std, but the daemon
+    // is fine with abrupt termination — its writes are tx-committed).
+    let _ = child.kill();
+    let _ = child.wait();
+
+    if verbose {
+        println!("demo preroll: done");
+    }
+}
+
+fn resolve_capture_bin() -> PathBuf {
+    if let Some(env_path) = std::env::var_os("TM_CAPTURE_BIN") {
+        return PathBuf::from(env_path);
+    }
+    if let Ok(self_exe) = std::env::current_exe() {
+        if let Some(parent) = self_exe.parent() {
+            let sibling = parent.join("tracemind-capture");
+            if sibling.exists() {
+                return sibling;
+            }
+        }
+    }
+    PathBuf::from("tracemind-capture")
 }
 
 fn cmd_demo_restore(dir: &PathBuf, force: bool) {

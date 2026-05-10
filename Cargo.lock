@@ -6066,6 +6066,7 @@ name = "tm-tauri"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "seahash",
  "serde",
  "serde_json",
@@ -6075,7 +6076,9 @@ dependencies = [
  "tm-episodic",
  "tm-graph",
  "tm-ingest",
+ "tm-intent",
  "tm-reason",
+ "tm-reflect",
  "tm-retrieval",
  "tm-types",
  "tokio",

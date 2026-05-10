@@ -16,6 +16,9 @@ tm-retrieval = { workspace = true }
 tm-episodic = { workspace = true }
 tm-controller = { workspace = true }
 tm-reason = { workspace = true }
+tm-reflect = { workspace = true }
+tm-intent = { workspace = true }
+chrono = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 uuid = { workspace = true }

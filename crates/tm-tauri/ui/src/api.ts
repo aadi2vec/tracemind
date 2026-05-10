@@ -236,3 +236,47 @@ export interface CaptureEvent {
   entities_count: number;
   triples_count: number;
 }
+
+// Daily brief — D-4
+
+export interface BriefCounts {
+  overdue: number;
+  open: number;
+  resolved: number;
+  candidates: number;
+  patterns: number;
+  insights: number;
+  proposals: number;
+  outcome_prompts: number;
+  contradictions: number;
+}
+
+export interface BriefRow {
+  id: string;
+  title: string;
+  horizon: string | null;
+  state: string;
+  polarity: string | null;
+  overdue_class: string | null;
+}
+
+export interface ContradictionRow {
+  id: string;
+  triple_a: string;
+  triple_b: string;
+  detected_at: string;
+  cosine_similarity: number;
+}
+
+export interface BriefView {
+  generated_at: string;
+  counts: BriefCounts;
+  overdue: BriefRow[];
+  open: BriefRow[];
+  resolved: BriefRow[];
+  contradictions: ContradictionRow[];
+}
+
+export async function getBrief(): Promise<BriefView> {
+  return invoke("cmd_brief");
+}

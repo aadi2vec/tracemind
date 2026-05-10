@@ -43,12 +43,12 @@ Legend: `[x]` done, `[-]` in progress / partial, `[ ]` not started. Est. = estim
 
 Sprint C-2 unlocked the *retraction beat* (the demo's hook). Now ship a clean recordable demo before any further engine work. Items are sequential — do not parallelize without explicit redirect.
 
-- [ ] **D-1: 3-minute "day in the life" script** — replace the 5-act CLI walkthrough. Lead with the morning brief, an overdue commitment, and a *retraction beat* (only believable now that contradictions surface). Living script: `docs/DEMO_SCRIPT.md`.
-- [ ] **D-2: Pre-warmed demo fixture** — deterministic `~/.tracemind/` snapshot (~50–80 triples, one ready contradiction, two due commitments, two stale ones). Restore via `tracemind demo restore`. Fixture lives in `crates/tm-cli/fixtures/demo/`.
-- [ ] **D-3: Real ambient capture in demo path** — clipboard or shell-history watcher running silently for 30s before the brief renders, so the brief is grounded in just-captured signals.
-- [ ] **D-4: Brief renders in the Tauri app, not stdout** — wire `BriefBuilder` into the existing Tauri shell. Fix the unfixed `models/**/*` glob blocking `cargo build -p tm-tauri`.
-- [ ] **D-5: Single-binary install** — `curl … | sh` drops `tracemind`, `tm-mcp`, capture daemon, `~/.tracemind/models/` seed. No "build from source" demo prologue.
-- [ ] **D-6: One-screen product close** — three products sharing one engine (TraceMind / Engram / Rosetta).
+- [x] **D-1: 3-minute "day in the life" script** — `docs/DEMO_SCRIPT.md`. Five shots; retraction beat in shot 2. Pre-roll uses `tracemind demo restore` + `tracemind demo preroll`.
+- [x] **D-2: Pre-warmed demo fixture** — `tracemind demo restore`. ~15 entities, 16 triples, 1 contradiction, 4 open + 5 resolved commitments, deterministic UUIDv5 from a frozen namespace. Sidecar persistence (`memory.db.contradictions.json`) so the contradiction survives across CLI invocations.
+- [x] **D-3: Real ambient capture in demo path** — `tracemind demo preroll [--seconds N]` spawns the existing `tracemind-capture` daemon silently (stdout/stderr suppressed) for the pre-roll window, then reaps it. Resolves the binary via `$TM_CAPTURE_BIN` → sibling executable → PATH.
+- [x] **D-4: Brief renders in the Tauri app** — new `cmd_brief` IPC + `BriefView.tsx` render the same DailyBrief the CLI shows, with the contradictions row at the top. `Brief` is the new default landing tab. The `models/**/*` glob is satisfied by the existing `models/manifest.json` placeholder.
+- [x] **D-5: Single-binary install** — `scripts/install.sh`. Detects platform, downloads release tarball, optional SHA256 verification, installs `tracemind` / `tm-mcp` / `tracemind-capture` to `/usr/local/bin` (or `~/.local/bin`), creates `~/.tracemind/`. Idempotent.
+- [x] **D-6: One-screen product close** — `docs/PRODUCT_CLOSE.md`. Three products / one engine: TraceMind (personal memory OS), Engram (memory SDK), Rosetta (semantic code memory). Shared crates listed; install one-liner on the end card.
 
 **Why P0:** items 1–4 unlock the recorded demo. 5–6 are needed before screen-sharing to anyone outside.
 
