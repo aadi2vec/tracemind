@@ -68,6 +68,25 @@ pub struct NegativeSignal {
     pub created_at: DateTime<Utc>,
 }
 
+/// A positive-feedback row written when the user marks a result as
+/// *helpful* for a query (F-1). Mirror of [`NegativeSignal`]; consumed
+/// by the same `finalize_pending_reward` path so the bandit learns
+/// from positives as well as corrections:
+///
+/// ```text
+/// final_reward = (relevance_reward + Σ positive_weights - Σ negative_weights).clamp(0, 1)
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PositiveSignal {
+    pub id: i64,
+    pub query_id: Uuid,
+    pub result_id: String,
+    pub kind: String,
+    pub context_id: Option<Uuid>,
+    pub weight: f32,
+    pub created_at: DateTime<Utc>,
+}
+
 /// What's currently active. Persisted to `~/.tracemind/active_context.json`
 /// so every CLI invocation (and every MCP request) sees the same scope.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -143,7 +162,19 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
             created_at  TEXT NOT NULL DEFAULT (datetime('now'))
         );
         CREATE INDEX IF NOT EXISTS idx_neg_query   ON negative_signals(query_id);
-        CREATE INDEX IF NOT EXISTS idx_neg_pair    ON negative_signals(context_a, context_b);",
+        CREATE INDEX IF NOT EXISTS idx_neg_pair    ON negative_signals(context_a, context_b);
+
+        CREATE TABLE IF NOT EXISTS positive_signals (
+            id          INTEGER PRIMARY KEY,
+            query_id    TEXT NOT NULL,
+            result_id   TEXT NOT NULL,
+            kind        TEXT NOT NULL DEFAULT 'helpful',
+            context_id  TEXT,
+            weight      REAL NOT NULL DEFAULT 1.0,
+            created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_pos_query   ON positive_signals(query_id);
+        CREATE INDEX IF NOT EXISTS idx_pos_ctx     ON positive_signals(context_id);",
     )
     .map_err(|e| TraceMindError::Storage(format!("init context schema: {e}")))?;
 
@@ -275,6 +306,45 @@ pub fn negative_weight_for_query(conn: &Connection, query_id: Uuid) -> Result<f3
     Ok(weight as f32)
 }
 
+/// Write a positive-feedback signal. Mirror of [`write_negative_signal`]
+/// for the F-1 "helpful" channel. `result_id` is opaque; `context_id`
+/// is the active context at the time the user clicked thumbs-up (so we
+/// can later learn per-context preference rates).
+pub fn write_positive_signal(
+    conn: &Connection,
+    query_id: Uuid,
+    result_id: &str,
+    kind: &str,
+    context_id: Option<Uuid>,
+    weight: f32,
+) -> Result<i64> {
+    conn.execute(
+        "INSERT INTO positive_signals (query_id, result_id, kind, context_id, weight)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![
+            query_id.to_string(),
+            result_id,
+            kind,
+            context_id.map(|u| u.to_string()),
+            weight,
+        ],
+    )
+    .map_err(|e| TraceMindError::Storage(format!("write_positive_signal: {e}")))?;
+    Ok(conn.last_insert_rowid())
+}
+
+/// Sum positive-signal weights for a given query. Used by the bandit
+/// reward composition: `final_reward = (relevance + this_sum - neg_sum).clamp(0, 1)`.
+pub fn positive_weight_for_query(conn: &Connection, query_id: Uuid) -> Result<f32> {
+    let mut stmt = conn
+        .prepare("SELECT COALESCE(SUM(weight), 0.0) FROM positive_signals WHERE query_id = ?1")
+        .map_err(|e| TraceMindError::Storage(format!("pos_weight prepare: {e}")))?;
+    let weight: f64 = stmt
+        .query_row(params![query_id.to_string()], |r| r.get(0))
+        .map_err(|e| TraceMindError::Storage(format!("pos_weight query: {e}")))?;
+    Ok(weight as f32)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -377,6 +447,28 @@ mod tests {
         assert!((s2 - 9.9).abs() < 1e-6);
 
         let s3 = negative_weight_for_query(&conn, Uuid::new_v4()).unwrap();
+        assert_eq!(s3, 0.0);
+    }
+
+    #[test]
+    fn positive_signals_sum_correctly() {
+        let conn = fresh_conn();
+        let q = Uuid::new_v4();
+        let ctx = Some(Uuid::new_v4());
+
+        write_positive_signal(&conn, q, "result-1", "helpful", ctx, 1.0).unwrap();
+        write_positive_signal(&conn, q, "result-2", "helpful", ctx, 0.5).unwrap();
+        // Different query — must not count.
+        let q2 = Uuid::new_v4();
+        write_positive_signal(&conn, q2, "result-3", "helpful", None, 9.9).unwrap();
+
+        let s = positive_weight_for_query(&conn, q).unwrap();
+        assert!((s - 1.5).abs() < 1e-6, "expected 1.5, got {s}");
+
+        let s2 = positive_weight_for_query(&conn, q2).unwrap();
+        assert!((s2 - 9.9).abs() < 1e-6);
+
+        let s3 = positive_weight_for_query(&conn, Uuid::new_v4()).unwrap();
         assert_eq!(s3, 0.0);
     }
 }

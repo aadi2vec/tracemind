@@ -4,7 +4,7 @@ pub mod store;
 
 pub use belief::{effective_confidence, BeliefStore, ContradictionView, ResolveChoice};
 pub use context::{
-    ActiveContext, Context, NegativeSignal,
+    ActiveContext, Context, NegativeSignal, PositiveSignal,
 };
 pub use store::{CapturedSignal, GraphStore, TripleDetail};
 

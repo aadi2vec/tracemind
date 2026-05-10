@@ -39,6 +39,8 @@ export interface AttributionInfo {
 }
 
 export interface QueryResponse {
+  /** Sprint C-0.7 / F-1 — stable id of this query for feedback wiring. */
+  query_id: string;
   arm: number;
   arm_name: string;
   latency_ms: number;
@@ -351,4 +353,59 @@ export async function recordOutcome(
     description,
     userNote,
   });
+}
+
+// Sprint D / F-1 — feedback channels + context CRUD
+
+export interface FeedbackAck {
+  row_id: number;
+  kind: string;
+}
+
+export async function markHelpful(
+  queryId: string,
+  resultId: string,
+  weight?: number,
+  kind?: string,
+): Promise<FeedbackAck> {
+  return invoke("cmd_helpful", { queryId, resultId, weight, kind });
+}
+
+export async function markNotRelated(
+  queryId: string,
+  resultId: string,
+  weight?: number,
+  kind?: string,
+): Promise<FeedbackAck> {
+  return invoke("cmd_not_related", { queryId, resultId, weight, kind });
+}
+
+export interface ContextInfo {
+  id: string;
+  name: string;
+  tags: string;
+  is_active: boolean;
+}
+
+export async function listContexts(): Promise<ContextInfo[]> {
+  return invoke("cmd_context_list");
+}
+
+export async function currentContext(): Promise<ContextInfo | null> {
+  return invoke("cmd_context_current");
+}
+
+export async function useContext(name: string): Promise<ContextInfo> {
+  return invoke("cmd_context_use", { name });
+}
+
+export async function createContext(
+  name: string,
+  tags?: string,
+): Promise<ContextInfo> {
+  return invoke("cmd_context_create", { name, tags });
+}
+
+export async function clearContext(): Promise<void> {
+  return invoke("cmd_context_clear");
 }
