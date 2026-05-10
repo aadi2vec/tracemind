@@ -1,8 +1,10 @@
 use seahash;
 use uuid::Uuid;
 
+use std::path::Path;
+
 use tm_types::{Entity, EntityType, MemoryOp, Predicate, Result, Trace, TraceEventType, Triple};
-use tm_graph::{CapturedSignal, GraphStore};
+use tm_graph::{context::ActiveContext, CapturedSignal, GraphStore};
 use tm_vector::{Embedder, EmbedModel};
 use tm_governance::GovernanceFilter;
 
@@ -86,6 +88,18 @@ impl IngestPipeline {
     /// If `hash_embed` is true, uses the deterministic hash embedder (no model download).
     pub fn open(db_path: &str, hash_embed: bool) -> Result<Self> {
         let graph = GraphStore::open(db_path)?;
+
+        // Sprint C-0.5: forward the active context (if any) to the graph
+        // so all subsequent upserts tag rows with the correct namespace.
+        // The state file lives next to memory.db so we share scope with
+        // the CLI and MCP server.
+        if let Some(parent) = Path::new(db_path).parent() {
+            let active_path = parent.join("active_context.json");
+            if let Ok(Some(active)) = ActiveContext::load(&active_path) {
+                graph.set_active_context(Some(active.id));
+            }
+        }
+
         let embedder = if hash_embed {
             Embedder::new_hash()
         } else if let Some(model) = std::env::var("TM_EMBED_MODEL").ok()

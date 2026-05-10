@@ -34,7 +34,14 @@ enum Commands {
     /// Ingest text into memory (use "-" to read from stdin)
     Ingest { text: String },
     /// Query memory with natural language
-    Query { text: String },
+    Query {
+        text: String,
+        /// Sprint C-0.6 — search every context instead of just the
+        /// active one. Off by default: decoupled-by-default is the
+        /// wedge.
+        #[arg(long)]
+        cross_context: bool,
+    },
     /// Ask a question — clean prose answer with citations, dispatched
     /// through the tiered answer layer (Tier 0 always; Tier 1 / Tier 2
     /// when available). Hides the entity-rank dump that `query` shows.
@@ -57,6 +64,9 @@ enum Commands {
         /// Render the full AnswerResponse as JSON.
         #[arg(long)]
         json: bool,
+        /// Sprint C-0.6 — bridge contexts when gathering grounding.
+        #[arg(long)]
+        cross_context: bool,
     },
     /// Register a reward for a bandit arm
     Feedback { arm: u8, reward: f64 },
@@ -827,11 +837,12 @@ fn main() {
             }
         }
 
-        Commands::Query { text } => {
+        Commands::Query { text, cross_context } => {
             let reranker = ColbertReranker::auto_download_or_none(0.7);
             let mut engine = RetrievalEngine::open(&db_path, &trace_path, cli.hash_embed)
                 .expect("failed to open retrieval engine")
                 .with_reranker_instance(reranker);
+            engine.set_cross_context(cross_context);
             let result = engine.query(&text).expect("query failed");
 
             // Sprint A: dispatch through the tiered answerer (Tier 0 always;
@@ -890,7 +901,7 @@ fn main() {
             // Bandit stats are auto-saved by RetrievalEngine after each query.
         }
 
-        Commands::Ask { text, tier, task, max_tokens, grounding, json } => {
+        Commands::Ask { text, tier, task, max_tokens, grounding, json, cross_context } => {
             cmd_ask(
                 &text,
                 tier.as_deref(),
@@ -901,6 +912,7 @@ fn main() {
                 &db_path,
                 &trace_path,
                 cli.hash_embed,
+                cross_context,
             );
         }
 
@@ -1497,6 +1509,7 @@ fn cmd_ask(
     db_path: &str,
     trace_path: &str,
     hash_embed: bool,
+    cross_context: bool,
 ) {
     use tm_answer::{AnswerRequest, AnswerTier, TaskKind};
 
@@ -1541,6 +1554,7 @@ fn cmd_ask(
     let mut engine = RetrievalEngine::open(db_path, trace_path, hash_embed)
         .expect("failed to open retrieval engine")
         .with_reranker_instance(reranker);
+    engine.set_cross_context(cross_context);
     let result = engine.query(text).expect("query failed");
 
     let answerer = answerer::build_answerer();
