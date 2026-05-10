@@ -8,6 +8,8 @@ Legend: `[x]` done, `[-]` in progress / partial, `[ ]` not started. Est. = estim
 
 ## Shipped (reference)
 
+- [x] Phase 4 / Sprint C-1: bitemporal substrate (tm-temporal embedded into tm-graph; query_at / history; entities + triples backfilled)
+- [x] Phase 4 / Sprint C-2: TMS-backed confidence (BeliefStore wraps tm-tms; contradictions surfaced in brief; effective_confidence policy)
 - [x] 24-crate Rust workspace compiles and tests pass
 - [x] Intent arc types: Need, Sentiment, Action + Belief trait (`tm-intent`)
 - [x] Intent arc persistence: SQLite tables + store methods for needs/sentiments/actions
@@ -37,6 +39,45 @@ Legend: `[x]` done, `[-]` in progress / partial, `[ ]` not started. Est. = estim
 
 ---
 
+## Priority 0 — Recordable demo (gates everything else)
+
+Sprint C-2 unlocked the *retraction beat* (the demo's hook). Now ship a clean recordable demo before any further engine work. Items are sequential — do not parallelize without explicit redirect.
+
+- [x] **D-1: 3-minute "day in the life" script** — `docs/DEMO_SCRIPT.md`. Five shots; retraction beat in shot 2. Pre-roll uses `tracemind demo restore` + `tracemind demo preroll`.
+- [x] **D-2: Pre-warmed demo fixture** — `tracemind demo restore`. ~15 entities, 16 triples, 1 contradiction, 4 open + 5 resolved commitments, deterministic UUIDv5 from a frozen namespace. Sidecar persistence (`memory.db.contradictions.json`) so the contradiction survives across CLI invocations.
+- [x] **D-3: Real ambient capture in demo path** — `tracemind demo preroll [--seconds N]` spawns the existing `tracemind-capture` daemon silently (stdout/stderr suppressed) for the pre-roll window, then reaps it. Resolves the binary via `$TM_CAPTURE_BIN` → sibling executable → PATH.
+- [x] **D-4: Brief renders in the Tauri app** — new `cmd_brief` IPC + `BriefView.tsx` render the same DailyBrief the CLI shows, with the contradictions row at the top. `Brief` is the new default landing tab. The `models/**/*` glob is satisfied by the existing `models/manifest.json` placeholder.
+- [x] **D-5: Single-binary install** — `scripts/install.sh`. Detects platform, downloads release tarball, optional SHA256 verification, installs `tracemind` / `tm-mcp` / `tracemind-capture` to `/usr/local/bin` (or `~/.local/bin`), creates `~/.tracemind/`. Idempotent.
+- [x] **D-6: One-screen product close** — `docs/PRODUCT_CLOSE.md`. Three products / one engine: TraceMind (personal memory OS), Engram (memory SDK), Rosetta (semantic code memory). Shared crates listed; install one-liner on the end card.
+
+**Why P0:** items 1–4 unlock the recorded demo. 5–6 are needed before screen-sharing to anyone outside.
+
+---
+
+## Priority 0.5 — Context segmentation (Sprint C-0, NEW 2026-05-10)
+
+**Wedge-critical.** Investor review on 2026-05-10 flagged the demo's cross-document bridge (Rondo↔TraceMind) as a *misfeature*: local machines have more context crowding than cloud (one laptop hosts Sidewalk, Horseshoe, Rondo, TraceMind, personal life). Without context discipline, a local memory OS is strictly worse than separate cloud accounts. The pitch is "system of intents + trust on-device" — and trust collapses the first time TraceMind draws an irrelevant parallel.
+
+**Design shape:** decoupled-by-default, opt-in coupling via accumulated positive signal, negative-feedback first-class.
+
+Ordering: blocks both Tier-1-as-default and Sprint-D demo polish. Do C-0 first, then return to Priority 1.
+
+- [x] **C-0.1 Schema (landed 2026-05-10)** — `contexts` + `negative_signals` tables and additive `context_id` column on `captured_signals` are created on every `GraphStore::open` via `tm_graph::context::init_schema`. Idempotent (re-runs are no-ops). `kg_relations` / `entities` will carry `context_id` inside their skg JSON `properties` blob (next slice — keeps skg's schema untouched). Migration of legacy stores is implicit: pre-existing rows have NULL `context_id`, which the retrieval filter will always treat as "always visible".
+- [x] **C-0.2 Active-context state (landed)** — `~/.tracemind/active_context.json` with atomic tempfile-rename writes; `ActiveContext::load / save / clear` in `tm-graph::context`.
+- [x] **C-0.3 Context CRUD (landed)** — `GraphStore::{create_context, list_contexts, get_context_by_name, write_negative_signal, negative_weight_for_query}`. 5 unit tests pass (`cargo test -p tm-graph context::`).
+- [x] **C-0.4 CLI surface (landed)** — `tracemind context create <name> [--tags t1,t2]`, `context list` (marks active with `*`), `context use <name>`, `context current`, `context clear`. Smoke-tested end-to-end.
+- [ ] **C-0.5 Ingest tagging** — `IngestPipeline` reads active context once at construction; passes through `upsert_entity` / `upsert_triple` / `append_signal` so every new row inherits the active `context_id`. (Skg-side storage: stash the UUID in the entity/relation `properties` JSON.)
+- [ ] **C-0.6 Scoped retrieval (default)** — `RetrievalEngine` filters vector + graph + signal hits to the active `context_id` by default. Flag: `--cross-context` (CLI) and `cross_context: bool` (MCP `memory_query`) re-enables old behavior. NULL `context_id` rows are always visible (legacy pre-migration data).
+- [ ] **C-0.7 Cross-context penalty in rerank** — when `cross_context=true`, results outside the active context get a soft `cross_context_penalty` term in the rerank score (initial value: -0.15, learned later from C-0.8 signals).
+- [x] **C-0.8 Negative feedback CLI (landed 2026-05-10)** — `tracemind not-related <query_id> <result_id> [--weight w] [--kind k] [--context-a u] [--context-b u]` writes a `negative_signals` row. Separate top-level command (not `feedback --not-related`) to preserve the existing positional `feedback <arm> <reward>` API. Reward decomposition helper (`tm_graph::negative_weight_for_query`) ships; consuming it in `UcbBandit::register_reward` is wired in the retrieval-filter slice. MCP equivalent (`memory_feedback {kind: "not_related"}`) still pending.
+- [ ] **C-0.9 Brief + UI surfacing** — daily brief header shows the active context; per-row context tag rendered next to each result; Tauri brief view picks this up via existing `cmd_brief`.
+- [ ] **C-0.10 Demo update** — `scripts/demo_real.sh` shot 6 changes from "cross-document bridge" celebration to **scoped recall**: same query "the bet on running the brain on-device" run twice — once in `rondo` context, once in `tracemind` context — returns two different, scoped answers. Adds a final shot demonstrating `tracemind not-related` retracting a stray bridge.
+- [-] **C-0.11 Tests** — context CRUD + active-context-file + negative-signal sum tests landed (5 in `tm-graph::context::tests`). Schema-migration test (legacy DB → migrated DB with NULL context_ids), ingest-writes-context-id test, retrieval-scope test, and reward-decomposition test all pending the next slice.
+
+**Why P0.5:** The L3 / recommendation surface is only valuable when cross-context parallels are *real*. Without C-0, the LLM amplifies bad bridging. C-0 is foundational to every later tier.
+
+---
+
 ## Priority 1 — Quality (highest F1 impact, pure code work)
 
 ### LoCoMo Tier-0 remaining fixes
@@ -54,22 +95,22 @@ Legend: `[x]` done, `[-]` in progress / partial, `[ ]` not started. Est. = estim
 
 ## Priority 2 — Wire isolated crates into the pipeline
 
-### Wire tm-tms into ingest + retrieval
+### Wire tm-tms into ingest + retrieval (Sprint C-2 — mostly shipped)
 
-- [ ] Call `TmsEngine.assert_belief()` at ingest time when entities/triples are upserted
-- [ ] Contradiction detection at ingest: explicit negation (cosine < -0.8), schema constraints, temporal overlap
-- [ ] Belief-aware retrieval ranking: boost `In` beliefs, demote `Contradicted`, hide `Out`
-- [ ] Surface contradictions in daily brief via tm-reflect
-- [ ] Persist TMS state (currently in-memory only)
+- [x] Call `TmsEngine.assert_belief()` at ingest time when entities/triples are upserted
+- [x] Contradiction detection at ingest (cosine < -0.8 via tm-tms threshold; schema/temporal triggers still pending)
+- [x] Belief-aware retrieval ranking: hide `Out`, downrank `Contradicted` via `effective_confidence`
+- [x] Surface contradictions in daily brief via tm-reflect
+- [ ] Schema-constraint and temporal-overlap contradiction triggers (in addition to cosine)
+- [ ] Persist TMS state across restarts (currently rebuilt from live triples)
 
-### Wire tm-temporal into tm-graph
+### Wire tm-temporal into tm-graph (Sprint C-1 — shipped)
 
-- [ ] Add bitemporal columns to `entities` table: `valid_from`, `valid_to`, `superseded_by` (nullable, backwards-compatible)
-- [ ] Add bitemporal columns to `relations` table: `valid_from`, `valid_to`, `retracted_at`, `retracted_by`, `retraction_reason`
-- [ ] Add `belief_revisions` table: id, original_id, revision_type, evidence, reason, txn_at, valid_at
-- [ ] Implement `GraphStore::query_at(TemporalQuery)`, `history_of(id)`, `diff(from, to)`
-- [ ] One-time migration backfilling `valid_from` from `created_at`
+- [x] Bitemporal substrate via embedded `TemporalStore` (sibling DB); write-through on every entity/triple upsert
+- [x] `GraphStore::entity_at`, `triple_at`, `entity_history`, `triple_history`
+- [ ] `belief_revisions` table for explicit retraction provenance (separate from JTMS retractions)
 - [ ] Time-machine queries in CLI + MCP: "what was I thinking in March?"
+- [ ] `GraphStore::diff(from, to)` for change inspection
 
 ---
 
@@ -216,3 +257,27 @@ Legend: `[x]` done, `[-]` in progress / partial, `[ ]` not started. Est. = estim
 - [ ] Intent preservation eval: 100 labeled before/after refactoring pairs
 - [ ] Belief consistency eval: formal JTMS spec compliance
 - [ ] Performance benchmarking: idle RAM, active RAM, cold-query latency, Tier-1 hot-query latency
+
+---
+
+## Priority 11 — LLM packaging + on-device personalization (deferred)
+
+Lower-priority phase queued behind the recordable demo and the existing P1–P10 work. Two layers:
+
+### L1 — `tm-llm` packaging crate
+
+- [ ] New `tm-llm` crate: `ModelManifest` (sha256, size, prompt template, tokenizer hash, license) + `ModelRegistry` reading `~/.tracemind/models/manifest.toml`
+- [ ] First-run model fetch with checksum verification + atomic install (no half-downloaded weights)
+- [ ] LoRA adapter slot: `BaseModel + Vec<AdapterSpec>` with hot-swap at the `LocalLlmBackend` boundary
+- [ ] CLI surface: `tracemind models list / install / remove / verify`
+- [ ] MCP surface: `model_status` returning manifest + adapter state
+
+### L2 — Resource-constrained on-device finetune
+
+- [ ] Python sidecar (`tools/finetune/`) using transformers + peft + bitsandbytes (Linux/Win) or MLX-LM (macOS) for QLoRA
+- [ ] Three default LoRA roles: `summarizer-personal`, `extractor-personal`, `prefs-personal`
+- [ ] Training data builder: pulls from accepted/rejected edits in tm-trace + commitment outcome history
+- [ ] Nightly schedule: opt-in only, runs when on AC + idle, capped at 30min wall clock
+- [ ] LoRA weights stay in `~/.tracemind/adapters/` — never leave device, no telemetry
+- [ ] Lightweight TRL/Unsloth alternative path for low-RAM machines (8GB target)
+- [ ] CLI: `tracemind finetune status / start / stop / rollback`

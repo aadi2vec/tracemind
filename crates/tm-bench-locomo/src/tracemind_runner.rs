@@ -16,6 +16,7 @@ use tm_ingest::IngestPipeline;
 use tm_retrieval::RetrievalEngine;
 
 use crate::dataset::LocomoQuestion;
+use crate::extract;
 use crate::runner::{LocomoRunner, RunnerContext};
 
 /// Configuration for the TraceMind runner.
@@ -161,7 +162,13 @@ impl TraceMindRunner {
         }
 
         let joined = parts.join(" ");
-        truncate(&joined, self.config.max_answer_chars)
+        // Tier-0 span composition: classify the question and pull the
+        // tightest matching span (date / money / time) from the candidate.
+        // Falls back to the full candidate when no extractor fires —
+        // SQuAD F1 punishes long predictions on precision but rewards
+        // recall, so the fallback is still better than empty.
+        let composed = extract::compose_short_answer(question, &joined);
+        truncate(&composed, self.config.max_answer_chars)
     }
 
     /// Find the next ingested turn after the one that matches `text`.
@@ -215,7 +222,17 @@ impl TraceMindRunner {
         if q_tokens.is_empty() {
             return None;
         }
-        let scored: Vec<(usize, usize, &String)> = self
+        // Detect "finish/final/actual/result" recency-cued questions —
+        // when the question asks for an outcome value, the LATEST turn
+        // that carries the right typed value is almost always the answer.
+        let qkind = extract::classify_question(question);
+        let lower_q = question.to_lowercase();
+        let recency_cue = lower_q.contains("finish")
+            || lower_q.contains("final")
+            || lower_q.contains("actual")
+            || lower_q.contains("result")
+            || lower_q.contains("end up");
+        let scored: Vec<(usize, bool, usize, &String)> = self
             .ingested_turns
             .iter()
             .enumerate()
@@ -230,23 +247,49 @@ impl TraceMindRunner {
                     .iter()
                     .filter(|t| body.contains(t.as_str()))
                     .count();
-                (overlap, idx, turn)
+                // Typed-value match: turn contains the specific kind of
+                // value the question is asking for. With a recency cue,
+                // this is the dominant signal — bumps the score above
+                // raw overlap.
+                let typed_hit = match qkind {
+                    extract::QKind::Time => extract::extract_time(turn).is_some(),
+                    extract::QKind::Date => extract::extract_date(turn).is_some(),
+                    extract::QKind::Money => extract::extract_money(turn).is_some(),
+                    _ => false,
+                };
+                (overlap, typed_hit, idx, turn)
             })
-            .filter(|(o, _, _)| *o > 0)
+            .filter(|(o, t, _, _)| *o > 0 || (recency_cue && *t))
             .collect();
-        // Tie-break: at equal overlap, *prefer question turns* — they
-        // signal a Q→A adjacency where the next turn is the answer.
-        // Then prefer later ingest position (more recent state).
+        // Tie-break order:
+        // 1. With a recency cue, typed-value-bearing turns win first.
+        //    (For "finish time", a turn with "2:58:42" beats a turn
+        //    that just shares the word "time".)
+        // 2. Otherwise raw overlap.
+        // 3. Question-turn (Q→A adjacency for next-turn answer).
+        // 4. Later ingest position.
         let best = scored.into_iter().max_by(|a, b| {
-            a.0.cmp(&b.0)
-                .then_with(|| {
-                    let aq = is_question_turn(a.2);
-                    let bq = is_question_turn(b.2);
-                    aq.cmp(&bq) // true > false → question wins
-                })
-                .then_with(|| a.1.cmp(&b.1))
+            if recency_cue {
+                a.1.cmp(&b.1)
+                    .then_with(|| a.0.cmp(&b.0))
+                    .then_with(|| {
+                        let aq = is_question_turn(a.3);
+                        let bq = is_question_turn(b.3);
+                        aq.cmp(&bq)
+                    })
+                    .then_with(|| a.2.cmp(&b.2))
+            } else {
+                a.0.cmp(&b.0)
+                    .then_with(|| a.1.cmp(&b.1))
+                    .then_with(|| {
+                        let aq = is_question_turn(a.3);
+                        let bq = is_question_turn(b.3);
+                        aq.cmp(&bq)
+                    })
+                    .then_with(|| a.2.cmp(&b.2))
+            }
         })?;
-        let (_, idx, turn) = best;
+        let (_, _, idx, turn) = best;
         // If the winner is a question turn, return the next turn — the
         // answer in a Q→A dialogue. Skip further questions.
         if is_question_turn(turn) {

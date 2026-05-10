@@ -411,19 +411,26 @@ impl IntentStore {
     /// Recently completed/abandoned/superseded commitments — i.e. anything
     /// in a terminal state. Returns newest-first by `made_at`. Brief shows
     /// "resolved yesterday".
+    /// Filters on the resolution timestamp, not the creation timestamp:
+    /// for `completed` we use `outcomes.observed_at`; for `abandoned` /
+    /// `superseded` (no outcome row) we fall back to `made_at`. Without
+    /// the LEFT JOIN, a commitment created weeks before the window but
+    /// resolved inside it would be wrongly excluded — see the brief's
+    /// "resolved (last 7d)" pane.
     pub fn list_recent_resolved(
         &self,
         since: chrono::DateTime<chrono::Utc>,
         limit: usize,
     ) -> Result<Vec<Commitment>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, kind, statement, made_at, horizon, context_snapshot_id,
-                    options_considered, chosen, confidence, expected_outcome,
-                    stakes, state, outcome_id, derived_from, tags, source
-             FROM commitments
-             WHERE state IN ('completed', 'abandoned', 'superseded')
-               AND made_at >= ?
-             ORDER BY made_at DESC
+            "SELECT c.id, c.kind, c.statement, c.made_at, c.horizon, c.context_snapshot_id,
+                    c.options_considered, c.chosen, c.confidence, c.expected_outcome,
+                    c.stakes, c.state, c.outcome_id, c.derived_from, c.tags, c.source
+             FROM commitments c
+             LEFT JOIN outcomes o ON o.id = c.outcome_id
+             WHERE c.state IN ('completed', 'abandoned', 'superseded')
+               AND COALESCE(o.observed_at, c.made_at) >= ?
+             ORDER BY COALESCE(o.observed_at, c.made_at) DESC
              LIMIT ?",
         )?;
         let rows = stmt.query_map(params![since.to_rfc3339(), limit as i64], row_to_commitment)?;
@@ -2291,35 +2298,68 @@ mod tests {
     }
 
     #[test]
-    fn list_recent_resolved_returns_terminal_states_since_cutoff() {
+    fn list_recent_resolved_filters_on_resolution_time_not_made_at() {
         use chrono::{Duration, Utc};
         let store = fresh_store();
         let now = Utc::now();
 
-        // Old completed (before cutoff) → excluded.
-        let mut old = Commitment::new(CommitmentKind::Intent, "old", Source::Manual);
-        old.made_at = now - Duration::days(30);
-        store.insert_commitment(&old).unwrap();
-        let oo = Outcome::new(old.id, Polarity::AsExpected, "fine", OutcomeSource::UserPrompted);
-        store.insert_outcome(&oo).unwrap();
-        transition(&mut old, State::Completed, Some(&oo)).unwrap();
-        store.update_state(old.id, old.state, old.outcome_id).unwrap();
+        // Old commitment (made_at -30d) but outcome observed inside the
+        // window → should be INCLUDED. This is the bug case: filtering
+        // on `made_at` would wrongly drop it from the brief.
+        let mut stale_made = Commitment::new(CommitmentKind::Intent, "stale_made", Source::Manual);
+        stale_made.made_at = now - Duration::days(30);
+        store.insert_commitment(&stale_made).unwrap();
+        let mut recent_outcome = Outcome::new(
+            stale_made.id,
+            Polarity::AsExpected,
+            "shipped late",
+            OutcomeSource::UserPrompted,
+        );
+        recent_outcome.observed_at = now - Duration::hours(2);
+        store.insert_outcome(&recent_outcome).unwrap();
+        transition(&mut stale_made, State::Completed, Some(&recent_outcome)).unwrap();
+        store
+            .update_state(stale_made.id, stale_made.state, stale_made.outcome_id)
+            .unwrap();
 
-        // Recent abandoned → included.
+        // Truly stale: both made_at AND observed_at outside the window → EXCLUDED.
+        let mut truly_old = Commitment::new(CommitmentKind::Intent, "truly_old", Source::Manual);
+        truly_old.made_at = now - Duration::days(30);
+        store.insert_commitment(&truly_old).unwrap();
+        let mut old_outcome = Outcome::new(
+            truly_old.id,
+            Polarity::AsExpected,
+            "fine",
+            OutcomeSource::UserPrompted,
+        );
+        old_outcome.observed_at = now - Duration::days(20);
+        store.insert_outcome(&old_outcome).unwrap();
+        transition(&mut truly_old, State::Completed, Some(&old_outcome)).unwrap();
+        store
+            .update_state(truly_old.id, truly_old.state, truly_old.outcome_id)
+            .unwrap();
+
+        // Recent abandoned (no outcome row) → INCLUDED via made_at fallback.
         let mut bailed = Commitment::new(CommitmentKind::Intent, "bailed", Source::Manual);
-        bailed.made_at = now - Duration::hours(2);
+        bailed.made_at = now - Duration::hours(3);
         store.insert_commitment(&bailed).unwrap();
         transition(&mut bailed, State::Abandoned, None).unwrap();
         store.update_state(bailed.id, bailed.state, None).unwrap();
 
-        // Recent open → excluded (not terminal).
+        // Recent open (not terminal) → EXCLUDED.
         let still_open = Commitment::new(CommitmentKind::Intent, "still open", Source::Manual);
         store.insert_commitment(&still_open).unwrap();
 
         let cutoff = now - Duration::days(1);
         let recent = store.list_recent_resolved(cutoff, 10).unwrap();
-        assert_eq!(recent.len(), 1);
-        assert_eq!(recent[0].id, bailed.id);
+        let ids: Vec<_> = recent.iter().map(|c| c.id).collect();
+        assert!(ids.contains(&stale_made.id), "stale-made-but-recent-outcome should appear");
+        assert!(ids.contains(&bailed.id), "recent-abandoned should appear");
+        assert!(!ids.contains(&truly_old.id), "outcome before cutoff should be excluded");
+        assert_eq!(recent.len(), 2);
+        // Newest first: stale_made's outcome is -2h, bailed's made_at is -3h.
+        assert_eq!(recent[0].id, stale_made.id);
+        assert_eq!(recent[1].id, bailed.id);
     }
 
     #[test]

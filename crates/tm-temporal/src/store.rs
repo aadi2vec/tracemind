@@ -241,6 +241,33 @@ impl TemporalStore {
         collect_facts(rows)
     }
 
+    /// Return the id of the currently-live fact for `(entity_id, fact_type)`,
+    /// i.e. the most recently recorded row with `superseded_at IS NULL`.
+    /// `None` means we've never seen this entity/fact-type combo (or every
+    /// version has been retracted).
+    pub fn current_fact_id(
+        &self,
+        entity_id: Uuid,
+        fact_type: &str,
+    ) -> Result<Option<Uuid>> {
+        let row: Option<String> = self
+            .conn
+            .query_row(
+                r#"
+                SELECT id FROM temporal_facts
+                WHERE entity_id = ? AND fact_type = ? AND superseded_at IS NULL
+                ORDER BY recorded_at DESC LIMIT 1
+                "#,
+                params![entity_id.to_string(), fact_type],
+                |r| r.get(0),
+            )
+            .optional()?;
+        match row {
+            Some(s) => Ok(Some(parse_uuid(&s, "fact_id")?)),
+            None => Ok(None),
+        }
+    }
+
     pub fn world_at(
         &self,
         as_of_valid: DateTime<Utc>,

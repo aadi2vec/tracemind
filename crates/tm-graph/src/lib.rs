@@ -1,5 +1,12 @@
+pub mod belief;
+pub mod context;
 pub mod store;
-pub use store::{CapturedSignal, GraphStore};
+
+pub use belief::{effective_confidence, BeliefStore, ContradictionView, ResolveChoice};
+pub use context::{
+    ActiveContext, Context, NegativeSignal,
+};
+pub use store::{CapturedSignal, GraphStore, TripleDetail};
 
 use tm_types::Predicate;
 use uuid::Uuid;

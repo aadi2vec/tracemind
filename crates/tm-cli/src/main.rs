@@ -60,6 +60,31 @@ enum Commands {
     },
     /// Register a reward for a bandit arm
     Feedback { arm: u8, reward: f64 },
+    /// Sprint C-0 — flag a retrieval result as not related to its query.
+    /// Writes a row to `negative_signals`; subsequent bandit rewards on
+    /// the same query_id are decomposed as
+    /// `final_reward = relevance_reward - Σ weight(negatives)`.
+    /// `result_id` is opaque (triple UUID, entity UUID, or signal row id).
+    NotRelated {
+        /// UUID of the query whose result you're flagging.
+        query_id: String,
+        /// Opaque id of the offending result.
+        result_id: String,
+        /// Negative weight in (0, ∞). Default 1.0.
+        #[arg(long, default_value = "1.0")]
+        weight: f32,
+        /// Kind tag — defaults to `not_related`. Free-form, lets future
+        /// surfaces split negatives by reason (e.g. `wrong_context`,
+        /// `stale`, `private`).
+        #[arg(long, default_value = "not_related")]
+        kind: String,
+        /// Optional source context UUID (the query's active context).
+        #[arg(long)]
+        context_a: Option<String>,
+        /// Optional target context UUID (the offending result's context).
+        #[arg(long)]
+        context_b: Option<String>,
+    },
     /// Show recent traces with full audit detail
     Trace {
         #[arg(long, default_value = "10")]
@@ -79,6 +104,14 @@ enum Commands {
     Proc {
         #[command(subcommand)]
         action: ProcAction,
+    },
+    /// Manage *contexts* — named namespaces for the local memory store.
+    /// Every captured signal + triple inherits the active context_id at
+    /// ingest time; retrieval defaults to the active scope. See Sprint
+    /// C-0 in `docs/DESIGN.md` §9.5. (`tracemind context use <name>`)
+    Context {
+        #[command(subcommand)]
+        action: ContextAction,
     },
     /// Import files or directories into memory
     Import {
@@ -262,6 +295,76 @@ enum Commands {
         /// Emit JSON instead of formatted text.
         #[arg(long)]
         json: bool,
+    },
+    /// Demo helpers — restore a deterministic `~/.tracemind/` snapshot
+    /// for recording the 3-minute walkthrough.
+    Demo {
+        #[command(subcommand)]
+        action: DemoAction,
+    },
+    /// JTMS contradictions surface — list outstanding rows + resolve
+    /// them. Mirrors the Tauri brief drawer (Shot 2 of the demo) so
+    /// the same retraction beat works without the desktop app.
+    Contradictions {
+        #[command(subcommand)]
+        action: ContradictionsAction,
+    },
+}
+
+#[derive(clap::Subcommand)]
+enum ContradictionsAction {
+    /// List outstanding contradictions (resolved ones are filtered out).
+    List {
+        /// Emit JSON instead of formatted text.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Resolve a contradiction by triple-pair. Use the triple UUIDs
+    /// from `contradictions list` (or the brief). The choice maps to:
+    ///
+    /// - `keep-a`     → retract triple B
+    /// - `keep-b`     → retract triple A
+    /// - `keep-both`  → neither retracted; mark resolved
+    Resolve {
+        /// First triple UUID (the "A" side).
+        triple_a: String,
+        /// Second triple UUID (the "B" side).
+        triple_b: String,
+        /// One of: keep-a | keep-b | keep-both.
+        choice: String,
+    },
+}
+
+#[derive(clap::Subcommand)]
+enum DemoAction {
+    /// Wipe the data directory and rebuild a deterministic fixture
+    /// (~15 entities, ~18 triples, 1 contradiction, 4 open + 5
+    /// resolved commitments) so the brief and the retraction beat
+    /// look the same on every run.
+    Restore {
+        /// Required when the data dir is non-empty. Wipes everything
+        /// under `$TM_DATA_DIR` (default `~/.tracemind/`) before
+        /// rebuilding. Without this, restore refuses to clobber an
+        /// existing install.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Run the ambient-capture daemon silently for N seconds. Used as
+    /// the off-camera pre-roll for the demo recording so the brief
+    /// already has fresh capture context when the camera rolls.
+    ///
+    /// Spawns `tracemind-capture` (or the path in `$TM_CAPTURE_BIN`)
+    /// as a child process with stdout/stderr fully suppressed,
+    /// waits, then sends SIGTERM and reaps it. No prompts, no
+    /// terminal flicker.
+    Preroll {
+        /// Pre-roll duration in seconds. Demo script default is 30s.
+        #[arg(long, default_value = "30")]
+        seconds: u64,
+        /// Print a one-line confirmation before/after instead of
+        /// staying fully silent. Off by default for the recording.
+        #[arg(long)]
+        verbose: bool,
     },
 }
 
@@ -478,6 +581,29 @@ enum ModelsAction {
         #[arg(long)]
         mobile: bool,
     },
+}
+
+#[derive(clap::Subcommand)]
+enum ContextAction {
+    /// Create a new context. Idempotent on name — re-running with the
+    /// same name is a no-op (the existing row is preserved).
+    Create {
+        /// Short name (e.g. `rondo`, `tracemind`, `personal`).
+        name: String,
+        /// Optional comma-separated tags.
+        #[arg(long, default_value = "")]
+        tags: String,
+    },
+    /// List every context, newest first.
+    List,
+    /// Make a context the *active* one. Every subsequent ingest tags
+    /// rows with this context_id; every retrieval is scoped to it
+    /// unless `--cross-context` is passed.
+    Use { name: String },
+    /// Print the active context (if any).
+    Current,
+    /// Clear the active context (back to unscoped behaviour).
+    Clear,
 }
 
 #[derive(clap::Subcommand)]
@@ -785,6 +911,56 @@ fn main() {
             println!("Reward registered.");
         }
 
+        Commands::NotRelated {
+            query_id,
+            result_id,
+            weight,
+            kind,
+            context_a,
+            context_b,
+        } => {
+            let qid = match Uuid::parse_str(&query_id) {
+                Ok(u) => u,
+                Err(e) => {
+                    eprintln!("error: invalid query_id (expect UUID): {e}");
+                    std::process::exit(1);
+                }
+            };
+            let ca = context_a
+                .as_deref()
+                .map(Uuid::parse_str)
+                .transpose()
+                .unwrap_or_else(|e| {
+                    eprintln!("error: invalid --context-a: {e}");
+                    std::process::exit(1);
+                });
+            let cb = context_b
+                .as_deref()
+                .map(Uuid::parse_str)
+                .transpose()
+                .unwrap_or_else(|e| {
+                    eprintln!("error: invalid --context-b: {e}");
+                    std::process::exit(1);
+                });
+            let graph = match GraphStore::open(&db_path) {
+                Ok(g) => g,
+                Err(e) => {
+                    eprintln!("error: failed to open graph store: {e}");
+                    std::process::exit(1);
+                }
+            };
+            let row_id = match graph.write_negative_signal(qid, &result_id, &kind, ca, cb, weight) {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("error: failed to write negative signal: {e}");
+                    std::process::exit(1);
+                }
+            };
+            println!(
+                "negative signal recorded (row {row_id}, query {qid}, result {result_id}, weight {weight}, kind {kind})"
+            );
+        }
+
         Commands::Decay { factor, threshold } => {
             let graph = GraphStore::open(&db_path)
                 .expect("failed to open graph store");
@@ -1026,7 +1202,8 @@ fn main() {
         Commands::Brief { json, resolved_days } => {
             let intents_path = dir.join("intents.db").to_str().unwrap().to_string();
             let world_path = dir.join("world_model.json");
-            cmd_brief(&intents_path, &world_path, json, resolved_days);
+            let graph_path = dir.join("memory.db").to_str().unwrap().to_string();
+            cmd_brief(&intents_path, &world_path, &graph_path, json, resolved_days);
         }
         Commands::Patterns { action } => {
             let intents_path = dir.join("intents.db").to_str().unwrap().to_string();
@@ -1080,12 +1257,135 @@ fn main() {
             let intents_path = dir.join("intents.db").to_str().unwrap().to_string();
             cmd_arc(&intents_path, &commitment_id, json);
         }
+        Commands::Demo { action } => {
+            cmd_demo(&dir, action);
+        }
+        Commands::Contradictions { action } => {
+            let db_path = dir.join("memory.db").to_str().unwrap().to_string();
+            cmd_contradictions(&db_path, action);
+        }
+        Commands::Context { action } => {
+            let db_path = dir.join("memory.db").to_str().unwrap().to_string();
+            cmd_context(&dir, &db_path, action);
+        }
     }
 }
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// `tracemind context …` handler — Sprint C-0 surface for the context
+/// segmentation primitive. The active context is persisted in
+/// `<data_dir>/active_context.json` so every subsequent CLI invocation
+/// (and the MCP server, which reads the same file) picks up the scope.
+fn cmd_context(data_dir: &PathBuf, db_path: &str, action: ContextAction) {
+    use tm_graph::context::{ActiveContext, Context};
+
+    let active_path = data_dir.join("active_context.json");
+
+    match action {
+        ContextAction::Create { name, tags } => {
+            let graph = match GraphStore::open(db_path) {
+                Ok(g) => g,
+                Err(e) => {
+                    eprintln!("error: failed to open graph store: {e}");
+                    std::process::exit(1);
+                }
+            };
+            // Idempotent: if a row with that name exists, surface it.
+            if let Ok(Some(existing)) = graph.get_context_by_name(&name) {
+                println!("context already exists: {} ({})", existing.name, existing.id);
+                return;
+            }
+            let ctx = Context::new(name.clone(), tags.clone());
+            if let Err(e) = graph.create_context(&ctx) {
+                eprintln!("error: failed to create context: {e}");
+                std::process::exit(1);
+            }
+            println!("created context: {} ({})", ctx.name, ctx.id);
+            if !tags.is_empty() {
+                println!("  tags: {}", tags);
+            }
+        }
+        ContextAction::List => {
+            let graph = match GraphStore::open(db_path) {
+                Ok(g) => g,
+                Err(e) => {
+                    eprintln!("error: failed to open graph store: {e}");
+                    std::process::exit(1);
+                }
+            };
+            let contexts = match graph.list_contexts() {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("error: failed to list contexts: {e}");
+                    std::process::exit(1);
+                }
+            };
+            let active = ActiveContext::load(&active_path).ok().flatten();
+            if contexts.is_empty() {
+                println!("no contexts yet — `tracemind context create <name>` to add one");
+                return;
+            }
+            for c in contexts {
+                let marker = match &active {
+                    Some(a) if a.id == c.id => "*",
+                    _ => " ",
+                };
+                let tags = if c.tags.is_empty() {
+                    String::new()
+                } else {
+                    format!("  [{}]", c.tags)
+                };
+                println!("{marker} {:<24} {}{}", c.name, c.id, tags);
+            }
+        }
+        ContextAction::Use { name } => {
+            let graph = match GraphStore::open(db_path) {
+                Ok(g) => g,
+                Err(e) => {
+                    eprintln!("error: failed to open graph store: {e}");
+                    std::process::exit(1);
+                }
+            };
+            let ctx = match graph.get_context_by_name(&name) {
+                Ok(Some(c)) => c,
+                Ok(None) => {
+                    eprintln!("error: no context named '{}' (create it first)", name);
+                    std::process::exit(1);
+                }
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    std::process::exit(1);
+                }
+            };
+            let active = ActiveContext { id: ctx.id, name: ctx.name.clone() };
+            if let Err(e) = active.save(&active_path) {
+                eprintln!("error: failed to save active context: {e}");
+                std::process::exit(1);
+            }
+            println!("active context → {} ({})", ctx.name, ctx.id);
+        }
+        ContextAction::Current => {
+            match ActiveContext::load(&active_path) {
+                Ok(Some(a)) => println!("active context: {} ({})", a.name, a.id),
+                Ok(None) => println!("no active context (unscoped)"),
+                Err(e) => {
+                    eprintln!("error: failed to read active context: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        ContextAction::Clear => {
+            if let Err(e) = ActiveContext::clear(&active_path) {
+                eprintln!("error: failed to clear active context: {e}");
+                std::process::exit(1);
+            }
+            println!("active context cleared");
+        }
+    }
+}
 
 /// `tracemind models …` handler. Reports tier-1 weight status and (when the
 /// `local-llm` feature is on) downloads the GGUF on demand.
@@ -2167,7 +2467,13 @@ fn cmd_candidates(intents_path: &str, action: CandidatesAction) {
 /// - JSON (`--json`) — the [`tm_reflect::DailyBrief`] structure
 ///   verbatim; this is the stable contract for agents and external
 ///   tooling.
-fn cmd_brief(intents_path: &str, world_path: &std::path::Path, json: bool, resolved_days: i64) {
+fn cmd_brief(
+    intents_path: &str,
+    world_path: &std::path::Path,
+    graph_path: &str,
+    json: bool,
+    resolved_days: i64,
+) {
     use chrono::{Duration, Utc};
     use tm_intent::IntentStore;
     use tm_reflect::{BriefBuilder, BriefConfig};
@@ -2186,6 +2492,11 @@ fn cmd_brief(intents_path: &str, world_path: &std::path::Path, json: bool, resol
     // on first-run installs.
     let world_model = tm_world_model::load(world_path).ok().flatten();
 
+    // Best-effort graph attach so the brief can surface JTMS-flagged
+    // contradictions (Sprint C-2). A missing graph DB on first-run
+    // installs is fine — the contradictions section just stays empty.
+    let graph = GraphStore::open(graph_path).ok();
+
     let cfg = BriefConfig {
         resolved_window: Duration::days(resolved_days),
         ..Default::default()
@@ -2193,6 +2504,9 @@ fn cmd_brief(intents_path: &str, world_path: &std::path::Path, json: bool, resol
     let mut builder = BriefBuilder::new(&store).with_config(cfg);
     if let Some(ref m) = world_model {
         builder = builder.with_world_model(m);
+    }
+    if let Some(ref g) = graph {
+        builder = builder.with_graph(g);
     }
     let brief = match builder.build(Utc::now()) {
         Ok(b) => b,
@@ -2482,7 +2796,7 @@ fn print_brief_text(brief: &tm_reflect::DailyBrief) {
         local_now.format("%a %b %d, %-I:%M %p")
     );
     println!(
-        "  overdue: {}    open: {}    resolved: {}    candidates: {}    patterns: {}    insights: {}    proposals: {}",
+        "  overdue: {}    open: {}    resolved: {}    candidates: {}    patterns: {}    insights: {}    proposals: {}    contradictions: {}",
         brief.counts.overdue,
         brief.counts.open,
         brief.counts.resolved,
@@ -2490,8 +2804,32 @@ fn print_brief_text(brief: &tm_reflect::DailyBrief) {
         brief.counts.patterns,
         brief.counts.insights,
         brief.counts.proposals,
+        brief.counts.contradictions,
     );
     println!();
+
+    // Contradictions panel — printed first because it's the highest-
+    // signal attention item: the JTMS engine has flagged two triples
+    // as logically inconsistent and the user needs to settle them.
+    // Sprint C-2: only populated when `BriefBuilder::with_graph` is set.
+    if !brief.contradictions.is_empty() {
+        println!("▸ contradictions ({})", brief.contradictions.len());
+        for c in &brief.contradictions {
+            let detected_local = c
+                .detected_at
+                .with_timezone(&chrono::Local)
+                .format("%b %-d");
+            println!(
+                "    ⚡ {} ↔ {}    cosine {:+.2}    detected {}",
+                short_id(c.triple_a),
+                short_id(c.triple_b),
+                c.cosine_similarity,
+                detected_local,
+            );
+        }
+        println!("    (review with `tracemind brief --json | jq .contradictions`)");
+        println!();
+    }
 
     // Insights panel — printed first so the user sees the most
     // attention-worthy rows before drowning in the open list.
@@ -3489,3 +3827,457 @@ fn cmd_arc(intents_path: &str, commitment_id_s: &str, json: bool) {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Demo fixture (P0 / D-2)
+// ---------------------------------------------------------------------------
+
+/// `tracemind demo …` — recordable-demo helpers. Currently exposes
+/// `restore`, which wipes `$TM_DATA_DIR` and rebuilds a deterministic
+/// fixture so the brief looks the same on every recording take.
+///
+/// Determinism strategy: every commitment / outcome / entity gets a
+/// UUIDv5 derived from a fixed namespace + a stable label. Times are
+/// expressed as offsets from `Utc::now()` so the brief's "due today"
+/// / "stale" buckets stay correct without us having to re-shoot when
+/// the calendar rolls over.
+fn cmd_demo(dir: &PathBuf, action: DemoAction) {
+    match action {
+        DemoAction::Restore { force } => cmd_demo_restore(dir, force),
+        DemoAction::Preroll { seconds, verbose } => cmd_demo_preroll(dir, seconds, verbose),
+    }
+}
+
+/// `tracemind contradictions list | resolve` — terminal mirror of the
+/// Tauri brief drawer. Same `BeliefStore::resolve_by_triples` path as
+/// the desktop app, so a sidecar saved here replays correctly when
+/// the user later opens the GUI.
+fn cmd_contradictions(db_path: &str, action: ContradictionsAction) {
+    use tm_graph::{GraphStore, ResolveChoice};
+
+    let graph = match GraphStore::open(db_path) {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("failed to open graph at {db_path}: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    match action {
+        ContradictionsAction::List { json } => {
+            let rows: Vec<_> = graph
+                .contradictions()
+                .into_iter()
+                .filter(|r| r.resolution.is_none())
+                .collect();
+            if json {
+                let out = serde_json::to_string_pretty(&rows)
+                    .unwrap_or_else(|_| "[]".to_string());
+                println!("{out}");
+            } else if rows.is_empty() {
+                println!("no outstanding contradictions");
+            } else {
+                println!("{} outstanding contradiction(s):\n", rows.len());
+                for r in &rows {
+                    let a = graph
+                        .triple_detail(r.triple_a)
+                        .ok()
+                        .flatten()
+                        .map(|d| format!("{} {} {}", d.subject_name, d.predicate, d.object_name))
+                        .unwrap_or_else(|| r.triple_a.to_string());
+                    let b = graph
+                        .triple_detail(r.triple_b)
+                        .ok()
+                        .flatten()
+                        .map(|d| format!("{} {} {}", d.subject_name, d.predicate, d.object_name))
+                        .unwrap_or_else(|| r.triple_b.to_string());
+                    println!(
+                        "  {}  cosine {:+.2}",
+                        r.detected_at.format("%Y-%m-%d %H:%M"),
+                        r.cosine_similarity,
+                    );
+                    println!("    A  {}  ({})", a, &r.triple_a.to_string()[..8]);
+                    println!("    B  {}  ({})", b, &r.triple_b.to_string()[..8]);
+                    println!();
+                }
+                println!(
+                    "resolve with: tracemind contradictions resolve <triple_a> <triple_b> <keep-a|keep-b|keep-both>",
+                );
+            }
+        }
+        ContradictionsAction::Resolve {
+            triple_a,
+            triple_b,
+            choice,
+        } => {
+            let ta = match uuid::Uuid::parse_str(&triple_a) {
+                Ok(u) => u,
+                Err(e) => {
+                    eprintln!("bad triple_a uuid: {e}");
+                    std::process::exit(2);
+                }
+            };
+            let tb = match uuid::Uuid::parse_str(&triple_b) {
+                Ok(u) => u,
+                Err(e) => {
+                    eprintln!("bad triple_b uuid: {e}");
+                    std::process::exit(2);
+                }
+            };
+            let ch = match choice.to_lowercase().replace('_', "-").as_str() {
+                "keep-a" => ResolveChoice::KeepA,
+                "keep-b" => ResolveChoice::KeepB,
+                "keep-both" => ResolveChoice::KeepBoth,
+                other => {
+                    eprintln!("unknown choice {other:?}; expected keep-a | keep-b | keep-both");
+                    std::process::exit(2);
+                }
+            };
+            match graph.resolve_contradiction_by_triples(ta, tb, ch) {
+                Some((retracted, kept)) => {
+                    println!("resolved: {} retracted, {} kept", retracted.len(), kept.len());
+                    for u in retracted {
+                        println!("  retracted {}", u);
+                    }
+                    for u in kept {
+                        println!("  kept      {}", u);
+                    }
+                }
+                None => {
+                    eprintln!("no matching contradiction for that triple pair");
+                    std::process::exit(1);
+                }
+            }
+        }
+    }
+}
+
+/// Run the ambient capture daemon silently for `seconds`, then stop it.
+///
+/// We resolve the binary in this order:
+/// 1. `$TM_CAPTURE_BIN` if set (lets us point at a freshly-built
+///    `target/release/tracemind-capture` from a workspace that isn't
+///    on `PATH`).
+/// 2. A sibling `tracemind-capture` next to the current executable.
+/// 3. `tracemind-capture` on `PATH`.
+///
+/// stdin is closed; stdout + stderr are routed to /dev/null so the
+/// recording stays free of terminal flicker. We propagate
+/// `TM_DATA_DIR` to the child so the daemon writes to the same data
+/// dir that the rest of the CLI uses.
+fn cmd_demo_preroll(dir: &PathBuf, seconds: u64, verbose: bool) {
+    use std::process::{Command, Stdio};
+    use std::thread;
+    use std::time::Duration as StdDuration;
+
+    let bin = resolve_capture_bin();
+    if !bin.exists() && std::env::var_os("TM_CAPTURE_BIN").is_none() {
+        // Fall back to PATH lookup — let the OS resolve it.
+        // (`Command::new("tracemind-capture")` will work if it's on PATH.)
+    }
+
+    if verbose {
+        println!(
+            "demo preroll: spawning capture daemon for {seconds}s ({})",
+            bin.display()
+        );
+    }
+
+    // Build the command. If `bin` doesn't exist on disk we still try
+    // it by name so PATH resolution gets a shot.
+    let mut cmd = if bin.exists() {
+        Command::new(&bin)
+    } else {
+        Command::new("tracemind-capture")
+    };
+    cmd.env("TM_DATA_DIR", dir);
+    cmd.stdin(Stdio::null());
+    cmd.stdout(Stdio::null());
+    cmd.stderr(Stdio::null());
+
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!(
+                "demo preroll: failed to spawn capture daemon ({e}). \
+                 Set TM_CAPTURE_BIN or add tracemind-capture to PATH."
+            );
+            std::process::exit(1);
+        }
+    };
+
+    // Sleep for the pre-roll window. We could poll child.try_wait()
+    // for early death, but the demo recording flow doesn't need that
+    // sophistication — if the daemon crashes, the brief just won't
+    // have fresh captures and the recording will fail naturally.
+    thread::sleep(StdDuration::from_secs(seconds));
+
+    // Send SIGTERM (kill = SIGKILL on Unix from std, but the daemon
+    // is fine with abrupt termination — its writes are tx-committed).
+    let _ = child.kill();
+    let _ = child.wait();
+
+    if verbose {
+        println!("demo preroll: done");
+    }
+}
+
+fn resolve_capture_bin() -> PathBuf {
+    if let Some(env_path) = std::env::var_os("TM_CAPTURE_BIN") {
+        return PathBuf::from(env_path);
+    }
+    if let Ok(self_exe) = std::env::current_exe() {
+        if let Some(parent) = self_exe.parent() {
+            let sibling = parent.join("tracemind-capture");
+            if sibling.exists() {
+                return sibling;
+            }
+        }
+    }
+    PathBuf::from("tracemind-capture")
+}
+
+fn cmd_demo_restore(dir: &PathBuf, force: bool) {
+    use chrono::{Duration, Utc};
+    use tm_graph::GraphStore;
+    use tm_intent::{
+        Commitment, CommitmentKind, IntentStore, Outcome, OutcomeSource, Polarity, Source,
+        Stakes, State, state::transition,
+    };
+    use tm_types::{Entity, EntityType, Predicate, Triple};
+
+    // Refuse to clobber a non-empty data dir without --force. Errs on
+    // the side of safety for users who run `tracemind demo restore`
+    // by accident on a real install.
+    let occupied = dir
+        .read_dir()
+        .map(|mut it| it.next().is_some())
+        .unwrap_or(false);
+    if occupied && !force {
+        eprintln!(
+            "refusing to overwrite non-empty data dir {} — pass --force to proceed",
+            dir.display()
+        );
+        std::process::exit(2);
+    }
+
+    if occupied {
+        // Wipe everything under dir but keep the dir itself so the
+        // path stays valid for the next stores we open.
+        if let Ok(entries) = dir.read_dir() {
+            for e in entries.flatten() {
+                let p = e.path();
+                let _ = if p.is_dir() {
+                    fs::remove_dir_all(&p)
+                } else {
+                    fs::remove_file(&p)
+                };
+            }
+        }
+    } else {
+        ensure_data_dir(dir);
+    }
+
+    let now = Utc::now();
+    let intents_path = dir.join("intents.db").to_str().unwrap().to_string();
+    let graph_path = dir.join("memory.db").to_str().unwrap().to_string();
+    let intents = IntentStore::open(&intents_path).expect("open intent store");
+    let graph = GraphStore::open(&graph_path).expect("open graph store");
+
+    // ── Entities (concept characters used by the script) ───────────
+    let mk_entity = |name: &str, kind: EntityType| -> Entity {
+        let id = Uuid::new_v5(&DEMO_NAMESPACE, format!("entity:{name}").as_bytes());
+        let mut e = Entity::new(name, kind, 0.92);
+        e.id = id;
+        e
+    };
+    let alice = mk_entity("Alice", EntityType::Person);
+    let bob = mk_entity("Bob", EntityType::Person);
+    let carla = mk_entity("Carla", EntityType::Person);
+    let priya = mk_entity("Priya", EntityType::Person);
+    let mercury = mk_entity("Mercury Inc", EntityType::Organization);
+    let q1memo = mk_entity("Q1 board memo", EntityType::File);
+    let demo_proj = mk_entity("TraceMind demo", EntityType::Project);
+    let postgres = mk_entity("Postgres", EntityType::Technology);
+    let sqlite = mk_entity("SQLite", EntityType::Technology);
+    let onboarding = mk_entity("Mercury onboarding", EntityType::Event);
+    let pitch_deck = mk_entity("Investor pitch deck", EntityType::File);
+    let calibration_plan = mk_entity("Calibration plan", EntityType::Concept);
+    let research_doc = mk_entity("LoCoMo eval doc", EntityType::File);
+    let sprint_plan = mk_entity("Sprint C-2 plan", EntityType::Concept);
+    let oncall_runbook = mk_entity("Oncall runbook", EntityType::File);
+
+    let entities = [
+        &alice, &bob, &carla, &priya, &mercury, &q1memo, &demo_proj,
+        &postgres, &sqlite, &onboarding, &pitch_deck, &calibration_plan,
+        &research_doc, &sprint_plan, &oncall_runbook,
+    ];
+    for e in entities {
+        graph.upsert_entity(e).expect("upsert entity");
+    }
+
+    // ── Triples ────────────────────────────────────────────────────
+    let mk_triple = |label: &str, s: Uuid, p: Predicate, o: Uuid, conf: f64| -> Triple {
+        let id = Uuid::new_v5(&DEMO_NAMESPACE, format!("triple:{label}").as_bytes());
+        let mut t = Triple::new(s, p, o, conf);
+        t.id = id;
+        t
+    };
+
+    let triples = vec![
+        mk_triple("alice-works-mercury", alice.id, Predicate::WorksAt, mercury.id, 0.95),
+        mk_triple("bob-works-mercury", bob.id, Predicate::WorksAt, mercury.id, 0.92),
+        mk_triple("carla-collab-alice", carla.id, Predicate::CollaboratesWith, alice.id, 0.88),
+        mk_triple("priya-collab-bob", priya.id, Predicate::CollaboratesWith, bob.id, 0.84),
+        mk_triple("alice-owns-q1memo", alice.id, Predicate::Owns, q1memo.id, 0.9),
+        mk_triple("q1memo-references-mercury", q1memo.id, Predicate::References, mercury.id, 0.93),
+        mk_triple("demo-depends-postgres", demo_proj.id, Predicate::DependsOn, postgres.id, 0.9),
+        mk_triple("demo-depends-sqlite", demo_proj.id, Predicate::DependsOn, sqlite.id, 0.95),
+        mk_triple("onboarding-partof-mercury", onboarding.id, Predicate::PartOf, mercury.id, 0.86),
+        mk_triple("pitch-references-demo", pitch_deck.id, Predicate::References, demo_proj.id, 0.91),
+        mk_triple("calibration-related", calibration_plan.id, Predicate::RelatedTo, demo_proj.id, 0.8),
+        mk_triple("research-references-locomo", research_doc.id, Predicate::References, demo_proj.id, 0.87),
+        mk_triple("sprint-related-demo", sprint_plan.id, Predicate::RelatedTo, demo_proj.id, 0.83),
+        mk_triple("oncall-references-postgres", oncall_runbook.id, Predicate::References, postgres.id, 0.81),
+        // The contradicting pair — same subject + object, opposing
+        // predicates. Detected explicitly below at cosine = -0.94.
+        mk_triple(
+            "alice-loves-bob",
+            alice.id,
+            Predicate::Custom("loves".into()),
+            bob.id,
+            0.88,
+        ),
+        mk_triple(
+            "alice-hates-bob",
+            alice.id,
+            Predicate::Custom("hates".into()),
+            bob.id,
+            0.85,
+        ),
+    ];
+    for t in &triples {
+        graph.upsert_triple(t).expect("upsert triple");
+    }
+
+    // Detect the contradiction so the brief surfaces it. The cosine
+    // is hard-coded — the live pipeline computes it from embeddings,
+    // but for the fixture we just want the JTMS to flip both beliefs
+    // to Contradicted.
+    let loves = triples[triples.len() - 2].id;
+    let hates = triples[triples.len() - 1].id;
+    let _ = graph
+        .record_contradiction(loves, hates, -0.94)
+        .expect("contradiction recorded");
+
+    // ── Commitments + outcomes ─────────────────────────────────────
+    let mk_commit = |label: &str,
+                     statement: &str,
+                     kind: CommitmentKind,
+                     stakes: Stakes,
+                     horizon: Option<chrono::DateTime<chrono::Utc>>|
+     -> Commitment {
+        let id = Uuid::new_v5(&DEMO_NAMESPACE, format!("commit:{label}").as_bytes());
+        let mut c = Commitment::new(kind, statement, Source::Manual);
+        c.id = id;
+        c.stakes = stakes;
+        c.horizon = horizon;
+        // Anchor `made_at` slightly before horizon so the brief's
+        // resolved-window math behaves predictably.
+        if let Some(h) = horizon {
+            c.made_at = h - Duration::days(7);
+        }
+        c
+    };
+
+    // Open + due
+    let due_today = mk_commit(
+        "memo-with-carla",
+        "file Q1 board memo with Carla",
+        CommitmentKind::Intent,
+        Stakes::High,
+        Some(now + Duration::hours(4)),
+    );
+    let overdue_3d = mk_commit(
+        "mercury-followup",
+        "follow up on Mercury contract",
+        CommitmentKind::Intent,
+        Stakes::High,
+        Some(now - Duration::days(3)),
+    );
+    let stale_a = mk_commit(
+        "rewrite-onboarding",
+        "rewrite Mercury onboarding doc",
+        CommitmentKind::Intent,
+        Stakes::Medium,
+        Some(now - Duration::days(21)),
+    );
+    let stale_b = mk_commit(
+        "ship-pitch-v2",
+        "ship investor pitch deck v2",
+        CommitmentKind::Intent,
+        Stakes::Medium,
+        Some(now - Duration::days(28)),
+    );
+
+    intents.insert_commitment(&due_today).unwrap();
+    intents.insert_commitment(&overdue_3d).unwrap();
+    intents.insert_commitment(&stale_a).unwrap();
+    intents.insert_commitment(&stale_b).unwrap();
+
+    // Resolved (last 7 days) — provide priors for patterns + insights.
+    let resolved_specs: Vec<(&str, &str, Polarity, i64)> = vec![
+        ("ship-c1", "ship Sprint C-1 bitemporal substrate", Polarity::Better, 1),
+        ("ship-c2", "ship Sprint C-2 contradictions", Polarity::AsExpected, 0),
+        ("locomo-mini", "rerun LoCoMo mini eval after BGE swap", Polarity::Worse, 2),
+        ("draft-investor", "draft investor narrative outline", Polarity::Better, 4),
+        ("calibration-review", "review calibration plan with Priya", Polarity::Mixed, 5),
+    ];
+    for (label, statement, polarity, days_ago) in &resolved_specs {
+        let mut c = mk_commit(
+            label,
+            statement,
+            CommitmentKind::Intent,
+            Stakes::Medium,
+            Some(now - Duration::days(*days_ago)),
+        );
+        // The resolved bucket filters by `made_at >= now - resolved_window`
+        // (default 7d). Without this override, mk_commit would push
+        // `made_at` to `horizon - 7d`, which sits *just outside* the
+        // window for `days_ago = 1`. Anchor `made_at` to `days_ago + 1`
+        // so all five resolved rows surface in the brief.
+        c.made_at = now - Duration::days(*days_ago + 1);
+        intents.insert_commitment(&c).unwrap();
+
+        let outcome = Outcome::new(
+            c.id,
+            *polarity,
+            format!("resolved: {statement}"),
+            OutcomeSource::Cli,
+        );
+        intents.insert_outcome(&outcome).unwrap();
+        // Drive the state machine to keep the brief's resolved bucket
+        // populated. transition() mutates the in-memory copy; we then
+        // persist the updated state via update_state().
+        transition(&mut c, State::Completed, Some(&outcome)).expect("transition Completed");
+        intents
+            .update_state(c.id, c.state, c.outcome_id)
+            .expect("persist state");
+    }
+
+    println!("✓ demo fixture restored to {}", dir.display());
+    println!("  entities:        {}", entities.len());
+    println!("  triples:         {}", triples.len());
+    println!("  contradictions:  1   (Alice loves Bob ↔ Alice hates Bob)");
+    println!("  open commitments: 4  (1 due today, 1 overdue 3d, 2 stale)");
+    println!("  resolved (7d):   {}", resolved_specs.len());
+    println!();
+    println!("  next: tracemind brief");
+}
+
+/// UUIDv5 namespace for the demo fixture. Picked once and frozen so
+/// every restore produces byte-identical UUIDs, which makes recordings
+/// re-shootable without re-editing the script's short-id callouts.
+const DEMO_NAMESPACE: Uuid = Uuid::from_bytes([
+    0x4d, 0x65, 0x6d, 0x6f, 0x52, 0x79, 0x44, 0x65, 0x6d, 0x6f, 0x46, 0x69, 0x78, 0x74, 0x75, 0x72,
+]);

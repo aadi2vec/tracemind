@@ -334,6 +334,12 @@ pub struct DailyBrief {
     /// Soonest-horizon-first.
     #[serde(default)]
     pub outcome_prompts: Vec<OutcomePrompt>,
+    /// Sprint C-2: contradicting triple pairs flagged by the JTMS at
+    /// ingest time. Empty unless a `GraphStore` was attached via
+    /// `BriefBuilder::with_graph`. Surfacing them in the brief is the
+    /// retraction-beat the demo punch list depends on.
+    #[serde(default)]
+    pub contradictions: Vec<ContradictionBriefRow>,
     /// Section counts for quick rendering of section headers.
     pub counts: BriefCounts,
     /// Set when the calibration gate suppressed the insights panel.
@@ -358,6 +364,19 @@ pub struct BriefCounts {
     pub proposals: usize,
     #[serde(default)]
     pub outcome_prompts: usize,
+    #[serde(default)]
+    pub contradictions: usize,
+}
+
+/// One contradicting pair as surfaced in the brief. Triple ids are
+/// kept in case the surface wants to render details on click.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ContradictionBriefRow {
+    pub id: Uuid,
+    pub triple_a: Uuid,
+    pub triple_b: Uuid,
+    pub detected_at: DateTime<Utc>,
+    pub cosine_similarity: f32,
 }
 
 pub struct BriefBuilder<'a> {
@@ -369,6 +388,11 @@ pub struct BriefBuilder<'a> {
     /// (`n_train_examples < MIN_PRIORS_FOR_OUTLOOK`), we still skip
     /// attachment — same n-too-small cliff as CLI/MCP preflight.
     world_model: Option<&'a tm_world_model::OutcomeModel>,
+    /// Sprint C-2: optional GraphStore for surfacing JTMS-flagged
+    /// contradictions in the brief. When `None`, the contradictions
+    /// section stays empty — keeps the builder usable in tests that
+    /// don't need a graph.
+    graph: Option<&'a tm_graph::GraphStore>,
 }
 
 impl<'a> BriefBuilder<'a> {
@@ -377,7 +401,15 @@ impl<'a> BriefBuilder<'a> {
             store,
             config: BriefConfig::default(),
             world_model: None,
+            graph: None,
         }
+    }
+
+    /// Attach a GraphStore so contradictions detected by the JTMS at
+    /// ingest time can be surfaced in the brief.
+    pub fn with_graph(mut self, graph: &'a tm_graph::GraphStore) -> Self {
+        self.graph = Some(graph);
+        self
     }
 
     pub fn with_config(mut self, config: BriefConfig) -> Self {
@@ -600,6 +632,30 @@ impl<'a> BriefBuilder<'a> {
             .due_prompts(now, prompt_cfg)
             .unwrap_or_default();
 
+        // Sprint C-2: project the JTMS contradictions into brief rows.
+        // No graph attached → empty section. We pull all of them; the
+        // surface decides how many to render. Most users will have 0;
+        // demo / contradiction-heavy users will have a handful.
+        let contradictions: Vec<ContradictionBriefRow> = self
+            .graph
+            .map(|g| {
+                g.contradictions()
+                    .into_iter()
+                    // Only surface unresolved contradictions — once
+                    // the user has acted via the drawer (KeepA / KeepB
+                    // / KeepBoth) the row should leave the brief.
+                    .filter(|c| c.resolution.is_none())
+                    .map(|c| ContradictionBriefRow {
+                        id: c.id,
+                        triple_a: c.triple_a,
+                        triple_b: c.triple_b,
+                        detected_at: c.detected_at,
+                        cosine_similarity: c.cosine_similarity,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
         let counts = BriefCounts {
             overdue: overdue.len(),
             open: open.len(),
@@ -609,6 +665,7 @@ impl<'a> BriefBuilder<'a> {
             insights: insights.len(),
             proposals: proposals.len(),
             outcome_prompts: outcome_prompts.len(),
+            contradictions: contradictions.len(),
         };
 
         Ok(DailyBrief {
@@ -621,6 +678,7 @@ impl<'a> BriefBuilder<'a> {
             insights,
             proposals,
             outcome_prompts,
+            contradictions,
             counts,
             model_quiet,
         })
@@ -1745,5 +1803,69 @@ mod tests {
         // Soonest-horizon-first → most overdue first: c4, c3.
         assert_eq!(brief.outcome_prompts[0].statement, "c4");
         assert_eq!(brief.outcome_prompts[1].statement, "c3");
+    }
+
+    // ─── Sprint C-2 ──────────────────────────────────────────────────
+
+    #[test]
+    fn brief_surfaces_contradictions_from_attached_graph() {
+        use tm_graph::GraphStore;
+        use tm_types::{Entity, EntityType, Predicate, Triple};
+
+        let store = fresh_store();
+        let now = Utc::now();
+
+        // Stand up a graph with two triples sharing subject+object but
+        // contradicting predicates ("loves" vs "hates"). Cosine sim
+        // below the JTMS -0.8 threshold marks both as Contradicted.
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("graph.db");
+        let graph = GraphStore::open(db_path.to_str().unwrap()).unwrap();
+
+        let alice = Entity::new("Alice", EntityType::Person, 0.9);
+        let bob = Entity::new("Bob", EntityType::Person, 0.9);
+        graph.upsert_entity(&alice).unwrap();
+        graph.upsert_entity(&bob).unwrap();
+
+        let t1 = Triple::new(alice.id, Predicate::Custom("loves".into()), bob.id, 0.9);
+        let t2 = Triple::new(
+            alice.id,
+            Predicate::Custom("hates".into()),
+            bob.id,
+            0.85,
+        );
+        graph.upsert_triple(&t1).unwrap();
+        graph.upsert_triple(&t2).unwrap();
+
+        let view = graph
+            .beliefs()
+            .detect_contradiction(t1.id, t2.id, -0.95)
+            .expect("contradiction recorded");
+
+        // Brief without graph: no contradictions surfaced.
+        let bare = BriefBuilder::new(&store).build(now).unwrap();
+        assert!(bare.contradictions.is_empty());
+        assert_eq!(bare.counts.contradictions, 0);
+
+        // Brief with graph: surfaces the JTMS-flagged pair.
+        let brief = BriefBuilder::new(&store)
+            .with_graph(&graph)
+            .build(now)
+            .unwrap();
+        assert_eq!(brief.contradictions.len(), 1);
+        assert_eq!(brief.counts.contradictions, 1);
+        let row = &brief.contradictions[0];
+        assert_eq!(row.id, view.id);
+        // Triple ids may come back in either order from the JTMS
+        // engine; assert membership rather than position.
+        let ids = [row.triple_a, row.triple_b];
+        assert!(ids.contains(&t1.id));
+        assert!(ids.contains(&t2.id));
+        assert!((row.cosine_similarity - (-0.95)).abs() < 1e-6);
+
+        // Round-trip through JSON keeps the section reachable.
+        let json = serde_json::to_value(&brief).unwrap();
+        assert_eq!(json["contradictions"].as_array().unwrap().len(), 1);
+        assert_eq!(json["counts"]["contradictions"], 1);
     }
 }
