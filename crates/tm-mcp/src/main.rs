@@ -422,6 +422,23 @@ fn tools_list() -> Value {
                         "action_limit":    {"type": "integer", "description": "Max actions to include (default 20).", "default": 20}
                     }
                 }
+            },
+            {
+                "name": "memory_feedback",
+                "description": "Record per-result feedback that trains the retrieval bandit. `kind` selects the channel: `helpful` writes to `positive_signals` (F-1, default weight 0.3); `not_related` and `cross_context_bridge` write to `negative_signals` (C-0.7, default weight 1.0). All three kinds feed `finalize_pending_reward` so the bandit's reward = `(relevance + Σ positives − Σ negatives).clamp(0, 1)`. `query_id` is the UUID returned in the previous `memory_query` response.",
+                "inputSchema": {
+                    "type": "object",
+                    "required": ["query_id", "result_id", "kind"],
+                    "properties": {
+                        "query_id":   {"type": "string", "description": "Query UUID returned by `memory_query`."},
+                        "result_id":  {"type": "string", "description": "Stable id of the result row receiving feedback (entity UUID or triple UUID)."},
+                        "kind":       {"type": "string", "enum": ["helpful", "not_related", "cross_context_bridge"], "description": "Feedback channel. `helpful` → positive_signals. `not_related` / `cross_context_bridge` → negative_signals."},
+                        "weight":     {"type": "number", "description": "Override default weight (helpful default 0.3, negative kinds default 1.0). Must be ≥ 0."},
+                        "context_id": {"type": "string", "description": "Optional context UUID for positive feedback (the active scope at click time)."},
+                        "context_a":  {"type": "string", "description": "For negative feedback that crosses a context boundary: the bad-result context."},
+                        "context_b":  {"type": "string", "description": "For negative feedback that crosses a context boundary: the query's active context."}
+                    }
+                }
             }
         ]
     })
@@ -1516,6 +1533,88 @@ fn handle_memory_consolidate(db_path: &str) -> Result<Value, String> {
     }))
 }
 
+/// `memory_feedback` — F-1 / C-0.7 per-result feedback channel.
+///
+/// `kind` routes the signal:
+///   * `helpful`               → `positive_signals` (default weight 0.3)
+///   * `not_related`           → `negative_signals` (default weight 1.0)
+///   * `cross_context_bridge`  → `negative_signals` (default weight 1.0, expects
+///                                `context_a` / `context_b`)
+///
+/// All three feed `finalize_pending_reward`, so the bandit reward composes as
+/// `(relevance + Σ positives − Σ negatives).clamp(0, 1)`.
+fn handle_memory_feedback(params: &Value, db_path: &str) -> Result<Value, String> {
+    let query_id_s = params
+        .get("query_id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "missing required parameter: query_id".to_string())?;
+    let query_id = Uuid::parse_str(query_id_s)
+        .map_err(|e| format!("invalid query_id '{query_id_s}': {e}"))?;
+
+    let result_id = params
+        .get("result_id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "missing required parameter: result_id".to_string())?;
+
+    let kind = params
+        .get("kind")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "missing required parameter: kind".to_string())?;
+
+    let override_weight = params.get("weight").and_then(|v| v.as_f64()).map(|w| w as f32);
+    if let Some(w) = override_weight {
+        if !w.is_finite() || w < 0.0 {
+            return Err(format!("weight must be a finite non-negative number, got {w}"));
+        }
+    }
+
+    let parse_ctx = |key: &str| -> Result<Option<Uuid>, String> {
+        match params.get(key).and_then(|v| v.as_str()) {
+            Some(s) if !s.is_empty() => Uuid::parse_str(s)
+                .map(Some)
+                .map_err(|e| format!("invalid {key} '{s}': {e}")),
+            _ => Ok(None),
+        }
+    };
+
+    let graph = GraphStore::open(db_path).map_err(|e| e.to_string())?;
+
+    match kind {
+        "helpful" => {
+            let weight = override_weight.unwrap_or(0.3);
+            let context_id = parse_ctx("context_id")?;
+            let row_id = graph
+                .write_positive_signal(query_id, result_id, kind, context_id, weight)
+                .map_err(|e| format!("write_positive_signal: {e}"))?;
+            Ok(json!({
+                "ok": true,
+                "channel": "positive_signals",
+                "row_id": row_id,
+                "kind": kind,
+                "weight": weight,
+            }))
+        }
+        "not_related" | "cross_context_bridge" => {
+            let weight = override_weight.unwrap_or(1.0);
+            let context_a = parse_ctx("context_a")?;
+            let context_b = parse_ctx("context_b")?;
+            let row_id = graph
+                .write_negative_signal(query_id, result_id, kind, context_a, context_b, weight)
+                .map_err(|e| format!("write_negative_signal: {e}"))?;
+            Ok(json!({
+                "ok": true,
+                "channel": "negative_signals",
+                "row_id": row_id,
+                "kind": kind,
+                "weight": weight,
+            }))
+        }
+        other => Err(format!(
+            "invalid kind '{other}': expected one of helpful, not_related, cross_context_bridge"
+        )),
+    }
+}
+
 /// `memory_brief` — render the daily brief from the system of intents
 /// (`docs/INTENT_SYSTEM.md` §9.1).
 ///
@@ -2352,6 +2451,10 @@ async fn handle_request(
                 }
                 "memory_arc" => {
                     handle_memory_arc(&args, intents_path)
+                        .map_err(|e| anyhow::anyhow!(e))?
+                }
+                "memory_feedback" => {
+                    handle_memory_feedback(&args, db_path)
                         .map_err(|e| anyhow::anyhow!(e))?
                 }
                 unknown => {
