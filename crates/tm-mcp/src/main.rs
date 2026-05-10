@@ -153,13 +153,18 @@ fn tools_list() -> Value {
             },
             {
                 "name": "memory_query",
-                "description": "Query TraceMind memory with natural-language text. Returns relevant entities and triples.",
+                "description": "Query TraceMind memory with natural-language text. Returns relevant entities and triples. Defaults to the active context; set cross_context=true to bridge all contexts.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "text": {
                             "type": "string",
                             "description": "Query text."
+                        },
+                        "cross_context": {
+                            "type": "boolean",
+                            "description": "Sprint C-0.6 — when true, ignores the active context and searches every namespace. Default false (scoped).",
+                            "default": false
                         }
                     },
                     "required": ["text"]
@@ -1156,8 +1161,13 @@ async fn handle_memory_query(
         .get("text")
         .and_then(|v| v.as_str())
         .ok_or_else(|| "missing required parameter: text".to_string())?;
+    let cross_context = params
+        .get("cross_context")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
 
     let mut engine = retrieval.lock().await;
+    engine.set_cross_context(cross_context);
     // Same rationale as memory_store: the retrieval engine's GraphStore cache
     // is stale relative to writes from the ingest-side GraphStore in a
     // long-running MCP session. See TM-UX-001 Phase C.

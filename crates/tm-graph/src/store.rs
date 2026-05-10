@@ -93,6 +93,12 @@ pub struct GraphStore {
     /// lets the brief surface them across CLI invocations.
     /// `None` when the graph is in-memory (`:memory:`).
     beliefs_path: Option<std::path::PathBuf>,
+    /// Sprint C-0: the context that every new entity / triple / signal
+    /// will be tagged with on insert. `None` means "no active context"
+    /// (= legacy / pre-Sprint-C-0 behaviour: rows are unscoped). Set
+    /// via [`GraphStore::set_active_context`] — typically the caller
+    /// reads `~/.tracemind/active_context.json` and forwards the UUID.
+    active_context_id: RefCell<Option<Uuid>>,
 }
 
 /// String tag stored in `temporal_facts.fact_type` for entity revisions.
@@ -288,6 +294,7 @@ impl GraphStore {
             temporal,
             beliefs: BeliefStore::new(),
             beliefs_path,
+            active_context_id: RefCell::new(None),
         };
 
         // One-time backfill: emit a temporal fact for any entity / triple
@@ -570,6 +577,117 @@ impl GraphStore {
     // free functions) so callers don't need to juggle the raw rusqlite
     // connection — the same pattern as `BeliefStore` wraps tm-tms.
 
+    /// Set (or clear) the context every new entity / triple / signal will
+    /// be tagged with on insert. Pass `None` to revert to the legacy
+    /// unscoped behaviour. Typical caller path:
+    ///
+    /// ```ignore
+    /// let active = ActiveContext::load(&active_path)?;
+    /// graph.set_active_context(active.map(|a| a.id));
+    /// ```
+    pub fn set_active_context(&self, ctx_id: Option<Uuid>) {
+        *self.active_context_id.borrow_mut() = ctx_id;
+    }
+
+    /// Read the active context UUID (or `None` if unscoped).
+    pub fn active_context_id(&self) -> Option<Uuid> {
+        *self.active_context_id.borrow()
+    }
+
+    /// Look up the `context_id` stashed in an entity's properties at
+    /// insert time. Returns `Ok(None)` if the entity is missing, was
+    /// inserted before Sprint C-0 (no property), or was inserted with
+    /// no active context. Used by the retrieval-scope filter.
+    pub fn entity_context_id(&self, entity_id: Uuid) -> Result<Option<Uuid>> {
+        let map = self.entity_map.borrow();
+        let Some(&skg_id) = map.get(&entity_id) else { return Ok(None) };
+        drop(map);
+        let skg_ent = self
+            .kg
+            .get_entity(skg_id)
+            .map_err(|e| TraceMindError::Storage(format!("skg get_entity: {e}")))?;
+        Ok(prop_uuid(skg_ent.get_property("context_id")))
+    }
+
+    /// Look up the `context_id` for a triple. See `entity_context_id`.
+    pub fn triple_context_id(&self, triple_id: Uuid) -> Result<Option<Uuid>> {
+        let map = self.triple_map.borrow();
+        let Some(&skg_id) = map.get(&triple_id) else { return Ok(None) };
+        drop(map);
+        let conn = self.kg.connection();
+        let props_str: std::result::Result<String, _> = conn.query_row(
+            "SELECT properties FROM kg_relations WHERE id = ?1",
+            params![skg_id],
+            |row| row.get(0),
+        );
+        let props_str = match props_str {
+            Ok(s) => s,
+            Err(_) => return Ok(None),
+        };
+        let props: HashMap<String, serde_json::Value> =
+            serde_json::from_str(&props_str).unwrap_or_default();
+        Ok(prop_uuid(props.get("context_id")))
+    }
+
+    /// True iff `entity_id` is visible under the active scope. Unscoped
+    /// rows (no `context_id` property) are *always* visible — legacy
+    /// data from before Sprint C-0 stays reachable. When `cross_context`
+    /// is true the function short-circuits to `true` (no filtering).
+    pub fn entity_in_active_scope(&self, entity_id: Uuid, cross_context: bool) -> Result<bool> {
+        if cross_context {
+            return Ok(true);
+        }
+        let active = self.active_context_id();
+        if active.is_none() {
+            return Ok(true);
+        }
+        let row_ctx = self.entity_context_id(entity_id)?;
+        Ok(match row_ctx {
+            None => true, // unscoped row — always visible
+            Some(c) => Some(c) == active,
+        })
+    }
+
+    /// True iff `triple_id` is visible under the active scope. Same
+    /// semantics as `entity_in_active_scope`.
+    pub fn triple_in_active_scope(&self, triple_id: Uuid, cross_context: bool) -> Result<bool> {
+        if cross_context {
+            return Ok(true);
+        }
+        let active = self.active_context_id();
+        if active.is_none() {
+            return Ok(true);
+        }
+        let row_ctx = self.triple_context_id(triple_id)?;
+        Ok(match row_ctx {
+            None => true,
+            Some(c) => Some(c) == active,
+        })
+    }
+
+    /// True iff `signal_id` is visible under the active scope. Reads
+    /// the dedicated `captured_signals.context_id` column.
+    pub fn signal_in_active_scope(&self, signal_id: i64, cross_context: bool) -> Result<bool> {
+        if cross_context {
+            return Ok(true);
+        }
+        let active = self.active_context_id();
+        if active.is_none() {
+            return Ok(true);
+        }
+        let conn = self.kg.connection();
+        let ctx_str: std::result::Result<Option<String>, _> = conn.query_row(
+            "SELECT context_id FROM captured_signals WHERE id = ?1",
+            params![signal_id],
+            |row| row.get(0),
+        );
+        match ctx_str {
+            Ok(None) => Ok(true),
+            Ok(Some(s)) => Ok(Uuid::parse_str(&s).ok() == active),
+            Err(_) => Ok(true), // unknown row — be permissive
+        }
+    }
+
     /// Create a new context (idempotent on name — duplicates are no-ops).
     pub fn create_context(&self, ctx: &crate::context::Context) -> Result<()> {
         crate::context::create_context(self.kg.connection(), ctx)
@@ -632,6 +750,12 @@ impl GraphStore {
             skg_ent.name = entity.name.clone();
             skg_ent.entity_type = etype_json.clone();
             set_entity_props(&mut skg_ent, entity);
+            // Sprint C-0: tag with the active context. On update we
+            // only *add* a context when one is now active — we never
+            // clobber an existing tag, so re-ingesting a known entity
+            // under "no active context" keeps it scoped to its
+            // original context.
+            set_entity_context(&mut skg_ent, *self.active_context_id.borrow());
 
             self.kg
                 .update_entity(&skg_ent)
@@ -640,6 +764,7 @@ impl GraphStore {
             // Insert new.
             let mut skg_ent = SkgEntity::new(&etype_json, &entity.name);
             set_entity_props(&mut skg_ent, entity);
+            set_entity_context(&mut skg_ent, *self.active_context_id.borrow());
 
             let skg_id = self
                 .kg
@@ -951,9 +1076,10 @@ impl GraphStore {
         let mut tmap = self.triple_map.borrow_mut();
 
         let is_new = !tmap.contains_key(&triple.id);
+        let active_ctx = *self.active_context_id.borrow();
         if let Some(&skg_id) = tmap.get(&triple.id) {
             // Update via raw SQL (skg has no update_relation).
-            let props = triple_props(triple, &predicate_str);
+            let props = triple_props(triple, &predicate_str, active_ctx);
             let conn = self.kg.connection();
             conn.execute(
                 "UPDATE kg_relations SET source_id=?1, target_id=?2, rel_type=?3, weight=?4, properties=?5 WHERE id=?6",
@@ -970,6 +1096,9 @@ impl GraphStore {
             rel.set_property("source_id", json!(triple.source_id));
             rel.set_property("created_at", json!(triple.created_at.to_rfc3339()));
             rel.set_property("updated_at", json!(triple.updated_at.to_rfc3339()));
+            if let Some(ctx_id) = active_ctx {
+                rel.set_property("context_id", json!(ctx_id.to_string()));
+            }
 
             let skg_id = self
                 .kg
@@ -1565,10 +1694,11 @@ impl GraphStore {
         ingested: bool,
     ) -> Result<()> {
         let conn = self.kg.connection();
+        let ctx = self.active_context_id.borrow().map(|u| u.to_string());
         conn.execute(
-            "INSERT INTO captured_signals (source, raw_text, content_hash, relevance_score, ingested) \
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![source, raw_text, content_hash as i64, relevance_score, ingested as i32],
+            "INSERT INTO captured_signals (source, raw_text, content_hash, relevance_score, ingested, context_id) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![source, raw_text, content_hash as i64, relevance_score, ingested as i32, ctx],
         )
         .map_err(|e| TraceMindError::Storage(format!("log_signal: {e}")))?;
         Ok(())
@@ -1605,10 +1735,11 @@ impl GraphStore {
     ) -> Result<i64> {
         let blob: Vec<u8> = embedding.iter().flat_map(|f| f.to_le_bytes()).collect();
         let conn = self.kg.connection();
+        let ctx = self.active_context_id.borrow().map(|u| u.to_string());
         conn.execute(
             "INSERT INTO captured_signals \
-             (source, raw_text, content_hash, relevance_score, ingested, session_id, embedding, priority_tier) \
-             VALUES (?1, ?2, ?3, ?4, 0, ?5, ?6, ?7)",
+             (source, raw_text, content_hash, relevance_score, ingested, session_id, embedding, priority_tier, context_id) \
+             VALUES (?1, ?2, ?3, ?4, 0, ?5, ?6, ?7, ?8)",
             params![
                 source,
                 raw_text,
@@ -1616,7 +1747,8 @@ impl GraphStore {
                 relevance_score,
                 session_id.to_string(),
                 blob,
-                priority_tier
+                priority_tier,
+                ctx
             ],
         )
         .map_err(|e| TraceMindError::Storage(format!("insert_signal_with_embedding: {e}")))?;
@@ -2119,14 +2251,30 @@ fn set_entity_props(skg_ent: &mut SkgEntity, entity: &Entity) {
     skg_ent.set_property("updated_at", json!(entity.updated_at.to_rfc3339()));
 }
 
-fn triple_props(triple: &Triple, predicate_str: &str) -> serde_json::Value {
-    json!({
+/// Stash the Sprint C-0 active context_id on a skg entity if set. Pulled
+/// out from `set_entity_props` so updates don't clobber a previously
+/// written context_id when the live context is None (e.g. CLI flow with
+/// no active context after some rows were already scoped).
+fn set_entity_context(skg_ent: &mut SkgEntity, ctx_id: Option<Uuid>) {
+    if let Some(c) = ctx_id {
+        skg_ent.set_property("context_id", json!(c.to_string()));
+    }
+}
+
+fn triple_props(triple: &Triple, predicate_str: &str, ctx_id: Option<Uuid>) -> serde_json::Value {
+    let mut obj = json!({
         "uuid": triple.id.to_string(),
         "predicate": predicate_str,
         "source_id": triple.source_id,
         "created_at": triple.created_at.to_rfc3339(),
         "updated_at": triple.updated_at.to_rfc3339(),
-    })
+    });
+    if let Some(c) = ctx_id {
+        if let Some(map) = obj.as_object_mut() {
+            map.insert("context_id".into(), json!(c.to_string()));
+        }
+    }
+    obj
 }
 
 fn skg_entity_to_tm(skg_ent: &SkgEntity) -> Result<Entity> {
@@ -2708,5 +2856,109 @@ mod tests {
         assert!(store.triple_history(unknown).unwrap().is_empty());
         assert!(store.entity_at(unknown, Utc::now()).unwrap().is_none());
         assert!(store.triple_at(unknown, Utc::now()).unwrap().is_none());
+    }
+
+    // ─── Sprint C-0.5: context tagging at ingest time ─────────────────
+
+    #[test]
+    fn entity_tagged_with_active_context() {
+        let store = GraphStore::open(":memory:").unwrap();
+        let ctx_id = Uuid::new_v4();
+        store.set_active_context(Some(ctx_id));
+
+        let e = make_entity("Alice", EntityType::Person);
+        store.upsert_entity(&e).unwrap();
+
+        let tagged = store.entity_context_id(e.id).unwrap();
+        assert_eq!(tagged, Some(ctx_id), "entity should inherit active ctx");
+    }
+
+    #[test]
+    fn entity_untagged_when_no_active_context() {
+        let store = GraphStore::open(":memory:").unwrap();
+        // Default: no active context.
+        let e = make_entity("Bob", EntityType::Person);
+        store.upsert_entity(&e).unwrap();
+
+        let tagged = store.entity_context_id(e.id).unwrap();
+        assert_eq!(tagged, None, "entity should be unscoped");
+    }
+
+    #[test]
+    fn triple_tagged_with_active_context() {
+        let store = GraphStore::open(":memory:").unwrap();
+        let ctx_id = Uuid::new_v4();
+        store.set_active_context(Some(ctx_id));
+
+        let a = make_entity("X", EntityType::Person);
+        let b = make_entity("Y", EntityType::Person);
+        store.upsert_entity(&a).unwrap();
+        store.upsert_entity(&b).unwrap();
+        let t = Triple {
+            id: Uuid::new_v4(),
+            subject_id: a.id,
+            predicate: Predicate::RelatedTo,
+            object_id: b.id,
+            confidence: 0.7,
+            source_id: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        store.upsert_triple(&t).unwrap();
+
+        assert_eq!(store.triple_context_id(t.id).unwrap(), Some(ctx_id));
+    }
+
+    #[test]
+    fn entity_in_active_scope_includes_unscoped() {
+        let store = GraphStore::open(":memory:").unwrap();
+        let ctx_a = Uuid::new_v4();
+        let ctx_b = Uuid::new_v4();
+
+        // Insert an unscoped legacy entity.
+        let legacy = make_entity("Legacy", EntityType::Person);
+        store.upsert_entity(&legacy).unwrap();
+
+        // Insert one scoped to ctx_a.
+        store.set_active_context(Some(ctx_a));
+        let scoped_a = make_entity("InA", EntityType::Person);
+        store.upsert_entity(&scoped_a).unwrap();
+
+        // Insert one scoped to ctx_b.
+        store.set_active_context(Some(ctx_b));
+        let scoped_b = make_entity("InB", EntityType::Person);
+        store.upsert_entity(&scoped_b).unwrap();
+
+        // Activate ctx_a — legacy + scoped_a should be visible; scoped_b should not.
+        store.set_active_context(Some(ctx_a));
+        assert!(store.entity_in_active_scope(legacy.id, false).unwrap());
+        assert!(store.entity_in_active_scope(scoped_a.id, false).unwrap());
+        assert!(!store.entity_in_active_scope(scoped_b.id, false).unwrap());
+
+        // cross_context=true short-circuits to true for everyone.
+        assert!(store.entity_in_active_scope(scoped_b.id, true).unwrap());
+    }
+
+    #[test]
+    fn signal_tagged_with_active_context() {
+        let store = GraphStore::open(":memory:").unwrap();
+        let ctx_id = Uuid::new_v4();
+        store.set_active_context(Some(ctx_id));
+
+        // log_signal goes through the tagged path.
+        store
+            .log_signal("test", "hello world", 42u64, None, false)
+            .unwrap();
+
+        // Read the row back via SQL.
+        let conn = store.kg.connection();
+        let ctx_str: Option<String> = conn
+            .query_row(
+                "SELECT context_id FROM captured_signals WHERE content_hash = ?1",
+                params![42i64],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(ctx_str, Some(ctx_id.to_string()));
     }
 }

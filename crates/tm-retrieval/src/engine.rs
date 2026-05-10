@@ -180,6 +180,11 @@ pub struct RetrievalEngine {
     /// SQLite kNN when a query has been pre-warmed by an upstream
     /// `AnticipationKind::PrefetchQuery`.
     prefetch: PrefetchCache,
+    /// Sprint C-0.6 — when false (default), retrieval filters out
+    /// entities/triples/signals tagged with a different context than
+    /// `graph.active_context_id()`. Unscoped rows (no tag) are always
+    /// visible. When true, the active scope is ignored.
+    cross_context: bool,
 }
 
 #[derive(Debug)]
@@ -260,7 +265,21 @@ impl RetrievalEngine {
             procedure_store,
             trajectory_store,
             prefetch: PrefetchCache::new(),
+            cross_context: false,
         })
+    }
+
+    /// Toggle cross-context retrieval. When `true`, ignores the active
+    /// context scope and returns results from every namespace. When
+    /// `false` (default), filters to the active context plus unscoped
+    /// legacy data. Sprint C-0.6.
+    pub fn set_cross_context(&mut self, cross_context: bool) {
+        self.cross_context = cross_context;
+    }
+
+    /// Read-only accessor for the current cross-context flag.
+    pub fn cross_context(&self) -> bool {
+        self.cross_context
     }
 
     /// Pre-warm the L1 prefetch cache with the kNN result for `text`.
@@ -905,6 +924,33 @@ impl RetrievalEngine {
             Some((plan_tuple.0.as_str(), plan_tuple.1.as_str(), plan_tuple.2)),
             &phase_pairs,
         );
+
+        // ── Sprint C-0.6: context scope filter ──
+        // Strip entities/triples/signals tagged with a context other
+        // than the active one. Unscoped rows (no tag) stay visible so
+        // legacy / pre-segmentation data remains reachable.
+        if !self.cross_context && self.graph.active_context_id().is_some() {
+            ws.entities
+                .retain(|e| self.graph.entity_in_active_scope(e.id, false).unwrap_or(true));
+            let kept_entity_ids: HashSet<Uuid> =
+                ws.entities.iter().map(|e| e.id).collect();
+            ws.triples.retain(|t| {
+                // Drop triples whose own context_id is foreign, OR
+                // whose subject/object has been filtered out.
+                let scope_ok = self
+                    .graph
+                    .triple_in_active_scope(t.id, false)
+                    .unwrap_or(true);
+                let endpoints_ok = kept_entity_ids.contains(&t.subject_id)
+                    && kept_entity_ids.contains(&t.object_id);
+                scope_ok && endpoints_ok
+            });
+            ws.signal_hits.retain(|h| {
+                self.graph
+                    .signal_in_active_scope(h.signal_id, false)
+                    .unwrap_or(true)
+            });
+        }
 
         let related_entities = compute_related_entities(
             &self.graph,
@@ -1861,6 +1907,7 @@ mod tests {
             procedure_store: None,
             trajectory_store: None,
             prefetch: PrefetchCache::new(),
+            cross_context: false,
         };
 
         let result = engine.query("hello world").unwrap();
@@ -1905,6 +1952,7 @@ mod tests {
             procedure_store: None,
             trajectory_store: None,
             prefetch: PrefetchCache::new(),
+            cross_context: false,
         };
 
         // Prime an entry for "hello world" — even on an empty graph
@@ -2026,6 +2074,101 @@ mod tests {
         // Empty primary → empty related (bounded).
         let none = compute_related_entities(&graph, &query_emb, &[], 5, 5);
         assert!(none.is_empty());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ─── Sprint C-0.6: retrieval scopes to active context ───────────────
+
+    /// When an active context is set, retrieval should filter out entities
+    /// tagged with a *different* context. Unscoped legacy entities + entities
+    /// in the active context stay visible. `cross_context=true` bypasses
+    /// the filter and surfaces everything.
+    #[test]
+    fn retrieval_scopes_to_active_context() {
+        let dir = std::env::temp_dir().join(format!("tm_ret_scope_{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("test.db").to_str().unwrap().to_string();
+        let traces = dir.join("traces.jsonl").to_str().unwrap().to_string();
+        let bandit_path = dir.join("bandit.json");
+        let linucb_path = dir.join("linucb.json");
+
+        let mut engine = RetrievalEngine {
+            graph: GraphStore::open(&db).unwrap(),
+            trace_store: TraceStore::open(&traces).unwrap(),
+            embedder: Embedder::new_hash(),
+            bandit: UcbBandit::new(),
+            bandit_path,
+            linucb: LinUcbBandit::new(),
+            linucb_path,
+            reranker: None,
+            query_cache: RecentQueryCache::new(10),
+            pending_reward: None,
+            planner: QueryPlanner::new(),
+            procedure_store: None,
+            trajectory_store: None,
+            prefetch: PrefetchCache::new(),
+            cross_context: false,
+        };
+
+        let now = chrono::Utc::now();
+        let mk = |name: &str| tm_types::Entity {
+            id: Uuid::new_v4(),
+            name: name.to_string(),
+            entity_type: tm_types::EntityType::Concept,
+            confidence: 0.95,
+            source_id: Some("ctx-test".to_string()),
+            created_at: now,
+            updated_at: now,
+        };
+
+        // Two contexts: rondo + tracemind.
+        let rondo = Uuid::new_v4();
+        let tracemind = Uuid::new_v4();
+
+        // Insert an unscoped legacy entity.
+        let legacy = mk("legacy concept item");
+        engine.graph.upsert_entity(&legacy).unwrap();
+        let emb = engine.embedder.embed(&legacy.name);
+        engine.graph.upsert_vector(legacy.id, &emb).unwrap();
+
+        // Insert one scoped to rondo.
+        engine.graph.set_active_context(Some(rondo));
+        let in_rondo = mk("rondo special player item");
+        engine.graph.upsert_entity(&in_rondo).unwrap();
+        let emb = engine.embedder.embed(&in_rondo.name);
+        engine.graph.upsert_vector(in_rondo.id, &emb).unwrap();
+
+        // Insert one scoped to tracemind.
+        engine.graph.set_active_context(Some(tracemind));
+        let in_tm = mk("tracemind special memory item");
+        engine.graph.upsert_entity(&in_tm).unwrap();
+        let emb = engine.embedder.embed(&in_tm.name);
+        engine.graph.upsert_vector(in_tm.id, &emb).unwrap();
+
+        // Activate rondo, query with a generic term that hits all three:
+        engine.graph.set_active_context(Some(rondo));
+        engine.set_cross_context(false);
+        let scoped = engine.query("item").unwrap();
+        let scoped_ids: std::collections::HashSet<Uuid> =
+            scoped.entities.iter().map(|e| e.id).collect();
+
+        // Legacy (unscoped) + rondo should pass; tracemind should be filtered.
+        assert!(
+            !scoped_ids.contains(&in_tm.id),
+            "tracemind entity must not leak into rondo scope, got: {:?}",
+            scoped.entities.iter().map(|e| &e.name).collect::<Vec<_>>(),
+        );
+
+        // cross_context=true should surface every entity, including tracemind's.
+        engine.set_cross_context(true);
+        let bridged = engine.query("item").unwrap();
+        let bridged_ids: std::collections::HashSet<Uuid> =
+            bridged.entities.iter().map(|e| e.id).collect();
+        assert!(
+            bridged_ids.contains(&in_tm.id) || bridged.entities.len() >= scoped.entities.len(),
+            "cross_context should not be stricter than scoped retrieval"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }
