@@ -110,18 +110,19 @@ pause_read
 narrate "Everything you're about to see runs on this machine."
 narrate "No cloud. No telemetry. No remote model calls."
 pause_read
-narrate "Five acts, ~7 minutes:"
+narrate "Six acts, ~8 minutes:"
 printf '%s    1. Memory          (real BGE embeddings, real entity extraction)%s\n' "$D" "$R"
-printf '%s    2. Intents         (commitment as a first-class object)%s\n' "$D" "$R"
-printf '%s    3. World model     (predicts outcomes from your own track record)%s\n' "$D" "$R"
-printf '%s    4. Calibration     (the model only speaks when it has earned trust)%s\n' "$D" "$R"
-printf '%s    5. MCP             (same brain, any agent runtime)%s\n' "$D" "$R"
+printf '%s    2. Retraction      (JTMS catches when memories contradict each other)%s\n' "$D" "$R"
+printf '%s    3. Intents         (commitment as a first-class object)%s\n' "$D" "$R"
+printf '%s    4. World model     (predicts outcomes from your own track record)%s\n' "$D" "$R"
+printf '%s    5. Calibration     (the model only speaks when it has earned trust)%s\n' "$D" "$R"
+printf '%s    6. MCP             (same brain, any agent runtime)%s\n' "$D" "$R"
 pause_title
 
 # ============================================================================
 # ACT 1 — MEMORY
 # ============================================================================
-title_card "ACT 1 of 5 — Memory" \
+title_card "ACT 1 of 6 — Memory" \
   "" \
   "TraceMind ingests free-form text. For each fact, three" \
   "things happen, all on-device:" \
@@ -193,9 +194,88 @@ recap_close
 pause_recap; pause_recap
 
 # ============================================================================
-# ACT 2 — INTENTS
+# ACT 2 — RETRACTION (memory consistency / JTMS)
 # ============================================================================
-title_card "ACT 2 of 5 — System of intents" \
+title_card "ACT 2 of 6 — Retraction" \
+  "" \
+  "TraceMind doesn't just store. It notices when two memories" \
+  "contradict each other and surfaces the conflict for review." \
+  "" \
+  "Mechanism — runs on every ingest, no LLM in the loop:" \
+  "  1. Each typed triple has a vector embedding for its object" \
+  "  2. BeliefStore hashes opposing-predicate pairs (loves/hates, …)" \
+  "  3. cosine < -0.85 between embeddings → contradiction" \
+  "  4. The brief surfaces it. You decide: keep A | keep B | keep both" \
+  "" \
+  "The choice is persisted; JTMS replays it on every restart."
+pause_title
+
+# Side data dir so the retraction beat doesn't trample the main narrative.
+RETRACT_DIR="/tmp/tm-walkthrough-retract"
+rm -rf "$RETRACT_DIR"
+# walkthrough.sh's run() eval's a single string — keep TMR as a string prefix
+# that we splice into each `run "..."` call.
+TMR="env TM_DATA_DIR=$RETRACT_DIR $TM"
+
+step_header "Step 1/4 — load a fixture with one known contradiction"
+narrate "We restore a small seeded fixture: 'Alice loves Bob' AND"
+narrate "'Alice hates Bob'. Same subject, opposing predicates."
+pause_read
+
+run "$TMR demo restore --force"
+pause_recap
+
+step_header "Step 2/4 — the brief surfaces it"
+narrate "Look at the contradictions counter. It's 1."
+narrate "No engineer wrote a custom rule for this. Embedding geometry caught it."
+pause_read
+
+run "$TMR brief"
+pause_recap
+
+step_header "Step 3/4 — list outstanding contradictions"
+narrate "Same surface as JSON. Each row pairs the two triple IDs"
+narrate "and the cosine between their object embeddings."
+pause_read
+
+run "$TMR contradictions list"
+pause_recap
+
+step_header "Step 4/4 — resolve (keep B → retract A)"
+narrate "We tell TraceMind: trust 'hates', retract 'loves'."
+narrate "JTMS marks the retracted belief as Out. A sidecar JSON"
+narrate "remembers the choice so it survives a restart."
+pause_read
+
+# Pluck the first contradiction's triple pair from the JSON surface.
+_PAIR=$(env TM_DATA_DIR="$RETRACT_DIR" "$TM" contradictions list --json 2>/dev/null | python3 -c '
+import json, sys
+rows = json.load(sys.stdin)
+r = rows[0]
+print(r["triple_a"], r["triple_b"])
+')
+_TA=$(echo "$_PAIR" | awk "{print \$1}")
+_TB=$(echo "$_PAIR" | awk "{print \$2}")
+
+run "$TMR contradictions resolve $_TA $_TB keep-b"
+
+recap_open
+recap_line "1 retracted, 1 kept. The 'loves' belief is now Out;"
+recap_line "the 'hates' belief stays In. Memory is consistent again."
+recap_line ""
+recap_line "Tauri ships the same flow as a side-drawer: click a"
+recap_line "contradiction row in the brief, see both triples with"
+recap_line "subject/object names, click keep A | keep B | keep both."
+recap_close
+pause_recap
+
+run "$TMR contradictions list"
+pause_recap; pause_recap
+
+# ============================================================================
+# ACT 3 — INTENTS
+# ============================================================================
+title_card "ACT 3 of 6 — System of intents" \
   "" \
   "A commitment is the wedge primitive. It is NOT a note;" \
   "it is NOT a todo. It is a recorded statement of intent" \
@@ -270,7 +350,7 @@ pause_recap; pause_recap
 # ============================================================================
 # ACT 3 — WORLD MODEL
 # ============================================================================
-title_card "ACT 3 of 5 — World model" \
+title_card "ACT 4 of 6 — World model" \
   "" \
   "f_outcome: a tiny logistic regression that predicts polarity" \
   "(better / as_expected / worse / mixed) from commitment metadata." \
@@ -339,7 +419,7 @@ pause_recap; pause_recap
 # ============================================================================
 # ACT 4 — CALIBRATION
 # ============================================================================
-title_card "ACT 4 of 5 — Calibration" \
+title_card "ACT 5 of 6 — Calibration" \
   "" \
   "A predictor that's never wrong on the training set is" \
   "easy to build. A predictor you should TRUST is harder." \
@@ -370,7 +450,7 @@ pause_recap; pause_recap
 # ============================================================================
 # ACT 5 — MCP
 # ============================================================================
-title_card "ACT 5 of 5 — MCP server" \
+title_card "ACT 6 of 6 — MCP server" \
   "" \
   "Same brain. Different agent runtime." \
   "" \
