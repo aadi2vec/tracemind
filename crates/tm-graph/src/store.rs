@@ -731,6 +731,34 @@ impl GraphStore {
         crate::context::negative_weight_for_query(self.kg.connection(), query_id)
     }
 
+    /// Append a positive-feedback row (F-1 "helpful" channel). Mirror of
+    /// `write_negative_signal` — `result_id` is opaque, `context_id` is
+    /// the active context at the time of feedback (may be `None` if no
+    /// context is active).
+    pub fn write_positive_signal(
+        &self,
+        query_id: Uuid,
+        result_id: &str,
+        kind: &str,
+        context_id: Option<Uuid>,
+        weight: f32,
+    ) -> Result<i64> {
+        crate::context::write_positive_signal(
+            self.kg.connection(),
+            query_id,
+            result_id,
+            kind,
+            context_id,
+            weight,
+        )
+    }
+
+    /// Sum of positive-signal weights for a query — added to the bandit
+    /// reward by `finalize_pending_reward`.
+    pub fn positive_weight_for_query(&self, query_id: Uuid) -> Result<f32> {
+        crate::context::positive_weight_for_query(self.kg.connection(), query_id)
+    }
+
     // ─── Entity CRUD ────────────────────────────────────────────────────
 
     pub fn upsert_entity(&self, entity: &Entity) -> Result<()> {

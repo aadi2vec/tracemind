@@ -95,6 +95,29 @@ enum Commands {
         #[arg(long)]
         context_b: Option<String>,
     },
+    /// Sprint D / F-1 — mark a retrieval result as *helpful* for its
+    /// query. Symmetric counterpart to `not-related`: writes a row to
+    /// `positive_signals`; the next bandit reward on the same query_id
+    /// is composed as
+    /// `final = (relevance + Σ positives - Σ negatives).clamp(0, 1)`.
+    Helpful {
+        /// UUID of the query whose result you're rewarding.
+        query_id: String,
+        /// Opaque id of the useful result (triple / entity / signal id).
+        result_id: String,
+        /// Positive weight in (0, ∞). Default 0.3 — a soft nudge so a
+        /// single thumbs-up doesn't saturate the reward.
+        #[arg(long, default_value = "0.3")]
+        weight: f32,
+        /// Kind tag — defaults to `helpful`. Free-form (`bookmark`,
+        /// `cited`, `kept`) so future surfaces can split positives.
+        #[arg(long, default_value = "helpful")]
+        kind: String,
+        /// Optional active context UUID (snapshot of `active_context`
+        /// at the time of feedback).
+        #[arg(long)]
+        context_id: Option<String>,
+    },
     /// Show recent traces with full audit detail
     Trace {
         #[arg(long, default_value = "10")]
@@ -974,6 +997,47 @@ fn main() {
             };
             println!(
                 "negative signal recorded (row {row_id}, query {qid}, result {result_id}, weight {weight}, kind {kind})"
+            );
+        }
+
+        Commands::Helpful {
+            query_id,
+            result_id,
+            weight,
+            kind,
+            context_id,
+        } => {
+            let qid = match Uuid::parse_str(&query_id) {
+                Ok(u) => u,
+                Err(e) => {
+                    eprintln!("error: invalid query_id (expect UUID): {e}");
+                    std::process::exit(1);
+                }
+            };
+            let ctx = context_id
+                .as_deref()
+                .map(Uuid::parse_str)
+                .transpose()
+                .unwrap_or_else(|e| {
+                    eprintln!("error: invalid --context-id: {e}");
+                    std::process::exit(1);
+                });
+            let graph = match GraphStore::open(&db_path) {
+                Ok(g) => g,
+                Err(e) => {
+                    eprintln!("error: failed to open graph store: {e}");
+                    std::process::exit(1);
+                }
+            };
+            let row_id = match graph.write_positive_signal(qid, &result_id, &kind, ctx, weight) {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("error: failed to write positive signal: {e}");
+                    std::process::exit(1);
+                }
+            };
+            println!(
+                "positive signal recorded (row {row_id}, query {qid}, result {result_id}, weight {weight}, kind {kind})"
             );
         }
 

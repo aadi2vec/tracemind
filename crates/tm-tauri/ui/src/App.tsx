@@ -6,6 +6,7 @@ import TracesView from "./views/TracesView";
 import IngestView from "./views/IngestView";
 import GraphView from "./views/GraphView";
 import ReasonView from "./views/ReasonView";
+import ContextSwitcher from "./views/ContextSwitcher";
 
 type View = "brief" | "dashboard" | "query" | "ingest" | "traces" | "graph" | "reason";
 
@@ -100,8 +101,12 @@ export default function App() {
           ))}
         </div>
 
-        <div className="p-4 border-t border-tm-border">
-          <div className="flex items-center gap-2">
+        <div className="p-3 border-t border-tm-border space-y-3">
+          <div>
+            <p className="text-[10px] uppercase tracking-wider text-tm-muted mb-1.5 px-1">Context</p>
+            <ContextSwitcher />
+          </div>
+          <div className="flex items-center gap-2 px-1">
             <div className="w-2 h-2 rounded-full bg-tm-green animate-pulse" />
             <span className="text-xs text-tm-muted">Local only</span>
           </div>

@@ -303,6 +303,15 @@ impl RetrievalEngine {
         self.cross_context
     }
 
+    /// Sprint D — hot-swap the active context on the live engine.
+    /// Used by the Tauri context dropdown so switching contexts
+    /// doesn't require an app restart. The graph uses interior
+    /// mutability so this only needs `&self`, but we keep the `&mut`
+    /// signature to match the rest of the engine setters.
+    pub fn set_active_context(&mut self, ctx_id: Option<Uuid>) {
+        self.graph.set_active_context(ctx_id);
+    }
+
     /// Pre-warm the L1 prefetch cache with the kNN result for `text`.
     ///
     /// Called by an upstream orchestrator that has access to active
@@ -1496,7 +1505,15 @@ impl RetrievalEngine {
             .graph
             .negative_weight_for_query(pending.query_id)
             .unwrap_or(0.0) as f64;
-        let reward = (relevance_reward - neg_weight).clamp(0.0, 1.0);
+        // Sprint D / F-1 — symmetric positive channel. `tracemind helpful
+        // <query_id> <result_id>` writes a `positive_signals` row that
+        // adds to the reward, so arms that pull in *genuinely* useful
+        // results get reinforced (not just penalised for misses).
+        let pos_weight = self
+            .graph
+            .positive_weight_for_query(pending.query_id)
+            .unwrap_or(0.0) as f64;
+        let reward = (relevance_reward + pos_weight - neg_weight).clamp(0.0, 1.0);
 
         self.bandit.register_reward(pending.arm, reward);
         self.bandit.save(&self.bandit_path);
@@ -2311,6 +2328,73 @@ mod tests {
         assert!(
             after_total < clean_total + 1e-9,
             "negative signal must not increase the bandit's mean reward (clean={clean_total}, after={after_total})"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Sprint D / F-1 — a `positive_signals` row keyed on the previous
+    /// query's `query_id` must *add* to the relevance reward when the
+    /// next query finalises that pending row. Mirror of
+    /// `not_related_signal_subtracts_from_bandit_reward`.
+    #[test]
+    fn helpful_signal_adds_to_bandit_reward() {
+        let dir = std::env::temp_dir().join(format!("tm_ret_pos_{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("test.db").to_str().unwrap().to_string();
+        let traces = dir.join("traces.jsonl").to_str().unwrap().to_string();
+        let bandit_path = dir.join("bandit.json");
+        let linucb_path = dir.join("linucb.json");
+
+        let mut engine = RetrievalEngine {
+            graph: GraphStore::open(&db).unwrap(),
+            trace_store: TraceStore::open(&traces).unwrap(),
+            embedder: Embedder::new_hash(),
+            bandit: UcbBandit::new(),
+            bandit_path: bandit_path.clone(),
+            linucb: LinUcbBandit::new(),
+            linucb_path: linucb_path.clone(),
+            reranker: None,
+            query_cache: RecentQueryCache::new(10),
+            pending_reward: None,
+            planner: QueryPlanner::new(),
+            procedure_store: None,
+            trajectory_store: None,
+            prefetch: PrefetchCache::new(),
+            cross_context: false,
+        };
+
+        let now = chrono::Utc::now();
+        let ent = tm_types::Entity {
+            id: Uuid::new_v4(),
+            name: "delta echo foxtrot".to_string(),
+            entity_type: tm_types::EntityType::Concept,
+            confidence: 0.95,
+            source_id: None,
+            created_at: now,
+            updated_at: now,
+        };
+        engine.graph.upsert_entity(&ent).unwrap();
+        let emb = engine.embedder.embed(&ent.name);
+        engine.graph.upsert_vector(ent.id, &emb).unwrap();
+
+        // Baseline: two consecutive queries finalise with no positive signal.
+        let _r1 = engine.query("delta echo").unwrap();
+        let _r2 = engine.query("delta echo again").unwrap();
+        let baseline_total: f64 = engine.bandit.arm_stats().iter().map(|(_, r)| *r).sum();
+
+        // With a helpful signal filed before finalisation.
+        let r3 = engine.query("delta echo third").unwrap();
+        engine
+            .graph
+            .write_positive_signal(r3.query_id, &ent.id.to_string(), "helpful", None, 0.3)
+            .unwrap();
+        let _r4 = engine.query("delta echo fourth").unwrap();
+        let with_pos_total: f64 = engine.bandit.arm_stats().iter().map(|(_, r)| *r).sum();
+
+        assert!(
+            with_pos_total > baseline_total - 1e-9,
+            "positive signal must not decrease bandit mean reward (baseline={baseline_total}, after={with_pos_total})"
         );
 
         std::fs::remove_dir_all(&dir).ok();

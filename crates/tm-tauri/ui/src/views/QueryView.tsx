@@ -1,5 +1,15 @@
 import { useState } from "react";
-import { queryMemory, entityClick, sendFeedback, type QueryResponse, type AttributionInfo } from "../api";
+import {
+  queryMemory,
+  entityClick,
+  sendFeedback,
+  markHelpful,
+  markNotRelated,
+  type QueryResponse,
+  type AttributionInfo,
+} from "../api";
+
+type RowFeedback = "helpful" | "not_related" | "wrong_context";
 
 const TYPE_COLORS: Record<string, string> = {
   Person: "bg-blue-500/20 text-blue-400",
@@ -24,12 +34,17 @@ export default function QueryView() {
   const [error, setError] = useState("");
   const [feedbackGiven, setFeedbackGiven] = useState<"up" | "down" | null>(null);
   const [showAttribution, setShowAttribution] = useState(false);
+  // Sprint D / UI-5 — per-row feedback. Keyed by entity id so the user
+  // can mark multiple rows independently. Optimistic: we render the
+  // pill immediately and rely on the backend ack arriving silently.
+  const [rowFeedback, setRowFeedback] = useState<Record<string, RowFeedback>>({});
 
   const handleQuery = async () => {
     if (!query.trim()) return;
     setLoading(true);
     setError("");
     setFeedbackGiven(null);
+    setRowFeedback({});
     try {
       const res = await queryMemory(query.trim());
       setResult(res);
@@ -39,6 +54,32 @@ export default function QueryView() {
       setLoading(false);
     }
   };
+
+  async function fileRowFeedback(
+    queryId: string,
+    entityId: string,
+    kind: RowFeedback,
+  ) {
+    // Optimistic update.
+    setRowFeedback((prev) => ({ ...prev, [entityId]: kind }));
+    try {
+      if (kind === "helpful") {
+        await markHelpful(queryId, entityId);
+      } else if (kind === "not_related") {
+        await markNotRelated(queryId, entityId, 1.0, "not_related");
+      } else {
+        await markNotRelated(queryId, entityId, 1.0, "cross_context_bridge");
+      }
+    } catch (e) {
+      // Roll back on failure so the user can retry.
+      console.error("row feedback failed:", e);
+      setRowFeedback((prev) => {
+        const next = { ...prev };
+        delete next[entityId];
+        return next;
+      });
+    }
+  }
 
   // Separate typed vs RelatedTo triples
   const typedTriples = result?.triples.filter((t) => t.predicate !== "RelatedTo") ?? [];
@@ -173,22 +214,70 @@ export default function QueryView() {
             </div>
           )}
 
-          {/* Entity cards — clickable for implicit feedback */}
+          {/* Entity rows — per-row feedback (Sprint D / UI-5) */}
           <div className="bg-tm-surface border border-tm-border rounded-lg p-5">
             <h3 className="text-sm font-medium text-tm-muted uppercase tracking-wider mb-3">
               Entities
             </h3>
-            <div className="flex flex-wrap gap-2">
-              {uniqueEntities.map((e) => (
-                <button
-                  key={e.id}
-                  onClick={() => entityClick(e.id)}
-                  className={`px-3 py-1.5 rounded-full text-xs font-medium cursor-pointer hover:ring-2 hover:ring-tm-accent/50 transition-all ${typeColor(e.entity_type)}`}
-                >
-                  {e.name}
-                  <span className="ml-1 opacity-60">{e.entity_type}</span>
-                </button>
-              ))}
+            <div className="space-y-1.5">
+              {uniqueEntities.map((e) => {
+                const fb = rowFeedback[e.id];
+                const dim = fb !== undefined;
+                return (
+                  <div
+                    key={e.id}
+                    className={`flex items-center gap-2 px-2 py-1.5 rounded hover:bg-white/5 transition-colors ${
+                      dim ? "opacity-60" : ""
+                    }`}
+                  >
+                    <button
+                      onClick={() => entityClick(e.id)}
+                      className={`px-2.5 py-1 rounded-full text-xs font-medium cursor-pointer hover:ring-2 hover:ring-tm-accent/50 transition-all ${typeColor(
+                        e.entity_type,
+                      )}`}
+                    >
+                      {e.name}
+                      <span className="ml-1 opacity-60">{e.entity_type}</span>
+                    </button>
+                    <span className="text-[10px] text-tm-muted ml-auto">
+                      {(e.confidence * 100).toFixed(0)}%
+                    </span>
+                    {fb ? (
+                      <span className="text-[10px] text-tm-muted italic px-2">
+                        {fb === "helpful"
+                          ? "noted ✓"
+                          : fb === "not_related"
+                            ? "filed not-related"
+                            : "filed wrong-context"}
+                      </span>
+                    ) : (
+                      <div className="flex items-center gap-1">
+                        <button
+                          onClick={() => fileRowFeedback(result.query_id, e.id, "helpful")}
+                          title="Helpful"
+                          className="px-1.5 py-0.5 text-xs rounded hover:bg-emerald-500/20 hover:text-emerald-400 transition-colors"
+                        >
+                          👍
+                        </button>
+                        <button
+                          onClick={() => fileRowFeedback(result.query_id, e.id, "not_related")}
+                          title="Not related"
+                          className="px-1.5 py-0.5 text-xs rounded hover:bg-red-500/20 hover:text-red-400 transition-colors"
+                        >
+                          👎
+                        </button>
+                        <button
+                          onClick={() => fileRowFeedback(result.query_id, e.id, "wrong_context")}
+                          title="Wrong context (cross-context bridge)"
+                          className="px-1.5 py-0.5 text-[10px] rounded text-tm-muted hover:bg-amber-500/20 hover:text-amber-400 transition-colors"
+                        >
+                          wrong ctx
+                        </button>
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
             </div>
           </div>
 

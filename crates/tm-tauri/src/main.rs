@@ -70,6 +70,11 @@ struct AttributionInfo {
 
 #[derive(Serialize)]
 struct QueryResponse {
+    /// Sprint C-0.7 / F-1 — stable id of this query for `helpful` /
+    /// `not_related` feedback. Frontend stashes this with every row so
+    /// inline buttons can file the right `positive_signals` /
+    /// `negative_signals` row against the originating bandit pull.
+    query_id: String,
     arm: u8,
     arm_name: String,
     latency_ms: u32,
@@ -279,6 +284,7 @@ fn cmd_query(text: String, state: State<AppState>) -> Result<QueryResponse, Stri
         .collect();
 
     Ok(QueryResponse {
+        query_id: result.query_id.to_string(),
         arm: result.arm,
         arm_name: arm_name(result.arm),
         latency_ms: result.latency_ms,
@@ -1319,6 +1325,163 @@ fn cmd_record_outcome(
 }
 
 // ---------------------------------------------------------------------------
+// Sprint D / F-1 — feedback channels + context CRUD
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize)]
+struct FeedbackAck {
+    row_id: i64,
+    kind: String,
+}
+
+/// 👍 button — write a row to `positive_signals`. Bandit reward for
+/// the originating query gets a soft additive nudge on next finalisation.
+#[tauri::command]
+fn cmd_helpful(
+    state: State<AppState>,
+    query_id: String,
+    result_id: String,
+    weight: Option<f32>,
+    kind: Option<String>,
+) -> Result<FeedbackAck, String> {
+    let qid = Uuid::parse_str(&query_id).map_err(|e| format!("bad query_id: {e}"))?;
+    let graph = GraphStore::open(&state.db_path).map_err(|e| e.to_string())?;
+    let ctx = graph.active_context_id();
+    let kind_s = kind.unwrap_or_else(|| "helpful".to_string());
+    let w = weight.unwrap_or(0.3);
+    let row_id = graph
+        .write_positive_signal(qid, &result_id, &kind_s, ctx, w)
+        .map_err(|e| e.to_string())?;
+    Ok(FeedbackAck { row_id, kind: kind_s })
+}
+
+/// 👎 / "wrong context" button — write a row to `negative_signals`.
+#[tauri::command]
+fn cmd_not_related(
+    state: State<AppState>,
+    query_id: String,
+    result_id: String,
+    weight: Option<f32>,
+    kind: Option<String>,
+) -> Result<FeedbackAck, String> {
+    let qid = Uuid::parse_str(&query_id).map_err(|e| format!("bad query_id: {e}"))?;
+    let graph = GraphStore::open(&state.db_path).map_err(|e| e.to_string())?;
+    let ctx = graph.active_context_id();
+    let kind_s = kind.unwrap_or_else(|| "not_related".to_string());
+    let w = weight.unwrap_or(1.0);
+    // For now, both context_a and context_b = active. A future iteration
+    // can resolve the offending result's owning context from the graph
+    // and surface the actual cross-context pair to the rerank learner.
+    let row_id = graph
+        .write_negative_signal(qid, &result_id, &kind_s, ctx, ctx, w)
+        .map_err(|e| e.to_string())?;
+    Ok(FeedbackAck { row_id, kind: kind_s })
+}
+
+#[derive(Serialize)]
+struct ContextInfo {
+    id: String,
+    name: String,
+    tags: String,
+    is_active: bool,
+}
+
+#[tauri::command]
+fn cmd_context_list(state: State<AppState>) -> Result<Vec<ContextInfo>, String> {
+    let graph = GraphStore::open(&state.db_path).map_err(|e| e.to_string())?;
+    let active = graph.active_context_id();
+    let rows = graph.list_contexts().map_err(|e| e.to_string())?;
+    Ok(rows
+        .into_iter()
+        .map(|c| ContextInfo {
+            id: c.id.to_string(),
+            name: c.name,
+            tags: c.tags,
+            is_active: Some(c.id) == active,
+        })
+        .collect())
+}
+
+#[tauri::command]
+fn cmd_context_current(state: State<AppState>) -> Result<Option<ContextInfo>, String> {
+    let dir = data_dir(&state);
+    let p = dir.join("active_context.json");
+    match tm_graph::context::ActiveContext::load(&p).map_err(|e| e.to_string())? {
+        Some(a) => Ok(Some(ContextInfo {
+            id: a.id.to_string(),
+            name: a.name,
+            tags: String::new(),
+            is_active: true,
+        })),
+        None => Ok(None),
+    }
+}
+
+/// Switch the active context by name. Writes `active_context.json`
+/// atomically so the next IngestPipeline / RetrievalEngine open picks
+/// it up. The in-process retrieval engine is also updated so the
+/// switch takes effect immediately for the current run.
+#[tauri::command]
+fn cmd_context_use(state: State<AppState>, name: String) -> Result<ContextInfo, String> {
+    let graph = GraphStore::open(&state.db_path).map_err(|e| e.to_string())?;
+    let ctx = graph
+        .get_context_by_name(&name)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("no context named '{name}'"))?;
+
+    let active = tm_graph::context::ActiveContext { id: ctx.id, name: ctx.name.clone() };
+    let dir = data_dir(&state);
+    let p = dir.join("active_context.json");
+    active.save(&p).map_err(|e| e.to_string())?;
+
+    // Propagate to the live retrieval engine + ingest pipeline so the
+    // switch is hot — no app restart required.
+    if let Ok(mut engine) = state.retrieval.lock() {
+        engine.set_active_context(Some(ctx.id));
+    }
+
+    Ok(ContextInfo {
+        id: ctx.id.to_string(),
+        name: ctx.name,
+        tags: ctx.tags,
+        is_active: true,
+    })
+}
+
+#[tauri::command]
+fn cmd_context_create(
+    state: State<AppState>,
+    name: String,
+    tags: Option<String>,
+) -> Result<ContextInfo, String> {
+    let graph = GraphStore::open(&state.db_path).map_err(|e| e.to_string())?;
+    let ctx = tm_graph::Context::new(&name, tags.unwrap_or_default());
+    graph.create_context(&ctx).map_err(|e| e.to_string())?;
+    // Re-fetch in case the row already existed (ON CONFLICT DO NOTHING).
+    let existing = graph
+        .get_context_by_name(&name)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("context '{name}' not created"))?;
+    Ok(ContextInfo {
+        id: existing.id.to_string(),
+        name: existing.name,
+        tags: existing.tags,
+        is_active: false,
+    })
+}
+
+#[tauri::command]
+fn cmd_context_clear(state: State<AppState>) -> Result<(), String> {
+    let dir = data_dir(&state);
+    let p = dir.join("active_context.json");
+    tm_graph::context::ActiveContext::clear(&p).map_err(|e| e.to_string())?;
+    if let Ok(mut engine) = state.retrieval.lock() {
+        engine.set_active_context(None);
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
 
@@ -1413,6 +1576,13 @@ fn main() {
             cmd_triple_detail,
             cmd_resolve_contradiction,
             cmd_record_outcome,
+            cmd_helpful,
+            cmd_not_related,
+            cmd_context_list,
+            cmd_context_current,
+            cmd_context_use,
+            cmd_context_create,
+            cmd_context_clear,
         ])
         .setup(move |app| {
             let handle = app.handle().clone();
