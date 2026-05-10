@@ -845,6 +845,10 @@ fn main() {
             engine.set_cross_context(cross_context);
             let result = engine.query(&text).expect("query failed");
 
+            // Sprint C-0.7 — surface the query_id so users can wire
+            // retraction feedback via `tracemind not-related <query_id> <result_id>`.
+            println!("Query: {}", result.query_id);
+
             // Sprint A: dispatch through the tiered answerer (Tier 0 always;
             // Tier 1 when `local-llm` feature is on and weights are present).
             let answerer = answerer::build_answerer();
