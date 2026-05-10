@@ -271,6 +271,38 @@ JTMS with BFS propagation. Beliefs are `In`, `Out`, or `Contradicted`. Justifica
 
 Wraps IntentStore + TmsEngine + TemporalStore. API: `assert_belief`, `retract`, `world_at`, `contradictions`, `history_of`, `set_goal`, `record_action`, `observe`. **Scaffolded only; no Python/TypeScript wrappers.**
 
+### 9.5 Context segmentation (NEW — Sprint C-0, top priority as of 2026-05-10)
+
+**Wedge-critical insight from 2026-05-10 investor review:** The local-only thesis only works if TraceMind respects context boundaries. A user's laptop is the *most* context-blurred surface in their digital life — multiple jobs, multiple ventures, personal life all on one machine. A "memory OS" that conflates unrelated contexts is worse than separate cloud accounts. The sharper wedge sentence: **"the on-device memory that knows when *not* to connect dots."**
+
+Concretely, this turns three currently-default behaviors into context-discipline failures:
+1. Related-entity 1-hop expansion fires across *all* contexts → bridges unrelated work streams.
+2. Vector retrieval scores semantic similarity context-agnostically → pulls Rondo paragraphs into TraceMind queries.
+3. The bandit rewards "relevant retrieval" with no notion of context-correctness.
+
+**Primitives:**
+- `Context { id, name, tags, created_at }` — a named namespace (e.g. "Rondo", "TraceMind", "Personal"). Stored in a `contexts` table.
+- `context_id` column on `captured_signals` (raw capture context) and `kg_relations` (asserted-in-context). Entities are context-free (a person named Carol can appear in multiple contexts); triples about Carol *belong to* a context.
+- Active context state in `~/.tracemind/active_context.json` — `null` means all-contexts mode (legacy behavior).
+- `negative_signals` table — per-result penalty signals (`not_related`, `wrong_context`) that the rerank and bandit consume.
+
+**Default behavior changes:**
+- Ingest tags every triple + signal with the active `context_id` (defaulting to a "general" context if none active).
+- Retrieval filters `WHERE context_id = ?` by default; `--cross-context` flag opts back into the wide net.
+- Related-entity 1-hop expansion only traverses within-context edges by default; cross-context edges require accumulated positive signal *or* explicit user opt-in.
+- Bandit reward decomposes: `final_reward = relevance_reward - cross_context_penalty(query, results)`.
+
+**Sprint C-0 deliverables (this week, replaces partial Sprint C-1 priority):**
+1. Schema migration: `contexts` table, `context_id` columns, `negative_signals` table.
+2. `tracemind context create|list|use|current` CLI.
+3. Ingest writes active `context_id` on every triple + signal.
+4. Retrieval honors active context (default scoped; `--cross-context` overrides).
+5. `tracemind feedback --not-related <query_id> <result_id>` writes a negative signal.
+6. Brief surface shows the active context + per-row context tags.
+7. Demo replaces "cross-document recall" shot with "scoped recall: same query, two contexts, two answers".
+
+**Why before C-1/C-2:** without `context_id`, the bitemporal + TMS work amplifies bad bridging (a Tier-1 LLM hallucinating across contexts is worse than no Tier-1 LLM). Context discipline is the substrate that makes everything else trustable.
+
 ---
 
 ## 10. Three capture paths for commitments

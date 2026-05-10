@@ -60,6 +60,31 @@ enum Commands {
     },
     /// Register a reward for a bandit arm
     Feedback { arm: u8, reward: f64 },
+    /// Sprint C-0 — flag a retrieval result as not related to its query.
+    /// Writes a row to `negative_signals`; subsequent bandit rewards on
+    /// the same query_id are decomposed as
+    /// `final_reward = relevance_reward - Σ weight(negatives)`.
+    /// `result_id` is opaque (triple UUID, entity UUID, or signal row id).
+    NotRelated {
+        /// UUID of the query whose result you're flagging.
+        query_id: String,
+        /// Opaque id of the offending result.
+        result_id: String,
+        /// Negative weight in (0, ∞). Default 1.0.
+        #[arg(long, default_value = "1.0")]
+        weight: f32,
+        /// Kind tag — defaults to `not_related`. Free-form, lets future
+        /// surfaces split negatives by reason (e.g. `wrong_context`,
+        /// `stale`, `private`).
+        #[arg(long, default_value = "not_related")]
+        kind: String,
+        /// Optional source context UUID (the query's active context).
+        #[arg(long)]
+        context_a: Option<String>,
+        /// Optional target context UUID (the offending result's context).
+        #[arg(long)]
+        context_b: Option<String>,
+    },
     /// Show recent traces with full audit detail
     Trace {
         #[arg(long, default_value = "10")]
@@ -79,6 +104,14 @@ enum Commands {
     Proc {
         #[command(subcommand)]
         action: ProcAction,
+    },
+    /// Manage *contexts* — named namespaces for the local memory store.
+    /// Every captured signal + triple inherits the active context_id at
+    /// ingest time; retrieval defaults to the active scope. See Sprint
+    /// C-0 in `docs/DESIGN.md` §9.5. (`tracemind context use <name>`)
+    Context {
+        #[command(subcommand)]
+        action: ContextAction,
     },
     /// Import files or directories into memory
     Import {
@@ -551,6 +584,29 @@ enum ModelsAction {
 }
 
 #[derive(clap::Subcommand)]
+enum ContextAction {
+    /// Create a new context. Idempotent on name — re-running with the
+    /// same name is a no-op (the existing row is preserved).
+    Create {
+        /// Short name (e.g. `rondo`, `tracemind`, `personal`).
+        name: String,
+        /// Optional comma-separated tags.
+        #[arg(long, default_value = "")]
+        tags: String,
+    },
+    /// List every context, newest first.
+    List,
+    /// Make a context the *active* one. Every subsequent ingest tags
+    /// rows with this context_id; every retrieval is scoped to it
+    /// unless `--cross-context` is passed.
+    Use { name: String },
+    /// Print the active context (if any).
+    Current,
+    /// Clear the active context (back to unscoped behaviour).
+    Clear,
+}
+
+#[derive(clap::Subcommand)]
 enum ProcAction {
     /// Add a new procedure (steps as "action1;action2;action3")
     Add {
@@ -853,6 +909,56 @@ fn main() {
             bandit.register_reward(arm, reward);
             bandit.save(&bandit_path);
             println!("Reward registered.");
+        }
+
+        Commands::NotRelated {
+            query_id,
+            result_id,
+            weight,
+            kind,
+            context_a,
+            context_b,
+        } => {
+            let qid = match Uuid::parse_str(&query_id) {
+                Ok(u) => u,
+                Err(e) => {
+                    eprintln!("error: invalid query_id (expect UUID): {e}");
+                    std::process::exit(1);
+                }
+            };
+            let ca = context_a
+                .as_deref()
+                .map(Uuid::parse_str)
+                .transpose()
+                .unwrap_or_else(|e| {
+                    eprintln!("error: invalid --context-a: {e}");
+                    std::process::exit(1);
+                });
+            let cb = context_b
+                .as_deref()
+                .map(Uuid::parse_str)
+                .transpose()
+                .unwrap_or_else(|e| {
+                    eprintln!("error: invalid --context-b: {e}");
+                    std::process::exit(1);
+                });
+            let graph = match GraphStore::open(&db_path) {
+                Ok(g) => g,
+                Err(e) => {
+                    eprintln!("error: failed to open graph store: {e}");
+                    std::process::exit(1);
+                }
+            };
+            let row_id = match graph.write_negative_signal(qid, &result_id, &kind, ca, cb, weight) {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("error: failed to write negative signal: {e}");
+                    std::process::exit(1);
+                }
+            };
+            println!(
+                "negative signal recorded (row {row_id}, query {qid}, result {result_id}, weight {weight}, kind {kind})"
+            );
         }
 
         Commands::Decay { factor, threshold } => {
@@ -1158,12 +1264,128 @@ fn main() {
             let db_path = dir.join("memory.db").to_str().unwrap().to_string();
             cmd_contradictions(&db_path, action);
         }
+        Commands::Context { action } => {
+            let db_path = dir.join("memory.db").to_str().unwrap().to_string();
+            cmd_context(&dir, &db_path, action);
+        }
     }
 }
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// `tracemind context …` handler — Sprint C-0 surface for the context
+/// segmentation primitive. The active context is persisted in
+/// `<data_dir>/active_context.json` so every subsequent CLI invocation
+/// (and the MCP server, which reads the same file) picks up the scope.
+fn cmd_context(data_dir: &PathBuf, db_path: &str, action: ContextAction) {
+    use tm_graph::context::{ActiveContext, Context};
+
+    let active_path = data_dir.join("active_context.json");
+
+    match action {
+        ContextAction::Create { name, tags } => {
+            let graph = match GraphStore::open(db_path) {
+                Ok(g) => g,
+                Err(e) => {
+                    eprintln!("error: failed to open graph store: {e}");
+                    std::process::exit(1);
+                }
+            };
+            // Idempotent: if a row with that name exists, surface it.
+            if let Ok(Some(existing)) = graph.get_context_by_name(&name) {
+                println!("context already exists: {} ({})", existing.name, existing.id);
+                return;
+            }
+            let ctx = Context::new(name.clone(), tags.clone());
+            if let Err(e) = graph.create_context(&ctx) {
+                eprintln!("error: failed to create context: {e}");
+                std::process::exit(1);
+            }
+            println!("created context: {} ({})", ctx.name, ctx.id);
+            if !tags.is_empty() {
+                println!("  tags: {}", tags);
+            }
+        }
+        ContextAction::List => {
+            let graph = match GraphStore::open(db_path) {
+                Ok(g) => g,
+                Err(e) => {
+                    eprintln!("error: failed to open graph store: {e}");
+                    std::process::exit(1);
+                }
+            };
+            let contexts = match graph.list_contexts() {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("error: failed to list contexts: {e}");
+                    std::process::exit(1);
+                }
+            };
+            let active = ActiveContext::load(&active_path).ok().flatten();
+            if contexts.is_empty() {
+                println!("no contexts yet — `tracemind context create <name>` to add one");
+                return;
+            }
+            for c in contexts {
+                let marker = match &active {
+                    Some(a) if a.id == c.id => "*",
+                    _ => " ",
+                };
+                let tags = if c.tags.is_empty() {
+                    String::new()
+                } else {
+                    format!("  [{}]", c.tags)
+                };
+                println!("{marker} {:<24} {}{}", c.name, c.id, tags);
+            }
+        }
+        ContextAction::Use { name } => {
+            let graph = match GraphStore::open(db_path) {
+                Ok(g) => g,
+                Err(e) => {
+                    eprintln!("error: failed to open graph store: {e}");
+                    std::process::exit(1);
+                }
+            };
+            let ctx = match graph.get_context_by_name(&name) {
+                Ok(Some(c)) => c,
+                Ok(None) => {
+                    eprintln!("error: no context named '{}' (create it first)", name);
+                    std::process::exit(1);
+                }
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    std::process::exit(1);
+                }
+            };
+            let active = ActiveContext { id: ctx.id, name: ctx.name.clone() };
+            if let Err(e) = active.save(&active_path) {
+                eprintln!("error: failed to save active context: {e}");
+                std::process::exit(1);
+            }
+            println!("active context → {} ({})", ctx.name, ctx.id);
+        }
+        ContextAction::Current => {
+            match ActiveContext::load(&active_path) {
+                Ok(Some(a)) => println!("active context: {} ({})", a.name, a.id),
+                Ok(None) => println!("no active context (unscoped)"),
+                Err(e) => {
+                    eprintln!("error: failed to read active context: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        ContextAction::Clear => {
+            if let Err(e) = ActiveContext::clear(&active_path) {
+                eprintln!("error: failed to clear active context: {e}");
+                std::process::exit(1);
+            }
+            println!("active context cleared");
+        }
+    }
+}
 
 /// `tracemind models …` handler. Reports tier-1 weight status and (when the
 /// `local-llm` feature is on) downloads the GGUF on demand.

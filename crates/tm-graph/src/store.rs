@@ -231,6 +231,11 @@ impl GraphStore {
         )
         .map_err(|e| TraceMindError::Storage(format!("create tables: {e}")))?;
 
+        // Sprint C-0: context segmentation schema (contexts +
+        // negative_signals tables, captured_signals.context_id column).
+        // Idempotent — safe to call on every open.
+        crate::context::init_schema(conn)?;
+
         // Migrate existing DBs that lack the two-speed pipeline columns.
         {
             let conn = kg.connection();
@@ -557,6 +562,55 @@ impl GraphStore {
         *self.entity_map.borrow_mut() = entity_map;
         *self.triple_map.borrow_mut() = triple_map;
         Ok(())
+    }
+
+    // ─── Sprint C-0: Context CRUD ──────────────────────────────────────
+    //
+    // Thin façades over `crate::context::*`. Held here (rather than as
+    // free functions) so callers don't need to juggle the raw rusqlite
+    // connection — the same pattern as `BeliefStore` wraps tm-tms.
+
+    /// Create a new context (idempotent on name — duplicates are no-ops).
+    pub fn create_context(&self, ctx: &crate::context::Context) -> Result<()> {
+        crate::context::create_context(self.kg.connection(), ctx)
+    }
+
+    /// List every context, newest first.
+    pub fn list_contexts(&self) -> Result<Vec<crate::context::Context>> {
+        crate::context::list_contexts(self.kg.connection())
+    }
+
+    /// Look up a context by name.
+    pub fn get_context_by_name(&self, name: &str) -> Result<Option<crate::context::Context>> {
+        crate::context::get_context_by_name(self.kg.connection(), name)
+    }
+
+    /// Append a negative-feedback row. `result_id` is opaque — pass the
+    /// triple UUID, entity UUID, or signal row id (stringified).
+    pub fn write_negative_signal(
+        &self,
+        query_id: Uuid,
+        result_id: &str,
+        kind: &str,
+        context_a: Option<Uuid>,
+        context_b: Option<Uuid>,
+        weight: f32,
+    ) -> Result<i64> {
+        crate::context::write_negative_signal(
+            self.kg.connection(),
+            query_id,
+            result_id,
+            kind,
+            context_a,
+            context_b,
+            weight,
+        )
+    }
+
+    /// Sum of negative-signal weights for a query — used by the bandit
+    /// reward decomposition (`final = relevance - this`).
+    pub fn negative_weight_for_query(&self, query_id: Uuid) -> Result<f32> {
+        crate::context::negative_weight_for_query(self.kg.connection(), query_id)
     }
 
     // ─── Entity CRUD ────────────────────────────────────────────────────

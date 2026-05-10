@@ -54,6 +54,30 @@ Sprint C-2 unlocked the *retraction beat* (the demo's hook). Now ship a clean re
 
 ---
 
+## Priority 0.5 — Context segmentation (Sprint C-0, NEW 2026-05-10)
+
+**Wedge-critical.** Investor review on 2026-05-10 flagged the demo's cross-document bridge (Rondo↔TraceMind) as a *misfeature*: local machines have more context crowding than cloud (one laptop hosts Sidewalk, Horseshoe, Rondo, TraceMind, personal life). Without context discipline, a local memory OS is strictly worse than separate cloud accounts. The pitch is "system of intents + trust on-device" — and trust collapses the first time TraceMind draws an irrelevant parallel.
+
+**Design shape:** decoupled-by-default, opt-in coupling via accumulated positive signal, negative-feedback first-class.
+
+Ordering: blocks both Tier-1-as-default and Sprint-D demo polish. Do C-0 first, then return to Priority 1.
+
+- [x] **C-0.1 Schema (landed 2026-05-10)** — `contexts` + `negative_signals` tables and additive `context_id` column on `captured_signals` are created on every `GraphStore::open` via `tm_graph::context::init_schema`. Idempotent (re-runs are no-ops). `kg_relations` / `entities` will carry `context_id` inside their skg JSON `properties` blob (next slice — keeps skg's schema untouched). Migration of legacy stores is implicit: pre-existing rows have NULL `context_id`, which the retrieval filter will always treat as "always visible".
+- [x] **C-0.2 Active-context state (landed)** — `~/.tracemind/active_context.json` with atomic tempfile-rename writes; `ActiveContext::load / save / clear` in `tm-graph::context`.
+- [x] **C-0.3 Context CRUD (landed)** — `GraphStore::{create_context, list_contexts, get_context_by_name, write_negative_signal, negative_weight_for_query}`. 5 unit tests pass (`cargo test -p tm-graph context::`).
+- [x] **C-0.4 CLI surface (landed)** — `tracemind context create <name> [--tags t1,t2]`, `context list` (marks active with `*`), `context use <name>`, `context current`, `context clear`. Smoke-tested end-to-end.
+- [ ] **C-0.5 Ingest tagging** — `IngestPipeline` reads active context once at construction; passes through `upsert_entity` / `upsert_triple` / `append_signal` so every new row inherits the active `context_id`. (Skg-side storage: stash the UUID in the entity/relation `properties` JSON.)
+- [ ] **C-0.6 Scoped retrieval (default)** — `RetrievalEngine` filters vector + graph + signal hits to the active `context_id` by default. Flag: `--cross-context` (CLI) and `cross_context: bool` (MCP `memory_query`) re-enables old behavior. NULL `context_id` rows are always visible (legacy pre-migration data).
+- [ ] **C-0.7 Cross-context penalty in rerank** — when `cross_context=true`, results outside the active context get a soft `cross_context_penalty` term in the rerank score (initial value: -0.15, learned later from C-0.8 signals).
+- [x] **C-0.8 Negative feedback CLI (landed 2026-05-10)** — `tracemind not-related <query_id> <result_id> [--weight w] [--kind k] [--context-a u] [--context-b u]` writes a `negative_signals` row. Separate top-level command (not `feedback --not-related`) to preserve the existing positional `feedback <arm> <reward>` API. Reward decomposition helper (`tm_graph::negative_weight_for_query`) ships; consuming it in `UcbBandit::register_reward` is wired in the retrieval-filter slice. MCP equivalent (`memory_feedback {kind: "not_related"}`) still pending.
+- [ ] **C-0.9 Brief + UI surfacing** — daily brief header shows the active context; per-row context tag rendered next to each result; Tauri brief view picks this up via existing `cmd_brief`.
+- [ ] **C-0.10 Demo update** — `scripts/demo_real.sh` shot 6 changes from "cross-document bridge" celebration to **scoped recall**: same query "the bet on running the brain on-device" run twice — once in `rondo` context, once in `tracemind` context — returns two different, scoped answers. Adds a final shot demonstrating `tracemind not-related` retracting a stray bridge.
+- [-] **C-0.11 Tests** — context CRUD + active-context-file + negative-signal sum tests landed (5 in `tm-graph::context::tests`). Schema-migration test (legacy DB → migrated DB with NULL context_ids), ingest-writes-context-id test, retrieval-scope test, and reward-decomposition test all pending the next slice.
+
+**Why P0.5:** The L3 / recommendation surface is only valuable when cross-context parallels are *real*. Without C-0, the LLM amplifies bad bridging. C-0 is foundational to every later tier.
+
+---
+
 ## Priority 1 — Quality (highest F1 impact, pure code work)
 
 ### LoCoMo Tier-0 remaining fixes
