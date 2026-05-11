@@ -92,7 +92,7 @@ export default function ContextSwitcher() {
       </button>
 
       {open && (
-        <div className="absolute left-0 right-0 mt-1 z-10 bg-tm-surface border border-tm-border rounded shadow-lg max-h-80 overflow-y-auto">
+        <div className="absolute left-0 right-0 bottom-full mb-1 z-10 bg-tm-surface border border-tm-border rounded shadow-lg max-h-80 overflow-y-auto">
           <button
             onClick={clearActive}
             disabled={busy}
