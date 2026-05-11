@@ -1,12 +1,16 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import {
   queryMemory,
   entityClick,
   sendFeedback,
   markHelpful,
   markNotRelated,
+  getRecentQueries,
+  getRecommendations,
   type QueryResponse,
   type AttributionInfo,
+  type RecentQueryInfo,
+  type RecommendationInfo,
 } from "../api";
 
 type RowFeedback = "helpful" | "not_related" | "wrong_context";
@@ -38,22 +42,50 @@ export default function QueryView() {
   // can mark multiple rows independently. Optimistic: we render the
   // pill immediately and rely on the backend ack arriving silently.
   const [rowFeedback, setRowFeedback] = useState<Record<string, RowFeedback>>({});
+  // 2026-05-11 UX (#4) — sticky pinned section. Recent queries +
+  // standing recommendations so the QueryView never feels empty when
+  // the user opens it. Refreshed after each query so the "you
+  // recently asked …" pills stay current.
+  const [recentQueries, setRecentQueries] = useState<RecentQueryInfo[]>([]);
+  const [standingRecs, setStandingRecs] = useState<RecommendationInfo[]>([]);
 
-  const handleQuery = async () => {
-    if (!query.trim()) return;
+  const refreshSticky = async () => {
+    try {
+      const [rq, sr] = await Promise.all([
+        getRecentQueries(5),
+        getRecommendations(3),
+      ]);
+      setRecentQueries(rq);
+      setStandingRecs(sr);
+    } catch (e) {
+      console.error("sticky refresh failed:", e);
+    }
+  };
+
+  useEffect(() => {
+    refreshSticky();
+  }, []);
+
+  const runQuery = async (text: string) => {
+    if (!text.trim()) return;
+    setQuery(text);
     setLoading(true);
     setError("");
     setFeedbackGiven(null);
     setRowFeedback({});
     try {
-      const res = await queryMemory(query.trim());
+      const res = await queryMemory(text.trim());
       setResult(res);
     } catch (e) {
       setError(String(e));
     } finally {
       setLoading(false);
+      // Refresh the sticky panel so the just-run query shows up.
+      refreshSticky();
     }
   };
+
+  const handleQuery = () => runQuery(query);
 
   async function fileRowFeedback(
     queryId: string,
@@ -96,6 +128,49 @@ export default function QueryView() {
   return (
     <div className="space-y-6">
       <h2 className="text-xl font-semibold">Query Memory</h2>
+
+      {/* Sticky pinned section (2026-05-11 UX #4). Tells the user what
+          they were just doing and what TraceMind currently thinks is
+          worth their attention — so the view has signal even before
+          they type. */}
+      {(recentQueries.length > 0 || standingRecs.length > 0) && (
+        <div className="bg-tm-surface/60 border border-tm-border rounded-lg p-3 space-y-2">
+          {recentQueries.length > 0 && (
+            <div className="flex items-center gap-2 flex-wrap">
+              <span className="text-[10px] uppercase tracking-wider text-tm-muted">
+                Recent
+              </span>
+              {recentQueries.map((q) => (
+                <button
+                  key={q.trace_id}
+                  onClick={() => runQuery(q.query_text)}
+                  title={`${q.entities_count} entities · ${q.arm_name ?? "?"} · ${q.created_at}`}
+                  className="px-2 py-0.5 rounded text-xs bg-tm-bg border border-tm-border hover:border-tm-accent text-tm-text transition-colors truncate max-w-[18rem]"
+                >
+                  {q.query_text}
+                </button>
+              ))}
+            </div>
+          )}
+          {standingRecs.length > 0 && (
+            <div className="flex items-center gap-2 flex-wrap">
+              <span className="text-[10px] uppercase tracking-wider text-tm-muted">
+                Suggested
+              </span>
+              {standingRecs.map((r) => (
+                <button
+                  key={r.entity_id}
+                  onClick={() => runQuery(r.entity_name)}
+                  title={`${r.reason} · ${r.reason_detail}${r.origin_context ? ` · in ${r.origin_context}` : ""}`}
+                  className="px-2 py-0.5 rounded text-xs bg-tm-accent/10 border border-tm-accent/30 hover:bg-tm-accent/20 text-tm-accent transition-colors"
+                >
+                  {r.entity_name}
+                </button>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
 
       {/* Search bar */}
       <div className="flex gap-3">
@@ -239,6 +314,16 @@ export default function QueryView() {
                       {e.name}
                       <span className="ml-1 opacity-60">{e.entity_type}</span>
                     </button>
+                    {/* 2026-05-11 UX (#1) — origin-context pill so the
+                        user can see *which* project a hit came from. */}
+                    {e.context_name && (
+                      <span
+                        className="px-1.5 py-0.5 rounded text-[10px] bg-tm-border/40 text-tm-muted"
+                        title={`Originally captured in context: ${e.context_name}`}
+                      >
+                        from {e.context_name}
+                      </span>
+                    )}
                     <span className="text-[10px] text-tm-muted ml-auto">
                       {(e.confidence * 100).toFixed(0)}%
                     </span>
@@ -297,7 +382,12 @@ export default function QueryView() {
             </div>
           )}
 
-          {/* Recommendations */}
+          {/* Recommendations (2026-05-11 UX #1 + #3 + #4). Each row
+              now carries: headline reason, structured reason_detail
+              ("PR 0.72 · seen recently"), origin context (which
+              project the rec came from), and the query that seeded
+              it. Clicking auto-runs the query instead of just
+              prefilling — fewer clicks to the next answer. */}
           {result.recommendations.length > 0 && (
             <div className="bg-tm-surface border border-tm-accent/20 rounded-lg p-5">
               <h3 className="text-sm font-medium text-tm-accent uppercase tracking-wider mb-3">
@@ -309,16 +399,32 @@ export default function QueryView() {
                     key={rec.entity_id}
                     onClick={() => {
                       entityClick(rec.entity_id);
-                      setQuery(rec.entity_name);
+                      runQuery(rec.entity_name);
                     }}
-                    className="w-full flex items-center gap-3 p-3 rounded bg-tm-bg border border-tm-border hover:border-tm-accent/40 transition-colors text-left"
+                    className="w-full flex items-start gap-3 p-3 rounded bg-tm-bg border border-tm-border hover:border-tm-accent/40 transition-colors text-left"
                   >
-                    <div className="flex-1">
-                      <span className="text-sm font-medium">{rec.entity_name}</span>
-                      <span className="text-xs text-tm-muted ml-2">{rec.entity_type}</span>
+                    <div className="flex-1 min-w-0">
+                      <div className="flex items-center gap-2 flex-wrap">
+                        <span className="text-sm font-medium">{rec.entity_name}</span>
+                        <span className="text-xs text-tm-muted">{rec.entity_type}</span>
+                        {rec.origin_context && (
+                          <span className="text-[10px] px-1.5 py-0.5 rounded bg-tm-border/40 text-tm-muted">
+                            in {rec.origin_context}
+                          </span>
+                        )}
+                      </div>
+                      <div className="text-xs text-tm-muted mt-1">
+                        <span className="text-tm-text/80">{rec.reason}</span>
+                        <span className="mx-1.5 opacity-50">·</span>
+                        <span className="font-mono">{rec.reason_detail}</span>
+                      </div>
+                      {rec.origin_query && (
+                        <div className="text-[10px] text-tm-muted/70 mt-0.5 italic truncate">
+                          seeded by your query: "{rec.origin_query}"
+                        </div>
+                      )}
                     </div>
-                    <span className="text-xs text-tm-muted">{rec.reason}</span>
-                    <span className="text-xs text-tm-accent font-mono">
+                    <span className="text-xs text-tm-accent font-mono shrink-0">
                       {(rec.score * 100).toFixed(0)}%
                     </span>
                   </button>

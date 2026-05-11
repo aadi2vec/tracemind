@@ -43,6 +43,14 @@ impl RecentQueryCache {
     fn context_text(&self) -> String {
         self.texts.iter().rev().take(3).cloned().collect::<Vec<_>>().join(" ")
     }
+
+    /// Most recent query text, if any. Used to populate the `origin_query`
+    /// field on recommendations so the UI can show *which* query a
+    /// suggestion was seeded from. (Issue #1 from the 2026-05-11 UX
+    /// review: "I don't know where the original context/trace was.")
+    fn last_query(&self) -> Option<String> {
+        self.texts.back().cloned()
+    }
 }
 
 /// Pending reward for deferred bandit feedback.
@@ -127,6 +135,83 @@ impl QueryWorkspace {
     }
 }
 
+/// A proactive recommendation with origin + structured reason.
+///
+/// 2026-05-11 UX review (issues #1 + #3): every recommendation must now
+/// answer two questions out of the box —
+///   1. *where did this come from?* (`origin_query`, `origin_context`)
+///   2. *why was it surfaced?*       (`reason_detail`)
+///
+/// `reason` is a short tag ("Central to your knowledge graph"), and
+/// `reason_detail` is the structured breakdown (e.g. "PR 0.72 · 86%
+/// match · seen recently") computed from the actual relevance /
+/// recency / novelty / pagerank numbers the recommender already had on
+/// hand. The UI shows `reason` as the headline and `reason_detail` as
+/// the subtitle, so users can see the *evidence* not just the label.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct Recommendation {
+    pub entity_id: String,
+    pub entity_name: String,
+    pub entity_type: String,
+    pub score: f64,
+    pub reason: String,
+    /// Structured "why" — components of the score the user can verify
+    /// at a glance. Always populated; never empty.
+    pub reason_detail: String,
+    /// The most recent query text that seeded this recommendation.
+    /// `None` only on cold start (no queries yet — recs come from
+    /// recent ingest activity, not query history).
+    pub origin_query: Option<String>,
+    /// The active context UUID this recommendation was computed under,
+    /// stringified. `None` if the engine is in unscoped mode.
+    pub origin_context_id: Option<String>,
+}
+
+/// Build the structured "why this was recommended" string from the
+/// score components. Picks the two strongest signals and renders them
+/// as a short, dot-separated breakdown. Always returns a non-empty
+/// string so the UI can render a stable subtitle.
+///
+/// Used by both warm and cold-start paths so the formatting stays
+/// consistent across "Recommended for You" panels.
+fn build_reason_detail(relevance: f64, recency: f64, novelty: f64, pr: f64) -> String {
+    let mut parts: Vec<(f64, String)> = Vec::with_capacity(4);
+    if relevance > 0.0 {
+        parts.push((relevance, format!("{:.0}% match", relevance * 100.0)));
+    }
+    if pr > 0.0 {
+        parts.push((pr, format!("PageRank {:.2}", pr)));
+    }
+    if recency > 0.0 {
+        let label = if recency > 0.7 {
+            "seen recently"
+        } else if recency > 0.3 {
+            "seen this week"
+        } else {
+            "older"
+        };
+        parts.push((recency, label.to_string()));
+    }
+    if novelty > 0.0 {
+        let label = if novelty > 0.7 {
+            "brand new"
+        } else if novelty > 0.4 {
+            "still rare"
+        } else {
+            "well-known"
+        };
+        parts.push((novelty, label.to_string()));
+    }
+    // Strongest two signals win the subtitle.
+    parts.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    let picked: Vec<String> = parts.into_iter().take(2).map(|(_, s)| s).collect();
+    if picked.is_empty() {
+        "from your graph".to_string()
+    } else {
+        picked.join(" · ")
+    }
+}
+
 /// A hit from the unpromoted-signal hybrid search.
 ///
 /// These are raw captures that haven't yet been consolidated into entities.
@@ -141,15 +226,8 @@ pub struct SignalHit {
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
-/// A proactive recommendation with reason.
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct Recommendation {
-    pub entity_id: String,
-    pub entity_name: String,
-    pub entity_type: String,
-    pub score: f64,
-    pub reason: String,
-}
+
+
 
 /// A related entity surfaced alongside primary query results.
 ///
@@ -1558,6 +1636,14 @@ impl RetrievalEngine {
         let recency_map = self.graph.batch_recency_scores(&entity_ids);
         let novelty_map = self.graph.batch_novelty_scores(&entity_ids);
 
+        // 2026-05-11 UX: origin tracking so the UI can answer
+        // "where did this come from?" without a second round-trip.
+        let origin_query = self.query_cache.last_query();
+        let origin_context_id = self
+            .graph
+            .active_context_id()
+            .map(|id| id.to_string());
+
         let mut scored: Vec<Recommendation> = Vec::new();
 
         for (entity_id, sim) in candidates {
@@ -1585,12 +1671,17 @@ impl RetrievalEngine {
                 "Connected in your knowledge graph".to_string()
             };
 
+            let reason_detail = build_reason_detail(relevance, recency, novelty, pr);
+
             scored.push(Recommendation {
                 entity_id: entity_id.to_string(),
                 entity_name: entity.name,
                 entity_type: format!("{}", entity.entity_type),
                 score,
                 reason,
+                reason_detail,
+                origin_query: origin_query.clone(),
+                origin_context_id: origin_context_id.clone(),
             });
         }
 
@@ -1624,6 +1715,14 @@ impl RetrievalEngine {
         let recency_map = self.graph.batch_recency_scores(&entity_ids_ordered);
         let novelty_map = self.graph.batch_novelty_scores(&entity_ids_ordered);
 
+        // Cold-start has no query history, but we can still record the
+        // active context so the UI's "from which context" pill stays
+        // populated when the user opens TraceMind fresh.
+        let origin_context_id = self
+            .graph
+            .active_context_id()
+            .map(|id| id.to_string());
+
         let mut scored: Vec<Recommendation> = Vec::new();
 
         for entity_id in &entity_ids_ordered {
@@ -1649,12 +1748,20 @@ impl RetrievalEngine {
                 "From your recent activity".to_string()
             };
 
+            // No relevance score on cold start — substitute entity
+            // confidence so the detail string still tells a story
+            // ("75% confidence · brand new · in your top central nodes").
+            let reason_detail = build_reason_detail(confidence, recency, novelty, pr);
+
             scored.push(Recommendation {
                 entity_id: entity_id.to_string(),
                 entity_name: entity.name,
                 entity_type: format!("{}", entity.entity_type),
                 score,
                 reason,
+                reason_detail,
+                origin_query: None,
+                origin_context_id: origin_context_id.clone(),
             });
         }
 
