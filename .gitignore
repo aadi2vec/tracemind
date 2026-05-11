@@ -23,3 +23,10 @@ demo/recordings/
 
 # Local Claude Code state (per-user, not for the repo)
 .claude/
+
+# Auto-downloaded model artifacts (regenerated on first use per TM-NLP-005)
+models/
+
+# macOS noise
+.DS_Store
+**/.DS_Store

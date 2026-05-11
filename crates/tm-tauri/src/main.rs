@@ -42,6 +42,13 @@ struct EntityInfo {
     name: String,
     entity_type: String,
     confidence: f64,
+    /// 2026-05-11 UX (#1) — the originating context this entity was
+    /// ingested under, resolved to a human-readable name. `None` if
+    /// the entity is unscoped (legacy pre-Sprint-C-0 data) or the
+    /// store has no contexts at all. Surfaced as a small pill in the
+    /// QueryView entity rows so the user always sees *which*
+    /// project/venture a hit came from.
+    context_name: Option<String>,
 }
 
 #[derive(Serialize, Clone)]
@@ -163,6 +170,17 @@ struct RecommendationInfo {
     entity_type: String,
     score: f64,
     reason: String,
+    /// 2026-05-11 UX (#3) — structured breakdown ("PR 0.72 · 86%
+    /// match"). Subtitle below the `reason` headline so the user can
+    /// see *which* signals fired, not just the label.
+    reason_detail: String,
+    /// 2026-05-11 UX (#1) — the query text that seeded this rec.
+    /// `None` on cold start (rec came from recent ingest, not a
+    /// query).
+    origin_query: Option<String>,
+    /// Human-readable name of the context this rec was computed
+    /// under. `None` if unscoped.
+    origin_context: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -173,6 +191,17 @@ const ARM_NAMES: [&str; 5] = ["vector-only", "graph-heavy", "hybrid", "episodic"
 
 fn arm_name(arm: u8) -> String {
     ARM_NAMES.get(arm as usize).unwrap_or(&"unknown").to_string()
+}
+
+/// Build a `Uuid → context_name` lookup map from the graph. Used by
+/// `cmd_query` / `cmd_ingest` to populate the `context_name` field on
+/// every returned `EntityInfo`. Cheap: contexts are small (< 100 rows
+/// in practice) and the call is one SELECT.
+fn context_name_map(graph: &GraphStore) -> HashMap<Uuid, String> {
+    graph
+        .list_contexts()
+        .map(|ctxs| ctxs.into_iter().map(|c| (c.id, c.name)).collect())
+        .unwrap_or_default()
 }
 
 // ---------------------------------------------------------------------------
@@ -193,12 +222,33 @@ fn cmd_ingest(text: String, state: State<AppState>) -> Result<IngestResponse, St
     let name_of: HashMap<Uuid, &str> = result.entities.iter()
         .map(|e| (e.id, e.name.as_str())).collect();
 
-    let entities: Vec<EntityInfo> = result.entities.iter().map(|e| EntityInfo {
-        id: e.id.to_string(),
-        name: e.name.clone(),
-        entity_type: format!("{}", e.entity_type),
-        confidence: e.confidence,
-    }).collect();
+    // Resolve context-name pills for the returned entities so the UI
+    // can show "[dev] Alice" without a second IPC round-trip. One
+    // shared graph handle, one contexts query, then per-entity
+    // property lookups (cheap — already in memory).
+    let entities: Vec<EntityInfo> = match GraphStore::open(&state.db_path) {
+        Ok(g) => {
+            let ctx_names = context_name_map(&g);
+            result.entities.iter().map(|e| {
+                let context_name = g.entity_context_id(e.id).ok().flatten()
+                    .and_then(|id| ctx_names.get(&id).cloned());
+                EntityInfo {
+                    id: e.id.to_string(),
+                    name: e.name.clone(),
+                    entity_type: format!("{}", e.entity_type),
+                    confidence: e.confidence,
+                    context_name,
+                }
+            }).collect()
+        }
+        Err(_) => result.entities.iter().map(|e| EntityInfo {
+            id: e.id.to_string(),
+            name: e.name.clone(),
+            entity_type: format!("{}", e.entity_type),
+            confidence: e.confidence,
+            context_name: None,
+        }).collect(),
+    };
 
     let mut typed_triples = Vec::new();
     let mut co_occurrence_count = 0;
@@ -231,11 +281,27 @@ fn cmd_query(text: String, state: State<AppState>) -> Result<QueryResponse, Stri
     let name_of: HashMap<Uuid, &str> = result.entities.iter()
         .map(|e| (e.id, e.name.as_str())).collect();
 
+    // Context-name lookup shared between entities and recommendations.
+    // The retrieval engine holds its own GraphStore but doesn't expose
+    // `entity_context_id` over its public API yet; opening a separate
+    // read-only handle is cheap (SQLite WAL — no contention).
+    let aux_graph = GraphStore::open(&state.db_path).ok();
+    let ctx_names: HashMap<Uuid, String> = aux_graph
+        .as_ref()
+        .map(context_name_map)
+        .unwrap_or_default();
+    let ctx_name_for = |entity_id: Uuid| -> Option<String> {
+        aux_graph.as_ref()
+            .and_then(|g| g.entity_context_id(entity_id).ok().flatten())
+            .and_then(|cid| ctx_names.get(&cid).cloned())
+    };
+
     let entities: Vec<EntityInfo> = result.entities.iter().map(|e| EntityInfo {
         id: e.id.to_string(),
         name: e.name.clone(),
         entity_type: format!("{}", e.entity_type),
         confidence: e.confidence,
+        context_name: ctx_name_for(e.id),
     }).collect();
 
     let triples: Vec<TripleInfo> = result.triples.iter().filter_map(|t| {
@@ -249,14 +315,24 @@ fn cmd_query(text: String, state: State<AppState>) -> Result<QueryResponse, Stri
         })
     }).collect();
 
-    // Generate recommendations from the query context
+    // Generate recommendations from the query context. Resolve the
+    // origin_context_id UUID → context_name once per response so the
+    // UI doesn't need a second IPC round-trip.
     let recs = engine.recommendations(5);
-    let recommendations: Vec<RecommendationInfo> = recs.into_iter().map(|r| RecommendationInfo {
-        entity_id: r.entity_id,
-        entity_name: r.entity_name,
-        entity_type: r.entity_type,
-        score: r.score,
-        reason: r.reason,
+    let recommendations: Vec<RecommendationInfo> = recs.into_iter().map(|r| {
+        let origin_context = r.origin_context_id.as_ref()
+            .and_then(|id_str| Uuid::parse_str(id_str).ok())
+            .and_then(|id| ctx_names.get(&id).cloned());
+        RecommendationInfo {
+            entity_id: r.entity_id,
+            entity_name: r.entity_name,
+            entity_type: r.entity_type,
+            score: r.score,
+            reason: r.reason,
+            reason_detail: r.reason_detail,
+            origin_query: r.origin_query,
+            origin_context,
+        }
     }).collect();
 
     // Build causal attribution info
@@ -527,13 +603,145 @@ fn cmd_entity_click(entity_id: String, state: State<AppState>) -> Result<(), Str
 fn cmd_recommendations(limit: Option<usize>, state: State<AppState>) -> Result<Vec<RecommendationInfo>, String> {
     let engine = state.retrieval.lock().map_err(|e| e.to_string())?;
     let recs = engine.recommendations(limit.unwrap_or(5));
-    Ok(recs.into_iter().map(|r| RecommendationInfo {
-        entity_id: r.entity_id,
-        entity_name: r.entity_name,
-        entity_type: r.entity_type,
-        score: r.score,
-        reason: r.reason,
+
+    // Same origin-context resolution as `cmd_query` — needs a read-only
+    // graph handle to translate context UUID → name.
+    let aux_graph = GraphStore::open(&state.db_path).ok();
+    let ctx_names: HashMap<Uuid, String> = aux_graph
+        .as_ref()
+        .map(context_name_map)
+        .unwrap_or_default();
+
+    Ok(recs.into_iter().map(|r| {
+        let origin_context = r.origin_context_id.as_ref()
+            .and_then(|id_str| Uuid::parse_str(id_str).ok())
+            .and_then(|id| ctx_names.get(&id).cloned());
+        RecommendationInfo {
+            entity_id: r.entity_id,
+            entity_name: r.entity_name,
+            entity_type: r.entity_type,
+            score: r.score,
+            reason: r.reason,
+            reason_detail: r.reason_detail,
+            origin_query: r.origin_query,
+            origin_context,
+        }
     }).collect())
+}
+
+/// 2026-05-11 UX (#2) — cold-start seed for the Reasoning Engine.
+///
+/// Returns the highest-PageRank entity in the active context (or
+/// globally, if unscoped) plus a short "why this entity" rationale.
+/// The ReasonView calls this on mount and immediately runs an
+/// `explore` from the seed, so the user lands on a populated graph
+/// view instead of an empty input prompt.
+#[derive(Serialize)]
+struct ReasonSeed {
+    entity_id: String,
+    entity_name: String,
+    entity_type: String,
+    /// Short rationale e.g. "most-connected entity in your graph
+    /// (PageRank 0.72)". Always non-empty.
+    why: String,
+}
+
+#[tauri::command]
+fn cmd_reason_seed(state: State<AppState>) -> Result<Option<ReasonSeed>, String> {
+    let graph = GraphStore::open(&state.db_path).map_err(|e| e.to_string())?;
+    let pr = graph.pagerank().map_err(|e| e.to_string())?;
+    if pr.is_empty() {
+        return Ok(None);
+    }
+
+    // Prefer an entity visible under the active context. If none of
+    // the top PR entities are in scope we fall back to the overall
+    // top — better to surface *something* than to leave the view
+    // empty.
+    let mut ranked: Vec<(Uuid, f64)> = pr.into_iter().collect();
+    ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+    let pick = ranked.iter()
+        .find(|(id, _)| graph.entity_in_active_scope(*id, false).unwrap_or(false))
+        .or_else(|| ranked.first())
+        .copied();
+
+    let Some((entity_id, score)) = pick else {
+        return Ok(None);
+    };
+
+    let entity = match graph.get_entity(entity_id) {
+        Ok(e) => e,
+        Err(_) => return Ok(None),
+    };
+
+    let why = format!(
+        "most-connected entity{} (PageRank {:.2})",
+        if graph.active_context_id().is_some() { " in this context" } else { "" },
+        score,
+    );
+
+    Ok(Some(ReasonSeed {
+        entity_id: entity_id.to_string(),
+        entity_name: entity.name,
+        entity_type: format!("{}", entity.entity_type),
+        why,
+    }))
+}
+
+/// 2026-05-11 UX (#4) — recent retrieval queries for the QueryView
+/// sticky panel. Reads the trace log and filters to Retrieve events,
+/// returning the natural-language query text and timing info. Used to
+/// render "you recently asked …" pills above the search bar so the
+/// user can see continuity across sessions.
+#[derive(Serialize)]
+struct RecentQueryInfo {
+    trace_id: String,
+    query_text: String,
+    arm_name: Option<String>,
+    entities_count: usize,
+    created_at: String,
+}
+
+#[tauri::command]
+fn cmd_query_recent(
+    limit: Option<usize>,
+    state: State<AppState>,
+) -> Result<Vec<RecentQueryInfo>, String> {
+    let trace_store = state.trace_store.lock().map_err(|e| e.to_string())?;
+    // Pull a generous window then filter to Retrieve traces with a
+    // non-empty `raw_text` (== the query string).
+    let traces = trace_store.recent(200).unwrap_or_default();
+    let want = limit.unwrap_or(5);
+
+    let mut out = Vec::with_capacity(want);
+    let mut seen_text: HashSet<String> = HashSet::new();
+    for t in traces.iter().rev() {
+        if !matches!(t.event_type, tm_types::TraceEventType::Retrieve) {
+            continue;
+        }
+        let Some(text) = t.raw_text.as_deref() else { continue };
+        let text = text.trim();
+        if text.is_empty() {
+            continue;
+        }
+        // Deduplicate consecutive identical queries — users often
+        // re-run the same string while tweaking results.
+        if !seen_text.insert(text.to_string()) {
+            continue;
+        }
+        out.push(RecentQueryInfo {
+            trace_id: t.id.to_string(),
+            query_text: text.to_string(),
+            arm_name: t.retrieval_arm.map(arm_name),
+            entities_count: t.entities_extracted.len(),
+            created_at: t.created_at.format("%H:%M").to_string(),
+        });
+        if out.len() >= want {
+            break;
+        }
+    }
+    Ok(out)
 }
 
 /// Explicit user feedback on query results (thumbs up = 1.0, thumbs down = 0.0).
@@ -1561,6 +1769,8 @@ fn main() {
             cmd_demo_ingest,
             cmd_entity_click,
             cmd_recommendations,
+            cmd_reason_seed,
+            cmd_query_recent,
             cmd_feedback,
             cmd_check_relevance,
             cmd_delete_entity,

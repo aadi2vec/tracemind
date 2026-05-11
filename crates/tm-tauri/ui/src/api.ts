@@ -7,6 +7,8 @@ export interface EntityInfo {
   name: string;
   entity_type: string;
   confidence: number;
+  /** 2026-05-11 UX (#1) — context this entity was ingested under, by name. */
+  context_name: string | null;
 }
 
 export interface TripleInfo {
@@ -29,6 +31,12 @@ export interface RecommendationInfo {
   entity_type: string;
   score: number;
   reason: string;
+  /** 2026-05-11 UX (#3) — structured why ("PR 0.72 · 86% match"). */
+  reason_detail: string;
+  /** 2026-05-11 UX (#1) — query text that seeded this rec. */
+  origin_query: string | null;
+  /** 2026-05-11 UX (#1) — context this rec was computed under. */
+  origin_context: string | null;
 }
 
 export interface AttributionInfo {
@@ -155,6 +163,31 @@ export async function entityClick(entityId: string): Promise<void> {
 
 export async function getRecommendations(limit?: number): Promise<RecommendationInfo[]> {
   return invoke("cmd_recommendations", { limit: limit ?? 5 });
+}
+
+// 2026-05-11 UX (#2) — cold-start seed for the Reasoning Engine.
+export interface ReasonSeed {
+  entity_id: string;
+  entity_name: string;
+  entity_type: string;
+  why: string;
+}
+
+export async function reasonSeed(): Promise<ReasonSeed | null> {
+  return invoke("cmd_reason_seed");
+}
+
+// 2026-05-11 UX (#4) — recent queries for the QueryView sticky panel.
+export interface RecentQueryInfo {
+  trace_id: string;
+  query_text: string;
+  arm_name: string | null;
+  entities_count: number;
+  created_at: string;
+}
+
+export async function getRecentQueries(limit?: number): Promise<RecentQueryInfo[]> {
+  return invoke("cmd_query_recent", { limit: limit ?? 5 });
 }
 
 export async function sendFeedback(score: number): Promise<void> {

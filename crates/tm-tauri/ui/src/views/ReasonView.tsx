@@ -1,5 +1,13 @@
-import { useState } from "react";
-import { reasonChain, reasonExplore, findAnalogies, type ReasoningChainInfo, type AnalogyInfo } from "../api";
+import { useEffect, useRef, useState } from "react";
+import {
+  reasonChain,
+  reasonExplore,
+  findAnalogies,
+  reasonSeed,
+  type ReasoningChainInfo,
+  type AnalogyInfo,
+  type ReasonSeed,
+} from "../api";
 
 type Mode = "explore" | "chain" | "analogy";
 
@@ -11,25 +19,32 @@ export default function ReasonView() {
   const [analogies, setAnalogies] = useState<AnalogyInfo[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
+  // 2026-05-11 UX (#2) — cold-start seed banner. Captures *which*
+  // entity we auto-loaded so the user can either accept the suggestion
+  // or type their own. `null` until seed lookup finishes; if no seed
+  // is available (empty graph) we render the legacy empty state.
+  const [seed, setSeed] = useState<ReasonSeed | null>(null);
+  const seededOnceRef = useRef(false);
 
-  const handleSubmit = async () => {
-    if (!input1.trim()) return;
+  // Run a query for the given entity name in the current mode.
+  // Pulled out of `handleSubmit` so the cold-start effect below can
+  // call it without going through the input → submit cycle.
+  const runFor = async (name: string) => {
     setLoading(true);
     setError("");
     setChains([]);
     setAnalogies([]);
-
     try {
       if (mode === "explore") {
-        const res = await reasonExplore(input1.trim());
-        setChains(res);
+        setChains(await reasonExplore(name));
       } else if (mode === "chain") {
-        if (!input2.trim()) { setError("Enter both entities"); setLoading(false); return; }
-        const res = await reasonChain(input1.trim(), input2.trim());
-        setChains(res);
+        if (!input2.trim()) {
+          setError("Enter both entities");
+          return;
+        }
+        setChains(await reasonChain(name, input2.trim()));
       } else {
-        const res = await findAnalogies(input1.trim());
-        setAnalogies(res);
+        setAnalogies(await findAnalogies(name));
       }
     } catch (e) {
       setError(String(e));
@@ -38,9 +53,61 @@ export default function ReasonView() {
     }
   };
 
+  const handleSubmit = async () => {
+    if (!input1.trim()) return;
+    await runFor(input1.trim());
+  };
+
+  // Cold-start: on first mount, ask the backend for a meaningful seed
+  // entity (highest PageRank in the active context) and auto-run
+  // `explore` so the view never sits empty. Only fires once per
+  // session — re-entering the view after a manual query keeps the
+  // user's last result.
+  useEffect(() => {
+    if (seededOnceRef.current) return;
+    seededOnceRef.current = true;
+    (async () => {
+      try {
+        const s = await reasonSeed();
+        if (s) {
+          setSeed(s);
+          setInput1(s.entity_name);
+          // Auto-run in explore mode only — chain mode needs two
+          // inputs, analogy mode is the user's choice.
+          if (mode === "explore") {
+            await runFor(s.entity_name);
+          }
+        }
+      } catch (e) {
+        console.error("reason seed failed:", e);
+      }
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   return (
     <div className="space-y-6">
       <h2 className="text-xl font-semibold">Reasoning Engine</h2>
+
+      {/* Cold-start seed banner (2026-05-11 UX #2). Surfaces which
+          entity we auto-seeded and why, so the user has context
+          before deciding to type their own. */}
+      {seed && (
+        <div className="flex items-center gap-2 text-xs text-tm-muted bg-tm-surface border border-tm-border rounded-lg px-3 py-2">
+          <span className="text-tm-accent">●</span>
+          <span>
+            Auto-seeded with <span className="text-tm-text font-medium">{seed.entity_name}</span>
+            <span className="text-tm-muted"> — {seed.why}</span>
+          </span>
+          <button
+            onClick={() => { setSeed(null); setInput1(""); setChains([]); setAnalogies([]); }}
+            className="ml-auto text-[10px] uppercase tracking-wider text-tm-muted hover:text-tm-text transition-colors"
+            title="Clear and start fresh"
+          >
+            clear
+          </button>
+        </div>
+      )}
 
       {/* Mode tabs */}
       <div className="flex gap-2">
