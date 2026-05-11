@@ -14,6 +14,7 @@ pub mod time_range;
 pub mod bundled;
 pub mod recent;
 pub mod working_memory;
+pub mod capture_permissions;
 
 pub use entity::*;
 pub use triple::*;
@@ -25,3 +26,4 @@ pub use memory_op::*;
 pub use time_range::*;
 pub use recent::*;
 pub use working_memory::*;
+pub use capture_permissions::*;

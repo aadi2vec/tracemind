@@ -342,6 +342,15 @@ enum Commands {
         #[command(subcommand)]
         action: ContradictionsAction,
     },
+    /// CAP-1 — manage per-source ambient capture permissions. Every
+    /// source (clipboard, shell, screenshot, browser, audio, calendar)
+    /// is opt-in and revocable. Default first-run state has clipboard
+    /// + shell enabled; everything else is off until you flip it on.
+    /// State persists to `~/.tracemind/capture_permissions.toml`.
+    Capture {
+        #[command(subcommand)]
+        action: CaptureAction,
+    },
 }
 
 #[derive(clap::Subcommand)]
@@ -637,6 +646,73 @@ enum ContextAction {
     Current,
     /// Clear the active context (back to unscoped behaviour).
     Clear,
+}
+
+#[derive(clap::Subcommand)]
+enum CaptureAction {
+    /// Show every source with its current enabled/disabled state,
+    /// grant timestamp, last event, and lifetime event count. This is
+    /// the audit surface — what the daemon would do *if started right
+    /// now*.
+    Status {
+        /// Emit JSON instead of formatted text.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Alias for `status` that prints only one source per line, with
+    /// short descriptions. Handy for piping into other tools.
+    List,
+    /// Turn a source ON. Sources: clipboard, shell, screenshot,
+    /// browser, audio, calendar. Re-enabling preserves the original
+    /// grant timestamp (reaffirmation, not new consent).
+    Enable {
+        /// Source name (case-insensitive).
+        source: String,
+    },
+    /// Turn a source OFF. The daemon will skip its loop on next
+    /// permission check. Existing captures are NOT deleted — use
+    /// `tracemind decay` or remove `recent.jsonl` to scrub data.
+    Disable {
+        /// Source name (case-insensitive).
+        source: String,
+    },
+    /// CAP-2 — ingest the last N days of shell history so the *first*
+    /// query post-install is non-empty (UX-8 "60-second meaningful
+    /// brief"). Skips entries older than the cutoff, blanks, and
+    /// trivial commands (ls/cd/pwd…). Honors capture permissions:
+    /// shell must be enabled. Idempotent — re-running deduplicates
+    /// against the existing memory.
+    Backfill {
+        /// How many days of history to scan (default: 7). Applies to
+        /// shell and notes; clipboard is a one-shot snapshot.
+        #[arg(long, default_value = "7")]
+        days: u32,
+        /// Maximum number of distinct shell commands to ingest in
+        /// this run (safety cap so a 50k-line history file doesn't
+        /// stall the daemon).
+        #[arg(long, default_value = "500")]
+        max: usize,
+        /// Skip shell-history backfill.
+        #[arg(long, default_value_t = false)]
+        no_shell: bool,
+        /// Skip Apple Notes backfill (macOS only).
+        #[arg(long, default_value_t = false)]
+        no_notes: bool,
+        /// Skip clipboard snapshot.
+        #[arg(long, default_value_t = false)]
+        no_clipboard: bool,
+    },
+    /// CAP-4 — print a one-line JavaScript bookmarklet snippet the
+    /// user can drag to their bookmarks bar. Tapping the bookmark on
+    /// any page POSTs `{url, title, selection}` to the capture
+    /// daemon's localhost endpoint, gated by the per-install
+    /// `capture_token`. The daemon must be running and `browser`
+    /// must be enabled.
+    Bookmarklet {
+        /// Print install instructions in addition to the snippet.
+        #[arg(long)]
+        full: bool,
+    },
 }
 
 #[derive(clap::Subcommand)]
@@ -1348,7 +1424,515 @@ fn main() {
             let db_path = dir.join("memory.db").to_str().unwrap().to_string();
             cmd_context(&dir, &db_path, action);
         }
+        Commands::Capture { action } => {
+            cmd_capture(&dir, action);
+        }
     }
+}
+
+/// `tracemind capture …` handler (CAP-1). Reads/writes
+/// `<data_dir>/capture_permissions.toml` via the schema in
+/// `tm_types::capture_permissions`. The daemon
+/// (`tracemind-capture`) reads the same file at startup and skips
+/// loops whose source is disabled.
+fn cmd_capture(data_dir: &PathBuf, action: CaptureAction) {
+    use tm_types::capture_permissions::{CapturePermissions, CaptureSource};
+
+    let path = data_dir.join("capture_permissions.toml");
+    let mut perms = match CapturePermissions::load_or_default(&path) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("failed to load capture permissions: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    match action {
+        CaptureAction::Status { json } => {
+            if json {
+                println!("{}", serde_json::to_string_pretty(&perms).unwrap());
+                return;
+            }
+            println!("capture permissions ({}):", path.display());
+            for source in CaptureSource::all() {
+                let p = perms.get(source);
+                let state = if p.enabled { "ON " } else { "off" };
+                let granted = p
+                    .granted_at
+                    .map(|t| t.format("%Y-%m-%d").to_string())
+                    .unwrap_or_else(|| "—".to_string());
+                let last = p
+                    .last_event_at
+                    .map(|t| t.format("%Y-%m-%d %H:%M").to_string())
+                    .unwrap_or_else(|| "—".to_string());
+                println!(
+                    "  [{state}] {:<10}  granted {granted}  last {last}  events {}",
+                    source.as_str(),
+                    p.event_count
+                );
+            }
+        }
+        CaptureAction::List => {
+            for source in CaptureSource::all() {
+                let p = perms.get(source);
+                let state = if p.enabled { "on " } else { "off" };
+                println!("{state}  {:<10}  {}", source.as_str(), source.description());
+            }
+        }
+        CaptureAction::Enable { source } => {
+            let Some(src) = CaptureSource::parse(&source) else {
+                eprintln!("unknown source: {source}");
+                eprintln!("valid: clipboard, shell, notes, screenshot, browser, audio, calendar");
+                std::process::exit(2);
+            };
+            perms.enable(src);
+            if let Err(e) = perms.save(&path) {
+                eprintln!("failed to save: {e}");
+                std::process::exit(1);
+            }
+            println!("enabled: {src}");
+        }
+        CaptureAction::Disable { source } => {
+            let Some(src) = CaptureSource::parse(&source) else {
+                eprintln!("unknown source: {source}");
+                eprintln!("valid: clipboard, shell, notes, screenshot, browser, audio, calendar");
+                std::process::exit(2);
+            };
+            perms.disable(src);
+            if let Err(e) = perms.save(&path) {
+                eprintln!("failed to save: {e}");
+                std::process::exit(1);
+            }
+            println!("disabled: {src}");
+        }
+        CaptureAction::Backfill {
+            days,
+            max,
+            no_shell,
+            no_notes,
+            no_clipboard,
+        } => {
+            // CAP-2 — three-source startup backfill (shell + notes +
+            // clipboard) so the seed user query post-install is
+            // non-empty. Each source is fail-closed against its own
+            // CaptureSource permission, skippable via --no-*.
+            let db_path = data_dir.join("memory.db").to_str().unwrap().to_string();
+
+            // Shell history.
+            if no_shell {
+                println!("skipped shell-history backfill (--no-shell)");
+            } else if !perms.is_enabled(CaptureSource::Shell) {
+                eprintln!("shell capture disabled — skipping (run `tracemind capture enable shell` to opt in)");
+            } else {
+                let ingested = cmd_capture_backfill_shell(&db_path, days, max);
+                println!("backfilled {ingested} shell history entries (last {days} days)");
+            }
+
+            // Apple Notes (macOS only).
+            if no_notes {
+                println!("skipped Apple Notes backfill (--no-notes)");
+            } else if !perms.is_enabled(CaptureSource::Notes) {
+                eprintln!("notes capture disabled — skipping (run `tracemind capture enable notes` to opt in)");
+            } else {
+                let ingested = cmd_capture_backfill_notes(&db_path, days);
+                println!("backfilled {ingested} Apple Notes entries (last {days} days)");
+            }
+
+            // Clipboard snapshot (one-shot).
+            if no_clipboard {
+                println!("skipped clipboard snapshot (--no-clipboard)");
+            } else if !perms.is_enabled(CaptureSource::Clipboard) {
+                eprintln!("clipboard capture disabled — skipping (run `tracemind capture enable clipboard` to opt in)");
+            } else {
+                let ingested = cmd_capture_backfill_clipboard(&db_path);
+                if ingested > 0 {
+                    println!("backfilled clipboard snapshot ({ingested} entry)");
+                } else {
+                    println!("clipboard was empty or skipped (too short / high-entropy)");
+                }
+            }
+        }
+        CaptureAction::Bookmarklet { full } => {
+            cmd_capture_bookmarklet(data_dir, full);
+        }
+    }
+}
+
+/// CAP-4 — emit the bookmarklet snippet. We read the per-install
+/// token from `<data_dir>/capture_token` (the capture daemon writes
+/// it on first start). If the token doesn't exist yet, we generate
+/// one here so the user can install the bookmarklet *before* booting
+/// the daemon. The same file is read by the daemon's HTTP loop.
+fn cmd_capture_bookmarklet(data_dir: &PathBuf, full: bool) {
+    let token_path = data_dir.join("capture_token");
+    let token = match std::fs::read_to_string(&token_path) {
+        Ok(t) => t.trim().to_string(),
+        Err(_) => {
+            // Generate + persist a token so the bookmarklet works on
+            // first run, before the daemon has booted.
+            if let Err(e) = std::fs::create_dir_all(data_dir) {
+                eprintln!("failed to create {}: {e}", data_dir.display());
+                std::process::exit(1);
+            }
+            let t = Uuid::new_v4().simple().to_string();
+            if let Err(e) = std::fs::write(&token_path, &t) {
+                eprintln!("failed to write {}: {e}", token_path.display());
+                std::process::exit(1);
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(
+                    &token_path,
+                    std::fs::Permissions::from_mode(0o600),
+                );
+            }
+            eprintln!("[tracemind] new capture token written to {}", token_path.display());
+            t
+        }
+    };
+
+    // Compose the JS payload. Keep it minimal: grab the URL, title,
+    // and selection; POST as JSON; show a tiny toast on success.
+    let js = format!(
+        "javascript:(function(){{var s=window.getSelection?String(window.getSelection()):'';fetch('http://127.0.0.1:7710/capture',{{method:'POST',headers:{{'Content-Type':'application/json','Authorization':'Bearer {token}'}},body:JSON.stringify({{url:location.href,title:document.title,selection:s}})}}).then(r=>{{var t=document.createElement('div');t.textContent=r.ok?'ok captured':'fail '+r.status;t.style.cssText='position:fixed;top:12px;right:12px;padding:8px 12px;background:#222;color:#fff;border-radius:6px;font:13px sans-serif;z-index:2147483647;opacity:0.9';document.body.appendChild(t);setTimeout(()=>t.remove(),1500);}}).catch(e=>alert('TraceMind capture failed: '+e));}})();"
+    );
+
+    if full {
+        println!("# TraceMind browser bookmarklet (CAP-4)");
+        println!();
+        println!("1. Make sure the capture daemon is running:");
+        println!("     tracemind-capture");
+        println!();
+        println!("2. Make sure browser capture is enabled:");
+        println!("     tracemind capture enable browser");
+        println!();
+        println!("3. Drag this JS snippet to your bookmarks bar (or create a new bookmark with the URL field set to it):");
+        println!();
+        println!("{js}");
+        println!();
+        println!("Token persisted at: {}", token_path.display());
+    } else {
+        println!("{js}");
+    }
+}
+
+/// CAP-2 — read shell history, filter by age + triviality, and
+/// ingest the surviving entries through `IngestPipeline::ingest_fast`.
+/// Mirrors the daemon's parser (`tm_capture::read_last_lines`) but
+/// is age-aware: zsh's `: <epoch>:0;<command>` format gives us the
+/// timestamp, so we can drop anything older than `days` cleanly.
+/// Bash history has no timestamps by default — we take the last
+/// `max` non-trivial lines and ingest them all.
+fn cmd_capture_backfill_shell(db_path: &str, days: u32, max: usize) -> usize {
+    use std::path::PathBuf;
+    use tm_ingest::IngestPipeline;
+
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    let zsh = PathBuf::from(&home).join(".zsh_history");
+    let bash = PathBuf::from(&home).join(".bash_history");
+    let (path, is_zsh) = if zsh.exists() {
+        (zsh, true)
+    } else if bash.exists() {
+        (bash, false)
+    } else {
+        eprintln!("no shell history file found at ~/.zsh_history or ~/.bash_history");
+        return 0;
+    };
+
+    let cutoff = chrono::Utc::now().timestamp() - i64::from(days) * 86_400;
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("read {}: {e}", path.display());
+            return 0;
+        }
+    };
+
+    let mut entries: Vec<String> = Vec::new();
+    // Walk newest-first so the safety cap keeps the *most recent* commands.
+    for line in raw.lines().rev() {
+        if entries.len() >= max {
+            break;
+        }
+        // zsh: ": 1715450000:0;cargo build --release"
+        let (ts, cmd) = if is_zsh && line.starts_with(": ") {
+            let rest = &line[2..];
+            let (ts_str, rest) = match rest.split_once(':') {
+                Some(p) => p,
+                None => continue,
+            };
+            let cmd = match rest.split_once(';') {
+                Some((_, c)) => c,
+                None => continue,
+            };
+            let ts = ts_str.parse::<i64>().unwrap_or(0);
+            (Some(ts), cmd)
+        } else {
+            (None, line)
+        };
+        if let Some(ts) = ts {
+            if ts < cutoff {
+                continue;
+            }
+        }
+        let cmd = cmd.trim();
+        if cmd.len() <= 5 || cmd.starts_with('#') {
+            continue;
+        }
+        if matches!(
+            cmd,
+            "ls" | "cd" | "pwd" | "clear" | "exit" | "history" | "ll" | "la"
+        ) {
+            continue;
+        }
+        entries.push(cmd.to_string());
+    }
+
+    if entries.is_empty() {
+        return 0;
+    }
+
+    // Reverse so we ingest oldest→newest (preserving causal order).
+    entries.reverse();
+
+    // Backfill is a bulk one-shot bypass the per-source token bucket
+    // (CAP-5) so a 7-day history doesn't get throttled to 2/min.
+    let pipeline = match IngestPipeline::open(db_path, /*hash_embed=*/ false) {
+        Ok(p) => p.with_rate_limiter(tm_ingest::RateLimiter::unlimited()),
+        Err(e) => {
+            eprintln!("open pipeline: {e}");
+            return 0;
+        }
+    };
+
+    let session = Uuid::new_v4();
+    let mut ingested = 0usize;
+    for cmd in entries {
+        let text = format!("shell command: {cmd}");
+        match pipeline.ingest_fast(&text, "shell-backfill", session) {
+            Ok(r) if r.skipped.is_none() => ingested += 1,
+            Ok(_) => {}
+            Err(e) => {
+                eprintln!("ingest_fast failed: {e}");
+            }
+        }
+    }
+    ingested
+}
+
+/// CAP-2 — Apple Notes backfill (macOS only). We shell out to
+/// `osascript` and ask the Notes app to enumerate every note's
+/// `folder`, `name`, `body`, and `modificationDate`. Notes has no
+/// public change-event API, so we treat this as a startup-time + on-
+/// demand dump; the daemon does *not* poll continuously. Re-running
+/// `tracemind capture backfill` picks up edits (`ingest_fast` is
+/// idempotent against the existing memory).
+///
+/// On non-macOS platforms this is a no-op.
+fn cmd_capture_backfill_notes(db_path: &str, days: u32) -> usize {
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (db_path, days);
+        eprintln!("Apple Notes backfill is macOS-only — skipping");
+        return 0;
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        use std::process::Command;
+        use tm_ingest::IngestPipeline;
+
+        // Field separator: pick something extremely unlikely to occur
+        // inside a note body, but still printable so we can split in
+        // Rust. Record separator (\u{1E}) and unit separator (\u{1F})
+        // are the canonical ASCII choices. AppleScript can emit them
+        // via `character id N`.
+        //
+        // Record  := folder \u{1F} title \u{1F} epoch_seconds \u{1F} body
+        // Records joined by \u{1E}.
+        let script = r#"
+set _rs to character id 30
+set _us to character id 31
+set _out to ""
+tell application "Notes"
+    set _notes to every note
+    repeat with _n in _notes
+        try
+            set _folder to name of container of _n
+        on error
+            set _folder to ""
+        end try
+        set _title to name of _n
+        set _modDate to modification date of _n
+        -- AppleScript epoch trick: subtract the Unix epoch.
+        set _epoch to (_modDate - (date "Thursday, January 1, 1970 at 12:00:00 AM")) as integer
+        set _body to plaintext of _n
+        if _out is not "" then
+            set _out to _out & _rs
+        end if
+        set _out to _out & _folder & _us & _title & _us & _epoch & _us & _body
+    end repeat
+end tell
+return _out
+"#;
+
+        let output = match Command::new("osascript").arg("-e").arg(script).output() {
+            Ok(o) => o,
+            Err(e) => {
+                eprintln!("osascript failed (is Apple Notes available?): {e}");
+                return 0;
+            }
+        };
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            eprintln!("osascript exited non-zero: {}", stderr.trim());
+            // Common case: user hasn't granted Automation access yet.
+            // Surface a hint and move on without crashing the rest of
+            // the backfill.
+            if stderr.contains("-1743") || stderr.to_lowercase().contains("not authorized") {
+                eprintln!("hint: System Settings → Privacy & Security → Automation → allow Terminal/iTerm to control Notes");
+            }
+            return 0;
+        }
+        let raw = String::from_utf8_lossy(&output.stdout);
+        let raw = raw.trim();
+        if raw.is_empty() {
+            return 0;
+        }
+
+        let cutoff = chrono::Utc::now().timestamp() - i64::from(days) * 86_400;
+        let pipeline = match IngestPipeline::open(db_path, /*hash_embed=*/ false) {
+            Ok(p) => p.with_rate_limiter(tm_ingest::RateLimiter::unlimited()),
+            Err(e) => {
+                eprintln!("open pipeline: {e}");
+                return 0;
+            }
+        };
+        let session = Uuid::new_v4();
+
+        let rs = char::from_u32(0x1E).unwrap();
+        let us = char::from_u32(0x1F).unwrap();
+
+        let mut ingested = 0usize;
+        for record in raw.split(rs) {
+            let mut parts = record.splitn(4, us);
+            let folder = parts.next().unwrap_or("").trim();
+            let title = parts.next().unwrap_or("").trim();
+            let epoch = parts.next().unwrap_or("0").trim().parse::<i64>().unwrap_or(0);
+            let body = parts.next().unwrap_or("").trim();
+
+            if epoch != 0 && epoch < cutoff {
+                continue;
+            }
+            // Drop empties; a Note with no title + no body is just a
+            // stale shell.
+            if title.is_empty() && body.is_empty() {
+                continue;
+            }
+
+            // Compose a single document. The folder + title give the
+            // memory a queryable header; the body is the payload.
+            let header = if folder.is_empty() {
+                format!("note: {title}")
+            } else {
+                format!("note ({folder}): {title}")
+            };
+            let text = if body.is_empty() {
+                header
+            } else {
+                format!("{header}\n\n{body}")
+            };
+
+            match pipeline.ingest_fast(&text, "notes-backfill", session) {
+                Ok(r) if r.skipped.is_none() => ingested += 1,
+                Ok(_) => {}
+                Err(e) => {
+                    eprintln!("ingest_fast failed for note '{title}': {e}");
+                }
+            }
+        }
+        ingested
+    }
+}
+
+/// CAP-2 — clipboard one-shot snapshot. We don't poll; the daemon's
+/// clipboard watcher handles that. This grabs `pbpaste` once at
+/// startup so the very first user query has something to land on
+/// even before they copy anything new. Same skip rules as the
+/// daemon: blank, <10 chars, or short high-entropy strings (looks
+/// like a token / API key) are dropped.
+///
+/// On non-macOS this is a no-op (no portable `pbpaste` equivalent
+/// ships by default; xclip / wl-clipboard support deferred).
+fn cmd_capture_backfill_clipboard(db_path: &str) -> usize {
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = db_path;
+        eprintln!("clipboard snapshot is macOS-only — skipping");
+        return 0;
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        use std::process::Command;
+        use tm_ingest::IngestPipeline;
+
+        let output = match Command::new("pbpaste").output() {
+            Ok(o) => o,
+            Err(e) => {
+                eprintln!("pbpaste failed: {e}");
+                return 0;
+            }
+        };
+        if !output.status.success() {
+            eprintln!("pbpaste exited non-zero");
+            return 0;
+        }
+        let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+
+        // Same skip rules as the daemon's `get_clipboard()`.
+        if text.len() < 10 {
+            return 0;
+        }
+        if looks_like_secret(&text) {
+            return 0;
+        }
+
+        let pipeline = match IngestPipeline::open(db_path, /*hash_embed=*/ false) {
+            Ok(p) => p.with_rate_limiter(tm_ingest::RateLimiter::unlimited()),
+            Err(e) => {
+                eprintln!("open pipeline: {e}");
+                return 0;
+            }
+        };
+        let session = Uuid::new_v4();
+        let payload = format!("clipboard contents: {text}");
+        match pipeline.ingest_fast(&payload, "clipboard-backfill", session) {
+            Ok(r) if r.skipped.is_none() => 1,
+            Ok(_) => 0,
+            Err(e) => {
+                eprintln!("ingest_fast failed: {e}");
+                0
+            }
+        }
+    }
+}
+
+/// Heuristic: short, no-spaces, high alphanum density → likely a
+/// token / API key / hash. Mirrors the daemon's filter so the one-
+/// shot snapshot doesn't sneak secrets into memory.
+#[cfg(target_os = "macos")]
+fn looks_like_secret(s: &str) -> bool {
+    if s.len() > 200 {
+        return false; // long pastes are almost certainly real text
+    }
+    if s.contains(char::is_whitespace) {
+        return false;
+    }
+    let alnum = s.chars().filter(|c| c.is_ascii_alphanumeric()).count();
+    let ratio = alnum as f64 / s.len() as f64;
+    ratio > 0.9
 }
 
 // ---------------------------------------------------------------------------

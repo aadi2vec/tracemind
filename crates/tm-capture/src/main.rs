@@ -7,7 +7,7 @@
 //! Automatically ingests captured content into TraceMind memory.
 
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
@@ -17,7 +17,10 @@ use uuid::Uuid;
 
 use tm_episodic::RecentStore;
 use tm_ingest::{FastIngestResult, IngestPipeline, SignalPriority};
+use tm_types::capture_permissions::{CapturePermissions, CaptureSource};
 use tm_types::RecentCapture;
+
+mod browser_capture;
 
 /// TM-NLP-004 helper: open an IngestPipeline and attach the real GLiNER
 /// NER extractor when the model is available on disk / over the network.
@@ -44,6 +47,15 @@ struct CaptureConfig {
     /// commitment candidates are persisted here for the daily-brief
     /// to surface — see `docs/INTENT_SYSTEM.md` §3.1.
     intents_path: String,
+    /// CAP-1 — path to per-source permissions file
+    /// (`<data_dir>/capture_permissions.toml`). Resolved here so the
+    /// daemon respects `TM_DATA_DIR` overrides used in tests.
+    permissions_path: PathBuf,
+    /// CAP-4 — path to the per-install browser bookmarklet token
+    /// (`<data_dir>/capture_token`). Generated on first start;
+    /// embedded in the bookmarklet snippet emitted by
+    /// `tracemind capture bookmarklet`.
+    capture_token_path: PathBuf,
     clipboard_interval: Duration,
     history_interval: Duration,
     /// How often to run the slow-path (Tier-3 Normal) consolidation pass.
@@ -68,6 +80,8 @@ impl CaptureConfig {
         Self {
             db_path: dir.join("memory.db").to_str().unwrap().to_string(),
             intents_path: dir.join("intents.db").to_str().unwrap().to_string(),
+            permissions_path: dir.join("capture_permissions.toml"),
+            capture_token_path: dir.join("capture_token"),
             clipboard_interval: Duration::from_millis(
                 std::env::var("TM_CLIP_INTERVAL_MS")
                     .ok()
@@ -209,6 +223,14 @@ fn content_hash(s: &str) -> u64 {
 }
 
 async fn clipboard_loop(config: &CaptureConfig) {
+    // CAP-1 — fail closed. If the source isn't explicitly enabled in
+    // capture_permissions.toml, the loop never starts and the daemon
+    // logs the skip so the user can audit.
+    if !load_enabled(&config.permissions_path, CaptureSource::Clipboard) {
+        info!("[clipboard] disabled in permissions — loop will not start");
+        return;
+    }
+
     info!("[clipboard] starting monitor (interval={}ms)", config.clipboard_interval.as_millis());
 
     let pipeline = match open_pipeline_with_ner(&config.db_path, config.hash_embed) {
@@ -339,7 +361,30 @@ fn read_last_lines(path: &PathBuf, n: usize) -> Vec<String> {
         .collect()
 }
 
+/// CAP-1 — load the permissions file (creating it with safe defaults
+/// on first run) and report whether `source` is enabled. We swallow
+/// load errors and fail *closed* (return false) so a malformed file
+/// can never silently start a sensitive source.
+fn load_enabled(path: &Path, source: CaptureSource) -> bool {
+    match CapturePermissions::load_or_default(path) {
+        Ok(perms) => perms.is_enabled(source),
+        Err(e) => {
+            warn!(
+                "[capture] failed to load permissions ({}); failing closed for {source}: {e}",
+                path.display()
+            );
+            false
+        }
+    }
+}
+
 async fn history_loop(config: &CaptureConfig) {
+    // CAP-1 — fail closed on the shell source.
+    if !load_enabled(&config.permissions_path, CaptureSource::Shell) {
+        info!("[shell] disabled in permissions — loop will not start");
+        return;
+    }
+
     let hist_path = match history_path() {
         Some(p) => p,
         None => {
@@ -535,7 +580,7 @@ async fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("tm_capture=info".parse().unwrap()),
+                .add_directive("tracemind_capture=info".parse().unwrap()),
         )
         .init();
 
@@ -561,6 +606,11 @@ async fn main() {
     tokio::join!(
         clipboard_loop(&config),
         history_loop(&config),
+        browser_capture::browser_capture_loop(
+            config.permissions_path.clone(),
+            config.db_path.clone(),
+            config.capture_token_path.clone(),
+        ),
         priority_consolidation_loop(&config),
         consolidation_loop(&config),
     );

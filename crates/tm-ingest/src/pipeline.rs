@@ -9,12 +9,19 @@ use tm_vector::{Embedder, EmbedModel};
 use tm_governance::GovernanceFilter;
 
 use crate::extractor::{EntityExtractor, HeuristicExtractor};
+use crate::rate_limit::RateLimiter;
 
 pub struct IngestPipeline {
     graph: GraphStore,
     embedder: Embedder,
     governance: GovernanceFilter,
     extractor: Box<dyn EntityExtractor>,
+    /// CAP-5 — per-source token-bucket rate limiter. Calls to
+    /// `ingest_fast` consume one token per `source`; when the bucket
+    /// empties, the call returns `skipped: Some("rate-limited: …")`.
+    /// `with_unlimited_rate()` (or `TM_RATE_*` env vars) disables it
+    /// for tests + the human-paced `tracemind ingest` subcommand.
+    rate_limiter: RateLimiter,
 }
 
 #[derive(Debug)]
@@ -116,6 +123,7 @@ impl IngestPipeline {
             embedder,
             governance,
             extractor: Box::new(HeuristicExtractor),
+            rate_limiter: RateLimiter::from_env(),
         })
     }
 
@@ -125,6 +133,13 @@ impl IngestPipeline {
     pub fn with_extractor(mut self, extractor: Box<dyn EntityExtractor>) -> Self {
         tracing::info!("[ingest] entity extractor: {}", extractor.name());
         self.extractor = extractor;
+        self
+    }
+
+    /// CAP-5 — replace the rate limiter. Pass `RateLimiter::unlimited()`
+    /// for tests + human-paced ingest paths that shouldn't be throttled.
+    pub fn with_rate_limiter(mut self, limiter: RateLimiter) -> Self {
+        self.rate_limiter = limiter;
         self
     }
 
@@ -382,6 +397,22 @@ impl IngestPipeline {
         source: &str,
         session_id: Uuid,
     ) -> Result<FastIngestResult> {
+        // 0. CAP-5 — per-source token-bucket throttle. Floods are
+        //    dropped here *before* the hash + embed + write path so a
+        //    runaway capture loop can't stall queries.
+        if let Err(reason) = self.rate_limiter.try_acquire(source) {
+            // Use a stable content hash so downstream observability
+            // doesn't see a UUID stream for rate-limited rejections.
+            let content_hash_str = format!("{:016x}", seahash::hash(text.as_bytes()));
+            return Ok(FastIngestResult {
+                signal_id: 0,
+                content_hash: content_hash_str,
+                priority: SignalPriority::Ephemeral,
+                instant_entities: vec![],
+                skipped: Some(reason),
+            });
+        }
+
         // 1. Governance: reject PII before storing anything.
         self.governance.check(text, 1.0)?;
 
@@ -1446,6 +1477,9 @@ mod tests {
             embedder: Embedder::new_hash(),
             governance: GovernanceFilter::default(),
             extractor: Box::new(HeuristicExtractor),
+            // Tests fire many ingest_fast calls in tight loops; the
+            // CAP-5 limiter would refuse them. Tests opt out.
+            rate_limiter: RateLimiter::unlimited(),
         }
     }
 
