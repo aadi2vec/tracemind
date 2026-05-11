@@ -1,314 +1,400 @@
 # TraceMind — Task List
 
-**Consolidated**: 2026-05-09. Canonical task list for all implementation work.
+**Reframed 2026-05-11 against the seed bar.** Every priority below is judged by one question: *does this get me closer to a user on camera saying "I won't go back"?* That sentence is the only thing that unlocks a seed check. Engine depth, three-product fan-out, and architectural elegance are graded *only* by whether they shorten the distance to that moment.
 
-Legend: `[x]` done, `[-]` in progress / partial, `[ ]` not started. Est. = estimated F1 lift where applicable.
+> **Canonical strategy doc:** [`docs/PROJECT_2026.md`](PROJECT_2026.md). This task list operationalises that plan. When they conflict, fix both.
+
+Legend: `[x]` done, `[-]` in progress / partial, `[ ]` not started.
 
 ---
 
-## Shipped (reference)
+## North star — the seed gate
 
-- [x] Phase 4 / Sprint C-1: bitemporal substrate (tm-temporal embedded into tm-graph; query_at / history; entities + triples backfilled)
-- [x] Phase 4 / Sprint C-2: TMS-backed confidence (BeliefStore wraps tm-tms; contradictions surfaced in brief; effective_confidence policy)
-- [x] 24-crate Rust workspace compiles and tests pass
-- [x] Intent arc types: Need, Sentiment, Action + Belief trait (`tm-intent`)
-- [x] Intent arc persistence: SQLite tables + store methods for needs/sentiments/actions
-- [x] MCP tools: memory_need, memory_sentiment, memory_action, memory_arc
-- [x] CLI commands: need, sentiment, action, arc
+A Sequoia seed check requires three artifacts. Until all three exist, nothing else matters:
+
+1. **One named design partner** using TraceMind daily, on camera, naming the pain (DP-6).
+2. **One retention number** — W2 ≥ 40% across at least 5 users (DP-3 + DP-5).
+3. **One head-to-head video** — TraceMind vs. Mem0 / Letta / Zep, same `claude` host, three beats: (a) persistence across sessions, (b) context isolation, (c) contradiction-aware retraction (W-5). Persistence + context-isolation lead; retraction is the closing moat beat.
+
+All P0–P3 below feed exactly these three artifacts. Everything from P4 down is deferred until the gate is cleared.
+
+---
+
+## Shipped (reference, do not re-litigate)
+
+**Engine + storage**
+- [x] 24-crate Rust workspace, full test suite green
+- [x] Bitemporal substrate (`tm-temporal` embedded into `tm-graph`)
+- [x] TMS-backed confidence + contradiction surfacing (Sprint C-2)
 - [x] Commitment primitive + state machine + outcome attachment
-- [x] CommitmentMiner (implicit phrase mining) + candidate confirm/dismiss
-- [x] Daily brief (BriefBuilder) + insights + pattern detector
-- [x] World model v0 (f_outcome logistic regression, preflight)
-- [x] Outcome proposals (implicit text matcher → accept/dismiss)
-- [x] Tier-0 extractive answerer (always-on fallback)
-- [x] Tier-1 scaffolded (LocalLlmBackend, Qwen 2.5 1.5B Q4, llama-cpp-2)
-- [x] Tier-2 scaffolded (AppleFmBackend stub)
-- [x] ColBERT rerank (mxbai-edge-colbert, auto-download)
-- [x] BGE-small ONNX embeddings (384-dim)
-- [x] 5-arm LinUCB bandit retrieval
+- [x] Daily brief + insights + pattern detector
+- [x] World model v0 (`f_outcome` logistic regression, preflight)
+- [x] Tier-0 extractive answerer + Tier-1 / Tier-2 scaffolds
+- [x] ColBERT rerank, BGE-small embeddings, 5-arm LinUCB bandit
 - [x] Reasoning: chains, analogy (WL kernel), causal trace, consolidator
-- [x] Capture daemon (clipboard + shell history)
-- [x] Tauri desktop app shell (basic query/ingest)
-- [x] LoCoMo benchmark harness (mini-set, 20 questions)
-- [x] LoCoMo v0.2 fixes: speaker-prefix strip, Q→A adjacency, skip-question fallback
-- [x] LoCoMo quick wins applied: cosine threshold 0.4→0.2, Q→A window 1→3 turns
-- [x] tm-temporal crate (bitemporal facts, TemporalStore, 10 tests)
-- [x] tm-tms crate (JTMS engine, BFS propagation, 11 tests)
-- [x] tm-modal crate (types, encoder trait, co-occurrence detector, 13 tests)
-- [x] tm-engram crate (Engram SDK scaffold, 4 tests)
+- [x] Capture daemon, Tauri desktop shell, LoCoMo bench harness
+
+**Context + feedback (Sprints C / D / F-1)**
+- [x] Sprint C-0: context segmentation (schema, CRUD, ingest tagging, scoped retrieval, cross-context penalty, negative-feedback CLI, demo rewrite)
+- [x] Sprint D investor-UI: query_id surface, context switcher, inline 👍/👎/wrong-ctx, demo fixture restore, smoke script
+- [x] F-1 positive-signal CLI + storage + MCP (helpful → bandit reward)
+- [x] D-1..D-6 recordable demo path (script, fixture, pre-roll, brief in Tauri, single-binary install, product-close doc)
+- [x] UX polish 2026-05-11: sticky recommendations, reason details, origin context, cold-start reasoning engine
+
+**MCP host integration (P0a, 2026-05-11)**
+- [x] MCP-1 Claude Code integration doc — `docs/CLAUDE_CODE_INTEGRATION.md`
+- [x] MCP-2 Goose integration doc — `docs/GOOSE_INTEGRATION.md`
+- [x] MCP-3 One-command Claude Code installer — `scripts/install_claude_code.sh` (`--project`, `--no-hint`, `--no-demo` flags)
+
+**Tauri investor UI (P0c, Sprint D 2026-05-10)**
+- [x] UI-1..UI-6 query_id surface, active-context switcher, inline 👍/👎/wrong-ctx buttons, demo fixture restore, smoke script
 
 ---
 
-## Priority 0 — Recordable demo (gates everything else)
+## P0 — Two surfaces, one engine (MCP wedge → Tauri flagship)
 
-Sprint C-2 unlocked the *retraction beat* (the demo's hook). Now ship a clean recordable demo before any further engine work. Items are sequential — do not parallelize without explicit redirect.
+**Strategic frame (2026-05-11, after investor input + second-pass review):** TraceMind ships *two complementary surfaces*, both P0:
 
-- [x] **D-1: 3-minute "day in the life" script** — `docs/DEMO_SCRIPT.md`. Five shots; retraction beat in shot 2. Pre-roll uses `tracemind demo restore` + `tracemind demo preroll`.
-- [x] **D-2: Pre-warmed demo fixture** — `tracemind demo restore`. ~15 entities, 16 triples, 1 contradiction, 4 open + 5 resolved commitments, deterministic UUIDv5 from a frozen namespace. Sidecar persistence (`memory.db.contradictions.json`) so the contradiction survives across CLI invocations.
-- [x] **D-3: Real ambient capture in demo path** — `tracemind demo preroll [--seconds N]` spawns the existing `tracemind-capture` daemon silently (stdout/stderr suppressed) for the pre-roll window, then reaps it. Resolves the binary via `$TM_CAPTURE_BIN` → sibling executable → PATH.
-- [x] **D-4: Brief renders in the Tauri app** — new `cmd_brief` IPC + `BriefView.tsx` render the same DailyBrief the CLI shows, with the contradictions row at the top. `Brief` is the new default landing tab. The `models/**/*` glob is satisfied by the existing `models/manifest.json` placeholder.
-- [x] **D-5: Single-binary install** — `scripts/install.sh`. Detects platform, downloads release tarball, optional SHA256 verification, installs `tracemind` / `tm-mcp` / `tracemind-capture` to `/usr/local/bin` (or `~/.local/bin`), creates `~/.tracemind/`. Idempotent.
-- [x] **D-6: One-screen product close** — `docs/PRODUCT_CLOSE.md`. Three products / one engine: TraceMind (personal memory OS), Engram (memory SDK), Rosetta (semantic code memory). Shared crates listed; install one-liner on the end card.
+- **MCP wedge (P0a)** — `tm-mcp` plugs into Claude Code, Goose, Cline, Cursor. This is the developer wedge — Sequoia partners install in 30 seconds during the meeting; design-partner recruiting runs through MCP-host communities.
+- **Tauri flagship (P0c)** — the consumer surface where the user goes when they want to *see* their memory: brief panel, context switcher, contradiction badges, calibration view. The MCP integration is the *first* surface; the Tauri app is where users live longer-term.
 
-**Why P0:** items 1–4 unlock the recorded demo. 5–6 are needed before screen-sharing to anyone outside.
+Two surfaces tell a stronger story than one — Vercel led CLI → dashboard, Linear led Mac app → web, Cursor led editor → enterprise. The MCP-only framing risks repositioning the company as a memory plugin (a Plaid) instead of a memory product (a Notion). Both surfaces stay P0 until W2 retention clears the seed gate, at which point Tauri investment intensifies.
 
----
+### P0a — MCP host distribution (the channel)
 
-## Priority 0.5 — Context segmentation (Sprint C-0, NEW 2026-05-10)
+MCP-1..MCP-3 shipped 2026-05-11 (see Shipped above). Open work:
 
-**Wedge-critical.** Investor review on 2026-05-10 flagged the demo's cross-document bridge (Rondo↔TraceMind) as a *misfeature*: local machines have more context crowding than cloud (one laptop hosts Sidewalk, Horseshoe, Rondo, TraceMind, personal life). Without context discipline, a local memory OS is strictly worse than separate cloud accounts. The pitch is "system of intents + trust on-device" — and trust collapses the first time TraceMind draws an irrelevant parallel.
+- [ ] **MCP-4 One-command Goose installer** — `scripts/install_goose.sh`. Mirror of MCP-3 for Goose: edits `~/.config/goose/config.yaml`, writes `.goosehints`, restores fixture, prints the 4-prompt demo.
+- [ ] **MCP-5 Submit to Anthropic's MCP servers directory + Goose extensions registry** — both maintain public lists of MCP servers. Landing on those lists is free organic distribution.
+- [ ] **MCP-6 One-sentence pitch propagated** — replace any "system of intents" / "contradiction-aware-first" / "never blurred" lead copy on `README.md`, `tracemind.dev`, MCP host directory entries with the W-7 wedge sentence: *"Ambient memory for every AI you use — captures what you do, scopes itself to the right context, learns your boundaries, never uploaded."* Cross-ref P1 W-7 (single source of truth for the line).
+- [ ] **MCP-7 Cline + Cursor integration docs** — 30-minute write-ups each. Cline is MCP-native and ships in VS Code; Cursor's MCP support is recent but landed. Both have aggressive early-adopter communities — direct DP-1 recruiting channels. Scheduled Q3 per PROJECT_2026.md.
 
-**Design shape:** decoupled-by-default, opt-in coupling via accumulated positive signal, negative-feedback first-class.
+### P0b — Design partner recruitment (the goal)
 
-Ordering: blocks both Tier-1-as-default and Sprint-D demo polish. Do C-0 first, then return to Priority 1.
+Without a named outside user using TraceMind every day, no later work compensates. This is the rate-limiting step. The integration docs above (MCP-1..MCP-3) **are** the onboarding kit — DP-2 below is no longer a blocking write-up, it's a polish + screen-recording job.
 
-- [x] **C-0.1 Schema (landed 2026-05-10)** — `contexts` + `negative_signals` tables and additive `context_id` column on `captured_signals` are created on every `GraphStore::open` via `tm_graph::context::init_schema`. Idempotent (re-runs are no-ops). `kg_relations` / `entities` will carry `context_id` inside their skg JSON `properties` blob (next slice — keeps skg's schema untouched). Migration of legacy stores is implicit: pre-existing rows have NULL `context_id`, which the retrieval filter will always treat as "always visible".
-- [x] **C-0.2 Active-context state (landed)** — `~/.tracemind/active_context.json` with atomic tempfile-rename writes; `ActiveContext::load / save / clear` in `tm-graph::context`.
-- [x] **C-0.3 Context CRUD (landed)** — `GraphStore::{create_context, list_contexts, get_context_by_name, write_negative_signal, negative_weight_for_query}`. 5 unit tests pass (`cargo test -p tm-graph context::`).
-- [x] **C-0.4 CLI surface (landed)** — `tracemind context create <name> [--tags t1,t2]`, `context list` (marks active with `*`), `context use <name>`, `context current`, `context clear`. Smoke-tested end-to-end.
-- [x] **C-0.5 Ingest tagging (landed 2026-05-10)** — `IngestPipeline::open` loads `ActiveContext` from `<data_dir>/active_context.json` (sibling of `memory.db`) and calls `graph.set_active_context(...)` once. `GraphStore::upsert_entity`, `upsert_triple`, `log_signal`, and `insert_signal_with_embedding` all read the borrowed `active_context_id` and tag new rows: entities and triples stash the UUID in their skg `properties` JSON; `captured_signals` writes the dedicated `context_id` column. Round-trip tests for entity / triple / signal tagging + unscoped (NULL) inheritance pass (`cargo test -p tm-graph store::tests::{entity_tagged_with_active_context, entity_untagged_when_no_active_context, triple_tagged_with_active_context, signal_tagged_with_active_context, entity_in_active_scope_includes_unscoped}`).
-- [x] **C-0.6 Scoped retrieval (landed 2026-05-10)** — `RetrievalEngine` carries a `cross_context: bool` field (default `false`) with `set_cross_context(bool)` setter. After per-query entity / triple / signal loading, results are post-filtered: rows whose `context_id` differs from `graph.active_context_id()` are dropped; unscoped (NULL) rows always pass. Triples are additionally pruned if either endpoint was filtered out. CLI surfaces `--cross-context` on both `tracemind query` and `tracemind ask`; MCP `memory_query` accepts `cross_context: boolean` (default false). Integration test in `tm-retrieval::engine::tests::retrieval_scopes_to_active_context` covers both modes.
-- [x] **C-0.7 Cross-context penalty + reward decomposition (landed 2026-05-10)** — two things land together so the negative-feedback loop actually closes. (1) After the rerank phase, when `cross_context=true` and an active context is set, candidates whose entity carries a *foreign* `context_id` take a soft `-0.15` score adjustment and the candidate list is re-sorted. Unscoped (legacy NULL) rows and same-context rows are untouched. (2) Every `query()` mints a `query_id: Uuid` that the retrieval trace, the new `PendingReward.query_id`, and the new `RetrievalResult.query_id` field all share — so `tracemind not-related <query_id> <result_id>` ties back to the originating bandit pull. `finalize_pending_reward` now reads `graph.negative_weight_for_query(pending.query_id)` and clamps `final_reward = (relevance_reward - Σ negative_weights)` into `[0, 1]` before calling both `UcbBandit::register_reward` and `LinUcbBandit::register_reward`. Tests: `tm-retrieval::engine::tests::{not_related_signal_subtracts_from_bandit_reward, cross_context_penalty_reorders_candidates}`.
-- [x] **C-0.8 Negative feedback CLI (landed 2026-05-10)** — `tracemind not-related <query_id> <result_id> [--weight w] [--kind k] [--context-a u] [--context-b u]` writes a `negative_signals` row. Separate top-level command (not `feedback --not-related`) to preserve the existing positional `feedback <arm> <reward>` API. Reward decomposition helper (`tm_graph::negative_weight_for_query`) ships; consuming it in `UcbBandit::register_reward` is wired in the retrieval-filter slice. MCP equivalent (`memory_feedback {kind: "not_related"}`) still pending.
-- [ ] **C-0.9 Brief + UI surfacing** — daily brief header shows the active context; per-row context tag rendered next to each result; Tauri brief view picks this up via existing `cmd_brief`.
-- [x] **C-0.10 Demo update (landed 2026-05-10)** — `scripts/demo_real.sh` fully rewritten. Shots 1 + 2 now create + activate named contexts (`rondo`, `tracemind`) before ingest, so every entity / triple / signal is tagged at write time. Shot 6 is the new scoped-recall flagship: the *same* query "the bet on running the brain on-device" is run once in each context and returns two different, properly scoped answers — explicitly framing context blur as a misfeature instead of celebrating it. A new shot 8 (replacing the old "cross-document bridge" shot) demonstrates the full negative-feedback loop end-to-end: an opt-in `--cross-context` query surfaces a bridge, the demo parses the printed `Query: <uuid>` line, files `tracemind not-related <query_id> <result_id> --kind cross_context_bridge`, then a follow-up query finalises the pending reward so the bandit consumes the penalty. Smoke-tested clean against the rebuilt release binary. **Sub-fix that landed with this slice:** `RetrievalEngine::open` now reads `<data_dir>/active_context.json` the same way `IngestPipeline::open` has since C-0.5 — without this, the CLI / MCP query path never picked up the user's active scope, so C-0.6's filter was dormant outside tests.
-- [-] **C-0.11 Tests** — context CRUD + active-context-file + negative-signal sum tests landed (5 in `tm-graph::context::tests`). Ingest-writes-context-id tests landed for entity / triple / signal (`tm-graph::store::tests`) plus an end-to-end retrieval-scope test in `tm-retrieval::engine::tests` (active scope filters foreign entities, `cross_context=true` bypasses). Reward-decomposition + cross-context penalty tests landed (2 in `tm-retrieval::engine::tests`). Schema-migration test (legacy DB → migrated DB with NULL context_ids) still pending.
+- [ ] **DP-1 Recruit list** — name 10 candidates. Now drawn from MCP host communities: Claude Code power users on r/ClaudeCode + Anthropic Discord, Goose Discord regulars, Cline GitHub stargazers, founders under NDA, therapists, coaches, researchers, journalists, IP lawyers. Personal email/DM each one, *not* a broadcast post.
+- [-] **DP-2 Onboarding kit** — `docs/CLAUDE_CODE_INTEGRATION.md` + `docs/GOOSE_INTEGRATION.md` + `scripts/install_claude_code.sh` cover the written kit. Remaining: 60-second screen recording showing `bash scripts/install_claude_code.sh` → `claude` session → retraction beat firing on prompt 3. Single `curl | sh` line at the top of the kit.
+- [ ] **DP-3 Instrumentation (privacy-preserving, local-only)** — local-only daily-active flag in `~/.tracemind/usage.json`: timestamp of last query, last `helpful` signal, last `not-related` signal. User opts in to share via `tracemind share-usage --to <email>` which prints the JSON for them to paste back. No telemetry.
+- [ ] **DP-4 Weekly check-in script** — 15-minute call per design partner, weekly: "what did you ask Claude/Goose this week? what did TraceMind get wrong? what would make you uninstall the MCP?" Write it down. This is the dataset.
+- [ ] **DP-5 W2 retention gate** — 5 partners onboarded by 2026-06-15. W2 retention measured by `usage.json` returns ≥ 3 active days in week 2 from at least 3 of 5. Below that → the wedge is wrong, stop building, re-brainstorm.
+- [ ] **DP-6 Testimonial video** — 60-second on-camera from the partner with the strongest W2: pain → what TraceMind does inside their Claude Code / Goose session → "I won't go back." This is slide 1 of the seed deck.
 
-**Why P0.5:** The L3 / recommendation surface is only valuable when cross-context parallels are *real*. Without C-0, the LLM amplifies bad bridging. C-0 is foundational to every later tier.
+**Exit criteria:** DP-6 captured. Without it, do not advance to P3 or beyond.
 
----
+### P0c — Tauri consumer surface (the flagship)
 
-## Priority 0.7 — Feedback-driven self-improvement loop (GEPA + MIPRO)
+The Tauri app is where the user goes when they want to *see* memory, not just *use* it inside a chat. It must be visibly product-grade by the seed pitch — slide 2 of the deck is a Tauri walkthrough.
 
-**Wedge claim:** every memory product gets better by scaling *capture*; we get better by scaling *feedback*. C-0.7 closed the negative-feedback loop end-to-end (user files `not-related`, bandit reward is decomposed); this priority generalises that into a full on-device optimizer. Full design in `docs/FEEDBACK_LOOP.md`.
+UI-1..UI-6 + 2026-05-11 UX fixes shipped (see Shipped above). Open work:
 
-- [x] **F-1 Positive signal CLI + storage + MCP (landed 2026-05-10)** — new `positive_signals(id, query_id, result_id, kind, context_id, weight, created_at)` table; `GraphStore::{write_positive_signal, positive_weight_for_query}`; `tracemind helpful <query_id> <result_id>` CLI + Tauri `cmd_helpful`; `finalize_pending_reward` composes `(relevance + Σ positives - Σ negatives).clamp(0, 1)`. **MCP `memory_feedback`** dispatches all three channels (`helpful` → `positive_signals`; `not_related` / `cross_context_bridge` → `negative_signals`) via a single tool — see `crates/tm-mcp/src/main.rs::handle_memory_feedback`. Smoke-tested end-to-end over JSON-RPC stdio.
-- [ ] **F-2 Corpus extractor** — new `tm-eval::corpus` module. Reads `traces.jsonl × {positive_signals, negative_signals × recent.jsonl}` and materialises a typed `EvalCorpus { examples: Vec<EvalExample> }`. Dedup on `(query_text, ts_bucket)`. Excludes ingest traces. Idempotent test. ~1 day.
-- [ ] **F-3 Parameter surface (`TuneConfig`)** — move ~20 named knobs (planner thresholds, UCB1 / LinUCB exploration, rerank α, RRA weights, MMR λ, `cross_context_penalty`, low-confidence threshold, extractive template set) from inline constants into `tm-types::TuneConfig`. Load from `~/.tracemind/configs/active.toml` (default shipped with the release). CLI `tracemind config {show, edit, rollback, diff <id>}`. ~2 days.
-- [ ] **F-4 `tm-eval` crate** — replays an `EvalCorpus` against a given `TuneConfig`, returns per-axis scores `EvalReport { f1, em, engagement_reward, neg_signal_rate, latency_p50, latency_p95 }`. Wire LoCoMo bench harness as one of the input corpora so we can co-optimise on user feedback *and* the public benchmark. ~1.5 days.
-- [ ] **F-5 `tm-tune` crate (GEPA-lite, on-device)** — idle-time binary that maintains a pareto frontier of `TuneConfig` candidates per query class. Mutation menu: numeric jitter, threshold step, extractor template swap, demo curation (Tier-1 gated). CLI `tracemind tune {run [--budget-min 10], frontier, promote <id>}`. Auto-promote is **off by default** — user must `promote` to swap `active.toml`. Atomic-symlink rollback. ~3 days.
-- [ ] **F-6 MIPRO-style few-shot demo selection (Tier-1)** — once `local-llm` is on, extend the mutator with "demo swap" actions: choose 3 examples for the Tier-1 prompt from the user's high-positive corpus, optimised per-task-kind. Joint search over (instruction, demos). ~2 days, blocked on Tier-1 wiring.
+- [ ] **UI-7 60–90s Tauri walkthrough screen recording** — human capture session. Slide 2 of seed deck. Sprint D ends when this exists.
+- [ ] **UI-8 First-run onboarding flow** — sample data → meaningful brief in 60 seconds. Critical for any non-developer DP candidate.
+- [ ] **UI-9 Brief panel polish** — read-on-open, dismissable, archived. C-0.9 (active context in brief) lives here.
+- [ ] **UI-10 Commitment timeline view** — vertical, color-coded by state, drawer on click. The intent-arc story needs a surface. PROJECT_2026.md Q4 commitment.
+- [ ] **UI-11 Calibration panel** — predictions made, outcome accuracy, Brier score. The "world model that works" slide. PROJECT_2026.md Q4 commitment.
+- [ ] **UI-12 Settings + privacy panel** — clear data, export, opt-in toggles for any future telemetry. Critical for trust-signaling to privacy-conscious DPs.
+- [ ] **UI-13 Capture-permissions panel (Q2, seed-critical)** — per-source toggle for clipboard / shell / screenshot / browser / audio / calendar; "last captured at" timestamp; event-count chip; one-click "forget all captures from this source." Powers CAP-1.
+- [ ] **UI-14 Context-switch suggestion banner** — when CTX-2 fires, Tauri brief shows a dismissable banner: "This might belong in your *work* context. Switch?" One-click switch + ingest in new context. Negative dismiss triggers `wrong_context_suggestion` feedback.
 
-**Why P0.7:** The Tier-1 LLM and the L3 prediction surface both ride on the same retrieval stack. Making the stack *learn from the user's own corrections* is the moat — it is the one capability cloud competitors can never copy without uploading the feedback corpus.
+**Exit criteria:** UI-7 recorded, UI-8 shipped, the Tauri app is the answer to *"after they install the MCP, where do they spend time?"*
 
 ---
 
-## Priority 0.8 — Investor demo UI sprint (Sprint D, NEW 2026-05-10)
+## P1 — The wedge proof (persistence + ambient capture + adaptive context, retraction as moat)
 
-**Why P0.8:** The Sprint C engine work is invisible from the CLI demo — investors can't *see* context scoping, retraction, or the closing feedback loop. The Tauri shell already has 27 commands + a 354-LoC API surface and BriefView landing tab; we need 4 surgical additions to make the demo *feel* like a product. Ordering matters — each item is the smallest unit that produces a visible-in-screen-record win.
+The user-felt wedge — what makes someone say "I won't go back" in week 1 — is *persistence + ambient capture + adaptive context*. Contradiction is the *architectural moat* that protects the wedge from being commoditised. The head-to-head must lead with the wedge demos and use retraction as the closing differentiator.
 
-- [-] **UI-1 Branch + Tauri build sanity (landed 2026-05-10)** — branch `sprint-d-investor-ui` cut from `2828160`. `cargo build -p tm-tauri` + `cargo build --workspace` both clean — the `models/**/*` glob block referenced in older memory is no longer present.
-- [x] **UI-2 `query_id` on Tauri `QueryResponse` (landed 2026-05-10)** — `QueryResponse` now carries `query_id: String` straight from `RetrievalResult.query_id`. Frontend `QueryResponse` interface in `crates/tm-tauri/ui/src/api.ts` mirrors it. Inline buttons (UI-5) consume it.
-- [x] **UI-3 Active-context badge + switcher (landed 2026-05-10)** — new Tauri commands `cmd_context_list`, `cmd_context_current`, `cmd_context_use`, `cmd_context_create`, `cmd_context_clear`. Frontend `ContextSwitcher.tsx` renders a sidebar dropdown showing the active context, lists every context, allows inline switch + create. `cmd_context_use` hot-swaps the live `RetrievalEngine`'s active context via a new `set_active_context(&mut self, Option<Uuid>)` method on the engine (graph already used interior mutability). No app restart required.
-- [x] **UI-4 F-1 backend: `positive_signals` + `helpful` CLI/MCP (CLI landed 2026-05-10)** — new `positive_signals(id, query_id, result_id, kind, context_id, weight, created_at)` table in `tm_graph::context::init_schema`. `GraphStore::{write_positive_signal, positive_weight_for_query}` mirror the negative-signal helpers. `tracemind helpful <query_id> <result_id> [--weight w] [--kind k] [--context-id u]` CLI command writes a row (default weight 0.3). `finalize_pending_reward` now composes `(relevance + Σ positives - Σ negatives).clamp(0, 1)` so both channels feed the bandit symmetrically. Tests: `tm_graph::context::tests::positive_signals_sum_correctly` + `tm_retrieval::engine::tests::helpful_signal_adds_to_bandit_reward`. **MCP `memory_feedback {kind: "helpful"}` still pending** — Tauri `cmd_helpful` ships with this slice, MCP surface deferred to the next slice.
-- [x] **UI-5 Inline 👍 / 👎 / wrong-ctx buttons on QueryView rows (landed 2026-05-10)** — per-entity row now renders three icon buttons. 👍 → `cmd_helpful(query_id, entity_id)` (weight 0.3, kind `helpful`); 👎 → `cmd_not_related(... kind="not_related")` (weight 1.0); "wrong ctx" → `cmd_not_related(... kind="cross_context_bridge")` (weight 1.0). UI is optimistic: row dims and replaces the buttons with an "noted ✓" / "filed not-related" / "filed wrong-context" pill on click, rolls back on backend error. Stored `rowFeedback` map clears on every new query.
-- [x] **UI-6 Demo fixture restore (landed 2026-05-10)** — `tracemind demo restore` runs cleanly against the C-0 schema. `init_schema` creates the new `contexts` / `positive_signals` / `negative_signals` tables on every open, so no migration drift. Extended the fixture to seed **two deterministic contexts** (`Mercury work`, `TraceMind dev`) keyed by UUIDv5 from the frozen `DEMO_NAMESPACE`. The 15 entities + 16 triples are now partitioned across the two scopes (8/7 entities, 9/7 triples — Alice/Bob/Mercury + the loves/hates contradiction live in Mercury work; demo project + Postgres/SQLite + investor pitch live in TraceMind dev). Verified: brief still renders with stable contradiction short IDs (`b6160aa5 ↔ 1b7b36b3`); `tracemind context list` returns both rows; `tracemind context use "Mercury work"` swaps the active scope; second `tracemind demo restore --force` is idempotent (still 2 contexts / 15 entities).
-- [-] **UI-7 End-to-end smoke + recording (smoke + docs landed 2026-05-10; recording still pending)** — new `scripts/demo_smoke.sh` (11 checks) drives the full flow from the CLI: `demo restore` → `context list` → scoped ingest into each context → scoped query → `tracemind helpful $QID alice` (verifies `positive_signals` row lands) → `tracemind not-related $QID postgres --kind cross_context_bridge` (verifies `negative_signals` row lands) → `brief` re-renders with the contradiction + commitments intact. All 11 checks pass against `release` build. `docs/DEMO_SCRIPT.md` rewritten: context-segmentation beat is now **Shot 2** (0:25 – 1:00), retraction beat moves to Shot 3, clipboard grounding → Shot 4, outcome prompt → Shot 5, product close → Shot 6. Hard-requirements section adds two new bullets (UI-3 switcher visible, UI-5 buttons write signals). **Remaining sub-item: the 60-90s screen recording itself** — needs a human capture session against the Tauri app with screen capture + voiceover.
+The format is **same host (Claude Code), different MCP memory servers** — not different apps. Four `claude` sessions side-by-side, each with a different memory MCP plugged in, same prompts in, different outcomes out — plus a fifth pane showing the Tauri brief with ambient-captured entities from clipboard/shell/screenshot.
 
-**Out of scope for Sprint D** (deferred to Sprint E): L2/L3 surfaces, force-directed memory garden, voice capture, calibration panel. Those are P3/P4 — this sprint is *only* the engine surfaces that already exist.
+### Wedge proof (lead with this)
 
----
+- [ ] **W-1 Persistence head-to-head** — same 90-second Claude Code scenario (fact stored in session A, recalled in fresh session B with a different working directory) run against Mem0, Letta, Zep, TraceMind. Document each failure mode on the fresh-session recall prompt. Save transcripts.
+- [ ] **W-2 Context-aware head-to-head** — three sub-scenarios on a 100-pair labeled set: (a) **correct isolation** — fact stored under context A, query in context B → nothing returned; (b) **correct bridge** — same person/concept genuinely present in both contexts → bridge fires with a visible label; (c) **correct switch suggestion** — user queries with content that scores poorly in active context but high in another → TraceMind proposes switching contexts. Score: TP-bridges − FP-bridges; target ≥ 92%. No competitor proposes context switches; document.
+- [ ] **W-3 Cross-session persistence microbenchmark** — 50 hand-labeled (session-A-store, session-B-query) pairs across 5 categories. Target ≥ 90% TraceMind.
+- [ ] **W-8 Ambient capture wedge demo** — record a 60-second flow: install TraceMind, work normally for 10 minutes (copy a few snippets, run shell commands, take 2 screenshots), then ask Claude Code about something you did. TraceMind answers from auto-captured entities; competitors return nothing because they were never told. This is the *"I never typed any of this in"* beat.
 
-## Priority 1 — Quality (highest F1 impact, pure code work)
+### Moat proof (close with this)
 
-### LoCoMo Tier-0 remaining fixes
+- [ ] **W-4 Retraction microbenchmark** — 50 hand-labeled commitment/retraction pairs with adversarial paraphrases (negation, time-shift, partial retraction). Target ≥ 80% TraceMind; competitors near 0%.
+- [ ] **W-5 Side-by-side recording** — 4-pane Claude Code capture + 1-pane Tauri brief, 90–120 seconds, four beats: (1) persistence recall in a fresh session, (2) adaptive context (isolation + switch suggestion), (3) ambient-captured entity surfacing, (4) retraction. No narration. Posted publicly on launch.
 
-- [ ] **Heuristic NER for span extraction** — dates, money, named entities, percentages. Return the span ("April 20", "$2.5M") instead of the full sentence. (Est. +8–15 F1)
-- [ ] **Yes/no oracle** — pre-screen `Did/Was/Is/Has` questions; if predicate disagrees with retrieved evidence, emit "No" + the contradicting fact. Tier-0 extractive cannot do this today. (Est. +5–10 F1)
-- [ ] **Recency bias for duplicate-entity turns** — when multiple turns mention the same entity, prefer the latest mention. (Est. +3–5 F1)
+### Public artefacts
 
-### Tier-1 as default
+- [ ] **W-6 Public leaderboard page** — `tracemind.dev/memory-bench` shows W-3 (persistence) + W-2 (context-aware) + W-4 (retraction) + W-8 (capture coverage demo) scores for TraceMind and each competitor. Monthly refresh. Code in `crates/tm-bench-memory/`.
+- [ ] **W-7 One-sentence wedge propagated** — replace any "system of intents" / "contradiction-aware-first" / "never blurred" lead copy with: *"Ambient memory for every AI you use — captures what you do, scopes itself to the right context, learns your boundaries, never uploaded."* README, deck slide 1, `tracemind.dev`, MCP tool descriptions, integration docs.
 
-- [ ] **Make Tier-1 the shipping default** — today it only activates with `--features local-llm`. Needs: first-run download flow with progress UI, auto-download on first query when weights missing, Tier-1 dispatched for all synthesis (not just structured tasks).
-- [ ] **Run LoCoMo mini-set with Tier-1** — measure actual F1 gain from LLM synthesis vs. extractive. Gate: ≥60 F1.
+**Exit criteria:** W-5 video live, W-3 ≥ 90%, W-2 ≥ 92%, W-8 demo recorded, W-7 propagated. Retraction (W-4) is the second-slide moat number, not the headline.
 
 ---
 
-## Priority 2 — Wire isolated crates into the pipeline
+## P1b — Ambient capture surface (the wedge moment)
 
-### Wire tm-tms into ingest + retrieval (Sprint C-2 — mostly shipped)
+Promoted from P10 (deferred) on user feedback (2026-05-11): *people will not hand-feed memory; we must auto-populate as much as possible with explicit per-source permissions.* This is the actual *"memory just is"* product, not a future indulgence. Without it, the wedge collapses to "a place to type things you'd otherwise type into ChatGPT memory" — not differentiated.
 
-- [x] Call `TmsEngine.assert_belief()` at ingest time when entities/triples are upserted
-- [x] Contradiction detection at ingest (cosine < -0.8 via tm-tms threshold; schema/temporal triggers still pending)
-- [x] Belief-aware retrieval ranking: hide `Out`, downrank `Contradicted` via `effective_confidence`
-- [x] Surface contradictions in daily brief via tm-reflect
-- [ ] Schema-constraint and temporal-overlap contradiction triggers (in addition to cosine)
+### Q2 — seed-critical (already-wired sources + screenshot + browser)
+
+- [ ] **CAP-1 Per-source permissions schema** — `~/.tracemind/capture_permissions.toml`, keyed by source (clipboard, shell, screenshot, browser, audio, calendar). Each entry: `enabled`, `granted_at`, `last_event_at`, `event_count`. Tauri settings panel (UI-13) reads/writes this. CLI mirror: `tracemind capture {enable,disable,status} <source>`.
+- [ ] **CAP-2 Clipboard + shell first-run backfill** — on install (or `tracemind capture backfill`), ingest the last 7 days of shell history + recent clipboard ring (if available on macOS via Pasteboard.changeCount log; Linux via parcellite-like daemons; Windows TBD). Seeds ~50 entities so the *first* query post-install is non-empty. Critical for the "60-second meaningful brief" UX-8 promise.
+- [ ] **CAP-3 Screenshot OCR + caption capture** — opt-in. On screenshot capture (system shortcut), pipe through Tesseract OCR + Moondream / SigLIP for caption, ingest as `Capture::Screenshot { ocr_text, caption, sha256 }`. Stored in `~/.tracemind/captures/screenshots/` referenced by hash; raw images never leave device. Privacy: skip captures that contain detected password fields / credit-card OCR.
+- [ ] **CAP-4 Browser bookmarklet / extension stub** — minimal: a bookmarklet posts current `{url, title, selection, ts}` to `http://localhost:7710/capture` (loopback only, token-gated). Full WebExtension lands in Q3. The bookmarklet is enough to demo *"I starred this article — TraceMind remembers and links it."*
+- [ ] **CAP-5 Capture-aware ingestion throttle** — `IngestPipeline` accepts a `Source` enum; rate-limits + dedupes per source. Clipboard dedups within 30s, shell dedups within session, screenshots dedup by `sha256`. Prevents capture floods from breaking query latency.
+
+### Q3 — coverage expansion
+
+- [ ] **CAP-6 Audio capture (Whisper-tiny, opt-in hotkey)** — global hotkey starts/stops; Whisper-tiny runs on-device; transcript ingested as `Capture::Audio`. No always-on listening unless explicitly enabled. Hotkey configurable.
+- [ ] **CAP-7 Calendar import** — macOS EventKit / Google Calendar OAuth (read-only). Events become entities; attendees become relationships; agenda joins the brief.
+- [ ] **CAP-8 Full browser extension** — replaces CAP-4 bookmarklet. Captures: visited pages, dwell time, copied text, "save to TraceMind" button. Permissions UI built-in.
+- [ ] **CAP-9 IDE telemetry capture** — VS Code / Cursor extension surfaces file-open / file-edit events as low-priority entities. Cross-references with shell git events for cohesive code-context recall.
+
+### Q4 — cross-modal join
+
+- [ ] **CAP-10 Cross-modal entity edges** — captures from screenshots / audio / code share entities (mention "Pat from Sequoia" in audio → links to a screenshot caption with that name → links to a calendar invite). Cross-modal pipeline (PROJECT_2026 Q4) consumes from these capture pipelines.
+
+### Per-source privacy invariants (non-negotiable)
+
+- Every capture source is **opt-in** at the per-source level. Default install: clipboard + shell on (low-sensitivity); screenshot/browser/audio/calendar off until toggled.
+- Every captured memory carries a `source` field surfaced in the UI ("from screenshot 2026-05-09 14:32").
+- "Forget this source" is one click and irreversibly deletes captures for that source.
+- No capture source ever transmits off-device. Audit by `tracemind capture audit-network` which greps `traces.jsonl` for any outbound URL.
+
+**Exit criteria for seed:** CAP-1..CAP-5 shipped; at least 3 sources live per DP; capture coverage shows up in W-8 demo.
+
+---
+
+## P1c — Performance gate (the wedge collapses without it)
+
+Promoted from "Evaluation infrastructure" on user feedback (2026-05-11): *if init / indexing / query is slow once auto-capture is live, users churn before they feel the magic.* Performance is a product feature, not a footnote.
+
+- [ ] **PERF-1 Performance baseline harness** — `cargo bench --bench perf_baseline` measures: cold-start (process spawn → first MCP response), query p50/p95 (under no load / under 100 events/min capture / under 1000 events/min capture), indexing throughput (events ingested per minute sustained for 10 min), idle RAM, Tier-1 hot-query latency. Output `bench/perf-{date}.json`.
+- [ ] **PERF-2 CI regression gate** — `.github/workflows/perf.yml` runs PERF-1 on every PR; diff vs. main baseline; > 10% regression on any metric blocks merge. Comment posted to PR with the deltas table.
+- [ ] **PERF-3 HNSW vector index (pulled forward to Q2)** — was Q4. Flat scan over SQLite caps out at ~50k entities; auto-capture pushes us past that in week 2. Use `hnsw_rs` or hand-roll; persist to `~/.tracemind/vector_hnsw.bin`.
+- [ ] **PERF-4 Batched embedding + async indexing** — capture pipeline batches embeds in groups of 16 (or 100ms window, whichever first); ingestion writes via a tokio bounded channel so the capture daemon never blocks. Capture latency cap: 5ms p99 (consumer-side); ingestion latency is allowed to lag.
+- [ ] **PERF-5 Lazy ColBERT rerank** — current path always runs MaxSim. Skip rerank when arm 0 (narrow) wins or top-1 vector score > 0.9. Saves ~150ms p50 on the fast path.
+- [ ] **PERF-6 Cold-start audit** — `cargo flamegraph` on `tm-mcp` startup. Likely culprits: tokenizer init, ONNX session warmup, SQLite WAL replay. Target ≤ 1.5s p95 → ≤ 1.0s by Q4.
+- [ ] **PERF-7 Capture-load query stress test** — spawn 1000 events/min synthetic capture load while running a 100-query benchmark. Verify p50 ≤ 500ms (Tier-0) / ≤ 800ms (Tier-1). Required for DP onboarding (DP-5 gates on this passing).
+
+**Exit criteria for seed:** PERF-1, PERF-2, PERF-3, PERF-4, PERF-7 shipped; CI gate enforced; Q2 performance dashboard row green.
+
+---
+
+## P1d — Adaptive cross-context (the misfeature-fix is now active, not passive)
+
+Promoted from passive isolation (Sprint C-0) to active learning on user feedback (2026-05-11): *the system should be smart, not rigid — feedback teaches when bridges are wrong and when the user is in the wrong context altogether.*
+
+- [ ] **CTX-1 Learned bridge threshold per (source_ctx, target_ctx)** — replace fixed C-0 penalty with `~/.tracemind/cross_ctx_thresholds.json`: each pair has a learned threshold initialised at 0.85, decremented by 0.05 on `cross_context_bridge` negative feedback, capped above 0.5. Bridges only fire when retrieval score exceeds the threshold.
+- [ ] **CTX-2 Context-mismatch detector** — after a query, if (top-1 vector score in active context) < 0.4 AND (top-1 score in *any other* context) > 0.7, emit a `ContextSuggestion { suggested_context, confidence }` in the response payload. MCP tool returns it; Tauri brief surfaces it as "this might belong in your *work* context — switch?"
+- [ ] **CTX-3 Bridge labels in UI/MCP** — every bridged result carries `bridge_from: ContextId`. MCP response shows `[from: personal]`. Tauri brief shows a chip. Without visible labels, bridges feel like blur, not bridges.
+- [ ] **CTX-4 Feedback-trained context routing** — `memory_feedback {kind: "wrong_context_suggestion"}` available when the system suggests the wrong switch. Trains a per-(content_topic, context) routing classifier (logistic) that biases future suggestions.
+- [ ] **CTX-5 Context-aware bench** — 100 labeled pairs covering: 30 correct-isolation, 30 correct-bridge, 30 correct-switch-suggestion, 10 adversarial. Score: TP − FP. Target ≥ 85% Q2 → ≥ 92% Q4. Powers W-2.
+
+**Exit criteria:** CTX-1, CTX-2, CTX-3 shipped; CTX-5 bench live; W-2 score ≥ 85% by Q2-end.
+
+---
+
+## P2 — A defensible quality number
+
+The deck currently confesses LoCoMo F1 25.7 vs. a target of 85. That kills the meeting. Either hit a defensible number or do not show one.
+
+- [ ] **Q-1 Tier-1 as shipping default** — auto-download Qwen 2.5 1.5B Q4 on first query, progress UI in CLI + Tauri, no `--features` flag. Tier-0 stays as fallback only.
+- [ ] **Q-2 LoCoMo Tier-0 remaining fixes** — heuristic NER for span extraction (dates, money, named entities; est. +8–15 F1), yes/no oracle (est. +5–10 F1), recency bias for duplicate-entity turns (est. +3–5 F1).
+- [ ] **Q-3 Query rewriting with Tier-1** — paraphrase expansion (3 variants → RRA fusion). Est. +5–8 F1 on multi-hop.
+- [ ] **Q-4 LoCoMo mini-set Tier-1 run** — target ≥ 60 F1. Below 60 → keep iterating; do not put a number on the deck.
+- [ ] **Q-5 Full LoCoMo run (~7000 q)** — only once mini-set hits 60. This is the headline metric.
+- [ ] **Q-6 Replace deck honest-disclosure slide** — swap "F1 25.7 vs 85" for "F1 X on N=7000 LoCoMo, beats Mem0 by Y" *or* cut the slide entirely. No middle ground.
+
+**Exit criteria:** Q-4 ≥ 60. Q-5 only after Q-4.
+
+---
+
+## P3 — Pitch surface rewrite (only after P0/P1 produce artifacts)
+
+The deck is rewriting itself once P0 and P1 land. Order matters — do not rewrite slides before you have the testimonial and the head-to-head.
+
+- [ ] **PR-1 Slide 1 is DP-6** — user's face, user's pain, user's quote. Not architecture.
+- [ ] **PR-2 Slide 2 is W-5** — the 4-pane head-to-head video (persistence → context isolation → retraction). Embedded, autoplay, no narration needed.
+- [ ] **PR-3 Slide 3 is the W-3 / W-2 / W-4 numbers + Q-5 number** — persistence ≥ 90%, context-isolation ≥ 95%, retraction ≥ 80%, LoCoMo F1 ≥ 65. Large type, no apology.
+- [ ] **PR-4 Slide 4 is the wedge sentence (W-7)** — one line, full slide.
+- [ ] **PR-5 Founder slide** — currently missing. Who are you, what have you built, why are you the person to build this. One slide.
+- [ ] **PR-6 90-day forward plan slide** — replaces every honest-self-critique slide. "By August: 10 design partners, W2 ≥ 50%, LoCoMo F1 70, Engram private beta with 3 design partners."
+- [ ] **PR-7 Move three-product close to appendix** — TraceMind alone is the seed pitch. Engram and Rosetta are "what the engine unlocks," not co-equal products. Cut from main flow.
+- [ ] **PR-8 Drop "system of intents" from the top-line** — keep as a technical-appendix frame. Top-line is W-5.
+- [ ] **PR-9 Ask sized to stage** — $500k–$1M pre-seed, not $3M seed. Right round for the artifact set.
+
+**Exit criteria:** PR-1..PR-9 reflected in a single 9-slide deck, ≤ 4 minutes to walk through.
+
+---
+
+## P4 — Feedback-driven self-improvement (the architectural moat slide)
+
+The one architectural claim that cloud competitors *cannot copy without uploading the user's corrections corpus*. Worth a slide once it's real. Until then, it's vapor — keep building.
+
+- [ ] **F-2 Corpus extractor** — `tm-eval::corpus` reads `traces.jsonl × {positive_signals, negative_signals × recent.jsonl}` into `EvalCorpus`. Dedup on `(query_text, ts_bucket)`. Idempotent test.
+- [ ] **F-3 Parameter surface (`TuneConfig`)** — move ~20 named knobs into `tm-types::TuneConfig`, load from `~/.tracemind/configs/active.toml`. CLI `tracemind config {show, edit, rollback, diff <id>}`.
+- [ ] **F-4 `tm-eval` crate** — replays `EvalCorpus` against a `TuneConfig`, returns `EvalReport { f1, em, engagement_reward, neg_signal_rate, latency_p50, latency_p95 }`. Wire LoCoMo as one corpus.
+- [ ] **F-5 `tm-tune` crate (GEPA-lite, on-device)** — idle-time pareto frontier per query class. CLI `tracemind tune {run, frontier, promote <id>}`. Auto-promote off by default.
+- [ ] **F-6 MIPRO-style demo selection (Tier-1)** — extend mutator with demo-swap actions for Tier-1 prompts. Joint search over (instruction, demos). Blocked on Q-1.
+
+**Exit criteria:** one design partner's `EvalReport` improves measurably over a week of their own feedback. That graph is a slide.
+
+---
+
+## P5 — Engine polish that visibly helps retention
+
+Only items that a design partner would *notice* in week 2. Everything else moves to P8+.
+
+- [ ] **C-0.9 Brief + UI surfacing of active context** — brief header shows active context; per-row context tag in Tauri brief view.
+- [ ] **C-0.11 Schema-migration test** — legacy DB → migrated DB with NULL context_ids. Closes Sprint C-0.
+- [ ] **UI-7 60–90s screen recording of full Tauri flow** — human capture session. Used in onboarding kit (DP-2) and pitch.
+- [ ] **WorkingMemory ring buffer** — `tm-types::WorkingMemory` feeds session context into follow-up queries. Visible: "remembers what we were just talking about."
+- [ ] **NarrativeResponse** — replace raw `RetrievalResult` / `AnswerResponse` at user-facing boundaries with `{ text, citations, related_threads, surprise }`.
+- [ ] **First-run onboarding in Tauri** — sample data → meaningful brief in 60 seconds. Gates DP-2.
+
+---
+
+## P6 — Wire-up debt (only if a partner hits it)
+
+Drop everything in this section unless a design partner files it as a bug. Do not pre-build.
+
+- [ ] Schema-constraint + temporal-overlap contradiction triggers (TMS already has cosine)
 - [ ] Persist TMS state across restarts (currently rebuilt from live triples)
-
-### Wire tm-temporal into tm-graph (Sprint C-1 — shipped)
-
-- [x] Bitemporal substrate via embedded `TemporalStore` (sibling DB); write-through on every entity/triple upsert
-- [x] `GraphStore::entity_at`, `triple_at`, `entity_history`, `triple_history`
-- [ ] `belief_revisions` table for explicit retraction provenance (separate from JTMS retractions)
+- [ ] `belief_revisions` table for explicit retraction provenance
 - [ ] Time-machine queries in CLI + MCP: "what was I thinking in March?"
 - [ ] `GraphStore::diff(from, to)` for change inspection
+- [ ] `NeedDetector` / `SentimentScorer` / `ActionMatcher` in tm-capture
 
 ---
 
-## Priority 3 — Product (session quality + UX)
+## P7 — Tauri surfaces a partner has asked for
 
-### WorkingMemory ring buffer
+Each item below stays in `[ ]` until a partner names it. Do not build speculatively.
 
-- [ ] Define `tm-types::WorkingMemory` — Vec-backed in-RAM ring of last N turns + retrieval results
-- [ ] Feed working memory into subsequent queries (session context for follow-ups)
-- [ ] Include working memory in `ContextSnapshot` at commitment time
-
-### NarrativeResponse
-
-- [ ] Define `NarrativeResponse` in tm-types: `text`, `citations`, `related_threads`, optional `surprise`, optional `voice_audio`
-- [ ] Replace raw `RetrievalResult` / `AnswerResponse` at all user-facing boundaries (CLI, MCP, Tauri)
-
-### Query rewriting
-
-- [ ] Tier-1 paraphrase expansion: expand raw question into 3 paraphrases, run all through retrieval, RRA fusion. (Est. +5–8 F1 on multi-hop)
-
-### Auto-detection pipeline components
-
-- [ ] `NeedDetector` in tm-capture — mine "I need to", "problem is", "goal is" patterns from capture stream
-- [ ] `SentimentScorer` — heuristic valence scoring from captured text (keyword-based first)
-- [ ] `ActionMatcher` — match shell commands, file edits, git commits to open commitments via embedding similarity
-
----
-
-## Priority 4 — Tauri UI surfaces
-
-- [ ] Daily brief panel (read on open, dismissable, archived)
-- [ ] Commitment timeline (vertical, color-coded by state, click → drawer with full context)
-- [ ] Intent arc visualization (Need → Sentiment → Commitment → Action → Outcome graph)
+- [ ] Commitment timeline (vertical, color-coded, drawer on click)
+- [ ] Intent arc visualization
 - [ ] Memory garden (force-directed entity graph)
-- [ ] Capture timeline (chronological ingest view)
+- [ ] Capture timeline
 - [ ] "What I noticed" surprise panel
-- [ ] First-run onboarding (sample data → meaningful brief in 60 seconds)
 - [ ] Settings panel (personality, voice, brief schedule)
-- [ ] Calibration panel (predictions made, outcome accuracy, Brier score, pattern stats)
+- [ ] Calibration panel (Brier score, pattern stats)
 
 ---
 
-## Priority 5 — Voice + capture moat
+## P8 — Post-seed commitments (Q4 2026 → Q1 2027 per PROJECT_2026.md)
 
-- [ ] `tm-voice` crate — Whisper-tiny STT (39MB) + Piper TTS (60MB)
-- [ ] Global hotkey ⌘⇧Space → hold-to-record → Tier-1 normalizes to Commitment draft
-- [ ] Daily brief TTS playback
-- [ ] Global hotkey ⌘⇧M for quick capture
-- [ ] Screenshot capture + VLM caption (SigLIP-small for encoding, Moondream/Phi-3.5-vision for caption)
-- [ ] Obsidian vault import (walk all Markdown files, ingest)
-- [ ] Browser extension (capture active tab content)
+These are *not* indefinitely deferred — PROJECT_2026.md commits them in the quarterly roadmap. They unlock only after the seed gate clears (P0–P3 produce artifacts) but they are scheduled, not optional. Listed here in execution order:
 
----
+### Q4 2026 — second surface + first revenue
 
-## Priority 6 — Engine depth (Phase 5A)
+- [ ] **B-1 Engram public release** — finalize `Belief` trait API, `tm-engram` full implementation, MCP tools (memory_believe, memory_retract, memory_world_at, memory_contradictions), standalone Engram MCP server, Python + TypeScript wrappers, integration test with Claude Code, publish to crates.io, benchmarks + 3 example agents. Open-core; paid commercial license.
+- [ ] **B-2 First Engram commercial deal** — target $X00–$2k/year/dev at one regulated org (HIPAA / finance / defense). PROJECT_2026.md §10 Q4 metric.
+- [ ] **Q-7 World model v1** — `f_topic` MLP (2-layer InfoNCE 384→512→384) for L1 silent prefetch, Platt scaling / isotonic regression on `f_outcome`, extend LinUCB context vector. PROJECT_2026.md §3 bet #7.
+- [ ] **Q-9 Iterative / agentic retrieval** — multi-step query refinement (Self-RAG / IR-CoT). +10 F1 on multi-hop. PROJECT_2026.md §3 bet #6.
+- [ ] **Q-10 Cross-modal entity-edge join** — bind capture pipelines from P1b (screenshots / audio / code) into shared entity graph via `ModalIngestPipeline` co-occurrence edges, arm 5 in tm-controller, cross-modal chains + citations. Pulled forward from Q1 2027 because capture inputs ship Q2-Q3.
 
-### Cross-modal pipeline
+(Note: HNSW moved to P1c PERF-3, Q2. Was originally P8 Q4 but auto-capture volume forces it earlier.)
 
-- [ ] Implement SigLIP-small ONNX encoder for images
-- [ ] Implement tree-sitter + BGE code encoder
-- [ ] Wire `ModalIngestPipeline` into tm-ingest (co-occurrence edges within 30-second window)
-- [ ] Add arm 5 (cross-modal) to tm-controller: top_k=12, hops=1, cross-modal=yes
-- [ ] Cross-modal chains in tm-reason (`CrossModalChainBuilder`)
-- [ ] Cross-modal citations in synthesis (screenshots + code spans)
+### Q1 2027 — Series A prep
 
-### World model upgrades
-
-- [ ] `f_topic` MLP (2-layer, 384→512→384, InfoNCE) — powers L1 silent prefetch
-- [ ] L1 silent prefetch: background task pre-warms tm-retrieval based on f_topic predictions
-- [ ] Platt scaling / isotonic regression on f_outcome for calibrated probabilities
-- [ ] Extend LinUCB context vector with working-memory state, tier, affective-graph density
-
-### Nightly processes
-
-- [ ] `tm-reflect` nightly cron/daemon (scheduled brief generation)
-- [ ] TMS consistency check nightly
-- [ ] Deductive/inductive promotion (raw captures → graph entities)
-- [ ] Temporal GC (archive retracted facts older than N days)
-- [ ] Two-speed ingestion: signal lake (fast, raw) + graph promotion (background)
+- [ ] **B-3 TraceMind Pro alpha** — $5–10/mo for E2EE multi-device sync via user's own iCloud/Drive. Never our servers. PROJECT_2026.md §10 row 2.
+- [ ] **B-4 First enterprise pilot signed** — 5-figure deal, single regulated org buying seats. PROJECT_2026.md §10 row 3.
+- [ ] **B-5 6-month retention cohort data** — charts ready for Series A meetings.
+- [ ] **Q-11 Cross-modal expansion** — VS Code / Cursor / JetBrains deep IDE plugins, audio-conversation summarization, mail/calendar bidirectional sync.
 
 ---
 
-## Priority 7 — Engram extraction (Phase 5B)
+## P9 — Business + ops commitments (Q2 → Q4 per PROJECT_2026.md)
 
-- [ ] Finalize Belief trait API across all intent-arc types
-- [ ] `tm-engram` full implementation: assert/retract/world_at/contradictions/history_of/set_goal/record_action/observe
-- [ ] MCP tools: memory_believe, memory_retract, memory_world_at, memory_contradictions
-- [ ] Standalone Engram MCP server binary
-- [ ] Python wrapper (PyO3) → PyPI: `engram`
-- [ ] TypeScript wrapper (napi-rs) → npm: `@tracemind/engram`
-- [ ] Integration test with Claude Code
-- [ ] Publish to crates.io
-- [ ] Benchmark: assertion latency <1ms, retraction propagation <10ms for 10k beliefs
-- [ ] 3 example agents (research assistant, code review, customer support)
+Non-engineering tasks the founder owns. Tracked here so they don't fall off the radar.
 
----
+### Hiring
 
-## Priority 8 — Rosetta foundation (Phase 5C)
+- [ ] **H-1 Hire #1 — ML engineer** (Q3 2026). Owns LoCoMo, bandit, world model. Non-negotiable per PROJECT_2026.md §9 + risk #6. Trigger: seed term sheet.
+- [ ] **H-2 Hire #2 — Design / product** (Q4 2026). Owns Tauri UX + onboarding + brand. Trigger: term sheet closes + Engram launch traction.
 
-- [ ] `tm-semcode` crate: tree-sitter parsing (Rust, Python, TypeScript, Go, Java)
-- [ ] Intent extraction pipeline: code → AST analysis → cross-modal fusion with tests/docs/git/PRs → CodeIntent
-- [ ] `SemanticDiff` engine: semantic change classification (Cosmetic/Refactor/IntentShift/New/Deleted)
-- [ ] Intent drift detection (bitemporal over git history)
-- [ ] `tm-rosetta` CLI: `rosetta diff HEAD~5..HEAD`
-- [ ] MCP tools: code_intent, code_semantic_diff
-- [ ] VS Code extension stub
-- [ ] (Stretch) Intent-preserving refactoring generation + property-based test generation
+### Funding
 
----
+- [ ] **FN-1 Friends & family / angel (optional)** — $100–250k Q2 2026 only if runway forces it. PROJECT_2026.md §10.
+- [ ] **FN-2 Pre-seed / seed close** — $1–1.5M Q3-Q4 2026. Trigger: P0–P3 artifacts complete (DP-6 + W2 ≥ 40% + W-5 video + LoCoMo ≥ 60).
+- [ ] **FN-3 Investor list assembled** — local-first / privacy-aligned funds and angels (Linear / Cursor / Vercel / Obsidian backers). Avoid generic AI Tier-2 funds that push SaaS economics. PROJECT_2026.md §10.
 
-## Priority 9 — Mobile + sync (Phase 6)
+### Launch + press
 
-- [ ] UniFFI bindings (Swift + Kotlin)
-- [ ] iOS app (SwiftUI)
-- [ ] Android app (Compose)
-- [ ] Apple FoundationModels backend (macOS 26+)
-- [ ] Photo ingest (EXIF + VLM caption)
-- [ ] `tm-sync` crate: Automerge CRDTs over iCloud/Drive
-- [ ] End-to-end encryption with per-user keypair
-- [ ] Opt-in encrypted-cloud Tier (low-end devices only)
+- [ ] **L-1 Hacker News launch (Q3 2026)** — "Why every AI memory layer forgets across sessions, blurs your contexts, and contradicts itself — and what we built instead." Three numbers (persistence, context isolation, retraction) + open repo. PROJECT_2026.md §5 distribution bet #2.
+- [ ] **L-2 MCP host directory listings** — Anthropic MCP servers list + Goose extensions registry + Cline marketplace. Free organic distribution. PROJECT_2026.md §7 metric row 7 (target: 4 by Q3, 6 by Q4).
+
+### Cadence
+
+- [ ] **OPS-1 Daily standup written to `~/.tracemind/standup.md`** — dogfood our own product. PROJECT_2026.md §11.
+- [ ] **OPS-2 Weekly Friday review** — 3 numbers: design partners, W2, F1. Update PROJECT_2026.md when any quarterly milestone slips. PROJECT_2026.md §11.
+- [ ] **OPS-3 Monthly DP check-ins (15 min each) + risk register review + deck refresh**.
+- [ ] **OPS-4 Quarterly re-read of PROJECT_2026.md** + Q+1 milestone update.
 
 ---
 
-## Priority 10 — Scale + world model v2 (Phase 7)
+## P10 — Indefinitely deferred (kill or revisit if a partner asks)
 
-- [ ] `f_outcome` v2: 4-layer transformer (~3M params, d=256, 4-class polarity)
-- [ ] HNSW vector index for 100k+ entities (replace flat scan)
-- [ ] Mamba/SSM history compression
-- [ ] GraphSAGE GNN for AnalogySolver (replace WL kernel)
-- [ ] Louvain/Leiden community detection in Consolidator
-- [ ] Factorization machine / MLP for PatternDetector (cross-cell interactions)
-- [ ] `tm-preference` crate: triplet contrastive loss on (query, kept_answer, rejected_answer)
-- [ ] Loop 4 counterfactual replay (doubly-robust OPE over trajectory store)
-- [ ] Iterative/agentic retrieval (multi-step query refinement)
-- [ ] Context-budget allocator (dynamic retrieval budget per query complexity)
+Excellent engineering. Not scheduled in PROJECT_2026.md. Park.
+
+(Note: clipboard, shell, screenshot, audio, browser, calendar capture **promoted to P1b** as seed-critical. Only TTS playback + Obsidian-style passive vault sync remain here.)
+
+### Auxiliary capture / output (deferred)
+
+- [ ] Piper TTS brief playback (audio *output*, not input — distinct from CAP-6 Whisper-tiny input)
+- [ ] Obsidian vault import (deferred until a DP asks; CAP-* already covers the primary capture surfaces)
+
+### Nightly processes (deferred)
+
+- [ ] `tm-reflect` cron, nightly TMS check, deductive/inductive promotion, temporal GC, two-speed ingestion
+
+### Rosetta foundation (deferred — re-open after Engram has a commercial deal)
+
+- [ ] `tm-semcode`, intent extraction pipeline, `SemanticDiff`, intent drift
+- [ ] `tm-rosetta` CLI, MCP tools, VS Code extension stub
+
+### Mobile + sync (deferred to post-Series A unless a partner forces it)
+
+- [ ] UniFFI bindings, iOS app, Android app
+- [ ] Apple FoundationModels backend, photo ingest
+- [ ] `tm-sync` (Automerge CRDTs), E2E encryption, opt-in encrypted-cloud tier
+- (Note: TraceMind Pro E2EE sync above (B-3) is the *consumer* sync product; UniFFI iOS/Android is the *separate* native-app bet, deferred until Pro proves out.)
+
+### Scale + world model v2 (deferred to 2027+)
+
+- [ ] `f_outcome` v2 transformer, Mamba history compression
+- [ ] GraphSAGE for AnalogySolver, Louvain/Leiden in Consolidator
+- [ ] Factorization machine for PatternDetector, `tm-preference` crate
+- [ ] Counterfactual replay, context-budget allocator
+
+(Note: HNSW moved to P1c PERF-3; iterative retrieval moved to P8 Q4 Q-9.)
+
+### LLM packaging + on-device finetune (deferred — see PROJECT_2026.md §3 weak-spot row "no personalization")
+
+- [ ] `tm-llm` crate (ModelManifest + ModelRegistry, first-run fetch, LoRA adapter slot)
+- [ ] Python sidecar QLoRA pipeline, 3 default LoRA roles, nightly opt-in schedule
+- Flagged as Series A blocker in PROJECT_2026.md, but not before. Revisit Q1 2027.
 
 ---
 
-## Evaluation infrastructure
+## Evaluation infrastructure (driven by what the pitch needs)
 
-- [ ] Full LoCoMo run (~7,000 questions) — mini-set numbers not comparable to competitors
-- [ ] Cross-modal eval harness: 50 hand-labeled multi-modal reasoning scenarios
-- [ ] Bitemporal correctness test suite (formal, 100%)
-- [ ] Intent preservation eval: 100 labeled before/after refactoring pairs
-- [ ] Belief consistency eval: formal JTMS spec compliance
-- [ ] Performance benchmarking: idle RAM, active RAM, cold-query latency, Tier-1 hot-query latency
+- [ ] Q-5 above (full LoCoMo, ≥ 65 F1)
+- [ ] W-3 above (persistence microbench)
+- [ ] W-2 above (context-isolation microbench)
+- [ ] W-4 above (retraction microbench)
+- [ ] New crate `tm-bench-memory` to house all three (persistence + context-isolation + retraction) under one CLI. Public leaderboard at `tracemind.dev/memory-bench` (PROJECT_2026.md §6 Q3).
+- [ ] Performance benchmarking (idle RAM, active RAM, cold-query, Tier-1 hot-query latency) — needed for Q-6 disclosures + PROJECT_2026.md technical-credibility dashboard
+- [ ] Cross-modal eval harness — deferred to post-seed (Q1 2027 per PROJECT_2026.md)
+- [ ] Bitemporal correctness test suite — deferred
+- [ ] Intent preservation eval — deferred
 
 ---
 
-## Priority 11 — LLM packaging + on-device personalization (deferred)
+## Operating rules
 
-Lower-priority phase queued behind the recordable demo and the existing P1–P10 work. Two layers:
-
-### L1 — `tm-llm` packaging crate
-
-- [ ] New `tm-llm` crate: `ModelManifest` (sha256, size, prompt template, tokenizer hash, license) + `ModelRegistry` reading `~/.tracemind/models/manifest.toml`
-- [ ] First-run model fetch with checksum verification + atomic install (no half-downloaded weights)
-- [ ] LoRA adapter slot: `BaseModel + Vec<AdapterSpec>` with hot-swap at the `LocalLlmBackend` boundary
-- [ ] CLI surface: `tracemind models list / install / remove / verify`
-- [ ] MCP surface: `model_status` returning manifest + adapter state
-
-### L2 — Resource-constrained on-device finetune
-
-- [ ] Python sidecar (`tools/finetune/`) using transformers + peft + bitsandbytes (Linux/Win) or MLX-LM (macOS) for QLoRA
-- [ ] Three default LoRA roles: `summarizer-personal`, `extractor-personal`, `prefs-personal`
-- [ ] Training data builder: pulls from accepted/rejected edits in tm-trace + commitment outcome history
-- [ ] Nightly schedule: opt-in only, runs when on AC + idle, capped at 30min wall clock
-- [ ] LoRA weights stay in `~/.tracemind/adapters/` — never leave device, no telemetry
-- [ ] Lightweight TRL/Unsloth alternative path for low-RAM machines (8GB target)
-- [ ] CLI: `tracemind finetune status / start / stop / rollback`
+1. **No work in P4+ until P0 has at least 3 active design partners.** Building the moat is irrelevant if no one is around to be locked in. P8 (post-seed) and P9 (business / ops) work is unblocked only when the seed gate clears.
+2. **No deck rewrite until P0 produces DP-6 and P1 produces W-5.** Slides without artifacts are vapor.
+3. **No three-product narrative in any external comms until TraceMind alone hits W2 ≥ 40%.** Optionality reads as lack of conviction.
+4. **Weekly review every Friday.** Three numbers: design partners onboarded, W2 retention, LoCoMo F1. Anything else is noise.
+5. **If a P0 candidate refuses three times, the wedge is wrong.** Stop building, run brainstorming, return.
+6. **Two surfaces, both P0.** MCP is the wedge (host integration → design-partner channel); Tauri is the flagship (where users go to *see* their memory). Investing only in one collapses the company narrative — into a plugin business if MCP-only, into a brand-from-zero problem if Tauri-only. Lead the deck with MCP-in-Claude-Code for the demo moment; slide 2 is the Tauri walkthrough.
+7. **Project 2026 (`docs/PROJECT_2026.md`) is the canonical strategy doc.** TASKS.md operationalises it. If TASKS.md drifts from PROJECT_2026.md, update both — don't fork.
