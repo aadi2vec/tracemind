@@ -242,37 +242,6 @@ The cognition roadmap items map onto these — see PHASE4_DELIGHT.md
 
 ---
 
-## Slide 11 — What I'm asking from you
-
-Not a check. Not yet. Three things:
-
-1. **Read this and tell me what's wrong.** You've seen more decks
-   than I have. The honest read.
-2. **Watch the 6-minute demo.** Tell me whether Act 3 (the world
-   model preflight moment) lands as the magic moment I think it is,
-   or if I'm fooling myself.
-3. **Two intros if any of this resonates:**
-   - one ML-flavoured solo founder I should compare notes with
-   - one privacy/security-aware angel who'd get the wedge
-     without me having to explain why local matters
-
----
-
-## Slide 12 — Closing
-
-The boring memory-OS race is already lost to Mem0 / Honcho.
-The *companion* race hasn't started.
-
-Privacy is the moat. The brain is the product.
-Everything you need to use TraceMind runs on this machine.
-
-`~/.tracemind/` is the only state. The user can `rm -rf` it.
-That's the whole pitch.
-
-— Aaditya
-
----
-
 ## Appendix — proof points
 
 - **Code:** 17-crate Rust workspace, 163 tests passing on `main`.

@@ -5815,6 +5815,7 @@ dependencies = [
  "seahash",
  "serde",
  "serde_json",
+ "tempfile",
  "tm-episodic",
  "tm-ingest",
  "tm-intent",
@@ -6124,6 +6125,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror 1.0.69",
+ "toml 0.8.2",
  "uuid",
 ]
 

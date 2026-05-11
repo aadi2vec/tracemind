@@ -132,13 +132,16 @@ The format is **same host (Claude Code), different MCP memory servers** — not 
 
 Promoted from P10 (deferred) on user feedback (2026-05-11): *people will not hand-feed memory; we must auto-populate as much as possible with explicit per-source permissions.* This is the actual *"memory just is"* product, not a future indulgence. Without it, the wedge collapses to "a place to type things you'd otherwise type into ChatGPT memory" — not differentiated.
 
-### Q2 — seed-critical (already-wired sources + screenshot + browser)
+### Q2 — seed-critical (text-only ambient sources)
 
-- [ ] **CAP-1 Per-source permissions schema** — `~/.tracemind/capture_permissions.toml`, keyed by source (clipboard, shell, screenshot, browser, audio, calendar). Each entry: `enabled`, `granted_at`, `last_event_at`, `event_count`. Tauri settings panel (UI-13) reads/writes this. CLI mirror: `tracemind capture {enable,disable,status} <source>`.
-- [ ] **CAP-2 Clipboard + shell first-run backfill** — on install (or `tracemind capture backfill`), ingest the last 7 days of shell history + recent clipboard ring (if available on macOS via Pasteboard.changeCount log; Linux via parcellite-like daemons; Windows TBD). Seeds ~50 entities so the *first* query post-install is non-empty. Critical for the "60-second meaningful brief" UX-8 promise.
-- [ ] **CAP-3 Screenshot OCR + caption capture** — opt-in. On screenshot capture (system shortcut), pipe through Tesseract OCR + Moondream / SigLIP for caption, ingest as `Capture::Screenshot { ocr_text, caption, sha256 }`. Stored in `~/.tracemind/captures/screenshots/` referenced by hash; raw images never leave device. Privacy: skip captures that contain detected password fields / credit-card OCR.
-- [ ] **CAP-4 Browser bookmarklet / extension stub** — minimal: a bookmarklet posts current `{url, title, selection, ts}` to `http://localhost:7710/capture` (loopback only, token-gated). Full WebExtension lands in Q3. The bookmarklet is enough to demo *"I starred this article — TraceMind remembers and links it."*
-- [ ] **CAP-5 Capture-aware ingestion throttle** — `IngestPipeline` accepts a `Source` enum; rate-limits + dedupes per source. Clipboard dedups within 30s, shell dedups within session, screenshots dedup by `sha256`. Prevents capture floods from breaking query latency.
+- [x] **CAP-1 Per-source permissions schema** — `~/.tracemind/capture_permissions.toml`, keyed by source (clipboard, shell, notes, screenshot, browser, audio, calendar). Each entry: `enabled`, `granted_at`, `last_event_at`, `event_count`. Tauri settings panel (UI-13) reads/writes this. CLI mirror: `tracemind capture {enable,disable,status} <source>`. *(shipped 2026-05-11: schema in `tm-types::capture_permissions`, 9 unit tests, CLI subcommand wired, capture daemon fails closed on disabled sources; notes source added 2026-05-11.)*
+- [x] **CAP-2 First-run backfill (shell + notes + clipboard)** — `tracemind capture backfill --days N --max M` ingests three text sources in one shot:
+  1. **Shell** — scans `~/.zsh_history` / `~/.bash_history`, filters by timestamp (zsh) + triviality (ls/cd/etc.).
+  2. **Notes** — macOS only. Dumps Apple Notes via `osascript` (folder + title + body + modification date), filters by `--days`.
+  3. **Clipboard** — one-shot `pbpaste` snapshot of current clipboard contents so the first query post-install isn't empty.
+  Per-step opt-outs `--no-shell` / `--no-notes` / `--no-clipboard`. Each step fails closed against the corresponding `CaptureSource` permission and bypasses CAP-5 via `RateLimiter::unlimited()`. *(shell shipped 2026-05-11; notes + clipboard added 2026-05-11.)*
+- [x] **CAP-4 Browser bookmarklet / extension stub** — minimal: a bookmarklet posts current `{url, title, selection}` to `http://127.0.0.1:7710/capture` (loopback only, Bearer-token gated). Full WebExtension lands in Q3. *(shipped 2026-05-11: hand-rolled HTTP/1.1 server in `tm-capture::browser_capture`, fail-closed on `CaptureSource::Browser`, per-install token at `~/.tracemind/capture_token` chmod 0600, 1 MiB body cap, `GET /health` unauthenticated for probe; CLI `tracemind capture bookmarklet` emits the install snippet. Curl smoke test: `/health` 200 → `/capture` 200 stored.)*
+- [x] **CAP-5 Capture-aware ingestion throttle** — `IngestPipeline.ingest_fast` now consults a per-source `RateLimiter` (token bucket, defaults: clipboard 60/min burst 30, shell 120/burst 60, notes 30/burst 15, screenshot 12/burst 6, browser 60/burst 30, audio 30/burst 15, calendar 6/burst 3, unknown 30/burst 15). Env override: `TM_RATE_<SOURCE>_PER_MIN` / `TM_RATE_<SOURCE>_BURST` (set both to 0 to disable). Rate-limited calls return `skipped: Some("rate-limited: …")`. Bulk paths (`import`, `capture backfill`) bypass via `RateLimiter::unlimited()`. Content-hash dedup remains permanent at the pipeline level. *(shipped 2026-05-11: 5 unit tests pass, full ingest suite 50/50.)*
 
 ### Q3 — coverage expansion
 
@@ -147,18 +150,21 @@ Promoted from P10 (deferred) on user feedback (2026-05-11): *people will not han
 - [ ] **CAP-8 Full browser extension** — replaces CAP-4 bookmarklet. Captures: visited pages, dwell time, copied text, "save to TraceMind" button. Permissions UI built-in.
 - [ ] **CAP-9 IDE telemetry capture** — VS Code / Cursor extension surfaces file-open / file-edit events as low-priority entities. Cross-references with shell git events for cohesive code-context recall.
 
-### Q4 — cross-modal join
+### Q4 — multi-modal + cross-modal join
 
-- [ ] **CAP-10 Cross-modal entity edges** — captures from screenshots / audio / code share entities (mention "Pat from Sequoia" in audio → links to a screenshot caption with that name → links to a calendar invite). Cross-modal pipeline (PROJECT_2026 Q4) consumes from these capture pipelines.
+Multi-modal capture (vision, audio, OCR) is deferred to Q4 — the on-device model footprint (Tesseract + Moondream / SigLIP) and the false-positive risk on screenshots that contain credentials make it the wrong wedge for seed. CAP-1/2/4/5 + W-8 demo carry us to seed on text alone.
+
+- [ ] **CAP-3 Screenshot OCR + caption capture** *(was Q2, deferred to Q4 on 2026-05-11)* — opt-in. On screenshot capture (system shortcut), pipe through Tesseract OCR + Moondream / SigLIP for caption, ingest as `Capture::Screenshot { ocr_text, caption, sha256 }`. Stored in `~/.tracemind/captures/screenshots/` referenced by hash; raw images never leave device. Privacy: skip captures that contain detected password fields / credit-card OCR. Lands alongside CAP-10 because cross-modal entity edges are the value unlock for visual capture.
+- [ ] **CAP-10 Cross-modal entity edges** — captures from screenshots / audio / code share entities (mention "Pat from Sequoia" in audio → links to a screenshot caption with that name → links to a calendar invite). Cross-modal pipeline (PROJECT_2026 Q4) consumes from these capture pipelines. Blocked on CAP-3 (screenshot OCR) + CAP-6 (audio).
 
 ### Per-source privacy invariants (non-negotiable)
 
-- Every capture source is **opt-in** at the per-source level. Default install: clipboard + shell on (low-sensitivity); screenshot/browser/audio/calendar off until toggled.
+- Every capture source is **opt-in** at the per-source level. Default install: clipboard + shell + notes on (low-sensitivity, text-only); screenshot/browser/audio/calendar off until toggled.
 - Every captured memory carries a `source` field surfaced in the UI ("from screenshot 2026-05-09 14:32").
 - "Forget this source" is one click and irreversibly deletes captures for that source.
 - No capture source ever transmits off-device. Audit by `tracemind capture audit-network` which greps `traces.jsonl` for any outbound URL.
 
-**Exit criteria for seed:** CAP-1..CAP-5 shipped; at least 3 sources live per DP; capture coverage shows up in W-8 demo.
+**Exit criteria for seed:** CAP-1, CAP-2, CAP-4, CAP-5 shipped; at least 3 sources live per DP; capture coverage shows up in W-8 demo. *(2026-05-11: CAP-1/2/4/5 ✅; CAP-3 deferred to Q4 alongside CAP-10 cross-modal — visual capture is not on the seed critical path.)*
 
 ---
 
