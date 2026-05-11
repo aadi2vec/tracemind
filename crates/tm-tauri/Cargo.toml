@@ -33,3 +33,13 @@ tauri-build = { version = "2", features = [] }
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
+
+[features]
+# Tauri 2 only embeds `frontendDist` into the binary when the `custom-protocol`
+# feature is on. Without it, even `cargo build --release` produces a binary
+# that loads from `devUrl` (http://localhost:3000) and shows a blank webview
+# unless Vite is running. We default-enable it so plain `cargo build --release`
+# produces a working desktop binary. For `cargo run` against the Vite dev
+# server, use `--no-default-features`.
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]
