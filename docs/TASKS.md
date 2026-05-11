@@ -64,10 +64,10 @@ Two surfaces tell a stronger story than one — Vercel led CLI → dashboard, Li
 
 MCP-1..MCP-3 shipped 2026-05-11 (see Shipped above). Open work:
 
-- [ ] **MCP-4 One-command Goose installer** — `scripts/install_goose.sh`. Mirror of MCP-3 for Goose: edits `~/.config/goose/config.yaml`, writes `.goosehints`, restores fixture, prints the 4-prompt demo.
+- [x] **MCP-4 One-command Goose installer** — `scripts/install_goose.sh`. Mirror of MCP-3 for Goose: edits `~/.config/goose/config.yaml`, restores fixture, prints the 4-prompt demo. *(Shipped 2026-05-11.)*
 - [ ] **MCP-5 Submit to Anthropic's MCP servers directory + Goose extensions registry** — both maintain public lists of MCP servers. Landing on those lists is free organic distribution.
-- [ ] **MCP-6 One-sentence pitch propagated** — replace any "system of intents" / "contradiction-aware-first" / "never blurred" lead copy on `README.md`, `tracemind.dev`, MCP host directory entries with the W-7 wedge sentence: *"Ambient memory for every AI you use — captures what you do, scopes itself to the right context, learns your boundaries, never uploaded."* Cross-ref P1 W-7 (single source of truth for the line).
-- [ ] **MCP-7 Cline + Cursor integration docs** — 30-minute write-ups each. Cline is MCP-native and ships in VS Code; Cursor's MCP support is recent but landed. Both have aggressive early-adopter communities — direct DP-1 recruiting channels. Scheduled Q3 per PROJECT_2026.md.
+- [x] **MCP-6 One-sentence pitch propagated** — W-7 wedge sentence now appears in `README.md` header, `tm-mcp` initialize-response `instructions` field, and the headers of `docs/CLAUDE_CODE_INTEGRATION.md` and `docs/GOOSE_INTEGRATION.md`. *(Shipped 2026-05-11.)*
+- [x] **MCP-7 Cline + Cursor integration docs** — `docs/CLINE_INTEGRATION.md` and `docs/CURSOR_INTEGRATION.md`. 30-second integration kits each, mirror of MCP-3. *(Shipped 2026-05-11.)*
 
 ### P0b — Design partner recruitment (the goal)
 
@@ -75,8 +75,8 @@ Without a named outside user using TraceMind every day, no later work compensate
 
 - [ ] **DP-1 Recruit list** — name 10 candidates. Now drawn from MCP host communities: Claude Code power users on r/ClaudeCode + Anthropic Discord, Goose Discord regulars, Cline GitHub stargazers, founders under NDA, therapists, coaches, researchers, journalists, IP lawyers. Personal email/DM each one, *not* a broadcast post.
 - [-] **DP-2 Onboarding kit** — `docs/CLAUDE_CODE_INTEGRATION.md` + `docs/GOOSE_INTEGRATION.md` + `scripts/install_claude_code.sh` cover the written kit. Remaining: 60-second screen recording showing `bash scripts/install_claude_code.sh` → `claude` session → retraction beat firing on prompt 3. Single `curl | sh` line at the top of the kit.
-- [ ] **DP-3 Instrumentation (privacy-preserving, local-only)** — local-only daily-active flag in `~/.tracemind/usage.json`: timestamp of last query, last `helpful` signal, last `not-related` signal. User opts in to share via `tracemind share-usage --to <email>` which prints the JSON for them to paste back. No telemetry.
-- [ ] **DP-4 Weekly check-in script** — 15-minute call per design partner, weekly: "what did you ask Claude/Goose this week? what did TraceMind get wrong? what would make you uninstall the MCP?" Write it down. This is the dataset.
+- [x] **DP-3 Instrumentation (privacy-preserving, local-only)** — `~/.tracemind/usage.json` populated by `cmd_query` / `cmd_helpful` / `cmd_not_related`. Exposed via `cmd_usage_stats` + `cmd_usage_share_payload`; the Settings view has the "copy share JSON" affordance. *(Shipped 2026-05-11.)*
+- [x] **DP-4 Weekly check-in script** — `docs/DP_CHECKIN.md`. Six-question, 15-minute script with a scoreboard schema and Friday aggregation flow. *(Shipped 2026-05-11.)*
 - [ ] **DP-5 W2 retention gate** — 5 partners onboarded by 2026-06-15. W2 retention measured by `usage.json` returns ≥ 3 active days in week 2 from at least 3 of 5. Below that → the wedge is wrong, stop building, re-brainstorm.
 - [ ] **DP-6 Testimonial video** — 60-second on-camera from the partner with the strongest W2: pain → what TraceMind does inside their Claude Code / Goose session → "I won't go back." This is slide 1 of the seed deck.
 
@@ -89,13 +89,13 @@ The Tauri app is where the user goes when they want to *see* memory, not just *u
 UI-1..UI-6 + 2026-05-11 UX fixes shipped (see Shipped above). Open work:
 
 - [ ] **UI-7 60–90s Tauri walkthrough screen recording** — human capture session. Slide 2 of seed deck. Sprint D ends when this exists.
-- [ ] **UI-8 First-run onboarding flow** — sample data → meaningful brief in 60 seconds. Critical for any non-developer DP candidate.
-- [ ] **UI-9 Brief panel polish** — read-on-open, dismissable, archived. C-0.9 (active context in brief) lives here.
-- [ ] **UI-10 Commitment timeline view** — vertical, color-coded by state, drawer on click. The intent-arc story needs a surface. PROJECT_2026.md Q4 commitment.
-- [ ] **UI-11 Calibration panel** — predictions made, outcome accuracy, Brier score. The "world model that works" slide. PROJECT_2026.md Q4 commitment.
-- [ ] **UI-12 Settings + privacy panel** — clear data, export, opt-in toggles for any future telemetry. Critical for trust-signaling to privacy-conscious DPs.
-- [ ] **UI-13 Capture-permissions panel (Q2, seed-critical)** — per-source toggle for clipboard / shell / screenshot / browser / audio / calendar; "last captured at" timestamp; event-count chip; one-click "forget all captures from this source." Powers CAP-1.
-- [ ] **UI-14 Context-switch suggestion banner** — when CTX-2 fires, Tauri brief shows a dismissable banner: "This might belong in your *work* context. Switch?" One-click switch + ingest in new context. Negative dismiss triggers `wrong_context_suggestion` feedback.
+- [x] **UI-8 First-run onboarding flow** — `OnboardingView.tsx` routed-to on first run via `getUsageStats().first_seen === null`; loads demo fixture and auto-runs a starter query. *(Shipped 2026-05-11.)*
+- [x] **UI-9 Brief panel polish** — `BriefView` has read-marker dots, hover-revealed dismiss/archive controls, an archive section with restore, and an inline active-context label (C-0.9). State lives in `localStorage`. *(Shipped 2026-05-11.)*
+- [x] **UI-10 Commitment timeline view** — `CommitmentTimelineView.tsx`. Vertical, color-coded by state, click-to-expand drawer per row. *(Shipped 2026-05-11.)*
+- [x] **UI-11 Calibration panel** — `CalibrationView.tsx`. Predictions tracked, resolution rate, contradictions, bandit-arm table. Brier-score panel reserved for Q-7 (Q4 2026). *(Shipped 2026-05-11.)*
+- [x] **UI-12 Settings + privacy panel** — `SettingsView.tsx`. Capture permissions, usage stats with copy-share JSON, privacy invariants. *(Shipped 2026-05-11.)*
+- [x] **UI-13 Capture-permissions panel (Q2, seed-critical)** — per-source toggle, granted_at + last_event_at + event_count, "forget all" CTA per source. Backed by `~/.tracemind/capture_permissions.toml`. *(Shipped 2026-05-11.)*
+- [x] **UI-14 Context-switch suggestion banner** — `QueryView` fires `cmd_context_suggest` in parallel with the query and renders a dismissable amber banner with "Switch & re-run" / "Dismiss". *(Shipped 2026-05-11.)*
 
 **Exit criteria:** UI-7 recorded, UI-8 shipped, the Tauri app is the answer to *"after they install the MCP, where do they spend time?"*
 

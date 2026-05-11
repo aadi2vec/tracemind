@@ -1,5 +1,7 @@
 # TraceMind + Claude Code — 30-second integration
 
+**Wedge sentence (W-7):** ambient memory for every AI you use — captures what you do, scopes itself to the right context, learns your boundaries, never uploaded.
+
 [Claude Code](https://claude.com/claude-code) is Anthropic's CLI for Claude. It's MCP-native, runs locally, and is already installed on the laptop of every developer worth pitching to. TraceMind ships an MCP server (`tm-mcp`), so the integration is a four-line config edit. **No new code on either side.**
 
 This is the headline onboarding kit. If you only read one integration doc, read this one.

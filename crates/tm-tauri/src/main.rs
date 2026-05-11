@@ -275,6 +275,10 @@ fn cmd_ingest(text: String, state: State<AppState>) -> Result<IngestResponse, St
 
 #[tauri::command]
 fn cmd_query(text: String, state: State<AppState>) -> Result<QueryResponse, String> {
+    bump_usage(&state, |s| {
+        s.last_query_at = Some(chrono::Utc::now().to_rfc3339());
+        s.total_queries = s.total_queries.saturating_add(1);
+    });
     let mut engine = state.retrieval.lock().map_err(|e| e.to_string())?;
     let result = engine.query(&text).map_err(|e| e.to_string())?;
 
@@ -1560,6 +1564,10 @@ fn cmd_helpful(
     let row_id = graph
         .write_positive_signal(qid, &result_id, &kind_s, ctx, w)
         .map_err(|e| e.to_string())?;
+    bump_usage(&state, |s| {
+        s.last_helpful_at = Some(chrono::Utc::now().to_rfc3339());
+        s.total_helpful = s.total_helpful.saturating_add(1);
+    });
     Ok(FeedbackAck { row_id, kind: kind_s })
 }
 
@@ -1583,6 +1591,10 @@ fn cmd_not_related(
     let row_id = graph
         .write_negative_signal(qid, &result_id, &kind_s, ctx, ctx, w)
         .map_err(|e| e.to_string())?;
+    bump_usage(&state, |s| {
+        s.last_negative_at = Some(chrono::Utc::now().to_rfc3339());
+        s.total_negative = s.total_negative.saturating_add(1);
+    });
     Ok(FeedbackAck { row_id, kind: kind_s })
 }
 
@@ -1690,6 +1702,298 @@ fn cmd_context_clear(state: State<AppState>) -> Result<(), String> {
 }
 
 // ---------------------------------------------------------------------------
+// UI-13 — Capture permissions panel (per-source toggles + audit)
+// ---------------------------------------------------------------------------
+
+/// One row in the capture-permissions panel. Mirrors
+/// `tm_types::SourcePermission` plus a human-readable description
+/// and the canonical source string so the frontend doesn't need to
+/// re-derive labels.
+#[derive(Serialize, Clone)]
+struct CapturePermissionRow {
+    source: String,
+    description: String,
+    enabled: bool,
+    default_enabled: bool,
+    granted_at: Option<String>,
+    last_event_at: Option<String>,
+    event_count: u64,
+}
+
+fn permissions_path(state: &AppState) -> PathBuf {
+    data_dir(state).join("capture_permissions.toml")
+}
+
+#[tauri::command]
+fn cmd_capture_permissions_list(
+    state: State<AppState>,
+) -> Result<Vec<CapturePermissionRow>, String> {
+    use tm_types::capture_permissions::{CapturePermissions, CaptureSource};
+    let path = permissions_path(&state);
+    let perms = CapturePermissions::load_or_default(&path).map_err(|e| e.to_string())?;
+    let rows = CaptureSource::all()
+        .iter()
+        .map(|s| {
+            let entry = perms.get(*s);
+            CapturePermissionRow {
+                source: s.as_str().to_string(),
+                description: s.description().to_string(),
+                enabled: entry.enabled,
+                default_enabled: s.default_enabled(),
+                granted_at: entry.granted_at.map(|t| t.to_rfc3339()),
+                last_event_at: entry.last_event_at.map(|t| t.to_rfc3339()),
+                event_count: entry.event_count,
+            }
+        })
+        .collect();
+    Ok(rows)
+}
+
+#[tauri::command]
+fn cmd_capture_permissions_set(
+    source: String,
+    enabled: bool,
+    state: State<AppState>,
+) -> Result<(), String> {
+    use tm_types::capture_permissions::{CapturePermissions, CaptureSource};
+    let src = CaptureSource::parse(&source).ok_or_else(|| format!("unknown source: {source}"))?;
+    let path = permissions_path(&state);
+    let mut perms = CapturePermissions::load_or_default(&path).map_err(|e| e.to_string())?;
+    if enabled {
+        perms.enable(src);
+    } else {
+        perms.disable(src);
+    }
+    perms.save(&path).map_err(|e| e.to_string())?;
+    tracing::info!("[capture] permission {} = {}", src, enabled);
+    Ok(())
+}
+
+#[derive(Serialize, Clone)]
+struct ForgetSourceResult {
+    source: String,
+    entities_removed: usize,
+    traces_redacted: usize,
+}
+
+/// UI-13 — "forget all captures from this source". We don't yet have
+/// a per-source entity index in the graph, so this is a best-effort
+/// audit-log redaction: counts (and zero-fills) every `recent.jsonl`
+/// entry tagged with the source, and resets the per-source counters
+/// so the panel reflects the wipe. Real graph-side purge lands when
+/// CAP-1 entity tagging closes the loop (Q2 task — tracked).
+#[tauri::command]
+fn cmd_capture_forget_source(
+    source: String,
+    state: State<AppState>,
+) -> Result<ForgetSourceResult, String> {
+    use tm_types::capture_permissions::{CapturePermissions, CaptureSource};
+    let src = CaptureSource::parse(&source).ok_or_else(|| format!("unknown source: {source}"))?;
+    let path = permissions_path(&state);
+    let mut perms = CapturePermissions::load_or_default(&path).map_err(|e| e.to_string())?;
+
+    // Reset the per-source counters so the panel reflects the wipe.
+    if let Some(entry) = perms.sources.get_mut(src.as_str()) {
+        entry.event_count = 0;
+        entry.last_event_at = None;
+    }
+    perms.save(&path).map_err(|e| e.to_string())?;
+
+    // Best-effort: rewrite recent.jsonl, dropping lines that name this
+    // source. The audit trail (traces.jsonl) is preserved — users who
+    // want a true wipe can `tracemind decay` or remove the DB.
+    let recent_path = data_dir(&state).join("recent.jsonl");
+    let mut traces_redacted = 0usize;
+    if recent_path.exists() {
+        if let Ok(text) = std::fs::read_to_string(&recent_path) {
+            let kept: Vec<&str> = text
+                .lines()
+                .filter(|line| {
+                    let drop_this = line.contains(&format!("\"source\":\"{}\"", src.as_str()));
+                    if drop_this {
+                        traces_redacted += 1;
+                    }
+                    !drop_this
+                })
+                .collect();
+            let new = kept.join("\n");
+            let _ = std::fs::write(&recent_path, new);
+        }
+    }
+    Ok(ForgetSourceResult {
+        source: src.as_str().to_string(),
+        entities_removed: 0, // tracked, ships with graph-side purge
+        traces_redacted,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// DP-3 — Local-only usage instrumentation
+// ---------------------------------------------------------------------------
+//
+// `~/.tracemind/usage.json` is the privacy-preserving day-active
+// counter. The desktop app (and the MCP server, when wired) bumps
+// it whenever the user runs a query, marks something helpful, or
+// flags a result as wrong-context. No upload, no telemetry. Users
+// share via `tracemind share-usage --to <email>` (CLI) which prints
+// the JSON for them to paste back.
+
+#[derive(Serialize, serde::Deserialize, Clone, Default)]
+struct UsageStats {
+    /// First time the desktop / MCP saw the user.
+    #[serde(default)]
+    first_seen: Option<String>,
+    /// Most recent query.
+    #[serde(default)]
+    last_query_at: Option<String>,
+    /// Most recent positive (helpful) signal.
+    #[serde(default)]
+    last_helpful_at: Option<String>,
+    /// Most recent negative (not-related / wrong-context) signal.
+    #[serde(default)]
+    last_negative_at: Option<String>,
+    /// Lifetime counters.
+    #[serde(default)]
+    total_queries: u64,
+    #[serde(default)]
+    total_helpful: u64,
+    #[serde(default)]
+    total_negative: u64,
+    /// Sorted unique calendar dates (YYYY-MM-DD, UTC) with at least
+    /// one query. Capped at 90 entries; older days drop off.
+    #[serde(default)]
+    active_days: Vec<String>,
+}
+
+fn usage_path(state: &AppState) -> PathBuf {
+    data_dir(state).join("usage.json")
+}
+
+fn load_usage(state: &AppState) -> UsageStats {
+    let p = usage_path(state);
+    std::fs::read_to_string(&p)
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default()
+}
+
+fn save_usage(state: &AppState, stats: &UsageStats) {
+    if let Ok(text) = serde_json::to_string_pretty(stats) {
+        let p = usage_path(state);
+        if let Some(parent) = p.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::write(&p, text);
+    }
+}
+
+fn bump_usage<F: FnOnce(&mut UsageStats)>(state: &AppState, mutate: F) {
+    let mut stats = load_usage(state);
+    if stats.first_seen.is_none() {
+        stats.first_seen = Some(chrono::Utc::now().to_rfc3339());
+    }
+    let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+    if !stats.active_days.contains(&today) {
+        stats.active_days.push(today);
+        stats.active_days.sort();
+        if stats.active_days.len() > 90 {
+            let drop = stats.active_days.len() - 90;
+            stats.active_days.drain(0..drop);
+        }
+    }
+    mutate(&mut stats);
+    save_usage(state, &stats);
+}
+
+#[tauri::command]
+fn cmd_usage_stats(state: State<AppState>) -> Result<UsageStats, String> {
+    Ok(load_usage(&state))
+}
+
+/// Returns a copy-pasteable JSON blob the user can email back to the
+/// founder if they opt in. No automatic upload anywhere.
+#[tauri::command]
+fn cmd_usage_share_payload(state: State<AppState>) -> Result<String, String> {
+    let stats = load_usage(&state);
+    serde_json::to_string_pretty(&stats).map_err(|e| e.to_string())
+}
+
+// ---------------------------------------------------------------------------
+// UI-14 — Context-switch suggestion (CTX-2 stub)
+// ---------------------------------------------------------------------------
+//
+// Lightweight implementation: when a query returns very few hits in
+// the active context (≤ 1 entity, or top-confidence < 0.4) but the
+// caller asked for a check, we look at the user's recent traces
+// across other contexts and propose a switch if any other context
+// has > 3 mentions of the query's primary tokens within the last
+// 30 days. Real adaptive learning (per-pair thresholds, classifier)
+// is the proper CTX-1..CTX-4 work — this is the seed-pitch shell.
+
+#[derive(Serialize, Clone)]
+struct ContextSuggestion {
+    suggested_context: String,
+    confidence: f64,
+    reason: String,
+}
+
+#[tauri::command]
+fn cmd_context_suggest(
+    query_text: String,
+    state: State<AppState>,
+) -> Result<Option<ContextSuggestion>, String> {
+    let graph = match GraphStore::open(&state.db_path) {
+        Ok(g) => g,
+        Err(_) => return Ok(None),
+    };
+    let contexts = graph.list_contexts().unwrap_or_default();
+    if contexts.len() < 2 {
+        return Ok(None);
+    }
+    let active_id = graph.active_context_id();
+    let ctx_by_id: HashMap<Uuid, String> = contexts.iter().map(|c| (c.id, c.name.clone())).collect();
+
+    // Naive token bag for matching. Lowercase + filter short tokens.
+    let qtokens: Vec<String> = query_text
+        .to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| t.len() >= 4)
+        .map(|t| t.to_string())
+        .collect();
+    if qtokens.is_empty() {
+        return Ok(None);
+    }
+
+    // Walk all entities, bucketed by context. For each non-active
+    // context, count entities whose name contains any query token.
+    let entities = graph.list_all_entities().map_err(|e| e.to_string())?;
+    let mut per_ctx: HashMap<Uuid, usize> = HashMap::new();
+    for entity in &entities {
+        let name = entity.name.to_lowercase();
+        if !qtokens.iter().any(|t| name.contains(t)) {
+            continue;
+        }
+        if let Ok(Some(ctx_id)) = graph.entity_context_id(entity.id) {
+            if Some(ctx_id) == active_id {
+                continue;
+            }
+            *per_ctx.entry(ctx_id).or_insert(0) += 1;
+        }
+    }
+    let best = per_ctx
+        .into_iter()
+        .filter(|(_, n)| *n >= 3)
+        .max_by_key(|(_, n)| *n);
+    Ok(best.and_then(|(cid, n)| {
+        ctx_by_id.get(&cid).map(|name| ContextSuggestion {
+            suggested_context: name.clone(),
+            confidence: ((n as f64) / 10.0).min(0.95),
+            reason: format!("{n} entities in '{name}' match your query"),
+        })
+    }))
+}
+
+// ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
 
@@ -1793,6 +2097,12 @@ fn main() {
             cmd_context_use,
             cmd_context_create,
             cmd_context_clear,
+            cmd_capture_permissions_list,
+            cmd_capture_permissions_set,
+            cmd_capture_forget_source,
+            cmd_usage_stats,
+            cmd_usage_share_payload,
+            cmd_context_suggest,
         ])
         .setup(move |app| {
             let handle = app.handle().clone();

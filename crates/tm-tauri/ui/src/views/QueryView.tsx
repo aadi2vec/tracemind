@@ -7,10 +7,13 @@ import {
   markNotRelated,
   getRecentQueries,
   getRecommendations,
+  suggestContext,
+  useContext,
   type QueryResponse,
   type AttributionInfo,
   type RecentQueryInfo,
   type RecommendationInfo,
+  type ContextSuggestion,
 } from "../api";
 
 type RowFeedback = "helpful" | "not_related" | "wrong_context";
@@ -48,6 +51,11 @@ export default function QueryView() {
   // recently asked …" pills stay current.
   const [recentQueries, setRecentQueries] = useState<RecentQueryInfo[]>([]);
   const [standingRecs, setStandingRecs] = useState<RecommendationInfo[]>([]);
+  // UI-14 — context-switch suggestion banner. If the query text looks
+  // like it belongs to a different context than the active one, the
+  // backend returns a ContextSuggestion and we offer a one-click switch.
+  const [ctxSuggestion, setCtxSuggestion] = useState<ContextSuggestion | null>(null);
+  const [ctxDismissed, setCtxDismissed] = useState(false);
 
   const refreshSticky = async () => {
     try {
@@ -73,6 +81,12 @@ export default function QueryView() {
     setError("");
     setFeedbackGiven(null);
     setRowFeedback({});
+    setCtxDismissed(false);
+    // UI-14 — fire the context suggestion in parallel with the query.
+    // It's a hint, not a blocker; if it errors we silently drop it.
+    suggestContext(text.trim())
+      .then((s) => setCtxSuggestion(s))
+      .catch(() => setCtxSuggestion(null));
     try {
       const res = await queryMemory(text.trim());
       setResult(res);
@@ -82,6 +96,22 @@ export default function QueryView() {
       setLoading(false);
       // Refresh the sticky panel so the just-run query shows up.
       refreshSticky();
+    }
+  };
+
+  // UI-14 — accept the suggestion: switch the active context, dismiss
+  // the banner, and re-run the query so the user sees results scoped
+  // to the new context.
+  const acceptContextSuggestion = async (s: ContextSuggestion) => {
+    try {
+      await useContext(s.suggested_context);
+      setCtxSuggestion(null);
+      setCtxDismissed(true);
+      if (query.trim()) {
+        await runQuery(query);
+      }
+    } catch (e) {
+      setError(String(e));
     }
   };
 
@@ -191,6 +221,40 @@ export default function QueryView() {
       </div>
 
       {error && <div className="text-tm-red text-sm">{error}</div>}
+
+      {/* UI-14 — context-switch suggestion banner. Shows when the
+          backend thinks the user's query belongs in a different
+          context than the active one (CTX-2 heuristic stub). One-click
+          switch + re-run, or dismiss. */}
+      {ctxSuggestion && !ctxDismissed && (
+        <div className="bg-amber-500/10 border border-amber-500/30 rounded-lg p-3 flex items-start gap-3">
+          <span className="text-amber-400 text-lg leading-none mt-0.5">⚠</span>
+          <div className="flex-1 text-sm">
+            <p className="text-tm-text">
+              This looks like it might belong to{" "}
+              <span className="font-medium text-amber-300">
+                {ctxSuggestion.suggested_context}
+              </span>
+              .
+            </p>
+            <p className="text-xs text-tm-muted mt-0.5">{ctxSuggestion.reason}</p>
+          </div>
+          <div className="flex gap-2 shrink-0">
+            <button
+              onClick={() => acceptContextSuggestion(ctxSuggestion)}
+              className="text-xs px-2.5 py-1 bg-amber-500/20 border border-amber-500/40 text-amber-300 rounded hover:bg-amber-500/30 transition-colors"
+            >
+              Switch & re-run
+            </button>
+            <button
+              onClick={() => setCtxDismissed(true)}
+              className="text-xs px-2.5 py-1 text-tm-muted hover:text-tm-text transition-colors"
+            >
+              Dismiss
+            </button>
+          </div>
+        </div>
+      )}
 
       {result && (
         <div className="space-y-5">

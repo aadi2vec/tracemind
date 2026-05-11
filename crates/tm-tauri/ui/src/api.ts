@@ -442,3 +442,66 @@ export async function createContext(
 export async function clearContext(): Promise<void> {
   return invoke("cmd_context_clear");
 }
+
+// UI-13 — Capture permissions panel
+
+export interface CapturePermissionRow {
+  source: string;
+  description: string;
+  enabled: boolean;
+  default_enabled: boolean;
+  granted_at: string | null;
+  last_event_at: string | null;
+  event_count: number;
+}
+
+export async function listCapturePermissions(): Promise<CapturePermissionRow[]> {
+  return invoke("cmd_capture_permissions_list");
+}
+
+export async function setCapturePermission(source: string, enabled: boolean): Promise<void> {
+  return invoke("cmd_capture_permissions_set", { source, enabled });
+}
+
+export interface ForgetSourceResult {
+  source: string;
+  entities_removed: number;
+  traces_redacted: number;
+}
+
+export async function forgetCaptureSource(source: string): Promise<ForgetSourceResult> {
+  return invoke("cmd_capture_forget_source", { source });
+}
+
+// DP-3 — usage instrumentation
+
+export interface UsageStats {
+  first_seen: string | null;
+  last_query_at: string | null;
+  last_helpful_at: string | null;
+  last_negative_at: string | null;
+  total_queries: number;
+  total_helpful: number;
+  total_negative: number;
+  active_days: string[];
+}
+
+export async function getUsageStats(): Promise<UsageStats> {
+  return invoke("cmd_usage_stats");
+}
+
+export async function getUsageSharePayload(): Promise<string> {
+  return invoke("cmd_usage_share_payload");
+}
+
+// UI-14 — Context-switch suggestion
+
+export interface ContextSuggestion {
+  suggested_context: string;
+  confidence: number;
+  reason: string;
+}
+
+export async function suggestContext(queryText: string): Promise<ContextSuggestion | null> {
+  return invoke("cmd_context_suggest", { queryText });
+}
