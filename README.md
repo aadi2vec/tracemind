@@ -1,6 +1,8 @@
 # TraceMind
 
-**Local-only memory OS for humans and AI agents.**
+**Ambient memory for every AI you use — captures what you do, scopes itself to the right context, learns your boundaries, never uploaded.**
+
+That's the wedge in one sentence (W-7). Below is what it actually does.
 
 TraceMind gives every context window a persistent, structured, privacy-first memory — running entirely on your machine. No cloud, no RAM bloat, no telemetry.
 

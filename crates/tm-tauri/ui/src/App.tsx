@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import BriefView from "./views/BriefView";
 import Dashboard from "./views/Dashboard";
 import QueryView from "./views/QueryView";
@@ -7,8 +7,24 @@ import IngestView from "./views/IngestView";
 import GraphView from "./views/GraphView";
 import ReasonView from "./views/ReasonView";
 import ContextSwitcher from "./views/ContextSwitcher";
+import SettingsView from "./views/SettingsView";
+import OnboardingView from "./views/OnboardingView";
+import CommitmentTimelineView from "./views/CommitmentTimelineView";
+import CalibrationView from "./views/CalibrationView";
+import { getUsageStats } from "./api";
 
-type View = "brief" | "dashboard" | "query" | "ingest" | "traces" | "graph" | "reason";
+type View =
+  | "brief"
+  | "dashboard"
+  | "query"
+  | "ingest"
+  | "traces"
+  | "graph"
+  | "reason"
+  | "commitments"
+  | "calibration"
+  | "settings"
+  | "onboarding";
 
 const NAV_ITEMS: { id: View; label: string; icon: string }[] = [
   { id: "brief", label: "Brief", icon: "brief" },
@@ -17,7 +33,10 @@ const NAV_ITEMS: { id: View; label: string; icon: string }[] = [
   { id: "ingest", label: "Ingest", icon: "plus" },
   { id: "graph", label: "Graph", icon: "graph" },
   { id: "reason", label: "Reason", icon: "reason" },
+  { id: "commitments", label: "Commitments", icon: "timeline" },
+  { id: "calibration", label: "Calibration", icon: "gauge" },
   { id: "traces", label: "Traces", icon: "list" },
+  { id: "settings", label: "Settings", icon: "settings" },
 ];
 
 function NavIcon({ type }: { type: string }) {
@@ -67,6 +86,25 @@ function NavIcon({ type }: { type: string }) {
           <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2" />
         </svg>
       );
+    case "timeline":
+      return (
+        <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 3v18M5 8h6M5 14h10M5 20h4" />
+        </svg>
+      );
+    case "gauge":
+      return (
+        <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 12a9 9 0 1118 0M12 12l4-4" />
+        </svg>
+      );
+    case "settings":
+      return (
+        <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" />
+          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
+        </svg>
+      );
     default:
       return null;
   }
@@ -74,6 +112,38 @@ function NavIcon({ type }: { type: string }) {
 
 export default function App() {
   const [view, setView] = useState<View>("brief");
+  const [firstRunChecked, setFirstRunChecked] = useState(false);
+
+  // UI-8 — route first-run users to onboarding. We detect "first run"
+  // as having no usage history yet (first_seen is null).
+  useEffect(() => {
+    getUsageStats()
+      .then((u) => {
+        if (!u.first_seen && u.total_queries === 0) {
+          setView("onboarding");
+        }
+      })
+      .catch(() => {
+        /* fall through to brief — DP-3 failures shouldn't block UI */
+      })
+      .finally(() => setFirstRunChecked(true));
+  }, []);
+
+  if (!firstRunChecked) {
+    return (
+      <div className="flex h-screen items-center justify-center bg-tm-bg">
+        <div className="w-6 h-6 border-2 border-tm-accent border-t-transparent rounded-full animate-spin" />
+      </div>
+    );
+  }
+
+  if (view === "onboarding") {
+    return (
+      <div className="h-screen overflow-y-auto bg-tm-bg p-6">
+        <OnboardingView onComplete={() => setView("brief")} />
+      </div>
+    );
+  }
 
   return (
     <div className="flex h-screen">
@@ -84,7 +154,7 @@ export default function App() {
           <p className="text-xs text-tm-muted mt-0.5">Local Memory OS</p>
         </div>
 
-        <div className="flex-1 py-3">
+        <div className="flex-1 py-3 overflow-y-auto">
           {NAV_ITEMS.map((item) => (
             <button
               key={item.id}
@@ -121,7 +191,10 @@ export default function App() {
         {view === "ingest" && <IngestView />}
         {view === "graph" && <GraphView />}
         {view === "reason" && <ReasonView />}
+        {view === "commitments" && <CommitmentTimelineView />}
+        {view === "calibration" && <CalibrationView />}
         {view === "traces" && <TracesView />}
+        {view === "settings" && <SettingsView />}
       </main>
     </div>
   );

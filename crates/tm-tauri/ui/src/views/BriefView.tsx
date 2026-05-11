@@ -12,13 +12,15 @@
 //     "Did you ship it? What was the outcome?" → user picks polarity
 //     → brief refreshes, the row moves from overdue → resolved.
 
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import {
+  currentContext,
   getBrief,
   getTripleDetail,
   resolveContradiction,
   recordOutcome,
   type BriefView as BriefData,
+  type ContextInfo,
   type ContradictionRow,
   type BriefRow,
   type ResolveChoice,
@@ -30,22 +32,104 @@ function shortId(id: string): string {
   return id.slice(0, 8);
 }
 
+// UI-9 — read / dismissed / archived state lives in localStorage so it
+// survives reloads without touching the backend. Keys are scoped per
+// brief row id; "read" is auto-marked when the user opens a drawer,
+// "dismissed" hides a row from the active panel, "archived" stashes it
+// in a collapsed section the user can re-open.
+const LS_READ = "tm.brief.read";
+const LS_DISMISSED = "tm.brief.dismissed";
+const LS_ARCHIVED = "tm.brief.archived";
+
+function loadSet(key: string): Set<string> {
+  try {
+    const raw = localStorage.getItem(key);
+    if (!raw) return new Set();
+    const arr = JSON.parse(raw) as string[];
+    return new Set(Array.isArray(arr) ? arr : []);
+  } catch {
+    return new Set();
+  }
+}
+
+function saveSet(key: string, set: Set<string>) {
+  try {
+    localStorage.setItem(key, JSON.stringify([...set]));
+  } catch {
+    /* quota / privacy mode — best-effort only */
+  }
+}
+
 export default function BriefView() {
   const [brief, setBrief] = useState<BriefData | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
+  // C-0.9 — show the active context inline so the brief makes it
+  // obvious which slice of the world model these commitments came from.
+  const [activeContext, setActiveContext] = useState<ContextInfo | null>(null);
 
   // Drawer state: only one drawer can be open at a time.
   const [contradictionDrawer, setContradictionDrawer] =
     useState<ContradictionRow | null>(null);
   const [outcomeDrawer, setOutcomeDrawer] = useState<BriefRow | null>(null);
 
+  // UI-9 — read / dismissed / archived markers (localStorage).
+  const [readIds, setReadIds] = useState<Set<string>>(() => loadSet(LS_READ));
+  const [dismissedIds, setDismissedIds] = useState<Set<string>>(() =>
+    loadSet(LS_DISMISSED),
+  );
+  const [archivedIds, setArchivedIds] = useState<Set<string>>(() =>
+    loadSet(LS_ARCHIVED),
+  );
+  const [showArchived, setShowArchived] = useState(false);
+
+  const markRead = (id: string) => {
+    setReadIds((prev) => {
+      if (prev.has(id)) return prev;
+      const next = new Set(prev);
+      next.add(id);
+      saveSet(LS_READ, next);
+      return next;
+    });
+  };
+
+  const dismiss = (id: string) => {
+    setDismissedIds((prev) => {
+      const next = new Set(prev);
+      next.add(id);
+      saveSet(LS_DISMISSED, next);
+      return next;
+    });
+  };
+
+  const archive = (id: string) => {
+    setArchivedIds((prev) => {
+      const next = new Set(prev);
+      next.add(id);
+      saveSet(LS_ARCHIVED, next);
+      return next;
+    });
+  };
+
+  const unarchive = (id: string) => {
+    setArchivedIds((prev) => {
+      const next = new Set(prev);
+      next.delete(id);
+      saveSet(LS_ARCHIVED, next);
+      return next;
+    });
+  };
+
   const refresh = async () => {
     setLoading(true);
     setError(null);
     try {
-      const data = await getBrief();
+      const [data, ctx] = await Promise.all([
+        getBrief(),
+        currentContext().catch(() => null),
+      ]);
       setBrief(data);
+      setActiveContext(ctx);
     } catch (e) {
       setError(String(e));
     } finally {
@@ -77,6 +161,23 @@ export default function BriefView() {
 
   const c = brief.counts;
 
+  // UI-9 — filter dismissed/archived rows out of the active sections.
+  // We render archived rows in a separate collapsible block so users
+  // can recover them without touching the database.
+  const visibleOverdue = brief.overdue.filter(
+    (r) => !dismissedIds.has(r.id) && !archivedIds.has(r.id),
+  );
+  const visibleOpen = brief.open.filter(
+    (r) => !dismissedIds.has(r.id) && !archivedIds.has(r.id),
+  );
+  const visibleResolved = brief.resolved.filter(
+    (r) => !dismissedIds.has(r.id) && !archivedIds.has(r.id),
+  );
+  const archivedRows = useMemo(() => {
+    const all = [...brief.overdue, ...brief.open, ...brief.resolved];
+    return all.filter((r) => archivedIds.has(r.id));
+  }, [brief.overdue, brief.open, brief.resolved, archivedIds]);
+
   return (
     <div className="max-w-4xl">
       <div className="flex items-baseline justify-between mb-5">
@@ -84,6 +185,13 @@ export default function BriefView() {
           <h2 className="text-lg font-semibold text-tm-text">TraceMind Brief</h2>
           <p className="text-xs text-tm-muted mt-0.5">
             generated {brief.generated_at}
+            {activeContext && (
+              <>
+                {" · "}
+                <span className="text-tm-muted">scope</span>{" "}
+                <span className="text-tm-accent">{activeContext.name}</span>
+              </>
+            )}
           </p>
         </div>
         <button
@@ -108,128 +216,165 @@ export default function BriefView() {
         </span>
       </div>
 
-      {brief.contradictions.length > 0 && (
+      {brief.contradictions.filter((r) => !dismissedIds.has(r.id)).length > 0 && (
         <section className="mb-6">
           <h3 className="text-sm font-semibold text-amber-400 mb-2">
-            ⚡ contradictions ({brief.contradictions.length})
+            ⚡ contradictions ({brief.contradictions.filter((r) => !dismissedIds.has(r.id)).length})
           </h3>
           <ul className="space-y-2">
-            {brief.contradictions.map((row) => (
-              <li
-                key={row.id}
-                onClick={() => setContradictionDrawer(row)}
-                className="border border-amber-500/30 bg-amber-500/5 rounded px-4 py-2.5 text-sm cursor-pointer hover:bg-amber-500/10 transition"
-              >
-                <div className="font-mono text-xs text-tm-muted">
-                  {shortId(row.triple_a)} ↔ {shortId(row.triple_b)}
-                </div>
-                <div className="text-tm-text mt-1">
-                  cosine{" "}
-                  <span className="font-mono">
-                    {row.cosine_similarity >= 0 ? "+" : ""}
-                    {row.cosine_similarity.toFixed(2)}
-                  </span>
-                  {" · detected "}
-                  <span className="text-tm-muted">{row.detected_at}</span>
-                  <span className="text-amber-400 ml-2">→ review</span>
-                </div>
-              </li>
-            ))}
-          </ul>
-        </section>
-      )}
-
-      {brief.overdue.length > 0 && (
-        <section className="mb-6">
-          <h3 className="text-sm font-semibold text-tm-text mb-2">
-            overdue ({brief.overdue.length})
-          </h3>
-          <ul className="space-y-1">
-            {brief.overdue.map((r) => (
-              <li
-                key={r.id}
-                onClick={() => setOutcomeDrawer(r)}
-                className="flex items-baseline gap-3 text-sm border-b border-tm-border py-2 cursor-pointer hover:bg-tm-accent/5 px-2 -mx-2 rounded transition"
-              >
-                <span className="font-mono text-xs text-tm-muted">
-                  {shortId(r.id)}
-                </span>
-                <span className="text-xs text-amber-400 uppercase tracking-wide">
-                  {r.overdue_class ?? "overdue"}
-                </span>
-                <span className="text-tm-text">{r.title}</span>
-                {r.horizon && (
-                  <span className="ml-auto text-xs text-tm-muted">{r.horizon}</span>
-                )}
-              </li>
-            ))}
-          </ul>
-        </section>
-      )}
-
-      {brief.open.length > 0 && (
-        <section className="mb-6">
-          <h3 className="text-sm font-semibold text-tm-text mb-2">
-            open ({brief.open.length})
-          </h3>
-          <ul className="space-y-1">
-            {brief.open.map((r) => (
-              <li
-                key={r.id}
-                onClick={() => setOutcomeDrawer(r)}
-                className="flex items-baseline gap-3 text-sm border-b border-tm-border py-2 cursor-pointer hover:bg-tm-accent/5 px-2 -mx-2 rounded transition"
-              >
-                <span className="font-mono text-xs text-tm-muted">
-                  {shortId(r.id)}
-                </span>
-                <span className="text-tm-text">{r.title}</span>
-                {r.horizon && (
-                  <span className="ml-auto text-xs text-tm-muted">{r.horizon}</span>
-                )}
-              </li>
-            ))}
-          </ul>
-        </section>
-      )}
-
-      {brief.resolved.length > 0 && (
-        <section className="mb-6">
-          <h3 className="text-sm font-semibold text-tm-text mb-2">
-            resolved ({brief.resolved.length})
-          </h3>
-          <ul className="space-y-1">
-            {brief.resolved.map((r) => (
-              <li
-                key={r.id}
-                className="flex items-baseline gap-3 text-sm border-b border-tm-border py-2"
-              >
-                <span className="font-mono text-xs text-tm-muted">
-                  {shortId(r.id)}
-                </span>
-                {r.polarity && (
-                  <span
-                    className={`text-xs uppercase tracking-wide ${
-                      r.polarity === "Positive"
-                        ? "text-emerald-400"
-                        : r.polarity === "Negative"
-                        ? "text-rose-400"
-                        : "text-tm-muted"
-                    }`}
+            {brief.contradictions
+              .filter((r) => !dismissedIds.has(r.id))
+              .map((row) => (
+                <li
+                  key={row.id}
+                  className="group border border-amber-500/30 bg-amber-500/5 rounded px-4 py-2.5 text-sm flex items-start gap-3"
+                >
+                  <button
+                    onClick={() => {
+                      markRead(row.id);
+                      setContradictionDrawer(row);
+                    }}
+                    className="flex-1 text-left cursor-pointer"
                   >
-                    {r.polarity}
-                  </span>
-                )}
-                <span className="text-tm-text">{r.title}</span>
-              </li>
+                    <div className="font-mono text-xs text-tm-muted">
+                      {!readIds.has(row.id) && (
+                        <span className="inline-block w-1.5 h-1.5 rounded-full bg-amber-400 mr-1.5 align-middle" />
+                      )}
+                      {shortId(row.triple_a)} ↔ {shortId(row.triple_b)}
+                    </div>
+                    <div className="text-tm-text mt-1">
+                      cosine{" "}
+                      <span className="font-mono">
+                        {row.cosine_similarity >= 0 ? "+" : ""}
+                        {row.cosine_similarity.toFixed(2)}
+                      </span>
+                      {" · detected "}
+                      <span className="text-tm-muted">{row.detected_at}</span>
+                      <span className="text-amber-400 ml-2">→ review</span>
+                    </div>
+                  </button>
+                  <button
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      dismiss(row.id);
+                    }}
+                    title="dismiss"
+                    className="opacity-0 group-hover:opacity-100 text-tm-muted hover:text-rose-400 text-xs transition"
+                  >
+                    ×
+                  </button>
+                </li>
+              ))}
+          </ul>
+        </section>
+      )}
+
+      {visibleOverdue.length > 0 && (
+        <section className="mb-6">
+          <h3 className="text-sm font-semibold text-tm-text mb-2">
+            overdue ({visibleOverdue.length})
+          </h3>
+          <ul className="space-y-1">
+            {visibleOverdue.map((r) => (
+              <BriefRowItem
+                key={r.id}
+                row={r}
+                read={readIds.has(r.id)}
+                onOpen={() => {
+                  markRead(r.id);
+                  setOutcomeDrawer(r);
+                }}
+                onDismiss={() => dismiss(r.id)}
+                onArchive={() => archive(r.id)}
+                accent="overdue"
+              />
             ))}
           </ul>
         </section>
       )}
 
-      {brief.overdue.length === 0 &&
-        brief.open.length === 0 &&
-        brief.resolved.length === 0 &&
-        brief.contradictions.length === 0 && (
+      {visibleOpen.length > 0 && (
+        <section className="mb-6">
+          <h3 className="text-sm font-semibold text-tm-text mb-2">
+            open ({visibleOpen.length})
+          </h3>
+          <ul className="space-y-1">
+            {visibleOpen.map((r) => (
+              <BriefRowItem
+                key={r.id}
+                row={r}
+                read={readIds.has(r.id)}
+                onOpen={() => {
+                  markRead(r.id);
+                  setOutcomeDrawer(r);
+                }}
+                onDismiss={() => dismiss(r.id)}
+                onArchive={() => archive(r.id)}
+              />
+            ))}
+          </ul>
+        </section>
+      )}
+
+      {visibleResolved.length > 0 && (
+        <section className="mb-6">
+          <h3 className="text-sm font-semibold text-tm-text mb-2">
+            resolved ({visibleResolved.length})
+          </h3>
+          <ul className="space-y-1">
+            {visibleResolved.map((r) => (
+              <BriefRowItem
+                key={r.id}
+                row={r}
+                read={readIds.has(r.id)}
+                onOpen={() => markRead(r.id)}
+                onDismiss={() => dismiss(r.id)}
+                onArchive={() => archive(r.id)}
+                accent="resolved"
+              />
+            ))}
+          </ul>
+        </section>
+      )}
+
+      {archivedRows.length > 0 && (
+        <section className="mb-6">
+          <button
+            onClick={() => setShowArchived((v) => !v)}
+            className="text-xs uppercase tracking-wider text-tm-muted hover:text-tm-text transition mb-2"
+          >
+            {showArchived ? "▾" : "▸"} archived ({archivedRows.length})
+          </button>
+          {showArchived && (
+            <ul className="space-y-1 opacity-70">
+              {archivedRows.map((r) => (
+                <li
+                  key={r.id}
+                  className="flex items-baseline gap-3 text-sm border-b border-tm-border/40 py-1.5"
+                >
+                  <span className="font-mono text-xs text-tm-muted">
+                    {shortId(r.id)}
+                  </span>
+                  <span className="text-tm-muted line-through decoration-tm-border">
+                    {r.title}
+                  </span>
+                  <button
+                    onClick={() => unarchive(r.id)}
+                    className="ml-auto text-xs text-tm-muted hover:text-tm-accent transition"
+                  >
+                    restore
+                  </button>
+                </li>
+              ))}
+            </ul>
+          )}
+        </section>
+      )}
+
+      {visibleOverdue.length === 0 &&
+        visibleOpen.length === 0 &&
+        visibleResolved.length === 0 &&
+        brief.contradictions.filter((r) => !dismissedIds.has(r.id)).length === 0 && (
           <p className="text-sm text-tm-muted">
             No commitments yet. Run <code>tracemind demo restore</code> to seed
             the deterministic fixture, or capture some text to populate the
@@ -259,6 +404,85 @@ export default function BriefView() {
         />
       )}
     </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// BriefRowItem — single row in the overdue/open/resolved lists. Carries
+// the read-marker dot, hover-revealed dismiss/archive buttons, and the
+// click-to-open-drawer affordance. UI-9 polish.
+// ---------------------------------------------------------------------------
+
+function BriefRowItem({
+  row,
+  read,
+  onOpen,
+  onDismiss,
+  onArchive,
+  accent,
+}: {
+  row: BriefRow;
+  read: boolean;
+  onOpen: () => void;
+  onDismiss: () => void;
+  onArchive: () => void;
+  accent?: "overdue" | "resolved";
+}) {
+  return (
+    <li className="group flex items-baseline gap-3 text-sm border-b border-tm-border py-2 px-2 -mx-2 rounded hover:bg-tm-accent/5 transition">
+      <button onClick={onOpen} className="flex items-baseline gap-3 flex-1 text-left">
+        <span className="font-mono text-xs text-tm-muted flex items-center gap-1.5">
+          {!read && (
+            <span className="inline-block w-1.5 h-1.5 rounded-full bg-tm-accent" />
+          )}
+          {shortId(row.id)}
+        </span>
+        {accent === "overdue" && (
+          <span className="text-xs text-amber-400 uppercase tracking-wide">
+            {row.overdue_class ?? "overdue"}
+          </span>
+        )}
+        {accent === "resolved" && row.polarity && (
+          <span
+            className={`text-xs uppercase tracking-wide ${
+              row.polarity === "Positive"
+                ? "text-emerald-400"
+                : row.polarity === "Negative"
+                  ? "text-rose-400"
+                  : "text-tm-muted"
+            }`}
+          >
+            {row.polarity}
+          </span>
+        )}
+        <span className={read ? "text-tm-muted" : "text-tm-text"}>{row.title}</span>
+        {row.horizon && (
+          <span className="ml-auto text-xs text-tm-muted">{row.horizon}</span>
+        )}
+      </button>
+      <div className="opacity-0 group-hover:opacity-100 flex items-center gap-1 transition">
+        <button
+          onClick={(e) => {
+            e.stopPropagation();
+            onArchive();
+          }}
+          title="archive"
+          className="text-xs text-tm-muted hover:text-tm-accent"
+        >
+          ⌫
+        </button>
+        <button
+          onClick={(e) => {
+            e.stopPropagation();
+            onDismiss();
+          }}
+          title="dismiss"
+          className="text-xs text-tm-muted hover:text-rose-400"
+        >
+          ×
+        </button>
+      </div>
+    </li>
   );
 }
 

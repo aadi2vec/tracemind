@@ -2327,10 +2327,15 @@ async fn handle_request(
 ) -> Result<Value, anyhow::Error> {
     match method {
         "initialize" => {
+            // MCP-6 (W-7) — propagate the canonical wedge sentence so every
+            // host's LLM sees the same framing the first moment it connects.
+            // The `instructions` field is part of the MCP 2024-11-05 spec for
+            // exactly this kind of server-level priming.
             Ok(json!({
                 "protocolVersion": "2024-11-05",
                 "capabilities": { "tools": {} },
-                "serverInfo": { "name": "tracemind", "version": "0.1.0" }
+                "serverInfo": { "name": "tracemind", "version": "0.1.0" },
+                "instructions": "TraceMind is ambient memory for every AI you use — it captures what you do, scopes itself to the right context, learns your boundaries, and never uploads anything off-device. Call memory_store proactively when the user shares anything durable. Call memory_query before answering anything that references the past. Always surface contradictions returned by memory_store — that retraction beat is the point."
             }))
         }
 

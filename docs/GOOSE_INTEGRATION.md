@@ -1,5 +1,7 @@
 # TraceMind + Goose — 60-second integration
 
+**Wedge sentence (W-7):** ambient memory for every AI you use — captures what you do, scopes itself to the right context, learns your boundaries, never uploaded.
+
 [Goose](https://github.com/block/goose) is Block's open-source local AI agent. It's MCP-native: every tool, every memory layer, every integration is an MCP server. TraceMind already ships one (`tm-mcp`), so the integration is pure configuration — **no new code on either side**.
 
 This doc is the onboarding kit for design partners who already use Goose.
