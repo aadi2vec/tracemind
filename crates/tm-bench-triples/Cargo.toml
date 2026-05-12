@@ -1,0 +1,31 @@
+[package]
+name = "tm-bench-triples"
+version.workspace = true
+edition.workspace = true
+
+# LM-10 — Triple-extraction quality bench.
+#
+# Scores the active triple extractor (HeuristicExtractor today; SML when
+# LM-8 ships) against a hand-labeled fixture of (subject, predicate,
+# object) triples. Two scores:
+#
+#   - entity-pair precision (predicate-agnostic): does the extractor at
+#     least *connect* the right pair? This is the floor — anything that
+#     misses the pair can't possibly be useful.
+#   - typed-predicate precision: does the predicate match the gold label?
+#     Stricter — what we actually want from an SML extractor.
+#
+# Q3 target ≥ 0.70 typed precision @ confidence ≥ 0.7 (matches the
+# PROJECT_2026 §1c sequencing). Q4 target ≥ 0.80. The harness is
+# fixture-only today and exits non-zero below `--threshold` so CI can
+# gate against regressions.
+[[bin]]
+name = "tm-bench-triples"
+path = "src/main.rs"
+
+[dependencies]
+tm-ingest = { workspace = true }
+tm-types = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }

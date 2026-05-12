@@ -5819,6 +5819,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "tm-bench-triples"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tm-ingest",
+ "tm-types",
+ "uuid",
+]
+
+[[package]]
 name = "tm-capture"
 version = "0.1.0"
 dependencies = [

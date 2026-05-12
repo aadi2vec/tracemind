@@ -2528,6 +2528,319 @@ fn cmd_export_context(
 }
 
 // ---------------------------------------------------------------------------
+// LM-1 — Backlinks panel (P5a Obsidian-parity)
+//
+// Returns every entity that points at the target via any non-RelatedTo
+// predicate (sorted by triple confidence). The UI renders these as the
+// "linked from" panel in the entity drawer (LM-3 entity-drawer rewrite).
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize, Clone)]
+struct BacklinkRow {
+    triple_id: String,
+    source_id: String,
+    source_name: String,
+    source_type: String,
+    predicate: String,
+    confidence: f64,
+}
+
+/// LM-1 — list incoming-edge backlinks for an entity.
+///
+/// `entity_id` accepts a UUID or an exact-match entity name. Returns at
+/// most `limit` rows (default 50). `include_related_to=false` filters
+/// out the noisy generic `RelatedTo` co-mention edges so the panel
+/// shows only meaningful relations.
+#[tauri::command]
+fn cmd_entity_backlinks(
+    state: State<AppState>,
+    entity_id: String,
+    limit: Option<usize>,
+    include_related_to: Option<bool>,
+) -> Result<Vec<BacklinkRow>, String> {
+    let graph = GraphStore::open(&state.db_path).map_err(|e| e.to_string())?;
+    let target = match Uuid::parse_str(&entity_id) {
+        Ok(u) => u,
+        Err(_) => graph
+            .find_entity_by_name_icase(&entity_id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("no entity matches '{entity_id}'"))?
+            .id,
+    };
+    let rows = graph
+        .backlinks(target, limit.or(Some(50)), include_related_to.unwrap_or(false))
+        .map_err(|e| e.to_string())?;
+    Ok(rows
+        .into_iter()
+        .map(|b| BacklinkRow {
+            triple_id: b.triple_id.to_string(),
+            source_id: b.source.id.to_string(),
+            source_name: b.source.name,
+            source_type: b.source.entity_type.to_string(),
+            predicate: b.predicate.to_string(),
+            confidence: b.confidence,
+        })
+        .collect())
+}
+
+// ---------------------------------------------------------------------------
+// LM-2 — Inline auto-rendered [[wikilinks]] (P5a Obsidian-parity)
+//
+// The UI sends the raw memory text; the backend returns byte-offset
+// spans that the renderer turns into `<a>` chips. User never types
+// `[[`.
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize, Clone)]
+struct WikilinkSpan {
+    entity_id: String,
+    entity_name: String,
+    entity_type: String,
+    start: usize,
+    end: usize,
+}
+
+/// LM-2 — resolve entity mentions in `text`. Returns one span per
+/// non-overlapping mention. Pass `context_id` (UUID) to limit candidate
+/// entities to one context — matches the decoupled-by-default stance.
+#[tauri::command]
+fn cmd_resolve_wikilinks(
+    state: State<AppState>,
+    text: String,
+    context_id: Option<String>,
+) -> Result<Vec<WikilinkSpan>, String> {
+    let graph = GraphStore::open(&state.db_path).map_err(|e| e.to_string())?;
+    let ctx = match context_id {
+        Some(s) if !s.is_empty() => {
+            Some(Uuid::parse_str(&s).map_err(|e| format!("bad context_id: {e}"))?)
+        }
+        _ => None,
+    };
+    let mentions = graph
+        .resolve_entity_in_text(&text, ctx)
+        .map_err(|e| e.to_string())?;
+    let mut out = Vec::with_capacity(mentions.len());
+    for m in mentions {
+        // fetch the canonical entity name + type so the UI doesn't
+        // need a second round-trip per span.
+        let ent = match graph.get_entity(m.entity_id) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        out.push(WikilinkSpan {
+            entity_id: m.entity_id.to_string(),
+            entity_name: ent.name,
+            entity_type: ent.entity_type.to_string(),
+            start: m.start,
+            end: m.end,
+        });
+    }
+    Ok(out)
+}
+
+// ---------------------------------------------------------------------------
+// LM-11d-fe — Memory Views Tauri command surface (P5c user-power)
+//
+// Mirrors `memory_views_*` MCP tools so Tauri threads can edit splices
+// without shelling out to the CLI. The frontend renders these in the
+// thread sidebar (LM-11e session-scoped splice).
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize, Clone)]
+struct ViewSummary {
+    id: String,
+    name: String,
+    description: String,
+    confidence_floor: f32,
+    include_pending: bool,
+    updated_at: String,
+    member_count: usize,
+}
+
+#[derive(Serialize, Clone)]
+struct ViewMemberRow {
+    kind: String,
+    member_type: String,
+    member_id: String,
+    added_at: String,
+}
+
+#[derive(Serialize, Clone)]
+struct ViewDetail {
+    view: ViewSummary,
+    members: Vec<ViewMemberRow>,
+}
+
+fn resolve_view(
+    graph: &GraphStore,
+    name_or_id: &str,
+) -> Result<tm_graph::MemoryView, String> {
+    if let Ok(id) = Uuid::parse_str(name_or_id) {
+        if let Some(v) = graph.get_view(id).map_err(|e| e.to_string())? {
+            return Ok(v);
+        }
+    }
+    graph
+        .get_view_by_name(name_or_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("no view named '{name_or_id}'"))
+}
+
+#[tauri::command]
+fn cmd_views_list(state: State<AppState>) -> Result<Vec<ViewSummary>, String> {
+    let graph = GraphStore::open(&state.db_path).map_err(|e| e.to_string())?;
+    let views = graph.list_views().map_err(|e| e.to_string())?;
+    let mut out = Vec::with_capacity(views.len());
+    for v in views {
+        let members = graph.list_view_members(v.id).map_err(|e| e.to_string())?;
+        out.push(ViewSummary {
+            id: v.id.to_string(),
+            name: v.name,
+            description: v.description,
+            confidence_floor: v.confidence_floor,
+            include_pending: v.include_pending,
+            updated_at: v.updated_at.to_rfc3339(),
+            member_count: members.len(),
+        });
+    }
+    Ok(out)
+}
+
+#[tauri::command]
+fn cmd_views_show(state: State<AppState>, name: String) -> Result<ViewDetail, String> {
+    let graph = GraphStore::open(&state.db_path).map_err(|e| e.to_string())?;
+    let v = resolve_view(&graph, &name)?;
+    let members = graph.list_view_members(v.id).map_err(|e| e.to_string())?;
+    Ok(ViewDetail {
+        view: ViewSummary {
+            id: v.id.to_string(),
+            name: v.name,
+            description: v.description,
+            confidence_floor: v.confidence_floor,
+            include_pending: v.include_pending,
+            updated_at: v.updated_at.to_rfc3339(),
+            member_count: members.len(),
+        },
+        members: members
+            .into_iter()
+            .map(|m| ViewMemberRow {
+                kind: m.kind.as_str().to_string(),
+                member_type: m.member_type.as_str().to_string(),
+                member_id: m.member_id.to_string(),
+                added_at: m.added_at.to_rfc3339(),
+            })
+            .collect(),
+    })
+}
+
+#[tauri::command]
+fn cmd_views_create(
+    state: State<AppState>,
+    name: String,
+    description: Option<String>,
+) -> Result<ViewSummary, String> {
+    let graph = GraphStore::open(&state.db_path).map_err(|e| e.to_string())?;
+    let v = tm_graph::MemoryView::new(name, description.unwrap_or_default());
+    graph.create_view(&v).map_err(|e| e.to_string())?;
+    Ok(ViewSummary {
+        id: v.id.to_string(),
+        name: v.name,
+        description: v.description,
+        confidence_floor: v.confidence_floor,
+        include_pending: v.include_pending,
+        updated_at: v.updated_at.to_rfc3339(),
+        member_count: 0,
+    })
+}
+
+#[tauri::command]
+fn cmd_views_add(
+    state: State<AppState>,
+    name: String,
+    kind: String,
+    member_type: String,
+    member_id: String,
+) -> Result<(), String> {
+    let graph = GraphStore::open(&state.db_path).map_err(|e| e.to_string())?;
+    let v = resolve_view(&graph, &name)?;
+    let k = tm_graph::MemberKind::parse(&kind).map_err(|e| e.to_string())?;
+    let mt = tm_graph::MemberType::parse(&member_type).map_err(|e| e.to_string())?;
+    let mid = Uuid::parse_str(&member_id).map_err(|e| format!("bad member_id: {e}"))?;
+    graph.add_view_member(v.id, k, mt, mid).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+fn cmd_views_remove(
+    state: State<AppState>,
+    name: String,
+    kind: String,
+    member_type: String,
+    member_id: String,
+) -> Result<bool, String> {
+    let graph = GraphStore::open(&state.db_path).map_err(|e| e.to_string())?;
+    let v = resolve_view(&graph, &name)?;
+    let k = tm_graph::MemberKind::parse(&kind).map_err(|e| e.to_string())?;
+    let mt = tm_graph::MemberType::parse(&member_type).map_err(|e| e.to_string())?;
+    let mid = Uuid::parse_str(&member_id).map_err(|e| format!("bad member_id: {e}"))?;
+    graph
+        .remove_view_member(v.id, k, mt, mid)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn cmd_views_delete(state: State<AppState>, name: String) -> Result<bool, String> {
+    let graph = GraphStore::open(&state.db_path).map_err(|e| e.to_string())?;
+    let v = resolve_view(&graph, &name)?;
+    graph.delete_view(v.id).map_err(|e| e.to_string())
+}
+
+// ---------------------------------------------------------------------------
+// LM-5c-fe — `Today` view (DailyNote surface)
+//
+// Returns the entity_id of today's auto-generated DailyNote so the
+// Tauri "Today" tab can deep-link into it. Read-only — creation is
+// done by the `tracemind today` CLI / capture loop (LM-5c-be).
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize, Clone)]
+struct DailyNotePointer {
+    entity_id: String,
+    entity_name: String,
+    backlink_count: usize,
+}
+
+#[tauri::command]
+fn cmd_daily_note_today(
+    state: State<AppState>,
+) -> Result<Option<DailyNotePointer>, String> {
+    use chrono::Local;
+    let graph = GraphStore::open(&state.db_path).map_err(|e| e.to_string())?;
+    let today = Local::now().date_naive().to_string();
+    let ent = match graph
+        .find_entity_by_name_icase(&today)
+        .map_err(|e| e.to_string())?
+    {
+        Some(e) => e,
+        None => return Ok(None),
+    };
+    // Only return it if it really is a DailyNote (guard against a
+    // collision with some other entity that happens to have a date
+    // string as its name).
+    if !matches!(ent.entity_type, tm_types::EntityType::DailyNote) {
+        return Ok(None);
+    }
+    let backlinks = graph
+        .backlinks(ent.id, Some(500), true)
+        .map_err(|e| e.to_string())?;
+    Ok(Some(DailyNotePointer {
+        entity_id: ent.id.to_string(),
+        entity_name: ent.name,
+        backlink_count: backlinks.len(),
+    }))
+}
+
+// ---------------------------------------------------------------------------
 // UI-13 — Capture permissions panel (per-source toggles + audit)
 // ---------------------------------------------------------------------------
 
@@ -2927,6 +3240,15 @@ fn main() {
             cmd_context_create,
             cmd_context_clear,
             cmd_export_context,
+            cmd_entity_backlinks,
+            cmd_resolve_wikilinks,
+            cmd_views_list,
+            cmd_views_show,
+            cmd_views_create,
+            cmd_views_add,
+            cmd_views_remove,
+            cmd_views_delete,
+            cmd_daily_note_today,
             cmd_capture_permissions_list,
             cmd_capture_permissions_set,
             cmd_capture_forget_source,

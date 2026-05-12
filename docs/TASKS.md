@@ -284,13 +284,13 @@ Added 2026-05-12 after partner conversation about Obsidian-style auto-graphs, gr
 
 Goal: ship the **same feature surface as Obsidian** (Karpathy's PKM workflow specifically) with **zero manual linking, tagging, or curation**. Every link is auto-extracted; every tag is auto-derived from cluster labels; every MOC is auto-generated from clusters + communities. The user trusts; the extraction does the labor.
 
-- [ ] **LM-1 Backlinks panel** — every memory in BriefView / DashboardView shows a "linked-from" panel: count + list of memories where the active entity appears. SQL JOIN on `kg_relations`. Click → navigate. (Q3 headline.)
-- [ ] **LM-2 Inline auto-rendered [[wikilinks]]** — entity mentions in memory text become `<a>`-style links to the entity drawer. Resolution: `tm-graph::resolve_entity_in_text(text, ctx) -> Vec<(span, entity_id)>`. **User never types `[[`** — extraction does it.
+- [x] **LM-1 Backlinks panel** — every memory in BriefView / DashboardView shows a "linked-from" panel: count + list of memories where the active entity appears. SQL JOIN on `kg_relations`. Click → navigate. (Q3 headline.)
+- [x] **LM-2 Inline auto-rendered [[wikilinks]]** — entity mentions in memory text become `<a>`-style links to the entity drawer. Resolution: `tm-graph::resolve_entity_in_text(text, ctx) -> Vec<(span, entity_id)>`. **User never types `[[`** — extraction does it.
 - [ ] **LM-3 Entity drawer rewrite** — replace current static entity view with: header (name + type + community) → backlinks panel (LM-1) → relations table → recent captures → cluster siblings (from `tm-cluster`).
 - [ ] **LM-4 Live graph update on capture** — when CAP-* ingests a new triple touching the active entity, the open entity drawer refreshes without reload. Tauri event channel.
 - [ ] **LM-5a Transclusion / memory embeds** — one memory can reference-embed another inline; embedded memory renders as a styled blockquote with a link to the source. Auto-triggered when a memory is summarised by another (e.g., daily note pulls in the morning's standup).
 - [ ] **LM-5b Auto-tags from cluster labels + heuristic hashtags** — every memory carries `tags: Vec<String>` derived from (a) HDBSCAN cluster label (CLU-6), (b) Louvain community label, (c) any literal `#hashtag` the user happens to type. Surfaced as Obsidian-style tag chips in the entity drawer + BriefView. **No manual tagging required.**
-- [ ] **LM-5c Auto-generated daily notes** — promote `tm-reflect`'s daily brief to a first-class `DailyNote` memory entity, dated, with auto-generated backlinks to every memory created that day. Tauri "Today" view = the daily note. Karpathy-style daily-note workflow without typing.
+- [x] **LM-5c Auto-generated daily notes** — promote `tm-reflect`'s daily brief to a first-class `DailyNote` memory entity, dated, with auto-generated backlinks to every memory created that day. Tauri "Today" view = the daily note. Karpathy-style daily-note workflow without typing.
 - [ ] **LM-5d Auto-generated MOCs (Maps of Content)** — for each persistent HDBSCAN cluster + each Louvain community, generate a `MapOfContent` memory: title (from c-TF-IDF label), description (top-3 representative memories), backlinks to all member memories. Refreshed nightly via `consolidate`. Surfaced in Tauri sidebar "Topics" panel.
 - [ ] **LM-5e Force-directed graph view (Q4 polish)** — Tauri Memory Garden full-graph mode. Anti-spam: never render > 500 nodes raw; collapse to cluster-summary view above that. Deferred until backlinks (LM-1..LM-3) are validated by DPs.
 - [ ] **LM-5f Canvas / whiteboard (Q4)** — visual spatial board where user drops a subset of memories (via Memory Views, LM-23..LM-26). Same surface as Obsidian Canvas. Doubles as the **user-controlled splice UI** for P5c primitive 3a.
@@ -300,10 +300,10 @@ Goal: ship the **same feature surface as Obsidian** (Karpathy's PKM workflow spe
 ### P5b — Granular open-vocabulary triple extraction (SML async pipeline)
 
 - [ ] **LM-6 SML candidate evaluation** — score REBEL (460M BART), GLiNER-Relation (~150MB), Qwen 2.5 0.5B-prompted, Phi-3-mini-4k on a 200-sentence eval set (precision, recall, per-sentence latency). Pick winner. Cheapest path: reuse Qwen (already auto-downloaded for Tier-1). Reference partner-recommended Jaya Gupta graph-extraction guide (link TBD when work item opens).
-- [ ] **LM-7 Open-vocabulary predicate schema migration** — `kg_relations.predicate` accepts arbitrary strings (was JSON-encoded enum `{IsA, WorksAt, PartOf}`). Backfill existing rows. Add `predicate_confidence FLOAT` column.
+- [x] **LM-7 Open-vocabulary predicate schema migration** — `kg_relations.predicate` accepts arbitrary strings (was JSON-encoded enum `{IsA, WorksAt, PartOf}`). Backfill existing rows. Add `predicate_confidence FLOAT` column.
 - [ ] **LM-8 Async triple-extraction worker** — `tm-ingest::TripleWorker` runs the chosen SML off the ingest hot path on a tokio bounded channel. Heuristic NER stays as the synchronous fast path; SML enriches asynchronously. Persists new triples with confidence.
-- [ ] **LM-9 Confidence-routed triple acceptance** — low-confidence (< 0.5) triples stay in a pending pool (`pending_relations` table) surfaced in Tauri for user confirmation. High-confidence (≥ 0.7) auto-enter `kg_relations`.
-- [ ] **LM-10 Triple-extraction benchmark** — `tm-bench-triples`: 200 sentences with hand-labeled triples; precision @ confidence ≥0.7. Q3 target ≥ 0.70, Q4 ≥ 0.80.
+- [x] **LM-9 Confidence-routed triple acceptance** — low-confidence (< 0.5) triples stay in a pending pool (`pending_relations` table) surfaced in Tauri for user confirmation. High-confidence (≥ 0.7) auto-enter `kg_relations`.
+- [x] **LM-10 Triple-extraction benchmark** — `tm-bench-triples`: 200 sentences with hand-labeled triples; precision @ confidence ≥0.7. Q3 target ≥ 0.70, Q4 ≥ 0.80.
 
 ### P5c — Context splicing (three layers: user-driven, auto-corrective, ontological)
 
@@ -311,22 +311,22 @@ Partner reframe (2026-05-12): splicing is primarily about **user surgical contro
 
 **3a. User-driven splice — Memory Views (the primary feature, Q2 seed-critical)**
 
-- [ ] **LM-11a Memory Views schema + storage** — new SQLite table `memory_views(id TEXT PRIMARY KEY, name, created_at, updated_at, description)` + `memory_view_members(view_id, memory_id, kind: 'include'|'exclude', added_at)`. A view = a named saved splice (set of include/exclude memory IDs).
-- [ ] **LM-11b Memory Views CLI** — `tracemind view {create <name>, list, show <name>, add <name> <id...>, remove <name> <id...>, delete <name>}`. Editable in plain JSON via `tracemind view edit <name>`.
-- [ ] **LM-11c Query-time splice** — `RetrievalEngine::query` accepts `RetrievalFilter { view: Option<ViewId>, include_ids: Vec<MemoryId>, exclude_ids: Vec<MemoryId> }`. Splice applied **after** retrieval ranking, before final result trimming. CLI: `tracemind query --view "rondo-only" --exclude-ids 42 "what did I decide?"`.
-- [ ] **LM-11d MCP tool surface** — `memory_query` MCP tool grows `view`, `include_ids`, `exclude_ids` parameters. Schema in `tm-mcp::schema`. Documented in CLAUDE_CODE_INTEGRATION.md.
+- [x] **LM-11a Memory Views schema + storage** — new SQLite table `memory_views(id TEXT PRIMARY KEY, name, created_at, updated_at, description)` + `memory_view_members(view_id, memory_id, kind: 'include'|'exclude', added_at)`. A view = a named saved splice (set of include/exclude memory IDs).
+- [x] **LM-11b Memory Views CLI** — `tracemind view {create <name>, list, show <name>, add <name> <id...>, remove <name> <id...>, delete <name>}`. Editable in plain JSON via `tracemind view edit <name>`.
+- [x] **LM-11c Query-time splice** — `RetrievalEngine::query` accepts `RetrievalFilter { view: Option<ViewId>, include_ids: Vec<MemoryId>, exclude_ids: Vec<MemoryId> }`. Splice applied **after** retrieval ranking, before final result trimming. CLI: `tracemind query --view "rondo-only" --exclude-ids 42 "what did I decide?"`.
+- [x] **LM-11d MCP tool surface** — `memory_query` MCP tool grows `view`, `include_ids`, `exclude_ids` parameters. Schema in `tm-mcp::schema`. Documented in CLAUDE_CODE_INTEGRATION.md.
 - [ ] **LM-11e Session-scoped splice (Q3, Tauri)** — Tauri thread sidebar shows active view; multi-select memories → "Use these for next query in this thread." Live-editable. State persisted in `localStorage` keyed by thread_id. Doubles as Canvas/whiteboard surface (LM-5f).
-- [ ] **LM-11f Export-a-view** — `tracemind export --view <name>` writes the splice as a markdown bundle. Sibling to LM-16.
+- [x] **LM-11f Export-a-view** — `tracemind export --view <name>` writes the splice as a markdown bundle. Sibling to LM-16.
 
 **3b. Auto-corrective: context deny-list (Q2 seed-critical)**
 
-- [ ] **LM-11 Context deny-list** — `~/.tracemind/cross_ctx_block_list.json` keyed by `(ctx_a, ctx_b)`. Bridges never fire on listed pairs regardless of cosine. CTX-1/CTX-2 in P1d consult this before any bridge proposal.
-- [ ] **LM-12 3-strike auto-deny** — `memory_feedback {kind: "wrong_context_suggestion"}` on the same `(ctx_a, ctx_b)` 3 times → auto-add to deny-list. User can undo from Tauri Settings.
-- [ ] **LM-13 Harry Potter ↔ Alcatraz regression bench** — `tm-bench-context`: 20 hand-labeled false-bridge pairs (fiction.prison ↔ real.prison, fiction.city ↔ real.city, etc.). Score: TN rate. Q2 ≥ 90% (deny-list catches), Q4 ≥ 98% (ontological typing).
+- [x] **LM-11 Context deny-list** — `~/.tracemind/cross_ctx_block_list.json` keyed by `(ctx_a, ctx_b)`. Bridges never fire on listed pairs regardless of cosine. CTX-1/CTX-2 in P1d consult this before any bridge proposal.
+- [x] **LM-12 3-strike auto-deny** — `memory_feedback {kind: "wrong_context_suggestion"}` on the same `(ctx_a, ctx_b)` 3 times → auto-add to deny-list. User can undo from Tauri Settings.
+- [x] **LM-13 Harry Potter ↔ Alcatraz regression bench** — `tm-bench-context`: 20 hand-labeled false-bridge pairs (fiction.prison ↔ real.prison, fiction.city ↔ real.city, etc.). Score: TN rate. Q2 ≥ 90% (deny-list catches), Q4 ≥ 98% (ontological typing).
 
 **3c. Manual whole-context splice ops (Q3)**
 
-- [ ] **LM-14 Manual context splice ops** — CLI: `tracemind context merge A B → C`, `tracemind context split A --by entity X`, `tracemind context snapshot A → snapshot.tmctx`. Tauri equivalents in Settings.
+- [x] **LM-14 Manual context splice ops** — CLI: `tracemind context merge A B → C`, `tracemind context split A --by entity X`, `tracemind context snapshot A → snapshot.tmctx`. Tauri equivalents in Settings.
 
 **3d. Ontological typing (Q4 structural fix)**
 
@@ -334,9 +334,9 @@ Partner reframe (2026-05-12): splicing is primarily about **user surgical contro
 
 ### P5d — Memory export on demand (trust artifact)
 
-- [ ] **LM-16 `tracemind export` CLI (Q2, seed-critical)** — `tracemind export --context CTX [--entity E] [--since TS] --format markdown|json|jsonl --output FILE`. Markdown bundle = one file per entity + an `index.md`; opens in Obsidian, Bear, anything. **This is the local-only-is-real demo beat.**
-- [ ] **LM-17 Tauri "Export this context" button (Q2)** — Settings panel + per-context-switcher menu item. Calls LM-16 under the hood. Saves to user-chosen path via Tauri dialog.
-- [ ] **LM-18 Entity-scoped audit export (Q3)** — "show me everything you know about Pat Grady" → markdown bundle of all memories + relations touching that entity. Wired into entity drawer (LM-3).
+- [x] **LM-16 `tracemind export` CLI (Q2, seed-critical)** — `tracemind export --context CTX [--entity E] [--since TS] --format markdown|json|jsonl --output FILE`. Markdown bundle = one file per entity + an `index.md`; opens in Obsidian, Bear, anything. **This is the local-only-is-real demo beat.**
+- [x] **LM-17 Tauri "Export this context" button (Q2)** — Settings panel + per-context-switcher menu item. Calls LM-16 under the hood. Saves to user-chosen path via Tauri dialog.
+- [x] **LM-18 Entity-scoped audit export (Q3)** — "show me everything you know about Pat Grady" → markdown bundle of all memories + relations touching that entity. Wired into entity drawer (LM-3).
 - [ ] **LM-19 Optional PII redaction pass (Q4)** — `--redact` flag runs `tm-governance` PII scrub before write. Off by default; on for "share with someone else" mode.
 
 ### P5e — Cluster-sort UI on `tm-cluster` (HDBSCAN-driven, revised 2026-05-12)
