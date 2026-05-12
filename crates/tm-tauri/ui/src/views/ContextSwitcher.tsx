@@ -35,6 +35,14 @@ export default function ContextSwitcher() {
 
   useEffect(() => {
     refresh();
+    // 2026-05-11 — QueryView (and others) may switch context via useContext()
+    // without going through this dropdown. Listen for a global event so the
+    // badge stays in sync.
+    const handler = () => {
+      refresh();
+    };
+    window.addEventListener("tm:context-changed", handler);
+    return () => window.removeEventListener("tm:context-changed", handler);
   }, []);
 
   async function switchTo(name: string) {
@@ -42,6 +50,7 @@ export default function ContextSwitcher() {
     try {
       await useCtx(name);
       await refresh();
+      window.dispatchEvent(new CustomEvent("tm:context-changed"));
       setOpen(false);
     } finally {
       setBusy(false);
@@ -53,6 +62,7 @@ export default function ContextSwitcher() {
     try {
       await clearContext();
       await refresh();
+      window.dispatchEvent(new CustomEvent("tm:context-changed"));
       setOpen(false);
     } finally {
       setBusy(false);

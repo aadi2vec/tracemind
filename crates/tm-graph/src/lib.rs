@@ -1,10 +1,15 @@
 pub mod belief;
 pub mod context;
+pub mod deny_list;
 pub mod store;
 
 pub use belief::{effective_confidence, BeliefStore, ContradictionView, ResolveChoice};
 pub use context::{
     ActiveContext, Context, NegativeSignal, PositiveSignal,
+};
+pub use deny_list::{
+    ContextPairRule, DenyList, EntityPairRule, StrikeOutcome,
+    DEFAULT_STRIKE_THRESHOLD, SCHEMA_VERSION as DENY_LIST_SCHEMA_VERSION,
 };
 pub use store::{CapturedSignal, GraphStore, TripleDetail};
 

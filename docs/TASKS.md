@@ -130,7 +130,7 @@ The format is **same host (Claude Code), different MCP memory servers** — not 
 
 ## P1b — Ambient capture surface (the wedge moment)
 
-Promoted from P10 (deferred) on user feedback (2026-05-11): *people will not hand-feed memory; we must auto-populate as much as possible with explicit per-source permissions.* This is the actual *"memory just is"* product, not a future indulgence. Without it, the wedge collapses to "a place to type things you'd otherwise type into ChatGPT memory" — not differentiated.
+Promoted from P11 (deferred) on user feedback (2026-05-11): *people will not hand-feed memory; we must auto-populate as much as possible with explicit per-source permissions.* This is the actual *"memory just is"* product, not a future indulgence. Without it, the wedge collapses to "a place to type things you'd otherwise type into ChatGPT memory" — not differentiated.
 
 ### Q2 — seed-critical (text-only ambient sources)
 
@@ -231,7 +231,127 @@ The deck is rewriting itself once P0 and P1 land. Order matters — do not rewri
 
 ---
 
-## P4 — Feedback-driven self-improvement (the architectural moat slide)
+## P4 — Working Memory Engine + clustering substrate (the anticipatory wedge, Q3 2026 post-seed)
+
+Promoted to its own priority on 2026-05-12 after a reframe: contradiction + commitment are *outputs* of the anticipatory surface, not the surface itself. The wedge moment in Q3 is the first card that appears unprompted and is *correct* about what the user is doing right now. Per PROJECT_2026.md §1b, this is product priority #1 within Pillar 1, scheduled for Q3 2026 (gated on seed-critical Q2 work: ambient capture + Tier-1 default + performance gate).
+
+**Strategic frame:** the WME is not a separate system from the context graph — it is a *consumer* of three storage primitives (`tm-graph`, `tm-vector`, new `tm-cluster`) that index the same capture event stream from different angles. All three are Rust-native (linfa + petgraph), CPU-only, persisted in SQLite. No Python sidecar in the hot path.
+
+### P4a — Clustering substrate (`tm-cluster`, blocks WME L1) — **HDBSCAN-first (revised 2026-05-12)**
+
+Partner constraint: no hardcoded `k`. HDBSCAN-first; KMeans is rejected. Outlier detection retained as first-class signal. Community detection on entity graph retained alongside.
+
+- [ ] **CLU-1 `tm-cluster` crate scaffold + HDBSCAN crate evaluation** — new workspace member. Spike: evaluate the [`hdbscan`](https://crates.io/crates/hdbscan) Rust crate vs. Python sklearn HDBSCAN via PyO3 sidecar on 5k synthetic capture events. Compare cluster persistence, outlier rate, latency. Pick winner. Public API: `Clusterer::open(db_path)`, `Clusterer::recluster() -> ClusterStats`, `Clusterer::assign(event_id, embedding) -> Assignment { cluster_id, membership_prob, is_outlier }`, `Clusterer::recent_centroids(window: Duration) -> Vec<(ClusterId, f32, MembershipProb)>`, `Clusterer::outliers(window) -> Vec<EventId>`. Two SQLite tables: `clusters(id, label_text, centroid_blob, n_members, persistence, is_outlier_bucket, updated_at)`, `event_clusters(event_id, cluster_id, membership_prob, is_outlier)`.
+- [ ] **CLU-2 HDBSCAN batch re-clusterer** — full HDBSCAN pass on a background thread every 100 events OR every 10 min, whichever first. Uses cosine distance on 384-d BGE embeddings. Persistence threshold defaults to `min_cluster_size = 5`, `min_samples = 3` — tune on real DP data. **No `k` parameter.**
+- [ ] **CLU-3 Nearest-centroid assignment between re-clusters** — new events arriving between full re-clusters get assigned to the nearest existing cluster centroid (cosine sim) if within `2σ` of the cluster's intra-distance; otherwise tagged outlier (`cluster_id = -1`). Outliers contribute their own embedding to the L1 topic vector directly.
+- [ ] **CLU-4 Capture pipeline hook** — `IngestPipeline.ingest_fast` calls `Clusterer::assign` after `VectorStore.embed` and persists the assignment. Adds ≤ 2ms to the ingest path (target). Full re-cluster is async and never blocks ingest.
+- [ ] **CLU-5 `tm-graph` Louvain community detection** — ~200 LOC community pass over `kg_relations` (or pull `leiden-rs`). Annotates `kg_entities` with `community_id`. Runs nightly via `consolidate`. **Sibling to HDBSCAN clusters, not a replacement** — HDBSCAN clusters events (topical/temporal), Louvain clusters entities (relational). Both feed WME and the P5a Obsidian surface.
+- [ ] **CLU-6 c-TF-IDF auto-label per cluster** — for each HDBSCAN cluster, run c-TF-IDF over the member memory texts → top-N terms → human-readable label ("rondo + veo3 + scouting"). ~50 LOC. Cached on `clusters.label_text`; regenerated on re-cluster. Feeds P5a MOCs + P5e Memory Garden.
+- [ ] **CLU-7 Outlier surfacing API** — `Clusterer::outliers(since: Duration) -> Vec<EventId>` returns recent outlier points. Feeds WME "Anticipate" verb (novel topics) + Tauri "Unsorted" tray (P5e). **Outliers are first-class signal, not noise.**
+- [ ] **CLU-8 Python-sidecar fallback path (conditional)** — if CLU-1 spike picks the sidecar, scaffold `tm-cluster::sklearn_sidecar` (subprocess or PyO3) that runs HDBSCAN nightly off the request path. Sync output to `clusters` + `event_clusters` tables. **Off the hot path** — Tier-0 retrieval keeps working without fresh clusters.
+
+**Exit criteria:** `cargo test -p tm-cluster` green; ingest-path latency regression ≤ 2ms p95; `tracemind status` reports cluster count + outlier count + community count; one DP's daily clusters look like topics they recognise (qualitative check).
+
+**Exit criteria:** `cargo test -p tm-cluster` green; ingest-path latency regression ≤ 2ms p95 (enforced by PERF-2 CI gate); `tracemind status` reports cluster count + community count.
+
+### P4b — Working Memory Engine v1 (consumes the substrate)
+
+- [ ] **WME-1 L1 rolling topic vector** — `tm-reflect::WorkingMemoryEngine::topic_vector(window: Duration) -> Vec<f32>`. EMA of recent cluster centroids weighted by recency over a 5-min decaying window. Updates every 30s or on significant capture event.
+- [ ] **WME-2 L2 proactive retrieval driver** — `WorkingMemoryEngine::candidates(topic_vec, active_entities) -> Vec<Candidate>`. Joins three primitives: vector ANN against topic vector, graph 1-hop on active entities, cluster siblings. Excludes memories already seen this session.
+- [ ] **WME-3 L3 verb-first card synthesis** — score = `relevance × surprise × recency_of_decision × outcome_signal`. Six verbs: Resume / Recall / Compare / Caution / Connect / Anticipate. Each verb is a typed `CardKind` with its own scoring rule; commitment+contradiction become filtered outputs of Caution+Compare.
+- [ ] **WME-4 Card queue + cooldowns** — `CardQueue` with per-(card_kind, target_id) cooldown, per-session displayed-set, hard cap ≤ 8 cards/hour. Producer/consumer split: WME never blocks query path.
+- [ ] **WME-5 Brief + Next Actions wiring** — Tauri `BriefView` + `DashboardView` consume `cmd_wme_cards()` instead of the current flat commitment/contradiction list. Reactive panels become anticipatory panels.
+- [ ] **WME-6 Feedback signals** — `memory_feedback {kind: "useful_now" | "not_useful_now" | "not_now_remind_later" | "dismiss_this_kind"}` MCP tool + Tauri buttons. Retrains card-score threshold per signal (per-user, per-card-kind).
+- [ ] **WME-7 MCP tool `memory_brief`** — exposes the active WME card set to MCP hosts. Claude Code / Cursor can ask "what should I be thinking about?" without a query and get verb cards back.
+
+### P4c — WME evaluation + guardrails
+
+- [ ] **WME-8 Useful-rate harness** — replay tool: feed a captured session log through WME, compute proactive-card useful-rate against ground-truth annotation. Target ≥ 30% by Q3-end, ≥ 45% by Q4 (PROJECT_2026.md §7 metric row).
+- [ ] **WME-9 Anti-spam regression test** — synthetic 1-hour session with 1000 capture events; assert `cards_surfaced ≤ 8`. PERF-2 CI gate.
+- [ ] **WME-10 WME tick latency benchmark** — `cargo bench --bench wme_tick`; target ≤ 50ms p95. Wired into PERF-1 baseline.
+
+**Exit criteria:** Q3 2026 milestone WME entries (PROJECT_2026.md §7) green; ≥ 3 design partners report at least one "this card appeared when I needed it" moment per week; useful-rate ≥ 30%.
+
+---
+
+## P5 — Legible Memory (visible + granular + steerable, partner-driven 2026-05-12)
+
+Added 2026-05-12 after partner conversation about Obsidian-style auto-graphs, granular triple extraction, context splicing, on-demand export, and cluster-sort UI. Per PROJECT_2026.md §1c, this is the *legibility pillar* — sibling to WME's *anticipatory pillar*. WME makes memory surface itself; Legible Memory makes the user trust, see, and control what's underneath.
+
+**Three items pulled into Q2 (seed-defensible quick wins):** markdown export (LM-16/LM-17), context deny-list (LM-11/LM-13), and **Memory Views user-splice API + CLI** (LM-11a..LM-11d, LM-11f). Memory Views is the partner-mandated *"focus on memories 1,2,3 not 4"* feature. All three close real investor objections. Rest of P5 is Q3 / Q4.
+
+### P5a — Obsidian-parity auto-graph (Karpathy PKM, zero manual intervention)
+
+Goal: ship the **same feature surface as Obsidian** (Karpathy's PKM workflow specifically) with **zero manual linking, tagging, or curation**. Every link is auto-extracted; every tag is auto-derived from cluster labels; every MOC is auto-generated from clusters + communities. The user trusts; the extraction does the labor.
+
+- [ ] **LM-1 Backlinks panel** — every memory in BriefView / DashboardView shows a "linked-from" panel: count + list of memories where the active entity appears. SQL JOIN on `kg_relations`. Click → navigate. (Q3 headline.)
+- [ ] **LM-2 Inline auto-rendered [[wikilinks]]** — entity mentions in memory text become `<a>`-style links to the entity drawer. Resolution: `tm-graph::resolve_entity_in_text(text, ctx) -> Vec<(span, entity_id)>`. **User never types `[[`** — extraction does it.
+- [ ] **LM-3 Entity drawer rewrite** — replace current static entity view with: header (name + type + community) → backlinks panel (LM-1) → relations table → recent captures → cluster siblings (from `tm-cluster`).
+- [ ] **LM-4 Live graph update on capture** — when CAP-* ingests a new triple touching the active entity, the open entity drawer refreshes without reload. Tauri event channel.
+- [ ] **LM-5a Transclusion / memory embeds** — one memory can reference-embed another inline; embedded memory renders as a styled blockquote with a link to the source. Auto-triggered when a memory is summarised by another (e.g., daily note pulls in the morning's standup).
+- [ ] **LM-5b Auto-tags from cluster labels + heuristic hashtags** — every memory carries `tags: Vec<String>` derived from (a) HDBSCAN cluster label (CLU-6), (b) Louvain community label, (c) any literal `#hashtag` the user happens to type. Surfaced as Obsidian-style tag chips in the entity drawer + BriefView. **No manual tagging required.**
+- [ ] **LM-5c Auto-generated daily notes** — promote `tm-reflect`'s daily brief to a first-class `DailyNote` memory entity, dated, with auto-generated backlinks to every memory created that day. Tauri "Today" view = the daily note. Karpathy-style daily-note workflow without typing.
+- [ ] **LM-5d Auto-generated MOCs (Maps of Content)** — for each persistent HDBSCAN cluster + each Louvain community, generate a `MapOfContent` memory: title (from c-TF-IDF label), description (top-3 representative memories), backlinks to all member memories. Refreshed nightly via `consolidate`. Surfaced in Tauri sidebar "Topics" panel.
+- [ ] **LM-5e Force-directed graph view (Q4 polish)** — Tauri Memory Garden full-graph mode. Anti-spam: never render > 500 nodes raw; collapse to cluster-summary view above that. Deferred until backlinks (LM-1..LM-3) are validated by DPs.
+- [ ] **LM-5f Canvas / whiteboard (Q4)** — visual spatial board where user drops a subset of memories (via Memory Views, LM-23..LM-26). Same surface as Obsidian Canvas. Doubles as the **user-controlled splice UI** for P5c primitive 3a.
+
+**Karpathy reference**: every feature above mirrors something Karpathy uses in his Obsidian PKM workflow (daily notes, tags, backlinks, MOCs, transclusion). Diff: he types every link; we auto-derive every link. Same outcome, zero tax.
+
+### P5b — Granular open-vocabulary triple extraction (SML async pipeline)
+
+- [ ] **LM-6 SML candidate evaluation** — score REBEL (460M BART), GLiNER-Relation (~150MB), Qwen 2.5 0.5B-prompted, Phi-3-mini-4k on a 200-sentence eval set (precision, recall, per-sentence latency). Pick winner. Cheapest path: reuse Qwen (already auto-downloaded for Tier-1). Reference partner-recommended Jaya Gupta graph-extraction guide (link TBD when work item opens).
+- [ ] **LM-7 Open-vocabulary predicate schema migration** — `kg_relations.predicate` accepts arbitrary strings (was JSON-encoded enum `{IsA, WorksAt, PartOf}`). Backfill existing rows. Add `predicate_confidence FLOAT` column.
+- [ ] **LM-8 Async triple-extraction worker** — `tm-ingest::TripleWorker` runs the chosen SML off the ingest hot path on a tokio bounded channel. Heuristic NER stays as the synchronous fast path; SML enriches asynchronously. Persists new triples with confidence.
+- [ ] **LM-9 Confidence-routed triple acceptance** — low-confidence (< 0.5) triples stay in a pending pool (`pending_relations` table) surfaced in Tauri for user confirmation. High-confidence (≥ 0.7) auto-enter `kg_relations`.
+- [ ] **LM-10 Triple-extraction benchmark** — `tm-bench-triples`: 200 sentences with hand-labeled triples; precision @ confidence ≥0.7. Q3 target ≥ 0.70, Q4 ≥ 0.80.
+
+### P5c — Context splicing (three layers: user-driven, auto-corrective, ontological)
+
+Partner reframe (2026-05-12): splicing is primarily about **user surgical control** over which memories enter a session. Deny-list (auto-corrective) and ontological typing (structural) are sibling layers but no longer the headline.
+
+**3a. User-driven splice — Memory Views (the primary feature, Q2 seed-critical)**
+
+- [ ] **LM-11a Memory Views schema + storage** — new SQLite table `memory_views(id TEXT PRIMARY KEY, name, created_at, updated_at, description)` + `memory_view_members(view_id, memory_id, kind: 'include'|'exclude', added_at)`. A view = a named saved splice (set of include/exclude memory IDs).
+- [ ] **LM-11b Memory Views CLI** — `tracemind view {create <name>, list, show <name>, add <name> <id...>, remove <name> <id...>, delete <name>}`. Editable in plain JSON via `tracemind view edit <name>`.
+- [ ] **LM-11c Query-time splice** — `RetrievalEngine::query` accepts `RetrievalFilter { view: Option<ViewId>, include_ids: Vec<MemoryId>, exclude_ids: Vec<MemoryId> }`. Splice applied **after** retrieval ranking, before final result trimming. CLI: `tracemind query --view "rondo-only" --exclude-ids 42 "what did I decide?"`.
+- [ ] **LM-11d MCP tool surface** — `memory_query` MCP tool grows `view`, `include_ids`, `exclude_ids` parameters. Schema in `tm-mcp::schema`. Documented in CLAUDE_CODE_INTEGRATION.md.
+- [ ] **LM-11e Session-scoped splice (Q3, Tauri)** — Tauri thread sidebar shows active view; multi-select memories → "Use these for next query in this thread." Live-editable. State persisted in `localStorage` keyed by thread_id. Doubles as Canvas/whiteboard surface (LM-5f).
+- [ ] **LM-11f Export-a-view** — `tracemind export --view <name>` writes the splice as a markdown bundle. Sibling to LM-16.
+
+**3b. Auto-corrective: context deny-list (Q2 seed-critical)**
+
+- [ ] **LM-11 Context deny-list** — `~/.tracemind/cross_ctx_block_list.json` keyed by `(ctx_a, ctx_b)`. Bridges never fire on listed pairs regardless of cosine. CTX-1/CTX-2 in P1d consult this before any bridge proposal.
+- [ ] **LM-12 3-strike auto-deny** — `memory_feedback {kind: "wrong_context_suggestion"}` on the same `(ctx_a, ctx_b)` 3 times → auto-add to deny-list. User can undo from Tauri Settings.
+- [ ] **LM-13 Harry Potter ↔ Alcatraz regression bench** — `tm-bench-context`: 20 hand-labeled false-bridge pairs (fiction.prison ↔ real.prison, fiction.city ↔ real.city, etc.). Score: TN rate. Q2 ≥ 90% (deny-list catches), Q4 ≥ 98% (ontological typing).
+
+**3c. Manual whole-context splice ops (Q3)**
+
+- [ ] **LM-14 Manual context splice ops** — CLI: `tracemind context merge A B → C`, `tracemind context split A --by entity X`, `tracemind context snapshot A → snapshot.tmctx`. Tauri equivalents in Settings.
+
+**3d. Ontological typing (Q4 structural fix)**
+
+- [ ] **LM-15 Ontological typing (Q4 expensive path)** — SML pass classifies entities into domains (`fiction.location`, `real.location`, `historical.event`, `concept`, `person.real`, `person.fictional`, etc.). Bridges denied across disjoint domains. Closes the Harry Potter problem at the type level.
+
+### P5d — Memory export on demand (trust artifact)
+
+- [ ] **LM-16 `tracemind export` CLI (Q2, seed-critical)** — `tracemind export --context CTX [--entity E] [--since TS] --format markdown|json|jsonl --output FILE`. Markdown bundle = one file per entity + an `index.md`; opens in Obsidian, Bear, anything. **This is the local-only-is-real demo beat.**
+- [ ] **LM-17 Tauri "Export this context" button (Q2)** — Settings panel + per-context-switcher menu item. Calls LM-16 under the hood. Saves to user-chosen path via Tauri dialog.
+- [ ] **LM-18 Entity-scoped audit export (Q3)** — "show me everything you know about Pat Grady" → markdown bundle of all memories + relations touching that entity. Wired into entity drawer (LM-3).
+- [ ] **LM-19 Optional PII redaction pass (Q4)** — `--redact` flag runs `tm-governance` PII scrub before write. Off by default; on for "share with someone else" mode.
+
+### P5e — Cluster-sort UI on `tm-cluster` (HDBSCAN-driven, revised 2026-05-12)
+
+- [ ] **LM-20 Memory Garden view (Q3)** — Tauri grid of all memories grouped by HDBSCAN `cluster_id`. Each cluster card: human-readable c-TF-IDF label (CLU-6) + count + 3 sample entities + persistence score. Click → drill into cluster. Outlier bucket (`cluster_id = -1`) renders as separate "Unsorted" tray.
+- [ ] **LM-21 Auto-cluster labels** — supplied by CLU-6 (c-TF-IDF in `tm-cluster`). Memory Garden just reads them. Optional override: user can rename a cluster label, persisted to `clusters.label_text`.
+- [ ] **LM-22 Outlier "Unsorted" tray + triage** — outlier events (CLU-7) shown in a dedicated Tauri tray. User actions per outlier: "add to existing cluster X," "create new cluster," "ignore." Triage feeds back to `event_clusters` so the next HDBSCAN pass has a head start. **Outliers are signal, not noise.**
+- [ ] **LM-23 Community-overlay toggle** — Memory Garden has an overlay mode that colors memories by Louvain `community_id` instead of HDBSCAN `cluster_id`. Lets the user see both organizational axes.
+- [ ] **LM-24 evoc / UMAP swap evaluation (Q4)** — if `evoc` (TutteInstitute) or a maintained Rust UMAP reaches production grade, A/B vs. native HDBSCAN on the Memory Garden quality (cluster-cohesion + user "this cluster makes sense" rating). Swap if A/B wins ≥ 2x.
+
+**Exit criteria for P5 seed-contribution:** LM-16 + LM-17 (markdown export) + LM-11 + LM-13 (deny-list + bench ≥90%) shipped by Q2-end. Rest of P5 lands Q3/Q4 per §1c sequencing table.
+
+---
+
+## P6 — Feedback-driven self-improvement (the architectural moat slide)
 
 The one architectural claim that cloud competitors *cannot copy without uploading the user's corrections corpus*. Worth a slide once it's real. Until then, it's vapor — keep building.
 
@@ -245,9 +365,9 @@ The one architectural claim that cloud competitors *cannot copy without uploadin
 
 ---
 
-## P5 — Engine polish that visibly helps retention
+## P7 — Engine polish that visibly helps retention
 
-Only items that a design partner would *notice* in week 2. Everything else moves to P8+.
+Only items that a design partner would *notice* in week 2. Everything else moves to P10+.
 
 - [ ] **C-0.9 Brief + UI surfacing of active context** — brief header shows active context; per-row context tag in Tauri brief view.
 - [ ] **C-0.11 Schema-migration test** — legacy DB → migrated DB with NULL context_ids. Closes Sprint C-0.
@@ -258,7 +378,7 @@ Only items that a design partner would *notice* in week 2. Everything else moves
 
 ---
 
-## P6 — Wire-up debt (only if a partner hits it)
+## P8 — Wire-up debt (only if a partner hits it)
 
 Drop everything in this section unless a design partner files it as a bug. Do not pre-build.
 
@@ -271,7 +391,7 @@ Drop everything in this section unless a design partner files it as a bug. Do no
 
 ---
 
-## P7 — Tauri surfaces a partner has asked for
+## P9 — Tauri surfaces a partner has asked for
 
 Each item below stays in `[ ]` until a partner names it. Do not build speculatively.
 
@@ -285,7 +405,7 @@ Each item below stays in `[ ]` until a partner names it. Do not build speculativ
 
 ---
 
-## P8 — Post-seed commitments (Q4 2026 → Q1 2027 per PROJECT_2026.md)
+## P10 — Post-seed commitments (Q4 2026 → Q1 2027 per PROJECT_2026.md)
 
 These are *not* indefinitely deferred — PROJECT_2026.md commits them in the quarterly roadmap. They unlock only after the seed gate clears (P0–P3 produce artifacts) but they are scheduled, not optional. Listed here in execution order:
 
@@ -297,7 +417,7 @@ These are *not* indefinitely deferred — PROJECT_2026.md commits them in the qu
 - [ ] **Q-9 Iterative / agentic retrieval** — multi-step query refinement (Self-RAG / IR-CoT). +10 F1 on multi-hop. PROJECT_2026.md §3 bet #6.
 - [ ] **Q-10 Cross-modal entity-edge join** — bind capture pipelines from P1b (screenshots / audio / code) into shared entity graph via `ModalIngestPipeline` co-occurrence edges, arm 5 in tm-controller, cross-modal chains + citations. Pulled forward from Q1 2027 because capture inputs ship Q2-Q3.
 
-(Note: HNSW moved to P1c PERF-3, Q2. Was originally P8 Q4 but auto-capture volume forces it earlier.)
+(Note: HNSW moved to P1c PERF-3, Q2. Was originally P10 Q4 but auto-capture volume forces it earlier.)
 
 ### Q1 2027 — Series A prep
 
@@ -308,7 +428,7 @@ These are *not* indefinitely deferred — PROJECT_2026.md commits them in the qu
 
 ---
 
-## P9 — Business + ops commitments (Q2 → Q4 per PROJECT_2026.md)
+## P11 — Business + ops commitments (Q2 → Q4 per PROJECT_2026.md)
 
 Non-engineering tasks the founder owns. Tracked here so they don't fall off the radar.
 
@@ -337,7 +457,7 @@ Non-engineering tasks the founder owns. Tracked here so they don't fall off the 
 
 ---
 
-## P10 — Indefinitely deferred (kill or revisit if a partner asks)
+## P12 — Indefinitely deferred (kill or revisit if a partner asks)
 
 Excellent engineering. Not scheduled in PROJECT_2026.md. Park.
 
@@ -371,7 +491,7 @@ Excellent engineering. Not scheduled in PROJECT_2026.md. Park.
 - [ ] Factorization machine for PatternDetector, `tm-preference` crate
 - [ ] Counterfactual replay, context-budget allocator
 
-(Note: HNSW moved to P1c PERF-3; iterative retrieval moved to P8 Q4 Q-9.)
+(Note: HNSW moved to P1c PERF-3; iterative retrieval moved to P10 Q4 Q-9.)
 
 ### LLM packaging + on-device finetune (deferred — see PROJECT_2026.md §3 weak-spot row "no personalization")
 
@@ -397,7 +517,7 @@ Excellent engineering. Not scheduled in PROJECT_2026.md. Park.
 
 ## Operating rules
 
-1. **No work in P4+ until P0 has at least 3 active design partners.** Building the moat is irrelevant if no one is around to be locked in. P8 (post-seed) and P9 (business / ops) work is unblocked only when the seed gate clears.
+1. **No work in P4+ until P0 has at least 3 active design partners (with two Q2 exceptions).** Building the WME (P4), Legible Memory (P5), feedback moat (P6), or anything below is irrelevant if no one is around to be locked in. *Q2 exceptions, both pulled forward as seed-defensible quick wins:* P5d LM-16/LM-17 markdown export (≤ 1 week of work, big trust artifact) and P5c LM-11/LM-13 context deny-list (closes the Harry Potter ↔ Alcatraz objection). P10 (post-seed Q4/Q1) and P11 (business / ops) work is unblocked only when the seed gate clears.
 2. **No deck rewrite until P0 produces DP-6 and P1 produces W-5.** Slides without artifacts are vapor.
 3. **No three-product narrative in any external comms until TraceMind alone hits W2 ≥ 40%.** Optionality reads as lack of conviction.
 4. **Weekly review every Friday.** Three numbers: design partners onboarded, W2 retention, LoCoMo F1. Anything else is noise.

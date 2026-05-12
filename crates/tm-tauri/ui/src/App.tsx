@@ -5,7 +5,6 @@ import QueryView from "./views/QueryView";
 import TracesView from "./views/TracesView";
 import IngestView from "./views/IngestView";
 import GraphView from "./views/GraphView";
-import ReasonView from "./views/ReasonView";
 import ContextSwitcher from "./views/ContextSwitcher";
 import SettingsView from "./views/SettingsView";
 import OnboardingView from "./views/OnboardingView";
@@ -20,19 +19,20 @@ type View =
   | "ingest"
   | "traces"
   | "graph"
-  | "reason"
   | "commitments"
   | "calibration"
   | "settings"
   | "onboarding";
 
+// Reason nav removed 2026-05-11 — reasoning primitives now surface as action
+// cards in Dashboard (Next Actions) and inline in Query/Brief. See
+// `tracemind_reason_to_proactive.md` memory.
 const NAV_ITEMS: { id: View; label: string; icon: string }[] = [
   { id: "brief", label: "Brief", icon: "brief" },
   { id: "dashboard", label: "Dashboard", icon: "grid" },
   { id: "query", label: "Query", icon: "search" },
   { id: "ingest", label: "Ingest", icon: "plus" },
   { id: "graph", label: "Graph", icon: "graph" },
-  { id: "reason", label: "Reason", icon: "reason" },
   { id: "commitments", label: "Commitments", icon: "timeline" },
   { id: "calibration", label: "Calibration", icon: "gauge" },
   { id: "traces", label: "Traces", icon: "list" },
@@ -129,6 +129,21 @@ export default function App() {
       .finally(() => setFirstRunChecked(true));
   }, []);
 
+  // 2026-05-11 — Dashboard "Next Actions" cards dispatch a custom event.
+  // Route by target_kind so commitment/contradiction cards open the
+  // right surface.
+  useEffect(() => {
+    const handler = (e: Event) => {
+      const detail = (e as CustomEvent).detail as { target_kind?: string } | undefined;
+      if (!detail) return;
+      if (detail.target_kind === "commitment") setView("commitments");
+      else if (detail.target_kind === "contradiction") setView("brief");
+      else if (detail.target_kind === "entity") setView("graph");
+    };
+    window.addEventListener("tm:next-action", handler);
+    return () => window.removeEventListener("tm:next-action", handler);
+  }, []);
+
   if (!firstRunChecked) {
     return (
       <div className="flex h-screen items-center justify-center bg-tm-bg">
@@ -190,7 +205,6 @@ export default function App() {
         {view === "query" && <QueryView />}
         {view === "ingest" && <IngestView />}
         {view === "graph" && <GraphView />}
-        {view === "reason" && <ReasonView />}
         {view === "commitments" && <CommitmentTimelineView />}
         {view === "calibration" && <CalibrationView />}
         {view === "traces" && <TracesView />}

@@ -218,6 +218,27 @@ fn cmd_ingest(text: String, state: State<AppState>) -> Result<IngestResponse, St
     let trace_store = state.trace_store.lock().map_err(|e| e.to_string())?;
     let _ = trace_store.append(&result.trace);
 
+    // 2026-05-11 — mine intent phrases from the ingested text and persist
+    // any hits as `pending` candidates. The capture daemon already does
+    // this on clipboard / shell events; doing it here too means any text
+    // the user types into the Query/Ingest view also feeds the Confirm
+    // cards on the dashboard. Errors are best-effort — we never want a
+    // miner failure to break ingest.
+    let mined = tm_intent::mine(&text);
+    if !mined.is_empty() {
+        let dir = data_dir(&state);
+        let intents_path = dir.join("intents.db");
+        if let Ok(mut store) =
+            tm_intent::IntentStore::open(intents_path.to_str().unwrap_or_default())
+        {
+            let records: Vec<tm_intent::store::CandidateRecord> = mined
+                .iter()
+                .map(|m| tm_intent::store::CandidateRecord::from_mined(m, text.clone()))
+                .collect();
+            let _ = store.insert_candidates(&records);
+        }
+    }
+
     // Build name lookup
     let name_of: HashMap<Uuid, &str> = result.entities.iter()
         .map(|e| (e.id, e.name.as_str())).collect();
@@ -280,6 +301,12 @@ fn cmd_query(text: String, state: State<AppState>) -> Result<QueryResponse, Stri
         s.total_queries = s.total_queries.saturating_add(1);
     });
     let mut engine = state.retrieval.lock().map_err(|e| e.to_string())?;
+    // Refresh the engine's UUID↔skg-id cache from disk before querying.
+    // Without this, any entity written by the external `tracemind-capture`
+    // daemon (separate process, same SQLite file) is filtered out by
+    // `search_vectors` because its UUID isn't in this engine's in-memory map.
+    // See tm-graph::store::reload_maps doc comment.
+    let _ = engine.refresh_graph();
     let result = engine.query(&text).map_err(|e| e.to_string())?;
 
     let name_of: HashMap<Uuid, &str> = result.entities.iter()
@@ -396,7 +423,7 @@ fn cmd_dashboard(state: State<AppState>) -> Result<DashboardStats, String> {
         retrieval_arm: t.retrieval_arm,
         retrieval_arm_name: t.retrieval_arm.map(arm_name),
         retrieval_latency_ms: t.retrieval_latency_ms,
-        created_at: t.created_at.format("%Y-%m-%d %H:%M:%S").to_string(),
+        created_at: t.created_at.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M:%S").to_string(),
     }).collect();
 
     let bandit = UcbBandit::load(&state.bandit_path);
@@ -433,7 +460,7 @@ fn cmd_traces(limit: Option<usize>, state: State<AppState>) -> Result<Vec<TraceI
         retrieval_arm: t.retrieval_arm,
         retrieval_arm_name: t.retrieval_arm.map(arm_name),
         retrieval_latency_ms: t.retrieval_latency_ms,
-        created_at: t.created_at.format("%Y-%m-%d %H:%M:%S").to_string(),
+        created_at: t.created_at.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M:%S").to_string(),
     }).collect())
 }
 
@@ -739,7 +766,7 @@ fn cmd_query_recent(
             query_text: text.to_string(),
             arm_name: t.retrieval_arm.map(arm_name),
             entities_count: t.entities_extracted.len(),
-            created_at: t.created_at.format("%H:%M").to_string(),
+            created_at: t.created_at.with_timezone(&chrono::Local).format("%H:%M").to_string(),
         });
         if out.len() >= want {
             break;
@@ -772,34 +799,178 @@ fn cmd_delete_entity(entity_id: String, state: State<AppState>) -> Result<(), St
     Ok(())
 }
 
-/// Get "most surprising things" — recently ingested entities with high novelty.
-/// These are entities that are new, not well-connected yet, and recently captured.
+/// Quality gate for entities surfaced in *proactive* panels (Drift, Connect,
+/// relation suggestions). Heuristic NER (`HeuristicExtractor`) over ambient
+/// capture grabs sentence-initial Title Case words and YAKE keyphrase
+/// fragments — useful for retrieval, but garbage when the user sees
+/// "Connect: your" or "Review: especially" on the Dashboard.
+///
+/// This gate is *only* applied at the panel layer — the underlying graph
+/// keeps every extracted entity so retrieval / signal hybrid paths are
+/// unchanged. 2026-05-11 audit, post user-feedback: dashboard panels were
+/// half-noise; this gate ships the cheapest fix while we wait on GLiNER
+/// to be wired into the default pipeline.
+fn is_proactive_quality_entity(name: &str) -> bool {
+    let trimmed = name.trim();
+    if trimmed.len() < 3 {
+        return false;
+    }
+    if !trimmed.chars().any(|c| c.is_alphabetic()) {
+        return false;
+    }
+    let lower = trimmed.to_lowercase();
+
+    // Hard stopword / sentence-initial junk list — pulled from the
+    // entities currently leaking into the panels plus the standard
+    // English closed-class set. Kept in-line so the filter has no
+    // dependency on the ingest crate's `GATE_STOPWORDS` (which has a
+    // different purpose — gating ingestion, not surfacing).
+    const STOP: &[&str] = &[
+        "the", "a", "an", "and", "or", "but", "not", "if", "then", "so", "as", "of", "to",
+        "for", "with", "by", "in", "on", "at", "from", "into", "onto", "upon", "over",
+        "under", "this", "that", "these", "those", "it", "its", "they", "them", "their",
+        "there", "i", "me", "my", "we", "us", "our", "you", "your", "yours", "he", "him",
+        "his", "she", "her", "hers", "is", "are", "was", "were", "be", "been", "being",
+        "have", "has", "had", "do", "does", "did", "will", "would", "could", "should",
+        "may", "might", "shall", "can", "must", "what", "when", "where", "why", "how",
+        "who", "whom", "which",
+        // Sentence-initial adverbs / fillers seen leaking into panels
+        "especially", "really", "very", "much", "more", "most", "less", "least",
+        "always", "never", "often", "sometimes", "usually", "rarely", "quite",
+        "well", "yes", "no", "ok", "okay", "good", "bad", "fine", "still", "just",
+        // Common verbs misread as proper nouns at sentence start
+        "sounds", "looks", "feels", "seems", "pull", "push", "make", "made", "take",
+        "took", "give", "gave", "get", "got", "see", "saw", "use", "used", "let",
+        "lets", "say", "said", "tell", "told", "ask", "asked", "want", "wanted",
+        "need", "needed", "try", "tried", "find", "found", "show", "shown",
+        // Determiners / quantifiers
+        "another", "one", "some", "any", "all", "each", "every", "few", "many",
+        "both", "either", "neither", "such",
+    ];
+    if STOP.contains(&lower.as_str()) {
+        return false;
+    }
+
+    // Single-word adjective / adverb suffixes — high false-positive rate
+    // for proper-noun extraction. Multi-word phrases bypass this filter
+    // (e.g. "Implementable Plan" stays, but bare "implementable" goes).
+    let is_single = !trimmed.contains(char::is_whitespace);
+    if is_single {
+        let suffixes = ["ly", "able", "ible", "ive", "ous", "ical", "ier", "iest", "ment"];
+        // "ment" gives some false negatives ("comment", "moment") but
+        // catches the more annoying "constraint"-style fragment-tokens.
+        // The cost of the FN is "doesn't appear in a tiny proactive
+        // panel" — fine. The cost of FP is user sees garbage.
+        for sfx in suffixes {
+            if lower.ends_with(sfx) && lower.len() > sfx.len() + 2 {
+                return false;
+            }
+        }
+    }
+
+    true
+}
+
+/// Get "most surprising things" — entities that are *semantically* far from
+/// the user's typical topic centroid, blended with recency so it stays
+/// "today-feeling". 2026-05-11 rewrite: the old definition keyed off
+/// `access_log` count, which collapsed to "newest 5 entities" whenever the
+/// user hadn't queried anything yet. The new definition computes the
+/// centroid of every stored entity embedding, then ranks entities by how
+/// far their own embedding sits from that centroid (cosine distance). An
+/// entity is "surprising" when it doesn't fit the user's usual semantic
+/// neighbourhood — which is what the label promises.
 #[tauri::command]
 fn cmd_surprising(limit: Option<usize>, state: State<AppState>) -> Result<Vec<SurprisingEntity>, String> {
     let graph = GraphStore::open(&state.db_path).map_err(|e| e.to_string())?;
     let entities = graph.list_all_entities().map_err(|e| e.to_string())?;
 
     let limit = limit.unwrap_or(5);
+    if entities.is_empty() {
+        return Ok(Vec::new());
+    }
 
-    // Batch-compute novelty and recency for all entities
     let entity_ids: Vec<Uuid> = entities.iter().map(|e| e.id).collect();
     let recency_map = graph.batch_recency_scores(&entity_ids);
-    let novelty_map = graph.batch_novelty_scores(&entity_ids);
 
-    let mut scored: Vec<SurprisingEntity> = entities.iter().map(|e| {
-        let recency = recency_map.get(&e.id).copied().unwrap_or(0.0);
-        let novelty = novelty_map.get(&e.id).copied().unwrap_or(1.0);
-        // Surprising = high novelty (rarely seen) + high recency (just arrived)
-        let score = 0.6 * novelty + 0.4 * recency;
-        SurprisingEntity {
-            entity_id: e.id.to_string(),
-            entity_name: e.name.clone(),
-            entity_type: format!("{}", e.entity_type),
-            novelty,
-            recency,
-            score,
+    // Pull every entity that has an embedding. With 378 entities + indexed
+    // PK lookup this takes <50ms; well within the 30s panel refresh cadence.
+    let mut vec_rows: Vec<(usize, Vec<f32>)> = Vec::new();
+    for (i, e) in entities.iter().enumerate() {
+        if let Ok(Some(v)) = graph.get_vector(e.id) {
+            if !v.is_empty() {
+                vec_rows.push((i, v));
+            }
         }
-    }).collect();
+    }
+    // Fallback: if nothing has a vector yet (fresh DB / hash-embed disabled),
+    // we can't compute a centroid — return empty rather than the misleading
+    // "novelty = 1.0 for everything" behaviour.
+    if vec_rows.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Centroid = element-wise mean of all embeddings, then L2-normalised so
+    // we can compare with cosine.
+    let dim = vec_rows[0].1.len();
+    let mut centroid = vec![0.0f32; dim];
+    for (_, v) in &vec_rows {
+        // Defensive: skip vectors whose dimension drifts (shouldn't happen,
+        // but old DBs that switched embedders might mix lengths).
+        if v.len() != dim {
+            continue;
+        }
+        for k in 0..dim {
+            centroid[k] += v[k];
+        }
+    }
+    let n = vec_rows.len() as f32;
+    for c in centroid.iter_mut() {
+        *c /= n;
+    }
+    let cnorm: f32 = centroid.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-12);
+    let centroid_unit: Vec<f32> = centroid.iter().map(|x| x / cnorm).collect();
+
+    let mut scored: Vec<SurprisingEntity> = vec_rows
+        .iter()
+        .filter_map(|(idx, v)| {
+            if v.len() != dim {
+                return None;
+            }
+            let e = &entities[*idx];
+            // Quality gate: drop NER fragments / stopwords from the
+            // surface even though they still count toward the centroid.
+            // Keeping them in the centroid is correct (it's the "shape"
+            // of the user's corpus); silencing them at the panel level
+            // is correct (no one wants to "Review: especially").
+            if !is_proactive_quality_entity(&e.name) {
+                return None;
+            }
+            let vnorm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-12);
+            let cos: f32 = v
+                .iter()
+                .zip(centroid_unit.iter())
+                .map(|(a, b)| a * b)
+                .sum::<f32>()
+                / vnorm;
+            // Cosine distance from the topic centroid, clamped to [0, 1].
+            let surprise = (1.0 - cos as f64).clamp(0.0, 1.0);
+            let recency = recency_map.get(&e.id).copied().unwrap_or(0.0);
+            // 70% semantic outlier-ness + 30% recency. The recency tail
+            // breaks ties towards "weird-and-recent" over "weird-and-old".
+            let score = 0.7 * surprise + 0.3 * recency;
+            Some(SurprisingEntity {
+                entity_id: e.id.to_string(),
+                entity_name: e.name.clone(),
+                entity_type: format!("{}", e.entity_type),
+                // `novelty` field is now repurposed as semantic outlier-ness
+                // (cosine distance from centroid). UI label stays "novelty".
+                novelty: surprise,
+                recency,
+                score,
+            })
+        })
+        .collect();
 
     scored.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
     scored.truncate(limit);
@@ -1313,6 +1484,7 @@ fn data_dir(state: &AppState) -> PathBuf {
 
 #[tauri::command]
 fn cmd_brief(state: State<AppState>) -> Result<BriefView, String> {
+    tracing::info!("[cmd_brief] invoked");
     let dir = data_dir(&state);
     let intents_path = dir.join("intents.db");
     let intents = tm_intent::IntentStore::open(intents_path.to_str().unwrap_or_default())
@@ -1321,6 +1493,16 @@ fn cmd_brief(state: State<AppState>) -> Result<BriefView, String> {
     // Attach the graph for JTMS contradictions — this is what gives the
     // brief its retraction-beat punch in the demo.
     let graph = GraphStore::open(&state.db_path).ok();
+
+    // Opportunistic structural contradiction scan — same logic as in
+    // cmd_next_actions. Cheap (deduped against already-recorded pairs);
+    // running it on every Brief load means the default view surfaces
+    // functional-predicate clashes (e.g. WorksAt(X,A) vs WorksAt(X,B))
+    // without requiring the user to navigate to Dashboard first.
+    if let Some(ref g) = graph {
+        let new_count = scan_functional_contradictions(g);
+        tracing::info!("[cmd_brief] structural-contradiction-scan new_count={}", new_count);
+    }
 
     let mut builder = tm_reflect::BriefBuilder::new(&intents);
     if let Some(ref g) = graph {
@@ -1348,7 +1530,7 @@ fn cmd_brief(state: State<AppState>) -> Result<BriefView, String> {
     };
 
     Ok(BriefView {
-        generated_at: brief.generated_at.format("%Y-%m-%d %H:%M:%S").to_string(),
+        generated_at: brief.generated_at.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M:%S").to_string(),
         counts: BriefCountsView {
             overdue: brief.counts.overdue,
             open: brief.counts.open,
@@ -1370,11 +1552,600 @@ fn cmd_brief(state: State<AppState>) -> Result<BriefView, String> {
                 id: c.id.to_string(),
                 triple_a: c.triple_a.to_string(),
                 triple_b: c.triple_b.to_string(),
-                detected_at: c.detected_at.format("%Y-%m-%d %H:%M").to_string(),
+                detected_at: c.detected_at.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M").to_string(),
                 cosine_similarity: c.cosine_similarity,
             })
             .collect(),
     })
+}
+
+// ---------------------------------------------------------------------------
+// Next Actions — proactive action feed (2026-05-11)
+// ---------------------------------------------------------------------------
+//
+// Replaces Dashboard "Suggested for You" entity recs with verb-first action
+// cards. Pulls signals from the same BriefBuilder that backs `cmd_brief`:
+//   - Overdue commitments → Resolve cards
+//   - Open commitments    → FollowUp cards
+//   - Contradictions      → Review cards
+//
+// Sorted by priority (overdue first), then recency. Capped at 12 cards.
+
+#[derive(Serialize)]
+struct NextActionInfo {
+    /// Stable id within this feed (commitment uuid or contradiction uuid).
+    id: String,
+    /// Verb-class for the surface to route on. One of:
+    /// "Resolve" | "FollowUp" | "Review" | "Confirm" | "Connect".
+    kind: String,
+    /// Short verb label, e.g. "Resolve", "Follow up", "Review".
+    verb: String,
+    /// Full action title, e.g. "Resolve: send the deck by Friday".
+    title: String,
+    /// Optional sub-line (triple text, deadline, context).
+    subtitle: Option<String>,
+    /// Target entity for the click action.
+    target_id: String,
+    /// What kind of target — "commitment" | "contradiction" | "entity".
+    target_kind: String,
+    /// "overdue" | "normal" | "low" — controls surface badge.
+    priority: String,
+}
+
+#[tauri::command]
+fn cmd_next_actions(state: State<AppState>) -> Result<Vec<NextActionInfo>, String> {
+    tracing::info!("[cmd_next_actions] invoked");
+    let dir = data_dir(&state);
+    let intents_path = dir.join("intents.db");
+    let intents = tm_intent::IntentStore::open(intents_path.to_str().unwrap_or_default())
+        .map_err(|e| format!("open intents: {e}"))?;
+
+    let graph = GraphStore::open(&state.db_path).ok();
+
+    // Opportunistic contradiction scan — populates `brief.contradictions`
+    // before the builder runs. Cheap (O(n) on triples, deduped against
+    // already-recorded pairs), so we can re-run on every dashboard load.
+    if let Some(ref g) = graph {
+        let _ = scan_functional_contradictions(g);
+    }
+
+    let mut builder = tm_reflect::BriefBuilder::new(&intents);
+    if let Some(ref g) = graph {
+        builder = builder.with_graph(g);
+    }
+    let brief = builder
+        .build(chrono::Utc::now())
+        .map_err(|e| format!("build brief: {e}"))?;
+
+    let mut out: Vec<NextActionInfo> = Vec::new();
+
+    // Overdue commitments → Resolve (priority).
+    for row in brief.overdue.iter().take(6) {
+        let horizon_str = row
+            .horizon
+            .map(|h| format!("due {}", h.format("%Y-%m-%d")))
+            .unwrap_or_else(|| "no deadline".to_string());
+        out.push(NextActionInfo {
+            id: row.id.to_string(),
+            kind: "Resolve".into(),
+            verb: "Resolve".into(),
+            title: format!("Resolve: {}", row.statement),
+            subtitle: Some(horizon_str),
+            target_id: row.id.to_string(),
+            target_kind: "commitment".into(),
+            priority: "overdue".into(),
+        });
+    }
+
+    // Contradictions → Review.
+    // Resolve the triple endpoints to natural-language form so the user
+    // sees the actual clash (e.g. "Aaditya works_at Anthropic ↔
+    // Aaditya works_at Google") instead of opaque UUID prefixes.
+    for row in brief.contradictions.iter().take(4) {
+        let triple_a_text = graph
+            .as_ref()
+            .and_then(|g| g.triple_detail(row.triple_a).ok().flatten())
+            .map(|d| format!("{} {} {}", d.subject_name, d.predicate, d.object_name));
+        let triple_b_text = graph
+            .as_ref()
+            .and_then(|g| g.triple_detail(row.triple_b).ok().flatten())
+            .map(|d| format!("{} {} {}", d.subject_name, d.predicate, d.object_name));
+        let (title, subtitle) = match (triple_a_text, triple_b_text) {
+            (Some(a), Some(b)) => (
+                format!("Review: {} ↔ {}", a, b),
+                Some("conflicting facts — pick the one you believe".into()),
+            ),
+            _ => (
+                "Review contradiction".into(),
+                Some(format!(
+                    "{} ↔ {}",
+                    short_uuid(&row.triple_a.to_string()),
+                    short_uuid(&row.triple_b.to_string())
+                )),
+            ),
+        };
+        out.push(NextActionInfo {
+            id: row.id.to_string(),
+            kind: "Review".into(),
+            verb: "Review".into(),
+            title,
+            subtitle,
+            target_id: row.id.to_string(),
+            target_kind: "contradiction".into(),
+            priority: "normal".into(),
+        });
+    }
+
+    // Pending mined candidates → Confirm. These are phrase-mined intents
+    // from ambient capture (clipboard / shell / MCP turns) — the user
+    // confirms / dismisses them in the Brief view. Surfacing them on the
+    // dashboard means day-1 users with no manually-entered commitments
+    // still see real actionable cards.
+    for cand in brief.candidates.iter().take(4) {
+        if out.len() >= 12 {
+            break;
+        }
+        let kind_label = match cand.kind {
+            tm_intent::types::CommitmentKind::Intent => "intent",
+            tm_intent::types::CommitmentKind::Decision => "decision",
+            tm_intent::types::CommitmentKind::Hypothesis => "hypothesis",
+        };
+        out.push(NextActionInfo {
+            id: cand.id.to_string(),
+            kind: "Confirm".into(),
+            verb: "Confirm".into(),
+            title: format!("Confirm: {}", cand.statement),
+            subtitle: Some(format!(
+                "{} · matched '{}' · {:.0}% confidence",
+                kind_label,
+                cand.matched_phrase,
+                cand.confidence * 100.0
+            )),
+            target_id: cand.id.to_string(),
+            target_kind: "candidate".into(),
+            priority: "normal".into(),
+        });
+    }
+
+    // Open commitments → Follow up (lower priority filler).
+    for row in brief.open.iter().take(6) {
+        if out.len() >= 12 {
+            break;
+        }
+        let horizon_str = row
+            .horizon
+            .map(|h| format!("due {}", h.format("%Y-%m-%d")))
+            .unwrap_or_else(|| "open".to_string());
+        out.push(NextActionInfo {
+            id: row.id.to_string(),
+            kind: "FollowUp".into(),
+            verb: "Follow up".into(),
+            title: format!("Follow up: {}", row.statement),
+            subtitle: Some(horizon_str),
+            target_id: row.id.to_string(),
+            target_kind: "commitment".into(),
+            priority: "normal".into(),
+        });
+    }
+
+    // 2026-05-11 v2 — Connect cards. Prefer concrete relation suggestions
+    // (high-cosine pairs without an edge) — those are one-click actions.
+    // Fall back to quality-gated orphan Connect cards only if no
+    // suggestion pairs exist (very sparse / brand-new graph).
+    if let Some(ref g) = graph {
+        if out.len() < 12 {
+            if let Ok(pairs) = relation_suggestions(g, 4, 0.75) {
+                for (a_id, a_name, b_id, b_name, sim) in pairs {
+                    if out.len() >= 12 {
+                        break;
+                    }
+                    // Encode both ids in target_id so the click handler can
+                    // route to either node (UI splits on '|').
+                    out.push(NextActionInfo {
+                        id: format!("{}|{}", a_id, b_id),
+                        kind: "Connect".into(),
+                        verb: "Connect".into(),
+                        title: format!("Link? {} ↔ {}", a_name, b_name),
+                        subtitle: Some(format!(
+                            "{:.0}% similar · no relation recorded",
+                            sim * 100.0
+                        )),
+                        target_id: a_id.to_string(),
+                        target_kind: "entity".into(),
+                        priority: "low".into(),
+                    });
+                }
+            }
+            // Fallback: only if we still have headroom AND no suggestion
+            // pairs surfaced, drop in a couple of quality-gated orphans.
+            if out.iter().filter(|a| a.kind == "Connect").count() == 0
+                && out.len() < 12
+            {
+                if let Ok(orphans) = orphan_entities(g, 3) {
+                    for (id, name) in orphans {
+                        if out.len() >= 12 {
+                            break;
+                        }
+                        out.push(NextActionInfo {
+                            id: id.to_string(),
+                            kind: "Connect".into(),
+                            verb: "Connect".into(),
+                            title: format!("Connect: {}", name),
+                            subtitle: Some(
+                                "0 relations — link into your graph".into(),
+                            ),
+                            target_id: id.to_string(),
+                            target_kind: "entity".into(),
+                            priority: "low".into(),
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(out)
+}
+
+/// Promote a pending mined candidate to an Open commitment. Returns the
+/// new commitment uuid as a string so the UI can navigate to the
+/// resulting commitment row without re-fetching the brief.
+#[tauri::command]
+fn cmd_accept_candidate(id: String, state: State<AppState>) -> Result<String, String> {
+    let dir = data_dir(&state);
+    let intents_path = dir.join("intents.db");
+    let mut store = tm_intent::IntentStore::open(intents_path.to_str().unwrap_or_default())
+        .map_err(|e| format!("open intents: {e}"))?;
+    let cid = Uuid::parse_str(&id).map_err(|e| format!("bad uuid: {e}"))?;
+    let new_id = store
+        .accept_candidate(cid)
+        .map_err(|e| format!("accept: {e}"))?;
+    Ok(new_id.to_string())
+}
+
+/// Dismiss a pending mined candidate (marks it `dismissed` so it never
+/// resurfaces). Returns whether the row was actually flipped (false if
+/// already accepted / dismissed). Idempotent.
+#[tauri::command]
+fn cmd_dismiss_candidate(id: String, state: State<AppState>) -> Result<bool, String> {
+    let dir = data_dir(&state);
+    let intents_path = dir.join("intents.db");
+    let store = tm_intent::IntentStore::open(intents_path.to_str().unwrap_or_default())
+        .map_err(|e| format!("open intents: {e}"))?;
+    let cid = Uuid::parse_str(&id).map_err(|e| format!("bad uuid: {e}"))?;
+    store
+        .dismiss_candidate(cid)
+        .map_err(|e| format!("dismiss: {e}"))
+}
+
+/// Return up to `limit` entities that have no relations in either direction
+/// AND pass the proactive-panel quality gate. Used as a fallback when the
+/// relation-suggestion path can't fill the Connect slot. We over-fetch (3×)
+/// and post-filter through `is_proactive_quality_entity` because the
+/// majority of orphans are NER fragments — pre-filtering at the SQL layer
+/// would require duplicating the stopword list in SQL.
+fn orphan_entities(graph: &GraphStore, limit: usize) -> Result<Vec<(Uuid, String)>, String> {
+    let conn = graph.inner().connection();
+    let fetch_limit = (limit * 4).max(8) as i64;
+    let sql = format!(
+        "SELECT name, properties FROM kg_entities \
+         WHERE id NOT IN ( \
+            SELECT source_id FROM kg_relations \
+            UNION \
+            SELECT target_id FROM kg_relations \
+         ) \
+         ORDER BY created_at DESC LIMIT {}",
+        fetch_limit
+    );
+    let mut stmt = conn
+        .prepare(&sql)
+        .map_err(|e| format!("prepare orphans: {e}"))?;
+    let rows = stmt
+        .query_map([], |row| {
+            let name: String = row.get(0)?;
+            let props: String = row.get(1)?;
+            Ok((name, props))
+        })
+        .map_err(|e| format!("query orphans: {e}"))?;
+    let mut out = Vec::new();
+    for r in rows.flatten() {
+        if !is_proactive_quality_entity(&r.0) {
+            continue;
+        }
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&r.1) {
+            if let Some(id_str) = json.get("uuid").and_then(|v| v.as_str()) {
+                if let Ok(uuid) = Uuid::parse_str(id_str) {
+                    out.push((uuid, r.0));
+                    if out.len() >= limit {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Find pairs of high-quality entities whose embeddings are highly similar
+/// but which have no edge in `kg_relations`. These are concrete "Link X to
+/// Y?" suggestions — much more actionable than bare "Connect: <name>"
+/// orphans because the user has a target to wire to.
+///
+/// Returns `(a_id, a_name, b_id, b_name, cosine_sim)` tuples sorted by
+/// similarity descending, capped at `limit`. Uses `graph.search_vectors`
+/// (skg's native nearest-neighbor) so each entity does one indexed
+/// top-k probe rather than an O(n²) scan.
+///
+/// `min_sim` should be ≥ 0.7 in practice — below that the pairs are noisy
+/// and the user gets junk. 2026-05-11: starting at 0.75.
+fn relation_suggestions(
+    graph: &GraphStore,
+    limit: usize,
+    min_sim: f32,
+) -> Result<Vec<(Uuid, String, Uuid, String, f32)>, String> {
+    // 1. Quality entities only — every other path here gets these and
+    //    we want the same surface across panels.
+    let entities = graph
+        .list_all_entities()
+        .map_err(|e| format!("list entities: {e}"))?;
+    let mut name_by_uuid: HashMap<Uuid, String> = HashMap::new();
+    for e in &entities {
+        if is_proactive_quality_entity(&e.name) {
+            name_by_uuid.insert(e.id, e.name.clone());
+        }
+    }
+    if name_by_uuid.len() < 2 {
+        return Ok(Vec::new());
+    }
+
+    // 2. Build the set of currently-linked UUID pairs (undirected).
+    //    kg_relations uses internal skg i64 IDs; we JOIN through
+    //    kg_entities to recover the TM UUIDs in `properties.uuid`.
+    let conn = graph.inner().connection();
+    let mut linked: HashSet<(Uuid, Uuid)> = HashSet::new();
+    let mut stmt = conn
+        .prepare(
+            "SELECT s.properties, t.properties \
+             FROM kg_relations r \
+             JOIN kg_entities s ON s.id = r.source_id \
+             JOIN kg_entities t ON t.id = r.target_id",
+        )
+        .map_err(|e| format!("prepare relations: {e}"))?;
+    let rows = stmt
+        .query_map([], |row| {
+            let sp: String = row.get(0)?;
+            let tp: String = row.get(1)?;
+            Ok((sp, tp))
+        })
+        .map_err(|e| format!("query relations: {e}"))?;
+    let extract_uuid = |props: &str| -> Option<Uuid> {
+        let json: serde_json::Value = serde_json::from_str(props).ok()?;
+        let s = json.get("uuid").and_then(|v| v.as_str())?;
+        Uuid::parse_str(s).ok()
+    };
+    for r in rows.flatten() {
+        if let (Some(a), Some(b)) = (extract_uuid(&r.0), extract_uuid(&r.1)) {
+            let (lo, hi) = if a < b { (a, b) } else { (b, a) };
+            linked.insert((lo, hi));
+        }
+    }
+
+    // 3. For each quality entity, top-K nearest-neighbor probe. Each
+    //    candidate pair gets canonicalised (lo < hi) and deduped — the
+    //    probe will surface both (A→B) and (B→A) otherwise.
+    //
+    //    We also dedup by lowercased name-pair so duplicate-entity
+    //    rows in the graph (e.g. two UUIDs both named "reranking") do
+    //    not produce "Link? reranking ↔ reranking" cards. This is a
+    //    UI-layer guard — the real fix is graph-level entity merge.
+    let mut seen: HashSet<(Uuid, Uuid)> = HashSet::new();
+    let mut seen_names: HashSet<(String, String)> = HashSet::new();
+    let mut candidates: Vec<(Uuid, String, Uuid, String, f32)> = Vec::new();
+    // Pre-sort entity ids for stable iteration order (so identical DB
+    // state yields identical card order — easier to verify in the UI).
+    let mut ordered: Vec<Uuid> = name_by_uuid.keys().copied().collect();
+    ordered.sort();
+    for id in &ordered {
+        let v = match graph.get_vector(*id) {
+            Ok(Some(v)) if !v.is_empty() => v,
+            _ => continue,
+        };
+        // top_k=6 → self + ≤5 candidates. We may need to look slightly
+        // deeper if the top neighbors are all noise entities filtered
+        // out by the quality gate, but in practice 6 is plenty.
+        let neighbors = match graph.search_vectors(&v, 6) {
+            Ok(n) => n,
+            Err(_) => continue,
+        };
+        for (nid, sim) in neighbors {
+            if nid == *id {
+                continue;
+            }
+            if sim < min_sim {
+                continue;
+            }
+            let Some(nname) = name_by_uuid.get(&nid) else {
+                continue;
+            };
+            let (lo, hi) = if *id < nid { (*id, nid) } else { (nid, *id) };
+            if linked.contains(&(lo, hi)) {
+                continue;
+            }
+            if !seen.insert((lo, hi)) {
+                continue;
+            }
+            let (a_id, a_name, b_id, b_name) = if *id < nid {
+                let aname = name_by_uuid
+                    .get(id)
+                    .cloned()
+                    .unwrap_or_default();
+                (*id, aname, nid, nname.clone())
+            } else {
+                let bname = name_by_uuid
+                    .get(id)
+                    .cloned()
+                    .unwrap_or_default();
+                (nid, nname.clone(), *id, bname)
+            };
+            // Skip same-name and duplicate-name-pair cards.
+            let a_lo = a_name.to_lowercase();
+            let b_lo = b_name.to_lowercase();
+            if a_lo == b_lo {
+                continue;
+            }
+            let name_key = if a_lo < b_lo {
+                (a_lo.clone(), b_lo.clone())
+            } else {
+                (b_lo.clone(), a_lo.clone())
+            };
+            if !seen_names.insert(name_key) {
+                continue;
+            }
+            candidates.push((a_id, a_name, b_id, b_name, sim));
+        }
+    }
+    candidates.sort_by(|a, b| b.4.partial_cmp(&a.4).unwrap_or(std::cmp::Ordering::Equal));
+    candidates.truncate(limit);
+    Ok(candidates)
+}
+
+fn short_uuid(s: &str) -> String {
+    s.chars().take(8).collect()
+}
+
+/// Scan for *functional-predicate* contradictions: two triples with the
+/// same subject + predicate but different objects. Examples that fire:
+/// "Cat is_a Animal" + "Cat is_a Plant"; "Aaditya works_at Anthropic"
+/// + "Aaditya works_at Google".
+///
+/// Only triples with predicates in `FUNCTIONAL` are considered — those
+/// are predicates where multiple objects on the same subject would be a
+/// genuine logical clash. `related_to`, `collaborates_with`,
+/// `references` etc. legitimately have many objects, so they're skipped.
+///
+/// New pairs are persisted via `graph.record_contradiction(..)` with a
+/// forced cosine of `-0.99` so the JTMS detector fires. Already-recorded
+/// pairs are deduped against `graph.contradictions()`.
+///
+/// Returns the number of *new* contradictions recorded.
+fn scan_functional_contradictions(graph: &GraphStore) -> usize {
+    // Functional predicates — stored in `kg_relations.rel_type` as the
+    // JSON serialization of the `Predicate` enum, which for unit
+    // variants is just the snake_case string wrapped in quotes (e.g.
+    // Predicate::IsA → "\"is_a\"").
+    const FUNCTIONAL: &[&str] = &[
+        "\"is_a\"",
+        "\"works_at\"",
+        "\"part_of\"",
+    ];
+    tracing::info!("[contradiction-scan] starting");
+
+    let conn = graph.inner().connection();
+    let mut stmt = match conn.prepare(
+        "SELECT properties, source_id, target_id, rel_type \
+         FROM kg_relations",
+    ) {
+        Ok(s) => s,
+        Err(_) => return 0,
+    };
+
+    let rows: Vec<(String, i64, i64, String)> = match stmt.query_map([], |row| {
+        let p: String = row.get(0)?;
+        let s: i64 = row.get(1)?;
+        let t: i64 = row.get(2)?;
+        let r: String = row.get(3)?;
+        Ok((p, s, t, r))
+    }) {
+        Ok(it) => it.filter_map(|r| r.ok()).collect(),
+        Err(_) => return 0,
+    };
+    drop(stmt);
+
+    // Group functional triples by (subject_skg_id, predicate) → (triple_uuid, object_skg_id).
+    let mut grouped: HashMap<(i64, String), Vec<(Uuid, i64)>> = HashMap::new();
+    for (props_str, src, tgt, rel) in &rows {
+        if !FUNCTIONAL.contains(&rel.as_str()) {
+            continue;
+        }
+        let props: serde_json::Value = match serde_json::from_str(props_str) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let triple_uuid = match props.get("uuid").and_then(|v| v.as_str()) {
+            Some(s) => match Uuid::parse_str(s) {
+                Ok(u) => u,
+                Err(_) => continue,
+            },
+            None => continue,
+        };
+        grouped
+            .entry((*src, rel.clone()))
+            .or_default()
+            .push((triple_uuid, *tgt));
+    }
+
+    // Pre-compute the set of already-recorded contradiction pairs so we
+    // don't re-insert them every dashboard refresh.
+    let mut already: HashSet<(Uuid, Uuid)> = HashSet::new();
+    for c in graph.contradictions() {
+        let (lo, hi) = if c.triple_a < c.triple_b {
+            (c.triple_a, c.triple_b)
+        } else {
+            (c.triple_b, c.triple_a)
+        };
+        already.insert((lo, hi));
+    }
+
+    tracing::info!(
+        "[contradiction-scan] groups={} already_recorded={}",
+        grouped.len(),
+        already.len()
+    );
+
+    let mut new_count = 0;
+    for ((subj, pred), items) in grouped.iter() {
+        if items.len() < 2 {
+            continue;
+        }
+        tracing::info!(
+            "[contradiction-scan] candidate group subj_skg={} pred={} size={}",
+            subj,
+            pred,
+            items.len()
+        );
+        for i in 0..items.len() {
+            for j in (i + 1)..items.len() {
+                // Different objects = candidate contradiction.
+                if items[i].1 == items[j].1 {
+                    continue;
+                }
+                let (lo, hi) = if items[i].0 < items[j].0 {
+                    (items[i].0, items[j].0)
+                } else {
+                    (items[j].0, items[i].0)
+                };
+                if already.contains(&(lo, hi)) {
+                    continue;
+                }
+                // Force cosine = -0.99 so the JTMS detector accepts it.
+                // The structural same-subject-same-predicate signal is
+                // the actual contradiction evidence.
+                let res = graph.record_contradiction(lo, hi, -0.99);
+                tracing::info!(
+                    "[contradiction-scan] record_contradiction({}, {}) -> {}",
+                    lo,
+                    hi,
+                    res.is_some()
+                );
+                if res.is_some() {
+                    already.insert((lo, hi));
+                    new_count += 1;
+                }
+            }
+        }
+    }
+    tracing::info!("[contradiction-scan] done new_count={}", new_count);
+    new_count
 }
 
 // ---------------------------------------------------------------------------
@@ -1414,7 +2185,7 @@ impl From<tm_graph::TripleDetail> for TripleDetailView {
             object_type: d.object_type,
             confidence: d.confidence,
             source_id: d.source_id,
-            ingested_at: d.ingested_at.format("%Y-%m-%d %H:%M").to_string(),
+            ingested_at: d.ingested_at.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M").to_string(),
             status: d.status.map(|s| format!("{:?}", s)),
         }
     }
@@ -2087,6 +2858,9 @@ fn main() {
             cmd_find_analogies,
             cmd_consolidate,
             cmd_brief,
+            cmd_next_actions,
+            cmd_accept_candidate,
+            cmd_dismiss_candidate,
             cmd_triple_detail,
             cmd_resolve_contradiction,
             cmd_record_outcome,
