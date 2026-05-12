@@ -1052,6 +1052,19 @@ pub(crate) fn extract_entities(text: &str) -> Vec<Entity> {
             let start = i;
             let mut end = i + 1;
             while end < words.len() {
+                // Bug-fix 2026-05-11: trailing punctuation on the previous raw
+                // word (comma, semicolon, period) signals a list / clause
+                // boundary — don't merge "Alice, Bob" into "Alice Bob".
+                let prev_raw = words[end - 1];
+                if prev_raw.ends_with(',')
+                    || prev_raw.ends_with(';')
+                    || prev_raw.ends_with('.')
+                    || prev_raw.ends_with(':')
+                    || prev_raw.ends_with('!')
+                    || prev_raw.ends_with('?')
+                {
+                    break;
+                }
                 let next = words[end].trim_matches(STRIP_CHARS);
                 if is_title_case(next) && !next.is_empty() {
                     end += 1;

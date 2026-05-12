@@ -58,6 +58,51 @@ export default function GraphView() {
   const animRef = useRef<number>(0);
   const dragRef = useRef<{ node: SimNode; offsetX: number; offsetY: number } | null>(null);
   const sizeRef = useRef({ w: 800, h: 600 });
+  // Viewport transform — pan + zoom. Lives in a ref so the rAF redraw
+  // sees fresh values without restarting the effect.
+  const viewRef = useRef({ tx: 0, ty: 0, scale: 1 });
+  const panRef = useRef<{ startX: number; startY: number; startTx: number; startTy: number } | null>(null);
+  // Mirror `hovered` into a ref so the draw loop can read it without the
+  // simulation effect listing it as a dep (which would tear down + restart
+  // the physics on every mouse move — exactly the "bouncing around" symptom).
+  const hoveredRef = useRef<SimNode | null>(null);
+  useEffect(() => { hoveredRef.current = hovered; }, [hovered]);
+  // Bump this state to force a manual redraw after view-only changes
+  // (zoom, pan, fit). The simulation rAF picks it up via the closure.
+  const [, setRedraw] = useState(0);
+  // Whether auto-fit has run for the current data load. Re-armed each
+  // time `data` changes (see effect below).
+  const autoFitDoneRef = useRef(false);
+
+  // 2026-05-11 — Compute a viewport (tx/ty/scale) that frames every node
+  // with a small padding. Called once after the force layout settles, and
+  // when the user presses "Fit".
+  const fitToScreen = useCallback(() => {
+    const ns = nodesRef.current;
+    if (!ns.length) return;
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    for (const n of ns) {
+      if (n.x - n.radius < minX) minX = n.x - n.radius;
+      if (n.y - n.radius < minY) minY = n.y - n.radius;
+      if (n.x + n.radius > maxX) maxX = n.x + n.radius;
+      if (n.y + n.radius > maxY) maxY = n.y + n.radius;
+    }
+    const { w, h } = sizeRef.current;
+    const bw = Math.max(1, maxX - minX);
+    const bh = Math.max(1, maxY - minY);
+    const pad = 40;
+    const sx = (w - pad * 2) / bw;
+    const sy = (h - pad * 2) / bh;
+    const s = Math.max(0.25, Math.min(4, Math.min(sx, sy)));
+    const cx = (minX + maxX) / 2;
+    const cy = (minY + maxY) / 2;
+    viewRef.current = {
+      tx: w / 2 - cx * s,
+      ty: h / 2 - cy * s,
+      scale: s,
+    };
+    setRedraw((r) => r + 1);
+  }, []);
 
   useEffect(() => {
     getGraph()
@@ -126,17 +171,25 @@ export default function GraphView() {
 
     const { w, h } = sizeRef.current;
 
-    // Init nodes
-    const nodes: SimNode[] = filteredNodes.map((n) => {
+    // Init nodes on a concentric circle layout — much faster to settle
+    // than random scatter, and avoids the "explosion" of the first ~200
+    // frames where everything was bouncing off the boundaries.
+    const N = filteredNodes.length;
+    const baseRadius = Math.min(w, h) * 0.32;
+    const nodes: SimNode[] = filteredNodes.map((n, idx) => {
       const degree = degreeMap.get(n.id) || 0;
+      // High-degree nodes start nearer the center; low-degree at the rim.
+      // This is a cheap proxy for "communities first, leaves last".
+      const tier = degree > 3 ? 0.35 : degree > 0 ? 0.75 : 1.0;
+      const angle = (idx / Math.max(N, 1)) * Math.PI * 2;
       return {
         id: n.id,
         name: n.name,
         entity_type: n.entity_type,
         confidence: n.confidence,
         community: n.community,
-        x: w / 2 + (Math.random() - 0.5) * w * 0.7,
-        y: h / 2 + (Math.random() - 0.5) * h * 0.7,
+        x: w / 2 + Math.cos(angle) * baseRadius * tier,
+        y: h / 2 + Math.sin(angle) * baseRadius * tier,
         vx: 0,
         vy: 0,
         radius: Math.max(5, Math.min(22, 6 + Math.sqrt(degree) * 3 + n.confidence * 4)),
@@ -145,12 +198,19 @@ export default function GraphView() {
     });
     nodesRef.current = nodes;
     edgesRef.current = filteredEdges;
+    // Re-arm auto-fit for the new layout.
+    autoFitDoneRef.current = false;
 
     const idToNode = new Map<string, SimNode>();
     nodes.forEach((n) => idToNode.set(n.id, n));
 
     let frameCount = 0;
     const maxSimFrames = 300; // stop simulation after settling
+    let settled = false;
+    // Pin the canvas's logical CSS resolution. The `2d` context's
+    // transform was already scaled to dpr in updateCanvasSize, so per-frame
+    // resets must use the same factor or hi-dpi screens get fractional offsets.
+    const dpr = window.devicePixelRatio || 1;
 
     const simulate = () => {
       const { w, h } = sizeRef.current;
@@ -163,8 +223,14 @@ export default function GraphView() {
       const damping = 0.85;
       const repulsionScale = isLargeGraph ? 0.03 : 0.05;
 
-      // Cooling: reduce force over time
-      const cooling = frameCount < maxSimFrames ? 1.0 - frameCount / maxSimFrames * 0.8 : 0.2;
+      // Cooling: ramp down to 0 (not 0.2!) once we pass maxSimFrames so the
+      // system can actually settle. The old 0.2 floor kept gravity injecting
+      // force forever and produced the visible drift.
+      const cooling = settled
+        ? 0
+        : frameCount < maxSimFrames
+          ? 1.0 - (frameCount / maxSimFrames) * 0.9
+          : Math.max(0, 0.1 - (frameCount - maxSimFrames) / 200);
 
       // Center gravity
       for (const n of nodes) {
@@ -208,23 +274,53 @@ export default function GraphView() {
         tgt.vy -= fy;
       }
 
-      // Apply velocity
+      // Apply velocity + accumulate kinetic energy. KE is the convergence
+      // signal — when it falls below a small epsilon and we're past the
+      // initial bursty period, freeze the simulation entirely.
+      let ke = 0;
       for (const n of nodes) {
         if (dragRef.current?.node === n) continue;
         n.vx *= damping;
         n.vy *= damping;
         n.x += n.vx;
         n.y += n.vy;
-        n.x = Math.max(n.radius + 5, Math.min(w - n.radius - 5, n.x));
-        n.y = Math.max(n.radius + 5, Math.min(h - n.radius - 5, n.y));
+        // Soft boundary: pull back gently instead of clamping so nodes
+        // don't get stuck on the wall (which used to drive the bouncing).
+        const margin = n.radius + 5;
+        if (n.x < margin) { n.x = margin; n.vx = 0; }
+        else if (n.x > w - margin) { n.x = w - margin; n.vx = 0; }
+        if (n.y < margin) { n.y = margin; n.vy = 0; }
+        else if (n.y > h - margin) { n.y = h - margin; n.vy = 0; }
+        ke += n.vx * n.vx + n.vy * n.vy;
       }
+      const meanKe = ke / Math.max(nodes.length, 1);
 
       frameCount++;
+      // Settle when energy is small and we've simulated long enough, OR
+      // when we've blown past the hard cap regardless. After this point
+      // we still draw (so drags and hovers stay responsive) but we apply
+      // zero force, which is what makes the graph stop drifting.
+      if (!settled && (
+        (frameCount > 60 && meanKe < 0.04) ||
+        frameCount > maxSimFrames * 2
+      )) {
+        settled = true;
+        // 2026-05-11 — Auto-fit once the layout settles. Without this the
+        // default viewport (tx=0, ty=0, scale=1) can leave the graph
+        // partially off-screen on first load, especially with many nodes.
+        if (!autoFitDoneRef.current) {
+          autoFitDoneRef.current = true;
+          fitToScreen();
+        }
+      }
 
-      // Draw
+      // Draw — apply dpr scale + viewport pan/zoom in one go.
+      const { tx, ty, scale } = viewRef.current;
       ctx.save();
-      ctx.setTransform(window.devicePixelRatio || 1, 0, 0, window.devicePixelRatio || 1, 0, 0);
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
       ctx.clearRect(0, 0, w, h);
+      ctx.translate(tx, ty);
+      ctx.scale(scale, scale);
 
       // Edges
       for (const edge of filteredEdges) {
@@ -255,7 +351,7 @@ export default function GraphView() {
       // Nodes
       for (const n of nodes) {
         const color = colorMode === "community" ? communityColor(n.community) : typeColor(n.entity_type);
-        const isHovered = hovered?.id === n.id;
+        const isHovered = hoveredRef.current?.id === n.id;
 
         // Glow for hovered
         if (isHovered) {
@@ -291,19 +387,30 @@ export default function GraphView() {
     animRef.current = requestAnimationFrame(simulate);
 
     return () => cancelAnimationFrame(animRef.current);
-  }, [data, hovered, filter, showLabels, colorMode]);
+    // NOTE: `hovered` is intentionally NOT a dep — see hoveredRef above.
+    // Listing it would restart the simulation (and the "explosion" reset)
+    // on every mouse move.
+  }, [data, filter, showLabels, colorMode, fitToScreen]);
 
   // Mouse interaction
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
 
-    const getNode = (e: MouseEvent): SimNode | null => {
+    // Convert a screen-space mouse event into world-space (post-zoom/pan)
+    // canvas coordinates. Every hit-test and drag uses this.
+    const toWorld = (e: MouseEvent): { x: number; y: number } => {
       const rect = canvas.getBoundingClientRect();
       const scaleX = sizeRef.current.w / rect.width;
       const scaleY = sizeRef.current.h / rect.height;
-      const mx = (e.clientX - rect.left) * scaleX;
-      const my = (e.clientY - rect.top) * scaleY;
+      const cssX = (e.clientX - rect.left) * scaleX;
+      const cssY = (e.clientY - rect.top) * scaleY;
+      const { tx, ty, scale } = viewRef.current;
+      return { x: (cssX - tx) / scale, y: (cssY - ty) / scale };
+    };
+
+    const getNode = (e: MouseEvent): SimNode | null => {
+      const { x: mx, y: my } = toWorld(e);
       for (const n of nodesRef.current) {
         const dx = mx - n.x;
         const dy = my - n.y;
@@ -314,30 +421,47 @@ export default function GraphView() {
 
     const onMove = (e: MouseEvent) => {
       if (dragRef.current) {
+        const { x, y } = toWorld(e);
+        dragRef.current.node.x = x - dragRef.current.offsetX;
+        dragRef.current.node.y = y - dragRef.current.offsetY;
+        dragRef.current.node.vx = 0;
+        dragRef.current.node.vy = 0;
+      } else if (panRef.current) {
+        // Two-finger or background drag: pan the viewport.
         const rect = canvas.getBoundingClientRect();
         const scaleX = sizeRef.current.w / rect.width;
         const scaleY = sizeRef.current.h / rect.height;
-        dragRef.current.node.x = (e.clientX - rect.left) * scaleX - dragRef.current.offsetX;
-        dragRef.current.node.y = (e.clientY - rect.top) * scaleY - dragRef.current.offsetY;
-        dragRef.current.node.vx = 0;
-        dragRef.current.node.vy = 0;
+        const dx = (e.clientX - rect.left) * scaleX - panRef.current.startX;
+        const dy = (e.clientY - rect.top) * scaleY - panRef.current.startY;
+        viewRef.current.tx = panRef.current.startTx + dx;
+        viewRef.current.ty = panRef.current.startTy + dy;
       } else {
         const node = getNode(e);
         setHovered(node);
-        canvas.style.cursor = node ? "grab" : "default";
+        canvas.style.cursor = node ? "grab" : "move";
       }
     };
 
     const onDown = (e: MouseEvent) => {
       const node = getNode(e);
       if (node) {
+        const { x, y } = toWorld(e);
+        dragRef.current = {
+          node,
+          offsetX: x - node.x,
+          offsetY: y - node.y,
+        };
+        canvas.style.cursor = "grabbing";
+      } else {
+        // Background click → start a viewport pan.
         const rect = canvas.getBoundingClientRect();
         const scaleX = sizeRef.current.w / rect.width;
         const scaleY = sizeRef.current.h / rect.height;
-        dragRef.current = {
-          node,
-          offsetX: (e.clientX - rect.left) * scaleX - node.x,
-          offsetY: (e.clientY - rect.top) * scaleY - node.y,
+        panRef.current = {
+          startX: (e.clientX - rect.left) * scaleX,
+          startY: (e.clientY - rect.top) * scaleY,
+          startTx: viewRef.current.tx,
+          startTy: viewRef.current.ty,
         };
         canvas.style.cursor = "grabbing";
       }
@@ -345,7 +469,28 @@ export default function GraphView() {
 
     const onUp = () => {
       dragRef.current = null;
+      panRef.current = null;
       canvas.style.cursor = "default";
+    };
+
+    // Wheel zoom around the cursor position so the spot under the
+    // pointer stays put as we zoom in/out. clamp scale to [0.25, 4].
+    const onWheel = (e: WheelEvent) => {
+      e.preventDefault();
+      const rect = canvas.getBoundingClientRect();
+      const scaleX = sizeRef.current.w / rect.width;
+      const scaleY = sizeRef.current.h / rect.height;
+      const cssX = (e.clientX - rect.left) * scaleX;
+      const cssY = (e.clientY - rect.top) * scaleY;
+      const v = viewRef.current;
+      const oldScale = v.scale;
+      const factor = Math.exp(-e.deltaY * 0.0015);
+      const newScale = Math.max(0.25, Math.min(4, oldScale * factor));
+      // Keep world point under cursor stationary: tx' = cssX - (cssX - tx) * (new/old)
+      v.tx = cssX - (cssX - v.tx) * (newScale / oldScale);
+      v.ty = cssY - (cssY - v.ty) * (newScale / oldScale);
+      v.scale = newScale;
+      setRedraw((r) => r + 1);
     };
 
     const onContextMenu = (e: MouseEvent) => {
@@ -363,12 +508,14 @@ export default function GraphView() {
     canvas.addEventListener("mouseup", onUp);
     canvas.addEventListener("mouseleave", onUp);
     canvas.addEventListener("contextmenu", onContextMenu);
+    canvas.addEventListener("wheel", onWheel, { passive: false });
     return () => {
       canvas.removeEventListener("mousemove", onMove);
       canvas.removeEventListener("mousedown", onDown);
       canvas.removeEventListener("mouseup", onUp);
       canvas.removeEventListener("mouseleave", onUp);
       canvas.removeEventListener("contextmenu", onContextMenu);
+      canvas.removeEventListener("wheel", onWheel);
     };
   }, [data]);
 
@@ -414,6 +561,13 @@ export default function GraphView() {
             }`}
           >
             Labels
+          </button>
+          <button
+            onClick={fitToScreen}
+            className="text-xs px-3 py-1 rounded bg-tm-surface border border-tm-border text-tm-muted hover:text-tm-text transition-colors"
+            title="Frame all nodes"
+          >
+            Fit
           </button>
           <button
             onClick={() => {

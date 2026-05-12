@@ -4,10 +4,34 @@ Real content, real BGE-small ONNX embeddings, real GLiNER NER, real on-device re
 
 ## Files
 
-- **`walkthrough.sh`** — the 5-act presentation. Self-contained, paced for narration.
+- **`walkthrough.sh`** — the 5-act CLI presentation. Self-contained, paced for narration.
 - **`record.sh`** — wraps `walkthrough.sh` with `screencapture -V` to produce a `.mov`.
+- **`record-clean.sh`** — spawns a fresh Terminal window and records just that rect (cleanest output).
+- **`mcp-walkthrough.sh`** — 6-act MCP demo. Drives `tm-mcp` over JSON-RPC stdio end-to-end (initialize → tools/list → memory_store → memory_query → memory_commit → memory_brief → memory_feedback). Fully automated.
+- **`record-mcp.sh`** — wraps `mcp-walkthrough.sh` in a spawned Terminal window with `screencapture`.
+- **`ui-walkthrough.sh`** — seeds a fresh `TM_DATA_DIR`, launches `tracemind-app`, prints narration cards for a presenter clicking through the new UI surfaces (Onboarding → Brief → Query banner → Commitments → Calibration → Settings).
+- **`record-ui.sh`** — runs `ui-walkthrough.sh` while screencapturing the whole display (Tauri window included).
 - **`capture-screen.sh`** + **`ocr.swift`** — Vision-framework OCR wrapper for the ambient-capture story (optional).
-- **`recordings/`** — output: `.mov` videos and `.txt` transcripts.
+- **`recordings/`** — output: `.mov` videos and `.txt`/`.ansi` transcripts.
+
+## Quick recipes
+
+```bash
+# CLI walkthrough (original)
+./demo/walkthrough.sh
+
+# MCP walkthrough — fully automated, produces a transcript artifact
+DEMO_PAUSE=0.05 ./demo/mcp-walkthrough.sh > demo/recordings/mcp.txt 2>&1
+
+# MCP walkthrough — recorded to .mov in a fresh Terminal window
+./demo/record-mcp.sh
+
+# UI walkthrough — seeds data + launches Tauri app + prints click cues
+./demo/ui-walkthrough.sh
+
+# UI walkthrough — full-display screen recording
+./demo/record-ui.sh
+```
 
 ## Quickstart
 

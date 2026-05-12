@@ -204,8 +204,9 @@ impl GraphStore {
                 priority_tier   INTEGER DEFAULT 3
             );
             CREATE INDEX IF NOT EXISTS idx_signals_hash ON captured_signals(content_hash);
-            CREATE INDEX IF NOT EXISTS idx_signals_cluster ON captured_signals(cluster_id);
-            CREATE INDEX IF NOT EXISTS idx_signals_tier ON captured_signals(priority_tier, cluster_id);
+            -- NOTE: idx_signals_cluster and idx_signals_tier reference cluster_id,
+            -- which may not yet exist on older DBs (pre two-speed pipeline). They
+            -- are created after the ALTER TABLE migration block below.
 
             CREATE TABLE IF NOT EXISTS retrieval_feedback (
                 id           INTEGER PRIMARY KEY,

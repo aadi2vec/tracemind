@@ -141,6 +141,13 @@ export default function BriefView() {
     refresh();
   }, []);
 
+  // Compute archived rows unconditionally so hook order is stable across renders.
+  const archivedRows = useMemo(() => {
+    if (!brief) return [] as BriefRow[];
+    const all = [...brief.overdue, ...brief.open, ...brief.resolved];
+    return all.filter((r) => archivedIds.has(r.id));
+  }, [brief, archivedIds]);
+
   if (error) {
     return (
       <div className="text-tm-muted">
@@ -173,10 +180,6 @@ export default function BriefView() {
   const visibleResolved = brief.resolved.filter(
     (r) => !dismissedIds.has(r.id) && !archivedIds.has(r.id),
   );
-  const archivedRows = useMemo(() => {
-    const all = [...brief.overdue, ...brief.open, ...brief.resolved];
-    return all.filter((r) => archivedIds.has(r.id));
-  }, [brief.overdue, brief.open, brief.resolved, archivedIds]);
 
   return (
     <div className="max-w-4xl">

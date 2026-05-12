@@ -316,6 +316,42 @@ export async function getBrief(): Promise<BriefView> {
   return invoke("cmd_brief");
 }
 
+// Next Actions — verb-first action feed (2026-05-11)
+//
+// Replaces Dashboard "Suggested for You" entity recs with verb cards
+// synthesised from commitments + contradictions in cmd_brief.
+
+export type NextActionKind = "Resolve" | "FollowUp" | "Review" | "Confirm" | "Connect";
+export type NextActionPriority = "overdue" | "normal" | "low";
+export type NextActionTargetKind = "commitment" | "contradiction" | "entity" | "candidate";
+
+export interface NextActionInfo {
+  id: string;
+  kind: NextActionKind;
+  verb: string;
+  title: string;
+  subtitle: string | null;
+  target_id: string;
+  target_kind: NextActionTargetKind;
+  priority: NextActionPriority;
+}
+
+export async function getNextActions(): Promise<NextActionInfo[]> {
+  return invoke("cmd_next_actions");
+}
+
+/// Promote a pending mined commitment candidate to an Open Commitment.
+/// Returns the new commitment uuid as a string.
+export async function acceptCandidate(id: string): Promise<string> {
+  return invoke("cmd_accept_candidate", { id });
+}
+
+/// Dismiss a pending mined candidate. Returns true if a row was flipped
+/// (false = already accepted / dismissed). Idempotent.
+export async function dismissCandidate(id: string): Promise<boolean> {
+  return invoke("cmd_dismiss_candidate", { id });
+}
+
 // Contradiction drawer (E series)
 
 export interface TripleDetailView {

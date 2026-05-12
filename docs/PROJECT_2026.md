@@ -24,6 +24,147 @@ Properties 1–4 are the *wedge* (what makes a user say "I won't go back" in wee
 
 ---
 
+## 1a. What we are NOT building (frame discipline)
+
+External readers consistently misread TraceMind as one of two products it is *not*. Both misreadings are commercially fatal because they map onto graveyards. Stating the disclaim here in writing keeps the team and any future investor conversation on the right frame.
+
+**TraceMind is not "everything in one" / consumer life-memory.** We are not Rewind, not Personal.ai, not Khoj-for-grandma. The pitch *"your Slack thread references your calendar references your screenshotted restaurant"* is the end-state prize for a hypothetical 2030 product; pursuing it as v1 is the trap that has killed every prior attempt. Twenty connectors × six weeks each is a year of plumbing before the first line of memory logic ships. Entity resolution at consumer tier (Sarah-from-Slack ≡ Sarah-Chen-from-Gmail ≡ S 🌸) is unsolved at the SOTA frontier, let alone on a 1.5B local model. Storage of five years of screenshots + mail + messages dies on phone. We do not pursue this frame.
+
+**TraceMind is "ambient memory for every AI agent you use."** The user-facing surface (Tauri flagship) is a side-effect of that thesis, not the thesis itself. The substrate is populated by the agent ecosystem via MCP — Claude Code reads code, Cursor reads IDE state, Goose reads whatever it points at, future hosts (ChatGPT desktop, Gemini agentic, Slack MCP) bring email/chat as they ship. *We do not build twenty connectors; the agent ecosystem brings ingestion to us.* This is the strategic inversion that makes the local-only constraint tractable where it kills every consumer-shaped attempt.
+
+**TraceMind is not a search platform.** Search-as-killer-feature is underwhelming because Spotlight, Cmd+F, and any LLM with grep already do it. Our surface is *anticipatory* — the right memory surfaced in the context of current work, before the user thinks to ask. Search is the fallback when anticipation misses. See §1b for the anticipatory surface architecture.
+
+**TraceMind is not a productivity-app commitment tracker.** Commitments and contradictions are *primitives inside* the anticipatory surface — they fire when the current work touches an open deadline or a stale fact. They are not the top-level UI. The Brief view and Next Actions panel ladder up to "what should I do given what I'm working on right now," not "here is your to-do list."
+
+If a feature, a roadmap line, or an external pitch reads more naturally as one of the four disclaimed products, it is wrong and should be cut or reframed.
+
+---
+
+## 1b. The anticipatory surface (proactive, not reactive)
+
+The hardest unsolved problem in personal memory is not storage, retrieval quality, or contradiction detection — those are tractable. It is **surfacing the right memory at the right moment without being asked.** Every product that has tried this has failed by being either too noisy (Clippy, every "AI suggestion" panel) or too inert (search bars no one opens). The wedge moment is the *first time* the user sees a card appear that says "you decided X about this last Tuesday" while they are actively re-encountering the same shape of problem — and they did not type a query.
+
+**Architecture: the Working Memory Engine (WME).**
+
+The WME is a rolling-window topic detector + proactive retrieval loop that runs on the capture stream. The contract:
+
+1. **Detect current topic** — maintain a decaying rolling embedding over the last 5 minutes of capture events (clipboard, shell, AI turns, query history, active context). Topic vector updates every 30s or on significant capture event.
+2. **Retrieve candidates** — query the memory substrate with the topic vector; pull top-K relevant prior memories that the user has *not* already seen this session.
+3. **Score for proactive surfacing** — `score = relevance × surprise × recency_of_decision × outcome_signal`. Surprise filter is critical: do not re-surface what the user is currently looking at; do surface what they have forgotten that bears on it.
+4. **Synthesize verb-first cards**:
+   - **Resume** — abandoned threads that match current topic (staleness × relevance)
+   - **Recall** — prior decisions about the exact thing now in scope
+   - **Compare** — analogical matches from `tm-reason::analogy` filtered by current topic
+   - **Caution** — negative-outcome patterns from trajectory store (last time you tried this shape, it reverted in 2d)
+   - **Connect** — entity → commitment / entity → person joins triggered by current mention
+   - **Anticipate** — time-of-day × topic patterns (you usually open file X next when working on Y)
+
+**Commitment and contradiction are special cases of the WME, not the top-level surface.** A commitment card fires when current topic intersects an open deadline. A contradiction card fires when current topic surfaces memories that disagree. Today's Next Actions panel is wrong — it shows every open commitment flat, which is why it reads as noisy. After WME, the Next Actions panel shows only the commitments and contradictions *relevant to what the user is currently doing.*
+
+**This maps to the L1/L2/L3 predictive layers from the April strategic direction note:**
+- L1 (detect current intent) — rolling topic vector from capture stream
+- L2 (predict useful priors) — retrieval driven by topic vector instead of explicit query
+- L3 (surface) — verb-first card synthesis into Brief / Next Actions / MCP `memory_brief`
+
+L1 plumbing exists (capture daemon). L2 exists (retrieval engine). L3 verb cards exist but fire reactively (deadline pass, contradiction detected) rather than predictively. Wiring the WME loop is a Q3 sprint, gated on the seed-critical Q2 work (auto-capture coverage + Tier-1 default).
+
+**Performance budget**: WME tick ≤ 50ms p95 on a quiet laptop; surfacing latency from capture event → card visible ≤ 2s. WME never blocks query path; it is a background producer to a card queue.
+
+**Anti-spam discipline**: per-session displayed-card set; cooldown per (card_kind, target_id); negative-feedback signal `not_useful_now` retrains the score threshold. If WME generates more than 8 cards/hour in steady state, the wedge collapses into Clippy — the threshold tuner is the difference between "magic" and "annoying."
+
+**Engineering substrate (Rust-native, no Python sidecar in the request path).** The WME is not a separate system from the context graph — it is a *consumer* of three storage primitives that index the same capture event stream from different angles:
+
+| Primitive | Crate | Indexes | Powers verbs |
+|---|---|---|---|
+| Typed-edge graph | `tm-graph` (existing) | relational structure (who/what/when, IsA/WorksAt/PartOf) | Compare, Caution, Connect |
+| Vector / ANN | `tm-vector` (existing) + HNSW (PERF-3) | semantic similarity | Recall, Resume |
+| **Topic clusters + communities** | **`tm-cluster` (new, Q3)** | density structure on the capture stream + Louvain communities on `kg_entities` | Resume, Recall, Connect, Anticipate |
+
+`tm-cluster` is **HDBSCAN-first, no hardcoded k** (revised 2026-05-12 after partner feedback that KMeans' fixed k is the wrong shape for personal memory — topics emerge organically and unevenly). Substrate stack:
+
+- **Primary clusterer: HDBSCAN** via the [`hdbscan`](https://crates.io/crates/hdbscan) crate (pure Rust port of sklearn HDBSCAN). Density-based, no `k` parameter, auto-discovers hierarchy + emits **outlier points** as `cluster_id = -1`. Outliers are first-class signal: they are the "this doesn't fit anything yet" memories the WME should surface as **Anticipate** candidates.
+- **Fallback if `hdbscan` crate maturity is insufficient at integration time**: Python sidecar (sklearn HDBSCAN) called nightly *off the request path* via PyO3 or subprocess. The clustering pass is non-blocking — Tier-0 retrieval continues to work without fresh clusters. Decision deferred to CLU-1 evaluation.
+- **Streaming protocol** (since HDBSCAN is batch-oriented): re-cluster the full event set every 100 events OR every 10 min, whichever first. Between re-clusters, new events are *assigned* to the nearest existing cluster centroid (or marked outlier if distance > threshold) but don't trigger re-clustering. The full HDBSCAN pass runs incrementally on a background thread; the user never sees a stall.
+- **Storage**: `clusters(id, label_text, centroid_blob, n_members, persistence, is_outlier_bucket, updated_at)`, `event_clusters(event_id, cluster_id, membership_prob, is_outlier)`. The `persistence` field is HDBSCAN's cluster-stability score — higher persistence ⇒ higher confidence the cluster is real.
+- **Confidence-routed graph build (highest-confidence first)**: cluster persistence + per-triple SML confidence (§1c P5b) both feed a single `graph_build_confidence` score per relation. Only triples above threshold enter `kg_relations`; below-threshold stay in `pending_relations` for user confirmation. Partner mandate: *"context graphs are built with the highest confidence."*
+- **Community detection retained in `tm-graph`**: Louvain over `kg_relations` nightly via `consolidate`. Annotates `kg_entities` with `community_id`. Two-layer organization: HDBSCAN clusters on the *event stream* (topical/temporal), Louvain communities on the *entity graph* (relational). Both are useful, both ship.
+- **Outlier detection retained as first-class signal**: HDBSCAN noise points feed the WME's `Anticipate` verb (novel topics) + a Tauri "Unsorted" tray the user can triage. Outliers are not failures — they are forward-leading signal.
+
+The L1 topic vector is the EMA of recent cluster centroids weighted by recency and `membership_prob` — outlier events contribute their own embedding directly (no centroid). Cheap (~384-dim vector update per capture, no model inference).
+
+**Why not KMeans?** Hardcoded `k` is the wrong shape for personal memory — the partner was right. Topics emerge unevenly (some sessions are tightly focused, others scattered), and KMeans forces a uniform partition that papers over real density structure. HDBSCAN matches the underlying distribution; outliers become signal instead of being absorbed into the nearest centroid.
+
+**Why not UMAP / BERTopic stack?** UMAP only via experimental `annembed`. We don't need dim-reduction for clustering at 384-d on 10k–100k events; HDBSCAN handles it directly. BERTopic is a Python orchestration of (UMAP + HDBSCAN + c-TF-IDF) that we replicate in Rust as needed (the c-TF-IDF labeling pass is ~50 LOC). `evoc` (TutteInstitute Rust port of HDBSCAN-on-embeddings) is tracked as a possible swap-in but unstable as of 2026-05.
+
+All three primitives are Rust-native first (linfa for utilities, `hdbscan` crate for clustering, `petgraph` for community detection), CPU-only, and stay in the SQLite footprint. Python sidecar is the *fallback* for clustering if the Rust crate disappoints, and the *only* path for QLoRA finetune (deferred per P12), both off the request path.
+
+---
+
+## 1c. The legibility pillar (visible, granular, steerable memory)
+
+Added 2026-05-12 after partner conversation. The WME (§1b) makes memory **anticipatory**; this pillar makes memory **legible**. Together they form the product narrative: *"memory you can trust because you can see and control it, that also surfaces what you need without asking."*
+
+The wedge moment for legibility is the user clicking on an entity in the Tauri app and seeing — without any manual linking on their part — every memory that mentions it, every relation that touches it, and every conversation thread it appeared in. Obsidian-style backlinks, but with zero manual `[[wiki-linking]]`. The extraction does the linking; the user does the trusting.
+
+**Five legibility primitives (each maps to a P5 sub-priority):**
+
+1. **Obsidian-parity auto-graph + Karpathy-style PKM, zero manual intervention** (P5a) — the kg is already built automatically by `tm-ingest`. What's missing is the *Obsidian-feature-set surface*, automated end-to-end. Reference: Andrej Karpathy's well-known PKM workflow over Obsidian (atomic notes + daily notes + tags + backlinks + [[wikilinks]] + search-driven recall). The bet: ship the *same feature surface*, but *every link is auto-extracted* — the user never types `[[`, never tags manually, never builds a Map of Content. Features to mirror, all auto-populated:
+   - **Backlinks panel** — "12 memories link here," auto-derived from `kg_relations`. (Q3, headline)
+   - **Bidirectional [[wikilinks]] inline** — entity mentions in memory text auto-render as clickable links to the entity drawer. SML extraction (P5b) drives entity resolution. (Q3)
+   - **Transclusion / memory embeds** — one memory can embed another by reference; the embedded memory renders inline. Auto-triggered when a memory is summarised by another. (Q3)
+   - **Auto-tags** — hashtags extracted from text + topic-cluster labels from `tm-cluster` HDBSCAN cluster_id. User never types `#`. (Q3)
+   - **Daily-notes auto-generation** — `tm-reflect` already produces a brief; promote it to a first-class "Daily Note" memory with date-stamped backlinks to every memory created that day. (Q3)
+   - **Maps of Content (MOCs)** — auto-generated index pages per HDBSCAN cluster and per Louvain community. "Everything about Rondo," "Everything about Sequoia conversations" — populated from the graph + clusterer, refreshed nightly. (Q3)
+   - **Force-directed graph view** — Q4 polish, never the headline. Anti-spam: cluster-summary view kicks in above 500 nodes.
+   - **Canvas / whiteboard** — visual spatial board where the user drops a chosen subset of memories. This *is* the user-controlled splice surface (see §1c primitive #3). (Q4)
+
+   The strategic claim: Obsidian's wedge is a *power-user manual PKM*. Karpathy and a tiny minority use it well; everyone else bounces because the manual linking tax is real. TraceMind's wedge is *Obsidian for everyone* — the same surface, no manual tax. Do **not** clone Obsidian's UI literally; clone the *feature contract*.
+
+2. **Granular open-vocabulary triple extraction** (P5b) — replace static `{IsA, WorksAt, PartOf}` predicates with arbitrary predicate strings extracted by a Small Language Model. Static schema breaks on real-world memory ("Aaditya is critiquing the X paper", "Rondo competes with Veo3"). Candidate SMLs: REBEL (BART-large, 460M), GLiNER-Relation (~150MB), Qwen 2.5 0.5B prompted. Reused Qwen is the cheapest path — same model already auto-downloaded for Tier-1. **Must run off the ingest hot path** (async background worker); heuristic NER stays as the synchronous fast path, SML enriches asynchronously. Reference: partner-recommended guide by Jaya Gupta on automatic-graph-extraction (link to be added when work item opens). Confidence-scored predicates; low-confidence triples don't enter `kg_relations` until validated.
+
+3. **Context splicing — three layers: user-driven, auto-corrective, ontological** (P5c) — partner reframe (2026-05-12): splicing is not just bug-fix for false bridges. Splicing is **giving the user surgical control over which memories enter a given agent session**. Three layers, each independently useful:
+
+   **3a. User-driven splice (the primary feature) — "use these memories, not those"**
+   The user must be able to say *"focus on memories 1, 2, 3 for this thread, ignore memory 4."* This is a first-class query API change, not just UI:
+   - **Memory Views** — a named, persisted set of memory IDs the user can assemble, save, and reuse. `tracemind view {create, list, add, remove, delete} <name>`. A view is a saved splice.
+   - **Per-query inclusion/exclusion** — `memory_query` accepts `{include_ids: [...], exclude_ids: [...], view: <name>}`. CLI: `tracemind query --view "rondo-only" --exclude-ids 42 "what did I decide?"`. MCP tool exposes the same.
+   - **Tauri splice UI** — memory list view with multi-select → "Create view from selection" or "Use these for next query." This is the **Canvas/whiteboard surface** from P5a primitive #1 wearing a different hat.
+   - **Session-scoped splice** — per-chat-thread splice, ephemeral. Tauri thread sidebar shows the active view; user can edit live.
+   - **Export-a-view** — `tracemind export --view <name>` writes the splice as a markdown bundle. Closes the loop with P5d.
+
+   This is the **power-user control surface** that the deny-list can't reach. It also fixes the framing problem with Obsidian: in Obsidian, the user manually curates by writing `[[links]]`; here, the user *post-hoc* curates by picking from auto-extracted memories. Same control, no manual labor up-front.
+
+   **3b. Auto-corrective bridges (the Harry-Potter-↔-Alcatraz fix)**
+   Existing CTX-1..CTX-5 (P1d) handles *when bridges should fire*. The HP↔Alcatraz failure (both are "prisons" in embedding space, in disjoint ontological domains) shows we also need *when bridges must NEVER fire*:
+   - **Deny-list** (cheap, Q2): explicit `cross_ctx_block_list.json` of (ctx_a, ctx_b) pairs that never bridge. Populated manually or after 3 strikes of `wrong_context_suggestion` feedback on the same pair.
+
+   **3c. Ontological typing (the structural fix)**
+   - **Domain classifier** (expensive, Q4): SML pass classifies entities into domains (`fiction.location`, `real.location`, `historical.event`, etc.); deny bridges between entities in disjoint domains regardless of cosine similarity. Closes HP↔Alcatraz at the type level, independent of which contexts the user happens to have created.
+
+   **Splice operations (CLI + UI, Q3)**: `tracemind context {merge A B, split A --by entity X, snapshot A → file}`. Manual splice ops on whole contexts (sibling to Memory Views which splice on memory IDs).
+
+4. **Memory export on demand** (P5d) — `tracemind export --context CTX --format markdown|json|jsonl --output FILE`. Markdown export = portable bundle (one file per entity + index) that opens in any tool, including Obsidian. Tauri "Export this context" button. Entity-scoped audit: "show me everything you know about Pat Grady." Optional PII redaction pass before write. **This is the seed-defensible trust artifact** — local-only stops being a marketing claim and becomes a clickable demo: "here's everything TraceMind has on me, in markdown, on disk, right now."
+
+5. **Cluster-sort UI on `tm-cluster`** (P5e) — Tauri "Memory Garden" view grouping all memories by `tm-cluster::cluster_id` with auto-generated human labels (top-3 entities per centroid). Optional HDBSCAN / evoc swap-in later if dense-region structure matters; don't block the UI on it.
+
+**Sequencing across quarters:**
+
+| Sub-priority | Q2 (seed-critical) | Q3 (post-seed) | Q4 |
+|---|---|---|---|
+| P5a Obsidian-parity auto-graph | — | backlinks panel + [[wikilinks]] inline + auto-tags + daily-notes + MOCs | force-directed graph view + canvas |
+| P5b Granular triples (SML) | — | SML extraction (Qwen 0.5B), async pipeline, confidence-routed acceptance | confidence calibration, schema migration |
+| P5c Context splicing | **Memory Views API + CLI** + deny-list + neg-feedback | session-scoped splice in Tauri + `tracemind context` ops | ontological typing |
+| P5d Export on demand | **markdown export shipped** (cheap trust win) | Tauri export buttons + view-export + audit-by-entity | redaction toggles |
+| P5e Cluster-sort UI | — | **HDBSCAN-driven** Memory Garden + auto-labels + Unsorted (outlier) tray | UMAP/canvas-style spatial view |
+
+**Where this lives in the architecture:** P5 is downstream of `tm-cluster` (P4a) and `tm-graph`. It does not add new storage primitives; it adds (a) a new extractor (SML async pipeline), (b) a new bridge-suppression rule (deny-list), (c) three new UI surfaces (backlinks, export, garden), (d) a new CLI verb (`export`). No re-architecture.
+
+**Performance budget:** SML extraction is async and not on the request path — no latency budget at query time. Backlinks query: ≤ 50ms p95 (it's a single SQL JOIN on `kg_relations`). Export: streamed; no in-memory budget.
+
+**Anti-pattern guard:** legibility ≠ exposure. Visible graph view ≠ raw entity dump. The UI must summarise (cluster labels, backlink counts, top-N relations) before it visualises. The Obsidian graph view fails at >500 nodes; ours hits that in week 2 with auto-capture.
+
+---
+
 ## 2. 2026 Vision (where we land by Dec 31)
 
 | Dimension | End of 2026 target |
@@ -161,14 +302,15 @@ A defensible seed requires four things. Honest scorecard:
 
 **Second-tier metric (moat):** retraction microbench accuracy ≥ 80% by Q3, ≥ 85% by Q4. Quantifies the architectural defensibility.
 
-**Six product priorities, in order:**
+**Seven product priorities, in order:**
 
-1. **Persistence must be effortless and invisible.** Facts mentioned in one `claude`/`goose`/CLI session must appear in the next, in any directory, with zero ceremony. Onboarding never says "configure the memory" — the memory just is.
-2. **Ambient capture must do the heavy lifting.** Most users will not hand-feed memory. By the end of Q2, every DP has at minimum clipboard + shell + screenshot capture running with explicit per-source permissions in the Tauri settings panel. By Q4, browser + calendar + audio (Whisper-tiny opt-in) join. The first run after install populates ~50 entities from the last week of clipboard + shell history alone — the "where did this come from?" moment is the magic.
-3. **Context is adaptive, not rigid.** Contexts are scoped by default (Sprint C-0 primitive). Cross-context bridges fire when learned confidence exceeds a per-arm threshold tuned by `cross_context_bridge` feedback. When retrieval quality is low under the current context (low click-through, repeated `not_related`), TraceMind proposes a context switch *or* surfaces a labeled bridge — the user is never silently confused. Hard isolation is the failure mode of an unlearned system, not the goal.
-4. **The retraction beat must be undeniable when it fires.** Every interaction surface — MCP, Tauri, CLI — produces a clear "you contradicted yourself" moment when reality changes. This is the moat sentence in the deck.
-5. **Performance is a feature, measured every week.** Cold start ≤ 1.5s p95, query p50 ≤ 500ms under live capture, indexing ≥ 500 events/min sustained. If any of these regresses for 2 weeks, halt feature work and fix. Auto-capture will silently break performance if HNSW + batched embeddings + async indexing don't land alongside it.
-6. **The Tauri flagship must feel like an app, not a tool.** Brief panel, commitment timeline, context switcher, calibration view, capture-permissions panel — each one click away. Onboarding to "first meaningful brief" in under 60 seconds. The feedback loop must measurably improve retrieval over a week of use (14-day `EvalReport` lift is a slide).
+1. **The anticipatory surface is the wedge moment.** The Working Memory Engine (§1b) — rolling-window topic detection + proactive retrieval + verb-first card synthesis — is what makes a captured memory *useful* instead of just *stored*. Without it, TraceMind is a search bar with a fancier backend. With it, the user sees "Recall: you decided X about this last Tuesday" appear while they re-encounter the same problem, without typing a query. Q3 sprint to wire L1→L2→L3 end-to-end; Q4 to tune the anti-spam thresholds against design-partner feedback.
+2. **Persistence must be effortless and invisible.** Facts mentioned in one `claude`/`goose`/CLI session must appear in the next, in any directory, with zero ceremony. Onboarding never says "configure the memory" — the memory just is.
+3. **Ambient capture must do the heavy lifting.** Most users will not hand-feed memory. By the end of Q2, every DP has at minimum clipboard + shell + screenshot capture running with explicit per-source permissions in the Tauri settings panel. By Q4, browser + calendar + audio (Whisper-tiny opt-in) join. The first run after install populates ~50 entities from the last week of clipboard + shell history alone — the "where did this come from?" moment is the magic. *Capture is also the WME's L1 substrate — the two priorities are coupled.*
+4. **Context is adaptive, not rigid.** Contexts are scoped by default (Sprint C-0 primitive). Cross-context bridges fire when learned confidence exceeds a per-arm threshold tuned by `cross_context_bridge` feedback. When retrieval quality is low under the current context (low click-through, repeated `not_related`), TraceMind proposes a context switch *or* surfaces a labeled bridge — the user is never silently confused. Hard isolation is the failure mode of an unlearned system, not the goal.
+5. **The retraction beat must be undeniable when it fires — but only when relevant to current work.** Contradiction is the moat sentence in the deck, but flat surfacing of every contradiction is noise. After WME lands, contradiction cards fire only when current topic touches a contradicted fact. Same for commitment "Resolve" cards. This is the difference between "retraction is theater" and "retraction is felt."
+6. **Performance is a feature, measured every week.** Cold start ≤ 1.5s p95, query p50 ≤ 500ms under live capture, indexing ≥ 500 events/min sustained, WME tick ≤ 50ms p95. If any of these regresses for 2 weeks, halt feature work and fix. Auto-capture will silently break performance if HNSW + batched embeddings + async indexing don't land alongside it.
+7. **The Tauri flagship must feel like an app, not a tool.** Brief panel, commitment timeline, context switcher, calibration view, capture-permissions panel — each one click away. Onboarding to "first meaningful brief" in under 60 seconds. The feedback loop must measurably improve retrieval over a week of use (14-day `EvalReport` lift is a slide).
 
 **Out of scope for 2026:** native mobile apps (iOS/Android SwiftUI/Compose), opt-in encrypted-cloud sync. These are 2027 work. Voice + browser + screenshot are **in scope** as ambient capture sources (previously deferred — moved up due to the wedge requirement).
 
@@ -226,10 +368,19 @@ A defensible seed requires four things. Honest scorecard:
 
 **Exit metric:** 5 active DPs + 1 testimonial + 4 defensible numbers (persistence bench, context-aware bench, retraction bench, performance budget) + auto-capture live on ≥ 3 sources per DP + LoCoMo F1 ≥ 60 in reach.
 
-### Q3 2026 (July–September) — Seed raise + scaling
+**Legibility Q2 pulls forward (§1c):**
+- [ ] **Markdown export shipped** (§1c P5d) — `tracemind export --context CTX --view VIEW --format markdown` writes a portable bundle. Tauri "Export this context" button on Settings. Trust artifact for the deck.
+- [ ] **Context deny-list shipped** (§1c P5c-3b) — `cross_ctx_block_list.json` + 3-strike auto-add on `wrong_context_suggestion`. Closes the Harry Potter ↔ Alcatraz objection at the deny-list level.
+- [ ] **Memory Views API + CLI shipped** (§1c P5c-3a) — `tracemind view {create, list, add, remove, delete} <name>` + `tracemind query --view <name> --include-ids ... --exclude-ids ...` + MCP `memory_query.view` parameter. Power-user splice control without UI.
 
-**Theme:** raise $1–1.5M, scale the wedge, ship the feedback loop.
+### Q3 2026 (July–September) — Seed raise + scaling + anticipatory surface
 
+**Theme:** raise $1–1.5M, scale the wedge, ship the feedback loop, **wire the Working Memory Engine end-to-end.**
+
+- [ ] **`tm-cluster` crate substrate** (§1b engineering substrate): new crate wrapping `linfa-clustering`. MiniBatchKMeans on BGE embeddings of capture events; SQLite tables `event_clusters` + `clusters`; re-cluster trigger every 100 events / 10 min; drift detection via mean-distance threshold → split cluster. Persisted in `memory.db`. Public API: `Clusterer::assign(event_id, embedding) -> ClusterId`, `Clusterer::centroid(cluster_id) -> Vec<f32>`, `Clusterer::recent_centroids(window) -> Vec<(ClusterId, f32)>`. **Gates WME L1.**
+- [ ] **Louvain community detection in `tm-graph`** (§1b engineering substrate): ~200 LOC community-detection pass over `kg_relations` (or pull `leiden-rs`). Annotates `kg_entities` with `community_id`. Runs nightly via `consolidate`. **Gates WME L2 "Connect" verb.**
+- [ ] **Working Memory Engine (WME) v1 — anticipatory surface** (§1b): rolling topic detector over capture stream (L1 = EMA of `tm-cluster` recent centroids), proactive retrieval driver (L2 = `tm-graph` + `tm-vector` + `tm-cluster` joined query), verb-first card synthesis (Resume/Recall/Compare/Caution/Connect/Anticipate). Commitment + contradiction cards become *filtered* outputs of WME instead of flat Next Actions. Performance budget: WME tick ≤ 50ms p95; capture→card surfacing ≤ 2s. Anti-spam: ≤ 8 cards/hour steady state per session. **Gates Q3 anticipatory-surface milestone.**
+- [ ] **WME feedback signals**: `useful_now`, `not_useful_now`, `not_now_remind_later`, `dismiss_this_kind`. Retrain card-score threshold per signal.
 - [ ] Run W-1/W-2 head-to-head against Mem0/Letta/Zep in Claude Code — publish 4-pane video
 - [ ] Full LoCoMo run (≥ 65 F1 target)
 - [ ] F-2..F-5 land: corpus extractor, `TuneConfig` surface, `tm-eval` crate, `tm-tune` GEPA-lite
@@ -241,6 +392,13 @@ A defensible seed requires four things. Honest scorecard:
 - [ ] 20 active design partners, W2 ≥ 40%
 - [ ] Seed deck v1 → partner meetings → term sheet
 - [ ] Hire #1: ML engineer (LoCoMo + bandit + world model + capture pipelines)
+
+**Legibility Q3 lands (§1c):**
+- [ ] **Granular open-vocabulary triple extraction** (§1c P5b) — Qwen 2.5 0.5B async background extractor; open-vocab predicates replace static `{IsA, WorksAt, PartOf}`; heuristic NER stays as synchronous fast path. Confidence-routed: high-confidence triples enter `kg_relations`, low-confidence stays in `pending_relations`. Reference Jaya Gupta graph-extraction guide + Karpathy PKM workflow.
+- [ ] **Obsidian-parity auto-graph (Karpathy PKM, zero manual)** (§1c P5a) — Tauri: backlinks panel ("12 memories link here"), inline auto-rendered [[wikilinks]] on entity mentions, transclusion of summarised memories, auto-tags from cluster labels, auto-generated daily-note memory, auto-generated MOCs per cluster + per community. **All zero manual intervention** — extraction does the linking, user does the trusting.
+- [ ] **Session-scoped Memory Views in Tauri** (§1c P5c-3a) — Tauri thread sidebar shows the active view; multi-select memories → "Use these for next query." Live-editable per chat thread.
+- [ ] **Manual context splice operations** (§1c P5c) — `tracemind context {merge A B, split A, snapshot A}` CLI + Tauri UI. Powers curated export bundles for DP onboarding.
+- [ ] **HDBSCAN-driven Memory Garden + Unsorted tray** (§1c P5e) — Tauri grid grouped by HDBSCAN `cluster_id` with auto-labels; outlier (`cluster_id = -1`) bucket renders as "Unsorted" tray the user triages. Community-detection labels overlaid.
 
 **Exit metric:** signed term sheet, $1–1.5M raised, hire #1 starts.
 
@@ -256,6 +414,12 @@ A defensible seed requires four things. Honest scorecard:
 - [ ] First Engram commercial deal ($X00–$2k/year/dev)
 - [ ] 50 active design partners, W2 ≥ 50%
 - [ ] Hire #2: design / product (Tauri UX + onboarding + capture-permissions polish)
+
+**Legibility Q4 polish (§1c):**
+- [ ] **Ontological typing for context bridges** (§1c P5c expensive path) — SML pass classifies entities into domains (fiction.location / real.location / etc.); bridges denied across disjoint domains. Closes the Harry Potter ↔ Alcatraz case at the *type* level, not just the deny-list level.
+- [ ] **Force-directed graph view** (§1c P5a polish) — Tauri graph view with cluster-coloring, summarised down to top-N entities per cluster. Anti-spam: never render > 500 nodes raw.
+- [ ] **HDBSCAN / evoc swap evaluation** (§1c P5e polish) — if Rust HDBSCAN or evoc reaches production grade, swap into Memory Garden for hierarchical density structure. Otherwise keep KMeans.
+- [ ] **Triple-confidence calibration** (§1c P5b polish) — Platt-scale the SML's emitted confidence; bandit-style routing decides which triples enter `kg_relations` vs. stay in a pending pool surfaced to the user for confirmation.
 
 **Exit metric:** $2k MRR from Engram, 50 DPs at 50% W2, Tauri walkthrough is a 2-minute polished tour, cross-modal captures live for ≥ 10 DPs.
 
@@ -287,6 +451,11 @@ Track these weekly. Anything else is noise.
 | Context-aware bench (TP bridges − FP bridges, 100 pairs) | new `tm-bench-memory` | bench built, ≥85% | ≥90% | ≥92% |
 | Retraction bench accuracy (moat) | new `tm-bench-memory` | bench built | 80% | 85% |
 | **Ambient capture coverage (sources live per DP)** | `tracemind status capture` | ≥3 (clip+shell+screenshot) | ≥4 (+browser) | ≥5 (+audio or calendar) |
+| **WME proactive-card useful-rate** (cards marked `useful_now` ÷ cards surfaced) | DP-3 feedback log | n/a — WME ships Q3 | ≥30% baseline | ≥45% |
+| **WME cards/hour steady state** (anti-spam guardrail) | DP-3 feedback log | n/a | ≤8 | ≤6 |
+| **Legibility — context deny-list false-bridge rate** (Harry Potter ↔ Alcatraz class) | new `tm-bench-context` | ≤10% (deny-list Q2) | ≤5% (manual splice + feedback Q3) | ≤2% (ontological typing Q4) |
+| **Legibility — SML triple-extraction precision** (open-vocab predicates) | new `tm-bench-triples` | n/a — SML ships Q3 | ≥0.70 precision @ confidence ≥0.7 | ≥0.80 |
+| **Legibility — export bundle adoption** (% of DPs who run `tracemind export` ≥1×/week) | DP-3 usage log | ≥40% (markdown Q2) | ≥60% | ≥70% |
 | **Cold-start CLI/MCP first response p95** | `tm-bench` | ≤1.5s | ≤1.2s | ≤1.0s |
 | **Query p50 under live capture** | `tm-bench` | ≤500ms (T0) / ≤800ms (T1) | ≤400ms / ≤600ms | ≤300ms / ≤500ms |
 | **Indexing throughput (events/min sustained)** | `tm-bench` | ≥500 | ≥1000 | ≥1500 |

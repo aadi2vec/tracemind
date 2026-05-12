@@ -1,5 +1,5 @@
 import { useEffect, useState, useRef } from "react";
-import { getDashboard, demoIngest, getRecommendations, entityClick, toggleCapture, getCaptureStatus, getSurprising, getEntityTrends, consolidateMemory, type DashboardStats, type RecommendationInfo, type CaptureEvent, type SurprisingEntity, type TrendPoint } from "../api";
+import { getDashboard, demoIngest, getNextActions, entityClick, toggleCapture, getCaptureStatus, getSurprising, getEntityTrends, consolidateMemory, acceptCandidate, dismissCandidate, type DashboardStats, type NextActionInfo, type CaptureEvent, type SurprisingEntity, type TrendPoint } from "../api";
 import { listen } from "@tauri-apps/api/event";
 
 function StatCard({ label, value, sub }: { label: string; value: string | number; sub?: string }) {
@@ -17,7 +17,7 @@ export default function Dashboard() {
   const [error, setError] = useState("");
   const [demoLoading, setDemoLoading] = useState(false);
   const [demoResult, setDemoResult] = useState<string | null>(null);
-  const [recommendations, setRecommendations] = useState<RecommendationInfo[]>([]);
+  const [nextActions, setNextActions] = useState<NextActionInfo[]>([]);
   const [captureOn, setCaptureOn] = useState(true);
   const [captureFeed, setCaptureFeed] = useState<CaptureEvent[]>([]);
   const feedRef = useRef<CaptureEvent[]>([]);
@@ -52,13 +52,13 @@ export default function Dashboard() {
     return () => clearInterval(interval);
   }, []);
 
-  // Fetch recommendations every 30s
+  // Fetch next actions every 15s — verb-first action feed.
   useEffect(() => {
-    const fetchRecs = () => {
-      getRecommendations(5).then(setRecommendations).catch(() => {});
+    const fetchActions = () => {
+      getNextActions().then(setNextActions).catch(() => {});
     };
-    fetchRecs();
-    const interval = setInterval(fetchRecs, 30000);
+    fetchActions();
+    const interval = setInterval(fetchActions, 15000);
     return () => clearInterval(interval);
   }, []);
 
@@ -224,25 +224,37 @@ export default function Dashboard() {
         </div>
       )}
 
-      {/* Surprising entities today */}
+      {/* Drift — entities pulling away from the user's topic clusters.
+          Renamed from "Semantic outliers" 2026-05-11: bare nouns aren't
+          actionable; framing each card as a Review verb tells the user
+          what to do (tag, split, or dismiss). The math (cosine distance
+          from centroid) is unchanged. */}
       {surprising.length > 0 && (
         <div className="bg-tm-surface border border-tm-yellow/20 rounded-lg p-5">
           <h3 className="text-sm font-medium text-tm-yellow uppercase tracking-wider mb-3">
-            Most Surprising Today
+            Drift
+            <span className="ml-2 text-[10px] text-tm-muted normal-case tracking-normal font-normal">
+              entities pulling away from your topic clusters — review or tag
+            </span>
           </h3>
           <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
             {surprising.map((s) => (
               <button
                 key={s.entity_id}
                 onClick={() => entityClick(s.entity_id)}
-                className="p-3 rounded bg-tm-bg border border-tm-border hover:border-tm-yellow/40 transition-colors text-left"
+                className="p-3 rounded bg-tm-bg border border-tm-border hover:border-tm-yellow/40 transition-colors text-left flex flex-col gap-2"
               >
-                <div className="flex items-center gap-2 mb-1">
-                  <span className="text-sm font-medium">{s.entity_name}</span>
+                <div className="flex items-center gap-2">
+                  <span className="text-[10px] font-semibold uppercase tracking-wider px-1.5 py-0.5 rounded bg-yellow-500/20 text-yellow-400">
+                    Review
+                  </span>
                   <span className="text-xs text-tm-muted">{s.entity_type}</span>
                 </div>
+                <p className="text-sm font-medium leading-snug line-clamp-2">
+                  Review: {s.entity_name}
+                </p>
                 <div className="flex gap-3 text-xs text-tm-muted">
-                  <span>novelty: {(s.novelty * 100).toFixed(0)}%</span>
+                  <span>distance: {(s.novelty * 100).toFixed(0)}%</span>
                   <span>recency: {(s.recency * 100).toFixed(0)}%</span>
                 </div>
               </button>
@@ -284,26 +296,99 @@ export default function Dashboard() {
         </div>
       )}
 
-      {/* Recommendations */}
-      {recommendations.length > 0 && (
+      {/* Next Actions — verb-first action feed (2026-05-11) */}
+      {nextActions.length > 0 && (
         <div className="bg-tm-surface border border-tm-accent/20 rounded-lg p-5">
-          <h3 className="text-sm font-medium text-tm-accent uppercase tracking-wider mb-3">
-            Suggested for You
-          </h3>
+          <div className="flex items-center justify-between mb-3">
+            <h3 className="text-sm font-medium text-tm-accent uppercase tracking-wider">
+              Next Actions
+            </h3>
+            <span className="text-xs text-tm-muted">{nextActions.length} pending</span>
+          </div>
           <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
-            {recommendations.map((rec) => (
-              <button
-                key={rec.entity_id}
-                onClick={() => entityClick(rec.entity_id)}
-                className="p-3 rounded bg-tm-bg border border-tm-border hover:border-tm-accent/40 transition-colors text-left"
-              >
-                <div className="flex items-center gap-2 mb-1">
-                  <span className="text-sm font-medium">{rec.entity_name}</span>
-                  <span className="text-xs text-tm-muted">{rec.entity_type}</span>
+            {nextActions.map((a) => {
+              const priorityClass =
+                a.priority === "overdue"
+                  ? "border-red-500/40 bg-red-500/5"
+                  : "border-tm-border hover:border-tm-accent/40";
+              const verbBadgeClass =
+                a.kind === "Resolve"
+                  ? "bg-red-500/20 text-red-400"
+                  : a.kind === "Review"
+                  ? "bg-yellow-500/20 text-yellow-400"
+                  : a.kind === "FollowUp"
+                  ? "bg-blue-500/20 text-blue-400"
+                  : a.kind === "Confirm"
+                  ? "bg-emerald-500/20 text-emerald-400"
+                  : a.kind === "Connect"
+                  ? "bg-purple-500/20 text-purple-400"
+                  : "bg-tm-accent/20 text-tm-accent";
+              const isCandidate = a.target_kind === ("candidate" as NextActionInfo["target_kind"]);
+              return (
+                <div
+                  key={`${a.target_kind}-${a.id}`}
+                  className={`p-3 rounded bg-tm-bg border ${priorityClass} transition-colors flex flex-col gap-2`}
+                >
+                  <button
+                    onClick={() => {
+                      // Routing: contradictions and commitments handled by
+                      // their own views — emit a custom event for the shell.
+                      window.dispatchEvent(
+                        new CustomEvent("tm:next-action", { detail: a }),
+                      );
+                    }}
+                    className="text-left flex flex-col gap-2"
+                  >
+                    <div className="flex items-center gap-2">
+                      <span className={`text-[10px] font-semibold uppercase tracking-wider px-1.5 py-0.5 rounded ${verbBadgeClass}`}>
+                        {a.verb}
+                      </span>
+                      {a.priority === "overdue" && (
+                        <span className="text-[10px] font-semibold uppercase tracking-wider px-1.5 py-0.5 rounded bg-red-500/30 text-red-300">
+                          Overdue
+                        </span>
+                      )}
+                    </div>
+                    <p className="text-sm font-medium leading-snug line-clamp-2">{a.title}</p>
+                    {a.subtitle && (
+                      <p className="text-xs text-tm-muted truncate">{a.subtitle}</p>
+                    )}
+                  </button>
+                  {isCandidate && (
+                    <div className="flex gap-2 mt-1 pt-2 border-t border-tm-border">
+                      <button
+                        onClick={async (e) => {
+                          e.stopPropagation();
+                          try {
+                            await acceptCandidate(a.id);
+                          } catch (err) {
+                            console.error("accept failed", err);
+                          }
+                          getNextActions().then(setNextActions).catch(() => {});
+                        }}
+                        className="text-[10px] font-semibold uppercase tracking-wider px-2 py-1 rounded bg-emerald-500/20 text-emerald-400 hover:bg-emerald-500/30 transition-colors"
+                      >
+                        Accept
+                      </button>
+                      <button
+                        onClick={async (e) => {
+                          e.stopPropagation();
+                          try {
+                            await dismissCandidate(a.id);
+                          } catch (err) {
+                            console.error("dismiss failed", err);
+                          }
+                          getNextActions().then(setNextActions).catch(() => {});
+                        }}
+                        className="text-[10px] font-semibold uppercase tracking-wider px-2 py-1 rounded bg-tm-bg border border-tm-border text-tm-muted hover:border-red-500/40 hover:text-red-400 transition-colors"
+                      >
+                        Dismiss
+                      </button>
+                    </div>
+                  )}
                 </div>
-                <p className="text-xs text-tm-muted">{rec.reason}</p>
-              </button>
-            ))}
+              );
+            })}
           </div>
         </div>
       )}

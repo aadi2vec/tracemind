@@ -160,6 +160,33 @@ enum Commands {
         #[arg(long)]
         dry_run: bool,
     },
+    /// LM-16 — export the local graph as a portable Obsidian-compatible
+    /// markdown bundle. Produces one file per entity with `[[wikilinks]]`
+    /// to related entities plus an `index.md` overview. Used as a trust
+    /// artifact ("your memory is yours, here's the bundle") and as the
+    /// data path for Karpathy-style PKM workflows (see PROJECT_2026 §1c).
+    Export {
+        /// Filter to a single context. Accepts a context name (e.g.
+        /// "TraceMind dev") or a context UUID.
+        #[arg(long)]
+        context: Option<String>,
+        /// Output format. Only `markdown` is supported today; `json` is
+        /// reserved for a future structured-export pass.
+        #[arg(long, default_value = "markdown")]
+        format: String,
+        /// Destination directory. Created if it does not exist. Existing
+        /// files inside are overwritten without prompting.
+        #[arg(long)]
+        output: PathBuf,
+        /// Reserved for LM-11f (Memory Views). Currently rejected with a
+        /// stub error so the CLI surface stays forward-compatible.
+        #[arg(long)]
+        view: Option<String>,
+        /// Cap the number of entities exported (most-recently-updated
+        /// first). `None` means "export all".
+        #[arg(long)]
+        limit: Option<usize>,
+    },
     /// Show bandit arm statistics
     Status,
     /// Show the most recent capture events from the ring buffer
@@ -1235,6 +1262,13 @@ fn main() {
 
         Commands::Import { path, ext, max_kb, dry_run } => {
             cmd_import(&path, &ext, max_kb, dry_run, cli.hash_embed, &db_path);
+        }
+
+        Commands::Export { context, format, output, view, limit } => {
+            if let Err(e) = cmd_export(&db_path, context.as_deref(), &format, &output, view.as_deref(), limit) {
+                eprintln!("export failed: {e}");
+                std::process::exit(1);
+            }
         }
 
         Commands::Status => {
@@ -2359,6 +2393,350 @@ fn cmd_import(path: &str, extensions: &str, max_kb: u64, dry_run: bool, hash_emb
     println!("  Total:    {} KB processed", total_bytes / 1024);
 }
 
+// ---------------------------------------------------------------------------
+// LM-16 — `tracemind export` markdown bundle.
+//
+// Emits an Obsidian-compatible markdown vault:
+//
+//   <output>/
+//     index.md            — overview, counts, time range, context filter
+//     entities/<slug>.md  — one file per entity with YAML frontmatter, a
+//                           Relations section using [[wikilinks]], and a
+//                           Backlinks section.
+//
+// The format is deliberately plain so users can open the bundle in
+// Obsidian / Logseq / a plain editor without any TraceMind binary. This
+// is the "your memory is yours" trust artifact promised in PROJECT_2026
+// §1c (Legibility), and the data path for Karpathy-style PKM workflows.
+// ---------------------------------------------------------------------------
+
+/// Convert an entity name into a filename-safe slug. Strategy: lowercase,
+/// keep `[a-z0-9]`, replace every other run of characters with a single
+/// `-`, trim leading/trailing dashes. Empty / all-symbol names fall back
+/// to `entity` so we never emit a zero-length filename.
+fn export_slug(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    let mut prev_dash = true; // suppress leading dashes
+    for c in name.chars() {
+        let lower = c.to_ascii_lowercase();
+        if lower.is_ascii_alphanumeric() {
+            out.push(lower);
+            prev_dash = false;
+        } else if !prev_dash {
+            out.push('-');
+            prev_dash = true;
+        }
+    }
+    while out.ends_with('-') {
+        out.pop();
+    }
+    if out.is_empty() {
+        "entity".to_string()
+    } else {
+        out
+    }
+}
+
+/// Escape a YAML scalar so it's safe to drop into our frontmatter. We
+/// quote with single quotes and double any embedded single quotes
+/// (standard YAML 1.2 single-quoted-scalar rules). Newlines collapse to
+/// spaces — entity names with newlines are pathological enough that
+/// the round-trip is best-effort.
+fn export_yaml_scalar(s: &str) -> String {
+    let escaped: String = s.replace('\'', "''").replace('\n', " ");
+    format!("'{}'", escaped)
+}
+
+/// Resolve a `--context` argument (name *or* UUID string) to a stored
+/// Context. Returns `Ok(None)` if the argument is `None` and the caller
+/// did not pass a filter. Returns `Err` if the argument was provided but
+/// no matching context exists — we want a hard error, not a silent
+/// "exported everything" surprise.
+fn export_resolve_context(
+    graph: &GraphStore,
+    arg: Option<&str>,
+) -> Result<Option<tm_graph::context::Context>, String> {
+    let Some(arg) = arg else { return Ok(None) };
+    // Try UUID first — cheaper than scanning the table.
+    if let Ok(uuid) = Uuid::parse_str(arg) {
+        let all = graph
+            .list_contexts()
+            .map_err(|e| format!("list contexts: {e}"))?;
+        if let Some(c) = all.into_iter().find(|c| c.id == uuid) {
+            return Ok(Some(c));
+        }
+        return Err(format!("no context with id {uuid}"));
+    }
+    match graph
+        .get_context_by_name(arg)
+        .map_err(|e| format!("lookup context '{arg}': {e}"))?
+    {
+        Some(c) => Ok(Some(c)),
+        None => Err(format!("no context named '{arg}'")),
+    }
+}
+
+fn cmd_export(
+    db_path: &str,
+    context_arg: Option<&str>,
+    format: &str,
+    output: &std::path::Path,
+    view: Option<&str>,
+    limit: Option<usize>,
+) -> Result<(), String> {
+    if format != "markdown" {
+        return Err(format!(
+            "unsupported --format '{format}' (only 'markdown' is implemented today)"
+        ));
+    }
+    if let Some(v) = view {
+        // LM-11f Memory Views is a separately-tracked task. Reject
+        // explicitly rather than silently ignore — investors using the
+        // bundle to validate "memory is portable" deserve a clear signal
+        // that the named view didn't actually get applied.
+        return Err(format!(
+            "--view '{v}' is not yet wired up (Memory Views land in LM-11f)"
+        ));
+    }
+
+    let graph = GraphStore::open(db_path).map_err(|e| format!("open graph: {e}"))?;
+
+    let ctx_filter = export_resolve_context(&graph, context_arg)?;
+
+    let mut entities = graph
+        .list_all_entities()
+        .map_err(|e| format!("list entities: {e}"))?;
+
+    // Apply context filter.
+    if let Some(ref ctx) = ctx_filter {
+        entities.retain(|e| {
+            graph
+                .entity_context_id(e.id)
+                .ok()
+                .flatten()
+                .map(|c| c == ctx.id)
+                .unwrap_or(false)
+        });
+    }
+
+    // Sort by updated_at desc so `--limit` keeps the most recent slice.
+    entities.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+    if let Some(n) = limit {
+        entities.truncate(n);
+    }
+
+    // Build a slug map up-front, disambiguating collisions with a
+    // short-id suffix. We need stable slugs *before* writing any file so
+    // that `[[wikilinks]]` between entities resolve correctly.
+    let mut slug_for: std::collections::HashMap<Uuid, String> =
+        std::collections::HashMap::with_capacity(entities.len());
+    let mut used: std::collections::HashSet<String> =
+        std::collections::HashSet::with_capacity(entities.len());
+    for e in &entities {
+        let base = export_slug(&e.name);
+        let mut slug = base.clone();
+        if used.contains(&slug) {
+            // Disambiguate with the first 8 chars of the UUID — enough
+            // to be unique in any realistic graph.
+            let short = e.id.simple().to_string();
+            slug = format!("{}-{}", base, &short[..8]);
+        }
+        used.insert(slug.clone());
+        slug_for.insert(e.id, slug);
+    }
+
+    // Compute backlinks: for each entity, the set of (other_entity_id,
+    // predicate) pairs whose `object_id` is this entity. We only walk
+    // *typed* (non-RelatedTo) triples because co-occurrence noise makes
+    // backlinks unreadable otherwise.
+    let mut backlinks: std::collections::HashMap<Uuid, Vec<(Uuid, tm_types::Predicate)>> =
+        std::collections::HashMap::new();
+
+    // Prepare output dir.
+    fs::create_dir_all(output).map_err(|e| format!("mkdir {}: {e}", output.display()))?;
+    let entities_dir = output.join("entities");
+    fs::create_dir_all(&entities_dir)
+        .map_err(|e| format!("mkdir {}: {e}", entities_dir.display()))?;
+
+    // First pass: build backlink map.
+    for e in &entities {
+        let triples = graph
+            .get_triples_for_entity(e.id)
+            .map_err(|err| format!("triples for {}: {err}", e.id))?;
+        for t in &triples {
+            // We only care about typed outgoing edges where subject == e.id.
+            if t.subject_id != e.id {
+                continue;
+            }
+            if matches!(t.predicate, tm_types::Predicate::RelatedTo) {
+                continue;
+            }
+            // Skip self-loops in the backlinks panel.
+            if t.object_id == e.id {
+                continue;
+            }
+            backlinks
+                .entry(t.object_id)
+                .or_default()
+                .push((e.id, t.predicate.clone()));
+        }
+    }
+
+    // Second pass: write per-entity markdown.
+    let mut written = 0usize;
+    let mut earliest: Option<chrono::DateTime<chrono::Utc>> = None;
+    let mut latest: Option<chrono::DateTime<chrono::Utc>> = None;
+    for e in &entities {
+        earliest = Some(earliest.map_or(e.created_at, |x| x.min(e.created_at)));
+        latest = Some(latest.map_or(e.updated_at, |x| x.max(e.updated_at)));
+
+        let slug = slug_for.get(&e.id).cloned().unwrap_or_else(|| "entity".into());
+        let file_path = entities_dir.join(format!("{slug}.md"));
+
+        let mut body = String::new();
+        body.push_str("---\n");
+        body.push_str(&format!("id: '{}'\n", e.id));
+        body.push_str(&format!("name: {}\n", export_yaml_scalar(&e.name)));
+        body.push_str(&format!("type: {}\n", export_yaml_scalar(&e.entity_type.to_string())));
+        body.push_str(&format!("confidence: {:.4}\n", e.confidence));
+        body.push_str(&format!("created_at: '{}'\n", e.created_at.to_rfc3339()));
+        body.push_str(&format!("updated_at: '{}'\n", e.updated_at.to_rfc3339()));
+        if let Some(src) = &e.source_id {
+            body.push_str(&format!("source_id: {}\n", export_yaml_scalar(src)));
+        }
+        if let Ok(Some(ctx_id)) = graph.entity_context_id(e.id) {
+            body.push_str(&format!("context_id: '{}'\n", ctx_id));
+        }
+        body.push_str(&format!(
+            "tags: ['tracemind', 'entity/{}']\n",
+            e.entity_type.to_string().to_lowercase()
+        ));
+        body.push_str("---\n\n");
+
+        body.push_str(&format!("# {}\n\n", e.name));
+        body.push_str(&format!(
+            "Type: **{}**  ·  Confidence: **{:.2}**\n\n",
+            e.entity_type, e.confidence
+        ));
+
+        // Outgoing typed relations.
+        let triples = graph
+            .get_triples_for_entity(e.id)
+            .map_err(|err| format!("triples for {}: {err}", e.id))?;
+        let mut outgoing: Vec<&tm_types::Triple> = triples
+            .iter()
+            .filter(|t| {
+                t.subject_id == e.id && !matches!(t.predicate, tm_types::Predicate::RelatedTo)
+            })
+            .collect();
+        outgoing.sort_by(|a, b| {
+            b.confidence
+                .partial_cmp(&a.confidence)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        if !outgoing.is_empty() {
+            body.push_str("## Relations\n\n");
+            for t in &outgoing {
+                let target_name = match slug_for.get(&t.object_id) {
+                    Some(s) => s.clone(),
+                    None => {
+                        // Target entity wasn't in our exported set (e.g.
+                        // filtered out by context). Fall back to fetching
+                        // its name; render as plain text rather than a
+                        // dangling wikilink.
+                        match graph.get_entity(t.object_id) {
+                            Ok(ent) => format!("`{}` _(not exported)_", ent.name),
+                            Err(_) => format!("`<unknown {}>`", t.object_id),
+                        }
+                    }
+                };
+                let target_display = if slug_for.contains_key(&t.object_id) {
+                    let target_human = graph
+                        .get_entity(t.object_id)
+                        .map(|x| x.name)
+                        .unwrap_or_else(|_| target_name.clone());
+                    format!("[[{target_name}|{target_human}]]")
+                } else {
+                    target_name
+                };
+                body.push_str(&format!(
+                    "- **{}** → {} _(conf {:.2})_\n",
+                    t.predicate, target_display, t.confidence
+                ));
+            }
+            body.push('\n');
+        }
+
+        // Backlinks.
+        if let Some(incoming) = backlinks.get(&e.id) {
+            let mut incoming = incoming.clone();
+            incoming.sort_by(|(a_id, _), (b_id, _)| a_id.cmp(b_id));
+            body.push_str("## Backlinks\n\n");
+            for (src_id, pred) in &incoming {
+                let src_slug = slug_for
+                    .get(src_id)
+                    .cloned()
+                    .unwrap_or_else(|| src_id.to_string());
+                let src_human = graph
+                    .get_entity(*src_id)
+                    .map(|x| x.name)
+                    .unwrap_or_else(|_| src_slug.clone());
+                body.push_str(&format!("- [[{src_slug}|{src_human}]] — **{pred}**\n"));
+            }
+            body.push('\n');
+        }
+
+        fs::write(&file_path, body)
+            .map_err(|err| format!("write {}: {err}", file_path.display()))?;
+        written += 1;
+    }
+
+    // index.md
+    let mut index = String::new();
+    index.push_str("---\n");
+    index.push_str("title: 'TraceMind export'\n");
+    index.push_str(&format!("exported_at: '{}'\n", chrono::Utc::now().to_rfc3339()));
+    if let Some(ref c) = ctx_filter {
+        index.push_str(&format!("context: {}\n", export_yaml_scalar(&c.name)));
+        index.push_str(&format!("context_id: '{}'\n", c.id));
+    }
+    index.push_str(&format!("entity_count: {}\n", written));
+    index.push_str("---\n\n");
+    index.push_str("# TraceMind export\n\n");
+    match &ctx_filter {
+        Some(c) => index.push_str(&format!("Filtered to context **{}**.\n\n", c.name)),
+        None => index.push_str("All contexts included.\n\n"),
+    }
+    index.push_str(&format!("- Entities: **{}**\n", written));
+    if let (Some(e), Some(l)) = (earliest, latest) {
+        index.push_str(&format!("- Earliest: {}\n", e.to_rfc3339()));
+        index.push_str(&format!("- Latest:   {}\n", l.to_rfc3339()));
+    }
+    index.push_str("\n## Entities\n\n");
+    // Stable alpha-sort for the index so diffs between exports stay
+    // small.
+    let mut sorted: Vec<&tm_types::Entity> = entities.iter().collect();
+    sorted.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    for e in &sorted {
+        let slug = slug_for.get(&e.id).cloned().unwrap_or_default();
+        index.push_str(&format!("- [[{slug}|{}]] — {}\n", e.name, e.entity_type));
+    }
+    let index_path = output.join("index.md");
+    fs::write(&index_path, index)
+        .map_err(|err| format!("write {}: {err}", index_path.display()))?;
+
+    println!("Exported {written} entit{} to {}", if written == 1 { "y" } else { "ies" }, output.display());
+    if let Some(c) = ctx_filter {
+        println!("  Context filter: {} ({})", c.name, c.id);
+    } else {
+        println!("  Context filter: (none — all contexts)");
+    }
+    println!("  Index:          {}", index_path.display());
+    println!("  Entities dir:   {}", entities_dir.display());
+    Ok(())
+}
+
 /// Strip a YAML frontmatter block (`---\n…\n---`) from the start of a
 /// markdown document. Supports both `---` and `+++` (TOML) fences. If no
 /// fence is present at the very start, returns the input unchanged.
@@ -2514,7 +2892,126 @@ fn print_trace_detail(trace: &tm_types::Trace, db_path: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::strip_md_frontmatter;
+    use super::{cmd_export, export_slug, export_yaml_scalar, strip_md_frontmatter};
+    use tm_graph::GraphStore;
+    use tm_types::{Entity, EntityType, Predicate, Triple};
+
+    #[test]
+    fn slug_basic_alphanumeric() {
+        assert_eq!(export_slug("TraceMind"), "tracemind");
+        assert_eq!(export_slug("Hello World"), "hello-world");
+    }
+
+    #[test]
+    fn slug_collapses_separators() {
+        assert_eq!(export_slug("foo / bar / baz"), "foo-bar-baz");
+        assert_eq!(export_slug("--leading--and--trailing--"), "leading-and-trailing");
+    }
+
+    #[test]
+    fn slug_empty_falls_back() {
+        assert_eq!(export_slug(""), "entity");
+        assert_eq!(export_slug("///"), "entity");
+    }
+
+    #[test]
+    fn yaml_scalar_quotes_and_escapes() {
+        assert_eq!(export_yaml_scalar("plain"), "'plain'");
+        assert_eq!(export_yaml_scalar("it's mine"), "'it''s mine'");
+        // newlines collapsed to spaces — best-effort round-trip
+        assert_eq!(export_yaml_scalar("a\nb"), "'a b'");
+    }
+
+    #[test]
+    fn export_writes_index_and_entity_files_with_wikilinks() {
+        // Build a throwaway store with two typed-linked entities, then
+        // run the export and inspect the bundle.
+        let tmp = tempdir_for_test("tm-cli-export-test");
+        let db = tmp.join("memory.db").to_string_lossy().to_string();
+        {
+            let graph = GraphStore::open(&db).expect("open graph");
+            let alice = Entity::new("Alice", EntityType::Person, 0.95);
+            let acme = Entity::new("Acme Corp", EntityType::Organization, 0.9);
+            graph.upsert_entity(&alice).expect("upsert alice");
+            graph.upsert_entity(&acme).expect("upsert acme");
+            let t = Triple::new(alice.id, Predicate::WorksAt, acme.id, 0.88);
+            graph.upsert_triple(&t).expect("upsert triple");
+        }
+
+        let out_dir = tmp.join("bundle");
+        cmd_export(&db, None, "markdown", &out_dir, None, None)
+            .expect("export ok");
+
+        let index = std::fs::read_to_string(out_dir.join("index.md")).expect("index.md");
+        assert!(index.contains("entity_count: 2"), "index frontmatter has count: {index}");
+        assert!(index.contains("[[alice|Alice]]"), "alice wikilink missing: {index}");
+        assert!(index.contains("[[acme-corp|Acme Corp]]"), "acme wikilink missing: {index}");
+
+        let alice_md = std::fs::read_to_string(out_dir.join("entities/alice.md"))
+            .expect("alice.md");
+        assert!(alice_md.starts_with("---\n"), "frontmatter open");
+        assert!(alice_md.contains("type: 'Person'"));
+        assert!(alice_md.contains("## Relations"), "relations section");
+        assert!(alice_md.contains("**WorksAt** → [[acme-corp|Acme Corp]]"), "wikilink in body: {alice_md}");
+
+        let acme_md = std::fs::read_to_string(out_dir.join("entities/acme-corp.md"))
+            .expect("acme-corp.md");
+        assert!(acme_md.contains("## Backlinks"), "backlinks section");
+        assert!(acme_md.contains("[[alice|Alice]]"), "backlink wikilink: {acme_md}");
+    }
+
+    #[test]
+    fn export_rejects_unsupported_format() {
+        let tmp = tempdir_for_test("tm-cli-export-fmt");
+        let db = tmp.join("memory.db").to_string_lossy().to_string();
+        // Touch the DB so open() doesn't error before format check.
+        {
+            let _ = GraphStore::open(&db).expect("open graph");
+        }
+        let out_dir = tmp.join("bundle");
+        let err = cmd_export(&db, None, "json", &out_dir, None, None)
+            .expect_err("must reject json");
+        assert!(err.contains("unsupported --format"), "got: {err}");
+    }
+
+    #[test]
+    fn export_rejects_unknown_context() {
+        let tmp = tempdir_for_test("tm-cli-export-ctx");
+        let db = tmp.join("memory.db").to_string_lossy().to_string();
+        {
+            let _ = GraphStore::open(&db).expect("open graph");
+        }
+        let out_dir = tmp.join("bundle");
+        let err = cmd_export(&db, Some("no-such-context"), "markdown", &out_dir, None, None)
+            .expect_err("must reject unknown context");
+        assert!(err.contains("no context named"), "got: {err}");
+    }
+
+    #[test]
+    fn export_view_flag_rejected_as_stub() {
+        let tmp = tempdir_for_test("tm-cli-export-view");
+        let db = tmp.join("memory.db").to_string_lossy().to_string();
+        {
+            let _ = GraphStore::open(&db).expect("open graph");
+        }
+        let out_dir = tmp.join("bundle");
+        let err = cmd_export(&db, None, "markdown", &out_dir, Some("focus-1-2-3"), None)
+            .expect_err("must reject --view stub");
+        assert!(err.contains("Memory Views"), "got: {err}");
+    }
+
+    /// Build a uniquely-named directory under the OS temp dir. Avoids
+    /// pulling in a new dev-dep just for tests.
+    fn tempdir_for_test(label: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
+        let pid = std::process::id();
+        let dir = std::env::temp_dir().join(format!("{label}-{pid}-{n}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create tempdir");
+        dir
+    }
 
     #[test]
     fn no_frontmatter_passthrough() {

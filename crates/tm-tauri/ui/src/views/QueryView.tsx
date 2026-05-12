@@ -105,6 +105,7 @@ export default function QueryView() {
   const acceptContextSuggestion = async (s: ContextSuggestion) => {
     try {
       await useContext(s.suggested_context);
+      window.dispatchEvent(new CustomEvent("tm:context-changed"));
       setCtxSuggestion(null);
       setCtxDismissed(true);
       if (query.trim()) {
