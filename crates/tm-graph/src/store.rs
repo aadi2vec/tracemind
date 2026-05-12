@@ -63,6 +63,54 @@ pub struct TripleDetail {
     pub status: Option<BeliefStatus>,
 }
 
+/// LM-1: one row of an entity's backlink panel. Carries the *source*
+/// entity (the one linking *to* the target) plus the typed predicate
+/// and confidence so the Tauri / Brief panels can render
+/// "[[Acme Corp]] — **employs** — _conf 0.88_" without further lookups.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct Backlink {
+    pub triple_id: Uuid,
+    pub source: Entity,
+    pub predicate: Predicate,
+    pub confidence: f64,
+}
+
+/// LM-9: result of routing a freshly-extracted triple through the
+/// confidence gate. Returned by
+/// [`GraphStore::route_triple_by_confidence`] so the ingest pipeline
+/// can attribute the outcome in the trace log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PendingRouteOutcome {
+    /// Triple confidence ≥ `ACCEPT_THRESHOLD`. Written to `kg_relations`.
+    Accepted,
+    /// Triple confidence ∈ `[PENDING_FLOOR, ACCEPT_THRESHOLD)`. Stored
+    /// in `pending_relations` with the wrapped row id.
+    Pending(Uuid),
+    /// Triple confidence < `PENDING_FLOOR`. Discarded silently.
+    Dropped,
+}
+
+/// Map a predicate string (produced by `Predicate::Display`) back to a
+/// [`Predicate`]. Used by `accept_pending` to re-hydrate the predicate
+/// from the open-vocab text column. Unknown names fall through to
+/// `Predicate::Custom(name)` so callers never silently lose information.
+fn parse_predicate(name: &str) -> Predicate {
+    match name {
+        "RelatedTo" => Predicate::RelatedTo,
+        "IsA" => Predicate::IsA,
+        "PartOf" => Predicate::PartOf,
+        "HasProperty" => Predicate::HasProperty,
+        "WorksAt" => Predicate::WorksAt,
+        "CollaboratesWith" => Predicate::CollaboratesWith,
+        "Owns" => Predicate::Owns,
+        "DependsOn" => Predicate::DependsOn,
+        "Produces" => Predicate::Produces,
+        "References" => Predicate::References,
+        "HasProcedure" => Predicate::HasProcedure,
+        other => Predicate::Custom(other.to_string()),
+    }
+}
+
 /// Knowledge-graph store backed by a single SQLite file (via sqlite-knowledge-graph).
 ///
 /// Provides entity/triple CRUD, k-hop traversal, vector search, PageRank, and
@@ -242,6 +290,15 @@ impl GraphStore {
         // negative_signals tables, captured_signals.context_id column).
         // Idempotent — safe to call on every open.
         crate::context::init_schema(conn)?;
+
+        // LM-11a: Memory Views — user-curated saved splices
+        // (memory_views + memory_view_members). Idempotent.
+        crate::memory_view::init_schema(conn)?;
+
+        // LM-9: confidence-routed triple pending pool. Low-confidence
+        // extracted relations land here instead of `kg_relations`;
+        // the Tauri panel reads from this table. Idempotent.
+        crate::pending_relations::init_schema(conn)?;
 
         // Migrate existing DBs that lack the two-speed pipeline columns.
         {
@@ -704,6 +761,158 @@ impl GraphStore {
         crate::context::get_context_by_name(self.kg.connection(), name)
     }
 
+    /// LM-14 — overwrite the `context_id` property stored on the skg
+    /// entity row. `None` strips the property (returns the row to
+    /// "unscoped" / always-visible). Used by `context merge` and
+    /// `context split` to move whole entity sets between contexts
+    /// without re-ingesting.
+    pub fn set_entity_context(&self, entity_id: Uuid, ctx_id: Option<Uuid>) -> Result<()> {
+        let map = self.entity_map.borrow();
+        let &skg_id = map.get(&entity_id).ok_or_else(|| {
+            TraceMindError::Storage(format!("entity {entity_id} not in id map"))
+        })?;
+        drop(map);
+        let mut skg_ent = self
+            .kg
+            .get_entity(skg_id)
+            .map_err(|e| TraceMindError::Storage(format!("skg get_entity: {e}")))?;
+        match ctx_id {
+            Some(c) => skg_ent.set_property("context_id", json!(c.to_string())),
+            None => skg_ent.set_property("context_id", json!(null)),
+        }
+        skg_ent.set_property("updated_at", json!(Utc::now().to_rfc3339()));
+        self.kg
+            .update_entity(&skg_ent)
+            .map_err(|e| TraceMindError::Storage(format!("skg update_entity: {e}")))?;
+        Ok(())
+    }
+
+    /// LM-14 — overwrite the `context_id` property on a triple's
+    /// `kg_relations.properties` JSON. Same semantics as
+    /// [`set_entity_context`].
+    pub fn set_triple_context(&self, triple_id: Uuid, ctx_id: Option<Uuid>) -> Result<()> {
+        let map = self.triple_map.borrow();
+        let &skg_id = map.get(&triple_id).ok_or_else(|| {
+            TraceMindError::Storage(format!("triple {triple_id} not in id map"))
+        })?;
+        drop(map);
+        let conn = self.kg.connection();
+        let props_str: std::result::Result<String, _> = conn.query_row(
+            "SELECT properties FROM kg_relations WHERE id = ?1",
+            params![skg_id],
+            |row| row.get(0),
+        );
+        let props_str = props_str.map_err(|e| {
+            TraceMindError::Storage(format!("read triple props for {triple_id}: {e}"))
+        })?;
+        let mut props: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str::<serde_json::Value>(&props_str)
+                .ok()
+                .and_then(|v| match v {
+                    serde_json::Value::Object(m) => Some(m),
+                    _ => None,
+                })
+                .unwrap_or_default();
+        match ctx_id {
+            Some(c) => {
+                props.insert("context_id".into(), json!(c.to_string()));
+            }
+            None => {
+                props.remove("context_id");
+            }
+        }
+        let new_props = serde_json::Value::Object(props).to_string();
+        conn.execute(
+            "UPDATE kg_relations SET properties = ?1 WHERE id = ?2",
+            params![new_props, skg_id],
+        )
+        .map_err(|e| {
+            TraceMindError::Storage(format!("update triple props for {triple_id}: {e}"))
+        })?;
+        Ok(())
+    }
+
+    /// LM-14 — list every entity tagged with `ctx_id`. Linear scan —
+    /// fine for `tracemind context merge/split/snapshot` which is
+    /// human-paced.
+    pub fn list_entities_in_context(&self, ctx_id: Uuid) -> Result<Vec<Entity>> {
+        let mut out = Vec::new();
+        for e in self.list_all_entities()? {
+            if self.entity_context_id(e.id)? == Some(ctx_id) {
+                out.push(e);
+            }
+        }
+        Ok(out)
+    }
+
+    /// LM-14 / LM-17 — assemble a self-contained snapshot of a single
+    /// context as a `serde_json::Value`. Returned value matches the
+    /// `.tmctx` on-disk shape (schema_version = 1, key = "tracemind.context_snapshot")
+    /// so callers can either persist it directly or attach it to a
+    /// transport payload (Tauri, IPC). Errors only on storage failures —
+    /// resolving the context by name is the caller's responsibility.
+    pub fn snapshot_context(
+        &self,
+        ctx: &crate::context::Context,
+    ) -> Result<serde_json::Value> {
+        let entities = self.list_entities_in_context(ctx.id)?;
+        let triples = self.list_triples_in_context(ctx.id)?;
+        Ok(json!({
+            "schema_version": 1,
+            "kind": "tracemind.context_snapshot",
+            "exported_at": Utc::now().to_rfc3339(),
+            "context": {
+                "id": ctx.id.to_string(),
+                "name": ctx.name,
+                "tags": ctx.tags,
+            },
+            "counts": {
+                "entities": entities.len(),
+                "triples": triples.len(),
+            },
+            "entities": entities,
+            "triples": triples,
+        }))
+    }
+
+    /// LM-14 — list every triple tagged with `ctx_id`. Uses SQLite's
+    /// `json_extract` so the filter is at the storage layer.
+    pub fn list_triples_in_context(&self, ctx_id: Uuid) -> Result<Vec<Triple>> {
+        let conn = self.kg.connection();
+        let mut stmt = conn
+            .prepare(
+                "SELECT id FROM kg_relations \
+                 WHERE json_extract(properties, '$.context_id') = ?1",
+            )
+            .map_err(|e| TraceMindError::Storage(format!("prepare list_triples_in_context: {e}")))?;
+        let skg_ids: Vec<i64> = stmt
+            .query_map(params![ctx_id.to_string()], |row| row.get::<_, i64>(0))
+            .map_err(|e| TraceMindError::Storage(format!("query list_triples_in_context: {e}")))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        // Reverse-map skg_id -> our triple uuid via triple_map.
+        let tmap = self.triple_map.borrow();
+        let mut wanted: Vec<Uuid> = Vec::new();
+        for (uuid, skg_id) in tmap.iter() {
+            if skg_ids.contains(skg_id) {
+                wanted.push(*uuid);
+            }
+        }
+        drop(tmap);
+
+        // Now fetch each triple. `get_triples_for_entity` is the only
+        // exposed reader, and it's keyed by subject/object — instead we
+        // hydrate via a dedicated single-triple read.
+        let mut out = Vec::with_capacity(wanted.len());
+        for id in wanted {
+            if let Some(t) = self.find_triple_by_id(id)? {
+                out.push(t);
+            }
+        }
+        Ok(out)
+    }
+
     /// Append a negative-feedback row. `result_id` is opaque — pass the
     /// triple UUID, entity UUID, or signal row id (stringified).
     pub fn write_negative_signal(
@@ -758,6 +967,195 @@ impl GraphStore {
     /// reward by `finalize_pending_reward`.
     pub fn positive_weight_for_query(&self, query_id: Uuid) -> Result<f32> {
         crate::context::positive_weight_for_query(self.kg.connection(), query_id)
+    }
+
+    // ─── Memory Views (LM-11a) ──────────────────────────────────────────
+
+    pub fn create_view(&self, view: &crate::memory_view::MemoryView) -> Result<()> {
+        crate::memory_view::create_view(self.kg.connection(), view)
+    }
+
+    pub fn list_views(&self) -> Result<Vec<crate::memory_view::MemoryView>> {
+        crate::memory_view::list_views(self.kg.connection())
+    }
+
+    pub fn get_view_by_name(
+        &self,
+        name: &str,
+    ) -> Result<Option<crate::memory_view::MemoryView>> {
+        crate::memory_view::get_view_by_name(self.kg.connection(), name)
+    }
+
+    pub fn get_view(&self, id: Uuid) -> Result<Option<crate::memory_view::MemoryView>> {
+        crate::memory_view::get_view(self.kg.connection(), id)
+    }
+
+    pub fn update_view_metadata(
+        &self,
+        view_id: Uuid,
+        description: Option<&str>,
+        confidence_floor: Option<f32>,
+        include_pending: Option<bool>,
+    ) -> Result<()> {
+        crate::memory_view::update_view_metadata(
+            self.kg.connection(),
+            view_id,
+            description,
+            confidence_floor,
+            include_pending,
+        )
+    }
+
+    pub fn delete_view(&self, view_id: Uuid) -> Result<bool> {
+        crate::memory_view::delete_view(self.kg.connection(), view_id)
+    }
+
+    pub fn add_view_member(
+        &self,
+        view_id: Uuid,
+        kind: crate::memory_view::MemberKind,
+        member_type: crate::memory_view::MemberType,
+        member_id: Uuid,
+    ) -> Result<()> {
+        crate::memory_view::add_member(
+            self.kg.connection(),
+            view_id,
+            kind,
+            member_type,
+            member_id,
+        )
+    }
+
+    pub fn remove_view_member(
+        &self,
+        view_id: Uuid,
+        kind: crate::memory_view::MemberKind,
+        member_type: crate::memory_view::MemberType,
+        member_id: Uuid,
+    ) -> Result<bool> {
+        crate::memory_view::remove_member(
+            self.kg.connection(),
+            view_id,
+            kind,
+            member_type,
+            member_id,
+        )
+    }
+
+    pub fn list_view_members(
+        &self,
+        view_id: Uuid,
+    ) -> Result<Vec<crate::memory_view::ViewMember>> {
+        crate::memory_view::list_members(self.kg.connection(), view_id)
+    }
+
+    pub fn load_view_filter(&self, view_id: Uuid) -> Result<crate::memory_view::ViewFilter> {
+        let view = self
+            .get_view(view_id)?
+            .ok_or_else(|| TraceMindError::Storage(format!("view {view_id} not found")))?;
+        crate::memory_view::load_filter(self.kg.connection(), &view)
+    }
+
+    // ─── LM-9 Pending relations ─────────────────────────────────────────
+
+    /// Insert one row into the pending pool. Callers should usually use
+    /// [`Self::route_triple_by_confidence`] which respects the
+    /// `ACCEPT_THRESHOLD` / `PENDING_FLOOR` constants.
+    pub fn insert_pending(&self, row: &crate::pending_relations::PendingRelation) -> Result<()> {
+        crate::pending_relations::insert(self.kg.connection(), row)
+    }
+
+    /// List pending pool rows. `None` returns every status.
+    pub fn list_pending(
+        &self,
+        status_filter: Option<crate::pending_relations::PendingStatus>,
+        limit: Option<usize>,
+    ) -> Result<Vec<crate::pending_relations::PendingRelation>> {
+        crate::pending_relations::list(self.kg.connection(), status_filter, limit)
+    }
+
+    /// Fetch one pending row by id.
+    pub fn get_pending(
+        &self,
+        id: Uuid,
+    ) -> Result<Option<crate::pending_relations::PendingRelation>> {
+        crate::pending_relations::get(self.kg.connection(), id)
+    }
+
+    /// Accept a pending row: promote it to `kg_relations` and mark the
+    /// row `accepted` for audit. The triple inherits the pending row's
+    /// confidence (which the caller may have bumped before accepting).
+    /// Returns the freshly created [`Triple`].
+    pub fn accept_pending(&self, id: Uuid, note: &str) -> Result<Triple> {
+        let pending = self
+            .get_pending(id)?
+            .ok_or_else(|| TraceMindError::Storage(format!("pending {id} not found")))?;
+        if pending.status != crate::pending_relations::PendingStatus::Pending {
+            return Err(TraceMindError::Storage(format!(
+                "pending {id} is already {:?}",
+                pending.status
+            )));
+        }
+        let predicate = parse_predicate(&pending.predicate);
+        let mut triple = Triple::new(
+            pending.subject_id,
+            predicate,
+            pending.object_id,
+            pending.confidence,
+        );
+        triple.source_id = pending.source_id.clone();
+        self.upsert_triple(&triple)?;
+        crate::pending_relations::set_status(
+            self.kg.connection(),
+            id,
+            crate::pending_relations::PendingStatus::Accepted,
+            note,
+        )?;
+        Ok(triple)
+    }
+
+    /// Reject a pending row. The row stays in the table for audit; the
+    /// triple never enters `kg_relations`.
+    pub fn reject_pending(&self, id: Uuid, note: &str) -> Result<bool> {
+        crate::pending_relations::set_status(
+            self.kg.connection(),
+            id,
+            crate::pending_relations::PendingStatus::Rejected,
+            note,
+        )
+    }
+
+    /// Purge terminal-state pending rows older than `days` days.
+    pub fn purge_pending(&self, days: i64) -> Result<usize> {
+        crate::pending_relations::purge_decided_older_than(self.kg.connection(), days)
+    }
+
+    /// LM-9 confidence routing.
+    ///
+    /// * `confidence >= ACCEPT_THRESHOLD`  → write directly to `kg_relations`
+    /// * `PENDING_FLOOR <= confidence < ACCEPT_THRESHOLD` → land in `pending_relations`
+    /// * `confidence < PENDING_FLOOR`  → drop entirely
+    ///
+    /// Returns [`PendingRouteOutcome`] describing what happened so the
+    /// ingest pipeline can log it.
+    pub fn route_triple_by_confidence(&self, triple: &Triple) -> Result<PendingRouteOutcome> {
+        if triple.confidence >= crate::pending_relations::ACCEPT_THRESHOLD {
+            self.upsert_triple(triple)?;
+            return Ok(PendingRouteOutcome::Accepted);
+        }
+        if triple.confidence >= crate::pending_relations::PENDING_FLOOR {
+            let row = crate::pending_relations::PendingRelation::new(
+                triple.subject_id,
+                triple.predicate.to_string(),
+                triple.object_id,
+                triple.confidence,
+                triple.source_id.clone(),
+            );
+            let id = row.id;
+            self.insert_pending(&row)?;
+            return Ok(PendingRouteOutcome::Pending(id));
+        }
+        Ok(PendingRouteOutcome::Dropped)
     }
 
     // ─── Entity CRUD ────────────────────────────────────────────────────
@@ -945,6 +1343,9 @@ impl GraphStore {
                 let source_id = prop_string(props.get("source_id"));
                 let created_at = prop_datetime(props.get("created_at"));
                 let updated_at = prop_datetime(props.get("updated_at"));
+                let predicate_confidence = props
+                    .get("predicate_confidence")
+                    .and_then(|v| v.as_f64());
                 Ok(Some(Triple {
                     id,
                     subject_id,
@@ -954,6 +1355,7 @@ impl GraphStore {
                     source_id,
                     created_at,
                     updated_at,
+                    predicate_confidence,
                 }))
             }
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
@@ -1127,6 +1529,10 @@ impl GraphStore {
             rel.set_property("updated_at", json!(triple.updated_at.to_rfc3339()));
             if let Some(ctx_id) = active_ctx {
                 rel.set_property("context_id", json!(ctx_id.to_string()));
+            }
+            // LM-7: SML-supplied predicate-label score (optional).
+            if let Some(pc) = triple.predicate_confidence {
+                rel.set_property("predicate_confidence", json!(pc));
             }
 
             let skg_id = self
@@ -1384,6 +1790,9 @@ impl GraphStore {
                 continue;
             }
 
+            let predicate_confidence = props
+                .get("predicate_confidence")
+                .and_then(|v| v.as_f64());
             triples.push(Triple {
                 id: triple_uuid,
                 subject_id: subject_uuid,
@@ -1393,6 +1802,7 @@ impl GraphStore {
                 source_id,
                 created_at,
                 updated_at,
+                predicate_confidence,
             });
         }
 
@@ -2239,6 +2649,57 @@ impl GraphStore {
             .collect())
     }
 
+    /// LM-1: Backlinks panel data. For an entity `target`, return every
+    /// *typed* (non-`RelatedTo`) triple that points at it, paired with
+    /// the source entity. Sorted by confidence desc so the Tauri /
+    /// Brief panels render the strongest links first.
+    ///
+    /// `limit = None` returns everything; `Some(n)` truncates.
+    /// `include_related_to = true` opts back in to the noisy co-
+    /// occurrence edges — disabled by default because they make the
+    /// panel unreadable.
+    pub fn backlinks(
+        &self,
+        target: Uuid,
+        limit: Option<usize>,
+        include_related_to: bool,
+    ) -> Result<Vec<Backlink>> {
+        let triples = self.get_triples_for_entity(target)?;
+        let mut rows: Vec<Backlink> = Vec::new();
+        for t in triples {
+            // Only incoming edges where the target is the *object*.
+            if t.object_id != target {
+                continue;
+            }
+            // Skip self-loops in the panel — they read as noise.
+            if t.subject_id == target {
+                continue;
+            }
+            if !include_related_to && matches!(t.predicate, Predicate::RelatedTo) {
+                continue;
+            }
+            let source = match self.get_entity(t.subject_id) {
+                Ok(e) => e,
+                Err(_) => continue, // dangling source, skip
+            };
+            rows.push(Backlink {
+                triple_id: t.id,
+                source,
+                predicate: t.predicate,
+                confidence: t.confidence,
+            });
+        }
+        rows.sort_by(|a, b| {
+            b.confidence
+                .partial_cmp(&a.confidence)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        if let Some(n) = limit {
+            rows.truncate(n);
+        }
+        Ok(rows)
+    }
+
     /// KG-R1 Action 3: Follow a specific predicate forward from an entity.
     /// Returns all target entities reachable via `predicate` from `entity_id`.
     pub fn follow_predicate(&self, entity_id: Uuid, predicate: &Predicate) -> Result<Vec<Entity>> {
@@ -2298,9 +2759,14 @@ fn triple_props(triple: &Triple, predicate_str: &str, ctx_id: Option<Uuid>) -> s
         "created_at": triple.created_at.to_rfc3339(),
         "updated_at": triple.updated_at.to_rfc3339(),
     });
-    if let Some(c) = ctx_id {
-        if let Some(map) = obj.as_object_mut() {
+    if let Some(map) = obj.as_object_mut() {
+        if let Some(c) = ctx_id {
             map.insert("context_id".into(), json!(c.to_string()));
+        }
+        // LM-7: independent predicate-label score (SML-supplied).
+        // Skipped when `None` so legacy rows don't grow a null field.
+        if let Some(pc) = triple.predicate_confidence {
+            map.insert("predicate_confidence".into(), json!(pc));
         }
     }
     obj
@@ -2528,6 +2994,48 @@ mod tests {
         assert!(not_found.is_none());
     }
 
+    /// LM-1: backlinks returns every incoming typed edge, sorted by
+    /// confidence desc, with the source entity hydrated.
+    #[test]
+    fn backlinks_returns_typed_incoming_edges_sorted() {
+        let store = GraphStore::open(":memory:").expect("open in-memory db");
+        let alice = make_entity("Alice", EntityType::Person);
+        let acme = make_entity("Acme Corp", EntityType::Organization);
+        let bob = make_entity("Bob", EntityType::Person);
+        store.upsert_entity(&alice).unwrap();
+        store.upsert_entity(&acme).unwrap();
+        store.upsert_entity(&bob).unwrap();
+
+        let t1 = Triple::new(alice.id, Predicate::WorksAt, acme.id, 0.7);
+        let t2 = Triple::new(bob.id, Predicate::WorksAt, acme.id, 0.9);
+        let t_noise = Triple::new(alice.id, Predicate::RelatedTo, acme.id, 0.5);
+        store.upsert_triple(&t1).unwrap();
+        store.upsert_triple(&t2).unwrap();
+        store.upsert_triple(&t_noise).unwrap();
+
+        let panel = store.backlinks(acme.id, None, false).expect("backlinks");
+        assert_eq!(panel.len(), 2, "RelatedTo is excluded by default: {panel:?}");
+        // Highest confidence first.
+        assert_eq!(panel[0].source.id, bob.id);
+        assert!((panel[0].confidence - 0.9).abs() < 1e-6);
+        assert_eq!(panel[1].source.id, alice.id);
+
+        // include_related_to=true brings the co-occurrence edge back.
+        let panel_all = store
+            .backlinks(acme.id, None, true)
+            .expect("backlinks include_related_to");
+        assert_eq!(panel_all.len(), 3);
+
+        // limit truncates.
+        let panel_top = store.backlinks(acme.id, Some(1), false).expect("limit");
+        assert_eq!(panel_top.len(), 1);
+        assert_eq!(panel_top[0].source.id, bob.id);
+
+        // Entity with no incoming typed edges → empty.
+        let empty = store.backlinks(alice.id, None, false).expect("empty");
+        assert!(empty.is_empty());
+    }
+
     #[test]
     fn test_upsert_entity_updates_fields() {
         let store = GraphStore::open(":memory:").expect("open in-memory db");
@@ -2564,6 +3072,7 @@ mod tests {
             source_id: Some("test".to_string()),
             created_at: now,
             updated_at: now,
+            predicate_confidence: None,
         };
         store.upsert_triple(&triple).expect("upsert triple");
 
@@ -2597,6 +3106,7 @@ mod tests {
             source_id: None,
             created_at: now,
             updated_at: now,
+            predicate_confidence: None,
         };
         let t2 = Triple {
             id: Uuid::new_v4(),
@@ -2607,6 +3117,7 @@ mod tests {
             source_id: None,
             created_at: now,
             updated_at: now,
+            predicate_confidence: None,
         };
         store.upsert_triple(&t1).expect("upsert t1");
         store.upsert_triple(&t2).expect("upsert t2");
@@ -2850,6 +3361,7 @@ mod tests {
             source_id: None,
             created_at: t0,
             updated_at: t0,
+            predicate_confidence: None,
         };
         store.upsert_triple(&t).unwrap();
 
@@ -2932,6 +3444,7 @@ mod tests {
             source_id: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
+            predicate_confidence: None,
         };
         store.upsert_triple(&t).unwrap();
 
@@ -2989,5 +3502,199 @@ mod tests {
             )
             .unwrap();
         assert_eq!(ctx_str, Some(ctx_id.to_string()));
+    }
+
+    // ─── LM-9: pending_relations integration ───────────────────────────
+
+    fn make_triple(subject: Uuid, object: Uuid, confidence: f64) -> Triple {
+        let mut t = Triple::new(subject, Predicate::CollaboratesWith, object, confidence);
+        t.source_id = Some("test-cap".to_string());
+        t
+    }
+
+    #[test]
+    fn route_triple_accepts_high_confidence_directly() {
+        let store = GraphStore::open(":memory:").expect("open db");
+        let alice = make_entity("Alice", EntityType::Person);
+        let bob = make_entity("Bob", EntityType::Person);
+        store.upsert_entity(&alice).unwrap();
+        store.upsert_entity(&bob).unwrap();
+
+        let t = make_triple(alice.id, bob.id, 0.85);
+        let outcome = store.route_triple_by_confidence(&t).unwrap();
+        assert_eq!(outcome, PendingRouteOutcome::Accepted);
+
+        // Triple landed in kg_relations.
+        let edges = store.get_triples_for_entity(alice.id).unwrap();
+        assert!(edges.iter().any(|e| e.id == t.id));
+        // Pending pool is empty.
+        let pending = store.list_pending(None, None).unwrap();
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn route_triple_pools_mid_confidence() {
+        let store = GraphStore::open(":memory:").expect("open db");
+        let alice = make_entity("Alice", EntityType::Person);
+        let bob = make_entity("Bob", EntityType::Person);
+        store.upsert_entity(&alice).unwrap();
+        store.upsert_entity(&bob).unwrap();
+
+        let t = make_triple(alice.id, bob.id, 0.5);
+        let outcome = store.route_triple_by_confidence(&t).unwrap();
+        match outcome {
+            PendingRouteOutcome::Pending(_id) => {}
+            other => panic!("expected Pending, got {other:?}"),
+        }
+
+        // Triple did NOT land in kg_relations.
+        let edges = store.get_triples_for_entity(alice.id).unwrap();
+        assert!(edges.iter().all(|e| e.id != t.id));
+
+        // Pending pool has one row.
+        let pending = store
+            .list_pending(Some(crate::pending_relations::PendingStatus::Pending), None)
+            .unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].subject_id, alice.id);
+        assert_eq!(pending[0].object_id, bob.id);
+        assert_eq!(pending[0].predicate, "CollaboratesWith");
+        assert!((pending[0].confidence - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn route_triple_drops_below_floor() {
+        let store = GraphStore::open(":memory:").expect("open db");
+        let alice = make_entity("Alice", EntityType::Person);
+        let bob = make_entity("Bob", EntityType::Person);
+        store.upsert_entity(&alice).unwrap();
+        store.upsert_entity(&bob).unwrap();
+
+        let t = make_triple(alice.id, bob.id, 0.15);
+        let outcome = store.route_triple_by_confidence(&t).unwrap();
+        assert_eq!(outcome, PendingRouteOutcome::Dropped);
+
+        assert!(store.list_pending(None, None).unwrap().is_empty());
+        let edges = store.get_triples_for_entity(alice.id).unwrap();
+        assert!(edges.iter().all(|e| e.id != t.id));
+    }
+
+    #[test]
+    fn accept_pending_promotes_to_kg_relations() {
+        let store = GraphStore::open(":memory:").expect("open db");
+        let alice = make_entity("Alice", EntityType::Person);
+        let bob = make_entity("Bob", EntityType::Person);
+        store.upsert_entity(&alice).unwrap();
+        store.upsert_entity(&bob).unwrap();
+
+        let t = make_triple(alice.id, bob.id, 0.55);
+        let outcome = store.route_triple_by_confidence(&t).unwrap();
+        let pending_id = match outcome {
+            PendingRouteOutcome::Pending(id) => id,
+            other => panic!("expected Pending, got {other:?}"),
+        };
+
+        let promoted = store.accept_pending(pending_id, "user accepted").unwrap();
+        // Predicate hydrates back from the open-vocab string.
+        assert_eq!(promoted.predicate, Predicate::CollaboratesWith);
+        assert_eq!(promoted.subject_id, alice.id);
+        assert_eq!(promoted.object_id, bob.id);
+        assert_eq!(promoted.source_id.as_deref(), Some("test-cap"));
+
+        // It's now in kg_relations.
+        let edges = store.get_triples_for_entity(alice.id).unwrap();
+        assert!(edges.iter().any(|e| e.id == promoted.id));
+
+        // Pending row stamped accepted with a decided_at.
+        let row = store.get_pending(pending_id).unwrap().unwrap();
+        assert_eq!(row.status, crate::pending_relations::PendingStatus::Accepted);
+        assert!(row.decided_at.is_some());
+
+        // Double-accept rejected.
+        let err = store.accept_pending(pending_id, "again").unwrap_err();
+        assert!(format!("{err}").contains("already"));
+    }
+
+    #[test]
+    fn reject_pending_keeps_row_out_of_kg() {
+        let store = GraphStore::open(":memory:").expect("open db");
+        let alice = make_entity("Alice", EntityType::Person);
+        let bob = make_entity("Bob", EntityType::Person);
+        store.upsert_entity(&alice).unwrap();
+        store.upsert_entity(&bob).unwrap();
+
+        let t = make_triple(alice.id, bob.id, 0.45);
+        let pending_id = match store.route_triple_by_confidence(&t).unwrap() {
+            PendingRouteOutcome::Pending(id) => id,
+            other => panic!("expected Pending, got {other:?}"),
+        };
+
+        assert!(store.reject_pending(pending_id, "wrong").unwrap());
+        let row = store.get_pending(pending_id).unwrap().unwrap();
+        assert_eq!(row.status, crate::pending_relations::PendingStatus::Rejected);
+
+        let edges = store.get_triples_for_entity(alice.id).unwrap();
+        assert!(edges.is_empty());
+    }
+
+    #[test]
+    fn predicate_confidence_roundtrips_through_storage() {
+        let store = GraphStore::open(":memory:").expect("open db");
+        let alice = make_entity("Alice", EntityType::Person);
+        let bob = make_entity("Bob", EntityType::Person);
+        store.upsert_entity(&alice).unwrap();
+        store.upsert_entity(&bob).unwrap();
+
+        let triple =
+            Triple::new(alice.id, Predicate::WorksAt, bob.id, 0.85).with_predicate_confidence(0.62);
+        store.upsert_triple(&triple).unwrap();
+
+        let edges = store.get_triples_for_entity(alice.id).unwrap();
+        let stored = edges.iter().find(|t| t.id == triple.id).expect("triple");
+        assert_eq!(stored.predicate_confidence, Some(0.62));
+        // Triple-existence confidence is unchanged.
+        assert!((stored.confidence - 0.85).abs() < 1e-9);
+    }
+
+    #[test]
+    fn predicate_confidence_defaults_to_none() {
+        let store = GraphStore::open(":memory:").expect("open db");
+        let alice = make_entity("Alice", EntityType::Person);
+        let bob = make_entity("Bob", EntityType::Person);
+        store.upsert_entity(&alice).unwrap();
+        store.upsert_entity(&bob).unwrap();
+
+        // Legacy `Triple::new` path — no predicate confidence set.
+        let triple = Triple::new(alice.id, Predicate::WorksAt, bob.id, 0.85);
+        store.upsert_triple(&triple).unwrap();
+
+        let edges = store.get_triples_for_entity(alice.id).unwrap();
+        let stored = edges.iter().find(|t| t.id == triple.id).expect("triple");
+        assert_eq!(stored.predicate_confidence, None);
+    }
+
+    #[test]
+    fn accept_pending_preserves_custom_predicate_string() {
+        let store = GraphStore::open(":memory:").expect("open db");
+        let alice = make_entity("Alice", EntityType::Person);
+        let bob = make_entity("Bob", EntityType::Person);
+        store.upsert_entity(&alice).unwrap();
+        store.upsert_entity(&bob).unwrap();
+
+        // Insert directly with a Custom predicate string that wouldn't
+        // round-trip through Triple → string → Predicate enum cleanly.
+        let row = crate::pending_relations::PendingRelation::new(
+            alice.id,
+            "mentored",
+            bob.id,
+            0.55,
+            Some("test-cap".to_string()),
+        );
+        let pending_id = row.id;
+        store.insert_pending(&row).unwrap();
+
+        let promoted = store.accept_pending(pending_id, "ok").unwrap();
+        // Unknown name falls through to Custom — original text preserved.
+        assert_eq!(promoted.predicate, Predicate::Custom("mentored".to_string()));
     }
 }

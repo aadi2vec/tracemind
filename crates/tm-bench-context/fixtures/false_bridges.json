@@ -1,0 +1,227 @@
+{
+  "schema_version": 1,
+  "description": "LM-13 — 20 hand-labeled false-bridge pairs. Each row is a pair of contexts that the retrieval pipeline must NOT bridge. Domains follow the loose taxonomy from PROJECT_2026 §1c (fiction.*, real.*, historical.*, concept.*). UUIDs are stable per-row so the bench can replay strikes deterministically.",
+  "strike_threshold": 3,
+  "pairs": [
+    {
+      "tag": "hp.prison <-> real.prison",
+      "domain_a": "fiction.location",
+      "domain_b": "real.location",
+      "ctx_a": "00000000-0000-0000-0000-00000000ff01",
+      "ctx_b": "00000000-0000-0000-0000-00000000ff02",
+      "entity_a": "Azkaban",
+      "entity_b": "Alcatraz",
+      "ent_a": "11000000-0000-0000-0000-000000000001",
+      "ent_b": "11000000-0000-0000-0000-000000000002"
+    },
+    {
+      "tag": "hp.school <-> real.school",
+      "domain_a": "fiction.org",
+      "domain_b": "real.org",
+      "ctx_a": "00000000-0000-0000-0000-00000000ff03",
+      "ctx_b": "00000000-0000-0000-0000-00000000ff04",
+      "entity_a": "Hogwarts",
+      "entity_b": "Stanford",
+      "ent_a": "11000000-0000-0000-0000-000000000003",
+      "ent_b": "11000000-0000-0000-0000-000000000004"
+    },
+    {
+      "tag": "hp.character <-> real.person",
+      "domain_a": "fiction.person",
+      "domain_b": "real.person",
+      "ctx_a": "00000000-0000-0000-0000-00000000ff05",
+      "ctx_b": "00000000-0000-0000-0000-00000000ff06",
+      "entity_a": "Harry Potter",
+      "entity_b": "Harry Truman",
+      "ent_a": "11000000-0000-0000-0000-000000000005",
+      "ent_b": "11000000-0000-0000-0000-000000000006"
+    },
+    {
+      "tag": "lotr.location <-> real.location",
+      "domain_a": "fiction.location",
+      "domain_b": "real.location",
+      "ctx_a": "00000000-0000-0000-0000-00000000ff07",
+      "ctx_b": "00000000-0000-0000-0000-00000000ff08",
+      "entity_a": "Mordor",
+      "entity_b": "Mongolia",
+      "ent_a": "11000000-0000-0000-0000-000000000007",
+      "ent_b": "11000000-0000-0000-0000-000000000008"
+    },
+    {
+      "tag": "got.character <-> real.person",
+      "domain_a": "fiction.person",
+      "domain_b": "real.person",
+      "ctx_a": "00000000-0000-0000-0000-00000000ff09",
+      "ctx_b": "00000000-0000-0000-0000-00000000ff0a",
+      "entity_a": "Jon Snow",
+      "entity_b": "Jon Stewart",
+      "ent_a": "11000000-0000-0000-0000-000000000009",
+      "ent_b": "11000000-0000-0000-0000-00000000000a"
+    },
+    {
+      "tag": "mcu.character <-> real.person",
+      "domain_a": "fiction.person",
+      "domain_b": "real.person",
+      "ctx_a": "00000000-0000-0000-0000-00000000ff0b",
+      "ctx_b": "00000000-0000-0000-0000-00000000ff0c",
+      "entity_a": "Tony Stark",
+      "entity_b": "Elon Musk",
+      "ent_a": "11000000-0000-0000-0000-00000000000b",
+      "ent_b": "11000000-0000-0000-0000-00000000000c"
+    },
+    {
+      "tag": "starwars.location <-> real.location",
+      "domain_a": "fiction.location",
+      "domain_b": "real.location",
+      "ctx_a": "00000000-0000-0000-0000-00000000ff0d",
+      "ctx_b": "00000000-0000-0000-0000-00000000ff0e",
+      "entity_a": "Tatooine",
+      "entity_b": "Tunisia",
+      "ent_a": "11000000-0000-0000-0000-00000000000d",
+      "ent_b": "11000000-0000-0000-0000-00000000000e"
+    },
+    {
+      "tag": "dnd.creature <-> real.species",
+      "domain_a": "fiction.entity",
+      "domain_b": "real.species",
+      "ctx_a": "00000000-0000-0000-0000-00000000ff0f",
+      "ctx_b": "00000000-0000-0000-0000-00000000ff10",
+      "entity_a": "Dragon",
+      "entity_b": "Komodo Dragon",
+      "ent_a": "11000000-0000-0000-0000-00000000000f",
+      "ent_b": "11000000-0000-0000-0000-000000000010"
+    },
+    {
+      "tag": "mythology.god <-> real.person",
+      "domain_a": "fiction.person",
+      "domain_b": "real.person",
+      "ctx_a": "00000000-0000-0000-0000-00000000ff11",
+      "ctx_b": "00000000-0000-0000-0000-00000000ff12",
+      "entity_a": "Thor",
+      "entity_b": "Thor Heyerdahl",
+      "ent_a": "11000000-0000-0000-0000-000000000011",
+      "ent_b": "11000000-0000-0000-0000-000000000012"
+    },
+    {
+      "tag": "game.faction <-> real.org",
+      "domain_a": "fiction.org",
+      "domain_b": "real.org",
+      "ctx_a": "00000000-0000-0000-0000-00000000ff13",
+      "ctx_b": "00000000-0000-0000-0000-00000000ff14",
+      "entity_a": "Vault-Tec",
+      "entity_b": "SpaceX",
+      "ent_a": "11000000-0000-0000-0000-000000000013",
+      "ent_b": "11000000-0000-0000-0000-000000000014"
+    },
+    {
+      "tag": "fiction.weapon <-> real.weapon",
+      "domain_a": "fiction.object",
+      "domain_b": "real.object",
+      "ctx_a": "00000000-0000-0000-0000-00000000ff15",
+      "ctx_b": "00000000-0000-0000-0000-00000000ff16",
+      "entity_a": "Lightsaber",
+      "entity_b": "Katana",
+      "ent_a": "11000000-0000-0000-0000-000000000015",
+      "ent_b": "11000000-0000-0000-0000-000000000016"
+    },
+    {
+      "tag": "fiction.event <-> historical.event",
+      "domain_a": "fiction.event",
+      "domain_b": "historical.event",
+      "ctx_a": "00000000-0000-0000-0000-00000000ff17",
+      "ctx_b": "00000000-0000-0000-0000-00000000ff18",
+      "entity_a": "Battle of Hogwarts",
+      "entity_b": "Battle of Stalingrad",
+      "ent_a": "11000000-0000-0000-0000-000000000017",
+      "ent_b": "11000000-0000-0000-0000-000000000018"
+    },
+    {
+      "tag": "game.city <-> real.city",
+      "domain_a": "fiction.location",
+      "domain_b": "real.location",
+      "ctx_a": "00000000-0000-0000-0000-00000000ff19",
+      "ctx_b": "00000000-0000-0000-0000-00000000ff1a",
+      "entity_a": "Rapture",
+      "entity_b": "Reykjavik",
+      "ent_a": "11000000-0000-0000-0000-000000000019",
+      "ent_b": "11000000-0000-0000-0000-00000000001a"
+    },
+    {
+      "tag": "fiction.ship <-> real.ship",
+      "domain_a": "fiction.object",
+      "domain_b": "real.object",
+      "ctx_a": "00000000-0000-0000-0000-00000000ff1b",
+      "ctx_b": "00000000-0000-0000-0000-00000000ff1c",
+      "entity_a": "Millennium Falcon",
+      "entity_b": "USS Enterprise (CVN-65)",
+      "ent_a": "11000000-0000-0000-0000-00000000001b",
+      "ent_b": "11000000-0000-0000-0000-00000000001c"
+    },
+    {
+      "tag": "fiction.school <-> real.school",
+      "domain_a": "fiction.org",
+      "domain_b": "real.org",
+      "ctx_a": "00000000-0000-0000-0000-00000000ff1d",
+      "ctx_b": "00000000-0000-0000-0000-00000000ff1e",
+      "entity_a": "Xavier Institute",
+      "entity_b": "MIT",
+      "ent_a": "11000000-0000-0000-0000-00000000001d",
+      "ent_b": "11000000-0000-0000-0000-00000000001e"
+    },
+    {
+      "tag": "fiction.country <-> real.country",
+      "domain_a": "fiction.location",
+      "domain_b": "real.location",
+      "ctx_a": "00000000-0000-0000-0000-00000000ff1f",
+      "ctx_b": "00000000-0000-0000-0000-00000000ff20",
+      "entity_a": "Wakanda",
+      "entity_b": "Rwanda",
+      "ent_a": "11000000-0000-0000-0000-00000000001f",
+      "ent_b": "11000000-0000-0000-0000-000000000020"
+    },
+    {
+      "tag": "fiction.scientist <-> real.scientist",
+      "domain_a": "fiction.person",
+      "domain_b": "real.person",
+      "ctx_a": "00000000-0000-0000-0000-00000000ff21",
+      "ctx_b": "00000000-0000-0000-0000-00000000ff22",
+      "entity_a": "Doc Brown",
+      "entity_b": "Robert Brown",
+      "ent_a": "11000000-0000-0000-0000-000000000021",
+      "ent_b": "11000000-0000-0000-0000-000000000022"
+    },
+    {
+      "tag": "fiction.detective <-> real.detective",
+      "domain_a": "fiction.person",
+      "domain_b": "real.person",
+      "ctx_a": "00000000-0000-0000-0000-00000000ff23",
+      "ctx_b": "00000000-0000-0000-0000-00000000ff24",
+      "entity_a": "Sherlock Holmes",
+      "entity_b": "J. Edgar Hoover",
+      "ent_a": "11000000-0000-0000-0000-000000000023",
+      "ent_b": "11000000-0000-0000-0000-000000000024"
+    },
+    {
+      "tag": "fiction.island <-> real.island",
+      "domain_a": "fiction.location",
+      "domain_b": "real.location",
+      "ctx_a": "00000000-0000-0000-0000-00000000ff25",
+      "ctx_b": "00000000-0000-0000-0000-00000000ff26",
+      "entity_a": "Isla Nublar",
+      "entity_b": "Isla Mujeres",
+      "ent_a": "11000000-0000-0000-0000-000000000025",
+      "ent_b": "11000000-0000-0000-0000-000000000026"
+    },
+    {
+      "tag": "fiction.disease <-> real.disease",
+      "domain_a": "fiction.concept",
+      "domain_b": "real.concept",
+      "ctx_a": "00000000-0000-0000-0000-00000000ff27",
+      "ctx_b": "00000000-0000-0000-0000-00000000ff28",
+      "entity_a": "Vorpal Sickness",
+      "entity_b": "Influenza",
+      "ent_a": "11000000-0000-0000-0000-000000000027",
+      "ent_b": "11000000-0000-0000-0000-000000000028"
+    }
+  ]
+}

@@ -244,6 +244,7 @@ fn entity_type_to_label(t: &EntityType) -> String {
         EntityType::Technology => "Technology".into(),
         EntityType::Decision => "Decision".into(),
         EntityType::Event => "Event".into(),
+        EntityType::DailyNote => "DailyNote".into(),
         EntityType::Custom(s) => s.clone(),
     }
 }

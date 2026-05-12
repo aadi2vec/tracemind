@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -153,7 +155,7 @@ fn tools_list() -> Value {
             },
             {
                 "name": "memory_query",
-                "description": "Query TraceMind memory with natural-language text. Returns relevant entities and triples. Defaults to the active context; set cross_context=true to bridge all contexts.",
+                "description": "Query TraceMind memory with natural-language text. Returns relevant entities and triples. Defaults to the active context; set cross_context=true to bridge all contexts. LM-11d: pass `view` to apply a saved Memory View splice, or `include_entity`/`exclude_entity` for one-shot UUID filters.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -165,9 +167,95 @@ fn tools_list() -> Value {
                             "type": "boolean",
                             "description": "Sprint C-0.6 — when true, ignores the active context and searches every namespace. Default false (scoped).",
                             "default": false
+                        },
+                        "view": {
+                            "type": "string",
+                            "description": "LM-11d — Memory View name or UUID to apply for this query. Empty string disables any active view."
+                        },
+                        "include_entity": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "LM-11d — ad-hoc entity UUIDs to force-include for this query (not persisted)."
+                        },
+                        "exclude_entity": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "LM-11d — ad-hoc entity UUIDs to force-exclude for this query (not persisted)."
                         }
                     },
                     "required": ["text"]
+                }
+            },
+            {
+                "name": "memory_views_list",
+                "description": "LM-11d — list every Memory View (saved user-curated splice). Newest-updated first.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {}
+                }
+            },
+            {
+                "name": "memory_views_create",
+                "description": "LM-11d — create a new Memory View. Returns the new view's UUID. Fails if a view with the same name already exists.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string", "description": "Unique view name."},
+                        "description": {"type": "string", "description": "Optional human description.", "default": ""},
+                        "confidence_floor": {"type": "number", "description": "Drop triples below this confidence (0.0 disables).", "default": 0.0},
+                        "include_pending": {"type": "boolean", "description": "Include rows from pending_relations (LM-9).", "default": false}
+                    },
+                    "required": ["name"]
+                }
+            },
+            {
+                "name": "memory_views_show",
+                "description": "LM-11d — show one Memory View's metadata + members.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string", "description": "View name or UUID."}
+                    },
+                    "required": ["name"]
+                }
+            },
+            {
+                "name": "memory_views_add",
+                "description": "LM-11d — add a member (entity / triple / context UUID) to a Memory View. Idempotent on the (view, kind, member_type, member_id) tuple.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string", "description": "View name or UUID."},
+                        "mode": {"type": "string", "enum": ["include", "exclude"], "description": "Which list to add to.", "default": "include"},
+                        "kind": {"type": "string", "enum": ["entity", "triple", "context"], "description": "Member type.", "default": "entity"},
+                        "id":   {"type": "string", "description": "UUID of the entity / triple / context."}
+                    },
+                    "required": ["name", "id"]
+                }
+            },
+            {
+                "name": "memory_views_remove",
+                "description": "LM-11d — remove a member from a Memory View.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string"},
+                        "mode": {"type": "string", "enum": ["include", "exclude"], "default": "include"},
+                        "kind": {"type": "string", "enum": ["entity", "triple", "context"], "default": "entity"},
+                        "id":   {"type": "string"}
+                    },
+                    "required": ["name", "id"]
+                }
+            },
+            {
+                "name": "memory_views_delete",
+                "description": "LM-11d — delete a Memory View and all its members.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string"}
+                    },
+                    "required": ["name"]
                 }
             },
             {
@@ -437,6 +525,41 @@ fn tools_list() -> Value {
                         "context_id": {"type": "string", "description": "Optional context UUID for positive feedback (the active scope at click time)."},
                         "context_a":  {"type": "string", "description": "For negative feedback that crosses a context boundary: the bad-result context."},
                         "context_b":  {"type": "string", "description": "For negative feedback that crosses a context boundary: the query's active context."}
+                    }
+                }
+            },
+            {
+                "name": "memory_pending_list",
+                "description": "LM-9 — list rows in the pending pool (mid-confidence triples awaiting human acceptance). Triples with `confidence >= 0.7` flow straight into `kg_relations`; rows here have `0.3 <= confidence < 0.7` and are held back until accepted/rejected. Sorted by confidence desc.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "status": {"type": "string", "enum": ["pending", "accepted", "rejected", "any"], "description": "Filter by lifecycle state. `any` returns every row regardless of status. Defaults to `pending`."},
+                        "limit":  {"type": "integer", "description": "Max rows to return. Defaults to 25.", "default": 25}
+                    }
+                }
+            },
+            {
+                "name": "memory_pending_accept",
+                "description": "LM-9 — promote a pending row into `kg_relations`. The triple inherits the row's confidence and source_id; the pending row is stamped `accepted` (kept for audit).",
+                "inputSchema": {
+                    "type": "object",
+                    "required": ["id"],
+                    "properties": {
+                        "id":   {"type": "string", "description": "Pending row UUID (from memory_pending_list)."},
+                        "note": {"type": "string", "description": "Optional human-readable note recorded alongside the acceptance decision."}
+                    }
+                }
+            },
+            {
+                "name": "memory_pending_reject",
+                "description": "LM-9 — reject a pending row. The triple never enters `kg_relations`; the row stays in `pending_relations` with status `rejected` for audit.",
+                "inputSchema": {
+                    "type": "object",
+                    "required": ["id"],
+                    "properties": {
+                        "id":   {"type": "string", "description": "Pending row UUID (from memory_pending_list)."},
+                        "note": {"type": "string", "description": "Optional human-readable note recorded alongside the rejection decision."}
                     }
                 }
             }
@@ -1182,9 +1305,61 @@ async fn handle_memory_query(
         .get("cross_context")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+    // LM-11d: optional view splice.
+    let view_param = params.get("view").and_then(|v| v.as_str()).map(str::to_string);
+    let include_entity: Vec<String> = params
+        .get("include_entity")
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect())
+        .unwrap_or_default();
+    let exclude_entity: Vec<String> = params
+        .get("exclude_entity")
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect())
+        .unwrap_or_default();
 
     let mut engine = retrieval.lock().await;
     engine.set_cross_context(cross_context);
+    // LM-11d: resolve view filter from MCP params. We do this on-demand
+    // (per-call) rather than carrying engine-level state because MCP
+    // callers may bounce between splices on every request.
+    {
+        let mut filter = tm_graph::ViewFilter::default();
+        let mut applied = false;
+        if let Some(name) = view_param.as_deref() {
+            if !name.is_empty() {
+                if let Ok(graph) = tm_graph::GraphStore::open(db_path) {
+                    let resolved = uuid::Uuid::parse_str(name)
+                        .ok()
+                        .and_then(|id| graph.get_view(id).ok().flatten())
+                        .or_else(|| graph.get_view_by_name(name).ok().flatten());
+                    if let Some(v) = resolved {
+                        if let Ok(f) = graph.load_view_filter(v.id) {
+                            filter = f;
+                            applied = true;
+                        }
+                    }
+                }
+            }
+        }
+        for s in &include_entity {
+            if let Ok(u) = uuid::Uuid::parse_str(s) {
+                filter.adhoc_include_entities.insert(u);
+                applied = true;
+            }
+        }
+        for s in &exclude_entity {
+            if let Ok(u) = uuid::Uuid::parse_str(s) {
+                filter.adhoc_exclude_entities.insert(u);
+                applied = true;
+            }
+        }
+        engine.set_view_filter(if applied && !filter.is_empty() {
+            Some(filter)
+        } else {
+            None
+        });
+    }
     // Same rationale as memory_store: the retrieval engine's GraphStore cache
     // is stale relative to writes from the ingest-side GraphStore in a
     // long-running MCP session. See TM-UX-001 Phase C.
@@ -1533,6 +1708,200 @@ fn handle_memory_consolidate(db_path: &str) -> Result<Value, String> {
     }))
 }
 
+// ---------------------------------------------------------------------------
+// LM-11d — Memory View MCP handlers
+// ---------------------------------------------------------------------------
+
+fn resolve_mcp_view(
+    graph: &GraphStore,
+    name_or_id: &str,
+) -> Result<tm_graph::MemoryView, String> {
+    if let Ok(id) = Uuid::parse_str(name_or_id) {
+        if let Some(v) = graph.get_view(id).map_err(|e| e.to_string())? {
+            return Ok(v);
+        }
+    }
+    graph
+        .get_view_by_name(name_or_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("no view named '{name_or_id}'"))
+}
+
+fn parse_mcp_member_type(s: &str) -> Result<tm_graph::MemberType, String> {
+    match s {
+        "entity" => Ok(tm_graph::MemberType::Entity),
+        "triple" => Ok(tm_graph::MemberType::Triple),
+        "context" => Ok(tm_graph::MemberType::Context),
+        other => Err(format!("unknown kind '{other}'")),
+    }
+}
+
+fn parse_mcp_member_kind(s: &str) -> Result<tm_graph::MemberKind, String> {
+    match s {
+        "include" => Ok(tm_graph::MemberKind::Include),
+        "exclude" => Ok(tm_graph::MemberKind::Exclude),
+        other => Err(format!("unknown mode '{other}'")),
+    }
+}
+
+fn handle_memory_views_list(db_path: &str) -> Result<Value, String> {
+    let graph = GraphStore::open(db_path).map_err(|e| e.to_string())?;
+    let views = graph.list_views().map_err(|e| e.to_string())?;
+    let out: Vec<Value> = views
+        .into_iter()
+        .map(|v| {
+            json!({
+                "id": v.id.to_string(),
+                "name": v.name,
+                "description": v.description,
+                "confidence_floor": v.confidence_floor,
+                "include_pending": v.include_pending,
+                "created_at": v.created_at.to_rfc3339(),
+                "updated_at": v.updated_at.to_rfc3339(),
+            })
+        })
+        .collect();
+    Ok(json!({ "views": out }))
+}
+
+fn handle_memory_views_create(params: &Value, db_path: &str) -> Result<Value, String> {
+    let name = params
+        .get("name")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "missing required parameter: name".to_string())?;
+    let description = params
+        .get("description")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let confidence_floor = params
+        .get("confidence_floor")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0) as f32;
+    let include_pending = params
+        .get("include_pending")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    let graph = GraphStore::open(db_path).map_err(|e| e.to_string())?;
+    let mut view = tm_graph::MemoryView::new(name, description);
+    view.confidence_floor = confidence_floor;
+    view.include_pending = include_pending;
+    graph.create_view(&view).map_err(|e| e.to_string())?;
+    Ok(json!({
+        "id": view.id.to_string(),
+        "name": view.name,
+    }))
+}
+
+fn handle_memory_views_show(params: &Value, db_path: &str) -> Result<Value, String> {
+    let name = params
+        .get("name")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "missing required parameter: name".to_string())?;
+    let graph = GraphStore::open(db_path).map_err(|e| e.to_string())?;
+    let view = resolve_mcp_view(&graph, name)?;
+    let members = graph.list_view_members(view.id).map_err(|e| e.to_string())?;
+    let members_json: Vec<Value> = members
+        .into_iter()
+        .map(|m| {
+            json!({
+                "kind": m.kind.as_str(),
+                "type": m.member_type.as_str(),
+                "id": m.member_id.to_string(),
+                "added_at": m.added_at.to_rfc3339(),
+            })
+        })
+        .collect();
+    Ok(json!({
+        "view": {
+            "id": view.id.to_string(),
+            "name": view.name,
+            "description": view.description,
+            "confidence_floor": view.confidence_floor,
+            "include_pending": view.include_pending,
+            "created_at": view.created_at.to_rfc3339(),
+            "updated_at": view.updated_at.to_rfc3339(),
+        },
+        "members": members_json,
+    }))
+}
+
+fn handle_memory_views_add(params: &Value, db_path: &str) -> Result<Value, String> {
+    let name = params
+        .get("name")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "missing required parameter: name".to_string())?;
+    let mode = params
+        .get("mode")
+        .and_then(|v| v.as_str())
+        .unwrap_or("include");
+    let kind = params
+        .get("kind")
+        .and_then(|v| v.as_str())
+        .unwrap_or("entity");
+    let id = params
+        .get("id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "missing required parameter: id".to_string())?;
+    let member_id = Uuid::parse_str(id).map_err(|_| format!("invalid UUID: {id}"))?;
+    let member_type = parse_mcp_member_type(kind)?;
+    let member_kind = parse_mcp_member_kind(mode)?;
+
+    let graph = GraphStore::open(db_path).map_err(|e| e.to_string())?;
+    let view = resolve_mcp_view(&graph, name)?;
+    graph
+        .add_view_member(view.id, member_kind, member_type, member_id)
+        .map_err(|e| e.to_string())?;
+    Ok(json!({
+        "view": view.name,
+        "added": {
+            "mode": member_kind.as_str(),
+            "kind": member_type.as_str(),
+            "id": member_id.to_string(),
+        }
+    }))
+}
+
+fn handle_memory_views_remove(params: &Value, db_path: &str) -> Result<Value, String> {
+    let name = params
+        .get("name")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "missing required parameter: name".to_string())?;
+    let mode = params
+        .get("mode")
+        .and_then(|v| v.as_str())
+        .unwrap_or("include");
+    let kind = params
+        .get("kind")
+        .and_then(|v| v.as_str())
+        .unwrap_or("entity");
+    let id = params
+        .get("id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "missing required parameter: id".to_string())?;
+    let member_id = Uuid::parse_str(id).map_err(|_| format!("invalid UUID: {id}"))?;
+    let member_type = parse_mcp_member_type(kind)?;
+    let member_kind = parse_mcp_member_kind(mode)?;
+
+    let graph = GraphStore::open(db_path).map_err(|e| e.to_string())?;
+    let view = resolve_mcp_view(&graph, name)?;
+    let removed = graph
+        .remove_view_member(view.id, member_kind, member_type, member_id)
+        .map_err(|e| e.to_string())?;
+    Ok(json!({ "view": view.name, "removed": removed }))
+}
+
+fn handle_memory_views_delete(params: &Value, db_path: &str) -> Result<Value, String> {
+    let name = params
+        .get("name")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "missing required parameter: name".to_string())?;
+    let graph = GraphStore::open(db_path).map_err(|e| e.to_string())?;
+    let view = resolve_mcp_view(&graph, name)?;
+    let deleted = graph.delete_view(view.id).map_err(|e| e.to_string())?;
+    Ok(json!({ "view": view.name, "deleted": deleted }))
+}
+
 /// `memory_feedback` — F-1 / C-0.7 per-result feedback channel.
 ///
 /// `kind` routes the signal:
@@ -1601,18 +1970,162 @@ fn handle_memory_feedback(params: &Value, db_path: &str) -> Result<Value, String
             let row_id = graph
                 .write_negative_signal(query_id, result_id, kind, context_a, context_b, weight)
                 .map_err(|e| format!("write_negative_signal: {e}"))?;
-            Ok(json!({
+
+            // LM-12: a `cross_context_bridge` negative signal also
+            // counts as a "this pair should not be bridged" strike.
+            // After `DEFAULT_STRIKE_THRESHOLD` strikes the pair auto-
+            // promotes to blocked, and `is_context_pair_blocked` will
+            // start returning true for downstream retrieval. We do this
+            // only when both contexts are provided — `not_related`
+            // without context info has no pair to record.
+            let mut deny_outcome: Option<tm_graph::StrikeOutcome> = None;
+            if kind == "cross_context_bridge" {
+                if let (Some(a), Some(b)) = (context_a, context_b) {
+                    let dir = data_dir();
+                    let path = tm_graph::DenyList::default_path(&dir);
+                    let mut deny = tm_graph::DenyList::load(&path).map_err(|e| {
+                        format!("load deny-list {}: {e}", path.display())
+                    })?;
+                    let note = format!(
+                        "auto-strike from memory_feedback query={query_id} result={result_id}"
+                    );
+                    let outcome = deny.record_context_strike(a, b, &note);
+                    deny.save(&path).map_err(|e| {
+                        format!("save deny-list {}: {e}", path.display())
+                    })?;
+                    deny_outcome = Some(outcome);
+                }
+            }
+
+            let deny_payload = deny_outcome.as_ref().map(|o| {
+                let (status, strikes) = match o {
+                    tm_graph::StrikeOutcome::Watching { strikes } => ("watching", *strikes),
+                    tm_graph::StrikeOutcome::JustBlocked { strikes } => ("just_blocked", *strikes),
+                    tm_graph::StrikeOutcome::AlreadyBlocked { strikes } => ("already_blocked", *strikes),
+                };
+                json!({ "status": status, "strikes": strikes })
+            });
+
+            let mut payload = json!({
                 "ok": true,
                 "channel": "negative_signals",
                 "row_id": row_id,
                 "kind": kind,
                 "weight": weight,
-            }))
+            });
+            if let Some(p) = deny_payload {
+                payload
+                    .as_object_mut()
+                    .expect("payload is object")
+                    .insert("deny_list".to_string(), p);
+            }
+            Ok(payload)
         }
         other => Err(format!(
             "invalid kind '{other}': expected one of helpful, not_related, cross_context_bridge"
         )),
     }
+}
+
+// ---------------------------------------------------------------------------
+// LM-9 — pending pool MCP handlers
+// ---------------------------------------------------------------------------
+
+/// Hydrate a [`tm_graph::PendingRelation`] into the wire-format the
+/// MCP / Tauri panels consume. Resolves subject/object UUIDs to the
+/// human-readable entity names where possible so clients don't need
+/// a second round-trip.
+fn pending_to_json(graph: &tm_graph::GraphStore, row: &tm_graph::PendingRelation) -> Value {
+    let subject_name = graph
+        .get_entity(row.subject_id)
+        .ok()
+        .map(|e| e.name)
+        .unwrap_or_default();
+    let object_name = graph
+        .get_entity(row.object_id)
+        .ok()
+        .map(|e| e.name)
+        .unwrap_or_default();
+    json!({
+        "id": row.id.to_string(),
+        "subject_id": row.subject_id.to_string(),
+        "subject_name": subject_name,
+        "predicate": row.predicate,
+        "object_id": row.object_id.to_string(),
+        "object_name": object_name,
+        "confidence": row.confidence,
+        "source_id": row.source_id,
+        "status": row.status,
+        "created_at": row.created_at.to_rfc3339(),
+        "decided_at": row.decided_at.map(|d| d.to_rfc3339()),
+        "note": row.note,
+    })
+}
+
+fn handle_memory_pending_list(params: &Value, db_path: &str) -> Result<Value, String> {
+    let graph = tm_graph::GraphStore::open(db_path)
+        .map_err(|e| format!("open graph: {e}"))?;
+    let status_str = params
+        .get("status")
+        .and_then(|v| v.as_str())
+        .unwrap_or("pending");
+    let filter = match status_str {
+        "any" | "all" => None,
+        other => Some(
+            tm_graph::PendingStatus::parse(other)
+                .map_err(|e| format!("status filter: {e}"))?,
+        ),
+    };
+    let limit = params
+        .get("limit")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as usize)
+        .unwrap_or(25);
+    let rows = graph
+        .list_pending(filter, Some(limit))
+        .map_err(|e| format!("list_pending: {e}"))?;
+    let payload: Vec<Value> = rows.iter().map(|r| pending_to_json(&graph, r)).collect();
+    Ok(json!({ "count": payload.len(), "rows": payload }))
+}
+
+fn handle_memory_pending_accept(params: &Value, db_path: &str) -> Result<Value, String> {
+    let graph = tm_graph::GraphStore::open(db_path)
+        .map_err(|e| format!("open graph: {e}"))?;
+    let id_str = params
+        .get("id")
+        .and_then(|v| v.as_str())
+        .ok_or("missing 'id'")?;
+    let id = uuid::Uuid::parse_str(id_str).map_err(|_| format!("invalid uuid '{id_str}'"))?;
+    let note = params.get("note").and_then(|v| v.as_str()).unwrap_or("");
+    let triple = graph
+        .accept_pending(id, note)
+        .map_err(|e| format!("accept_pending: {e}"))?;
+    Ok(json!({
+        "ok": true,
+        "promoted_triple": {
+            "id": triple.id.to_string(),
+            "subject_id": triple.subject_id.to_string(),
+            "predicate": triple.predicate.to_string(),
+            "object_id": triple.object_id.to_string(),
+            "confidence": triple.confidence,
+            "source_id": triple.source_id,
+        }
+    }))
+}
+
+fn handle_memory_pending_reject(params: &Value, db_path: &str) -> Result<Value, String> {
+    let graph = tm_graph::GraphStore::open(db_path)
+        .map_err(|e| format!("open graph: {e}"))?;
+    let id_str = params
+        .get("id")
+        .and_then(|v| v.as_str())
+        .ok_or("missing 'id'")?;
+    let id = uuid::Uuid::parse_str(id_str).map_err(|_| format!("invalid uuid '{id_str}'"))?;
+    let note = params.get("note").and_then(|v| v.as_str()).unwrap_or("");
+    let ok = graph
+        .reject_pending(id, note)
+        .map_err(|e| format!("reject_pending: {e}"))?;
+    Ok(json!({ "ok": ok, "id": id.to_string() }))
 }
 
 /// `memory_brief` — render the daily brief from the system of intents
@@ -2370,6 +2883,30 @@ async fn handle_request(
                         .await
                         .map_err(|e| anyhow::anyhow!(e))?
                 }
+                "memory_views_list" => {
+                    handle_memory_views_list(db_path)
+                        .map_err(|e| anyhow::anyhow!(e))?
+                }
+                "memory_views_create" => {
+                    handle_memory_views_create(&args, db_path)
+                        .map_err(|e| anyhow::anyhow!(e))?
+                }
+                "memory_views_show" => {
+                    handle_memory_views_show(&args, db_path)
+                        .map_err(|e| anyhow::anyhow!(e))?
+                }
+                "memory_views_add" => {
+                    handle_memory_views_add(&args, db_path)
+                        .map_err(|e| anyhow::anyhow!(e))?
+                }
+                "memory_views_remove" => {
+                    handle_memory_views_remove(&args, db_path)
+                        .map_err(|e| anyhow::anyhow!(e))?
+                }
+                "memory_views_delete" => {
+                    handle_memory_views_delete(&args, db_path)
+                        .map_err(|e| anyhow::anyhow!(e))?
+                }
                 "get_trace" => {
                     handle_get_trace(&args, traces)
                         .await
@@ -2460,6 +2997,18 @@ async fn handle_request(
                 }
                 "memory_feedback" => {
                     handle_memory_feedback(&args, db_path)
+                        .map_err(|e| anyhow::anyhow!(e))?
+                }
+                "memory_pending_list" => {
+                    handle_memory_pending_list(&args, db_path)
+                        .map_err(|e| anyhow::anyhow!(e))?
+                }
+                "memory_pending_accept" => {
+                    handle_memory_pending_accept(&args, db_path)
+                        .map_err(|e| anyhow::anyhow!(e))?
+                }
+                "memory_pending_reject" => {
+                    handle_memory_pending_reject(&args, db_path)
                         .map_err(|e| anyhow::anyhow!(e))?
                 }
                 unknown => {
@@ -3974,6 +4523,86 @@ mod tests {
             .unwrap();
         assert!(matches!(c.state, tm_intent::State::Open));
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// LM-12: three `cross_context_bridge` strikes on the same
+    /// context-pair must auto-promote the pair to *blocked* in the
+    /// deny-list (`cross_ctx_block_list.json`). Strike #4 is reported
+    /// as `already_blocked`. We override `TM_DATA_DIR` so the file
+    /// lands inside our temp dir.
+    #[test]
+    fn cross_context_bridge_strikes_auto_deny_at_three() {
+        let dir = std::env::temp_dir().join(format!("tm_mcp_lm12_{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("memory.db").to_str().unwrap().to_string();
+
+        // Force `data_dir()` to point at our temp dir for this test.
+        // Tests in this binary run single-threaded by default; even if
+        // they didn't, the env var is checked synchronously at the top
+        // of `handle_memory_feedback`'s deny-list path.
+        std::env::set_var("TM_DATA_DIR", &dir);
+
+        // Seed enough graph state so write_negative_signal succeeds.
+        let _ = tm_graph::GraphStore::open(&db_path).expect("open graph");
+
+        let qid = Uuid::new_v4();
+        let ctx_a = Uuid::new_v4();
+        let ctx_b = Uuid::new_v4();
+
+        let call = |strike_n: u32| -> Value {
+            let params = json!({
+                "query_id": qid.to_string(),
+                "result_id": format!("res-{strike_n}"),
+                "kind": "cross_context_bridge",
+                "context_a": ctx_a.to_string(),
+                "context_b": ctx_b.to_string(),
+            });
+            handle_memory_feedback(&params, &db_path).expect("feedback ok")
+        };
+
+        let r1 = call(1);
+        assert_eq!(r1["deny_list"]["status"], json!("watching"));
+        assert_eq!(r1["deny_list"]["strikes"], json!(1));
+        let r2 = call(2);
+        assert_eq!(r2["deny_list"]["status"], json!("watching"));
+        assert_eq!(r2["deny_list"]["strikes"], json!(2));
+        let r3 = call(3);
+        assert_eq!(
+            r3["deny_list"]["status"],
+            json!("just_blocked"),
+            "third strike must auto-promote: {r3}"
+        );
+        assert_eq!(r3["deny_list"]["strikes"], json!(3));
+        let r4 = call(4);
+        assert_eq!(r4["deny_list"]["status"], json!("already_blocked"));
+
+        // Confirm the on-disk file actually reflects the block, and
+        // `is_context_pair_blocked` returns true.
+        let path = tm_graph::DenyList::default_path(&dir);
+        assert!(path.exists(), "deny-list file should exist at {}", path.display());
+        let deny = tm_graph::DenyList::load(&path).expect("load");
+        assert!(
+            deny.is_context_pair_blocked(ctx_a, ctx_b),
+            "context pair must be blocked on disk"
+        );
+
+        // `not_related` (no contexts) must NOT carry a deny_list payload.
+        let r_nr = handle_memory_feedback(
+            &json!({
+                "query_id": qid.to_string(),
+                "result_id": "nr-1",
+                "kind": "not_related",
+            }),
+            &db_path,
+        )
+        .expect("not_related ok");
+        assert!(
+            r_nr.get("deny_list").is_none(),
+            "not_related without contexts shouldn't emit a deny_list payload: {r_nr}"
+        );
+
+        std::env::remove_var("TM_DATA_DIR");
         std::fs::remove_dir_all(&dir).ok();
     }
 }

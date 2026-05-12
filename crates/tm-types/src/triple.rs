@@ -3,6 +3,17 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 /// A typed relationship between two entities (subject → predicate → object).
+///
+/// LM-7 note: `confidence` is the *triple existence* score (how much we
+/// believe this S–P–O assertion is true). `predicate_confidence` —
+/// optional, populated by the SML extractor (LM-8) — is the *predicate
+/// label* score, i.e. how confident we are that "works_at" is the
+/// right label vs. "consults_for" / "owns" / etc. They move
+/// independently: a triple can be solidly grounded (high `confidence`)
+/// even when the predicate name is uncertain (low
+/// `predicate_confidence`), and that downstream rerankers care about
+/// the difference. `None` means the column wasn't populated — the
+/// legacy heuristic / pattern extractor produces only one score.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Triple {
     pub id: Uuid,
@@ -13,6 +24,10 @@ pub struct Triple {
     pub source_id: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    /// LM-7: separate score for the predicate label. `None` for legacy
+    /// rows and for the heuristic extractor that doesn't distinguish.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub predicate_confidence: Option<f64>,
 }
 
 impl Triple {
@@ -32,7 +47,15 @@ impl Triple {
             source_id: None,
             created_at: now,
             updated_at: now,
+            predicate_confidence: None,
         }
+    }
+
+    /// LM-7: builder-style setter for the SML-supplied predicate label
+    /// confidence. Clamps to `[0.0, 1.0]` like `confidence` does.
+    pub fn with_predicate_confidence(mut self, conf: f64) -> Self {
+        self.predicate_confidence = Some(conf.clamp(0.0, 1.0));
+        self
     }
 
     pub fn decay(&mut self, factor: f64) {

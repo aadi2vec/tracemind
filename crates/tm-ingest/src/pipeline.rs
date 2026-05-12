@@ -28,7 +28,18 @@ pub struct IngestPipeline {
 pub struct IngestResult {
     pub trace: Trace,
     pub entities: Vec<Entity>,
+    /// Triples that were accepted (confidence ≥ ACCEPT_THRESHOLD) and
+    /// written to `kg_relations` during this ingest.
     pub triples: Vec<Triple>,
+    /// LM-9 pending-pool row ids for triples whose confidence fell
+    /// between `PENDING_FLOOR` and `ACCEPT_THRESHOLD`. These rows are
+    /// persisted in `pending_relations` but are *not* in the live
+    /// graph yet — the user (or a future SLM) accepts/rejects them.
+    pub pending_triples: Vec<Uuid>,
+    /// Triples that were dropped (confidence below `PENDING_FLOOR`).
+    /// Surfaced in the trace so the UI can show "discarded" counts
+    /// without leaking the rows themselves.
+    pub dropped_triples: usize,
     pub content_hash: String,
     /// Memory-R1 CRUD operations performed for each entity (entity_name, op).
     pub memory_ops: Vec<(String, MemoryOp)>,
@@ -214,6 +225,8 @@ impl IngestPipeline {
                 trace,
                 entities: vec![],
                 triples: vec![],
+                pending_triples: vec![],
+                dropped_triples: 0,
                 content_hash,
                 memory_ops: vec![],
                 skip_gate: true,
@@ -349,10 +362,23 @@ impl IngestPipeline {
         // 6. Extract typed triples via pattern matching, then fill with co-occurrence.
         let triples = self.extractor.extract_triples(text, &entities);
 
-        // 7. Upsert triples to graph.
-        for triple in &triples {
-            self.graph.upsert_triple(triple)?;
+        // 7. LM-9 confidence routing — accept high-confidence triples
+        //    immediately, queue mid-confidence ones in the pending pool,
+        //    drop the rest. Keep `triples` populated with the accepted
+        //    rows only so downstream consumers (trace, UI) see the live
+        //    graph state.
+        let extracted = triples;
+        let mut accepted_triples: Vec<Triple> = Vec::with_capacity(extracted.len());
+        let mut pending_triples: Vec<Uuid> = Vec::new();
+        let mut dropped_triples = 0usize;
+        for triple in extracted {
+            match self.graph.route_triple_by_confidence(&triple)? {
+                tm_graph::PendingRouteOutcome::Accepted => accepted_triples.push(triple),
+                tm_graph::PendingRouteOutcome::Pending(pid) => pending_triples.push(pid),
+                tm_graph::PendingRouteOutcome::Dropped => dropped_triples += 1,
+            }
         }
+        let triples = accepted_triples;
 
         // 8. Build trace record with full provenance.
         let mut trace = Trace::new(session_id, TraceEventType::Ingest, &content_hash);
@@ -364,6 +390,8 @@ impl IngestPipeline {
             trace,
             entities,
             triples,
+            pending_triples,
+            dropped_triples,
             content_hash,
             memory_ops,
             skip_gate: false,

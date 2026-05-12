@@ -1,6 +1,9 @@
 pub mod belief;
 pub mod context;
 pub mod deny_list;
+pub mod entity_resolve;
+pub mod memory_view;
+pub mod pending_relations;
 pub mod store;
 
 pub use belief::{effective_confidence, BeliefStore, ContradictionView, ResolveChoice};
@@ -11,7 +14,15 @@ pub use deny_list::{
     ContextPairRule, DenyList, EntityPairRule, StrikeOutcome,
     DEFAULT_STRIKE_THRESHOLD, SCHEMA_VERSION as DENY_LIST_SCHEMA_VERSION,
 };
-pub use store::{CapturedSignal, GraphStore, TripleDetail};
+pub use entity_resolve::{resolve_in_text, EntityMention};
+pub use memory_view::{
+    MemberKind, MemberType, MemoryView, ViewFilter, ViewMember, VIEW_SCHEMA_VERSION,
+};
+pub use pending_relations::{
+    PendingRelation, PendingStatus, ACCEPT_THRESHOLD as PENDING_ACCEPT_THRESHOLD,
+    PENDING_FLOOR, SCHEMA_VERSION as PENDING_RELATIONS_SCHEMA_VERSION,
+};
+pub use store::{Backlink, CapturedSignal, GraphStore, PendingRouteOutcome, TripleDetail};
 
 use tm_types::Predicate;
 use uuid::Uuid;
