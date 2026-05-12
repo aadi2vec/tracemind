@@ -1,0 +1,30 @@
+{"text": "Aaditya Srivathsan works at Acme Corp on TraceMind", "triples": [{"subject": "Aaditya Srivathsan", "predicate": "WorksAt", "object": "Acme Corp"}]}
+{"text": "Pat Grady is a partner at Sequoia Capital", "triples": [{"subject": "Pat Grady", "predicate": "WorksAt", "object": "Sequoia Capital"}]}
+{"text": "Sam Altman works at OpenAI", "triples": [{"subject": "Sam Altman", "predicate": "WorksAt", "object": "OpenAI"}]}
+{"text": "Dario Amodei founded Anthropic", "triples": [{"subject": "Dario Amodei", "predicate": "Owns", "object": "Anthropic"}]}
+{"text": "Mira Murati joined OpenAI", "triples": [{"subject": "Mira Murati", "predicate": "WorksAt", "object": "OpenAI"}]}
+{"text": "Andrej Karpathy worked at Tesla", "triples": [{"subject": "Andrej Karpathy", "predicate": "WorksAt", "object": "Tesla"}]}
+{"text": "Demis Hassabis works at Google DeepMind", "triples": [{"subject": "Demis Hassabis", "predicate": "WorksAt", "object": "Google DeepMind"}]}
+{"text": "Yann LeCun works at Meta", "triples": [{"subject": "Yann LeCun", "predicate": "WorksAt", "object": "Meta"}]}
+{"text": "Geoffrey Hinton joined Google in 2013", "triples": [{"subject": "Geoffrey Hinton", "predicate": "WorksAt", "object": "Google"}]}
+{"text": "Yoshua Bengio works at Mila", "triples": [{"subject": "Yoshua Bengio", "predicate": "WorksAt", "object": "Mila"}]}
+{"text": "Ilya Sutskever founded SSI", "triples": [{"subject": "Ilya Sutskever", "predicate": "Owns", "object": "SSI"}]}
+{"text": "Greg Brockman works at OpenAI", "triples": [{"subject": "Greg Brockman", "predicate": "WorksAt", "object": "OpenAI"}]}
+{"text": "Jensen Huang works at NVIDIA", "triples": [{"subject": "Jensen Huang", "predicate": "WorksAt", "object": "NVIDIA"}]}
+{"text": "Lisa Su works at AMD", "triples": [{"subject": "Lisa Su", "predicate": "WorksAt", "object": "AMD"}]}
+{"text": "Satya Nadella works at Microsoft", "triples": [{"subject": "Satya Nadella", "predicate": "WorksAt", "object": "Microsoft"}]}
+{"text": "Sundar Pichai works at Google", "triples": [{"subject": "Sundar Pichai", "predicate": "WorksAt", "object": "Google"}]}
+{"text": "Tim Cook works at Apple", "triples": [{"subject": "Tim Cook", "predicate": "WorksAt", "object": "Apple"}]}
+{"text": "Mark Zuckerberg founded Facebook", "triples": [{"subject": "Mark Zuckerberg", "predicate": "Owns", "object": "Facebook"}]}
+{"text": "Aravind Srinivas works at Perplexity", "triples": [{"subject": "Aravind Srinivas", "predicate": "WorksAt", "object": "Perplexity"}]}
+{"text": "Mustafa Suleyman works at Microsoft", "triples": [{"subject": "Mustafa Suleyman", "predicate": "WorksAt", "object": "Microsoft"}]}
+{"text": "Karri Saarinen founded Linear", "triples": [{"subject": "Karri Saarinen", "predicate": "Owns", "object": "Linear"}]}
+{"text": "Guillermo Rauch works at Vercel", "triples": [{"subject": "Guillermo Rauch", "predicate": "WorksAt", "object": "Vercel"}]}
+{"text": "Aaditya works at Anthropic", "triples": [{"subject": "Aaditya", "predicate": "WorksAt", "object": "Anthropic"}]}
+{"text": "TraceMind depends on Rust for performance", "triples": [{"subject": "TraceMind", "predicate": "DependsOn", "object": "Rust"}]}
+{"text": "Cursor depends on VS Code", "triples": [{"subject": "Cursor", "predicate": "DependsOn", "object": "VS Code"}]}
+{"text": "Apple owns the iPhone product line", "triples": [{"subject": "Apple", "predicate": "Owns", "object": "iPhone"}]}
+{"text": "Anthropic created Claude", "triples": [{"subject": "Anthropic", "predicate": "Owns", "object": "Claude"}]}
+{"text": "OpenAI created GPT-5", "triples": [{"subject": "OpenAI", "predicate": "Owns", "object": "GPT-5"}]}
+{"text": "Meta created Llama 3", "triples": [{"subject": "Meta", "predicate": "Owns", "object": "Llama 3"}]}
+{"text": "Google DeepMind created AlphaFold", "triples": [{"subject": "Google DeepMind", "predicate": "Owns", "object": "AlphaFold"}]}

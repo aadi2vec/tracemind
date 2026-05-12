@@ -17,6 +17,7 @@ members = [
     "crates/tm-reason",
     "crates/tm-bench",
     "crates/tm-bench-context",
+    "crates/tm-bench-triples",
     "crates/tm-answer",
     "crates/tm-bench-locomo",
     "crates/tm-intent",
