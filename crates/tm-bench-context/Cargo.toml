@@ -1,0 +1,20 @@
+[package]
+name = "tm-bench-context"
+version.workspace = true
+edition.workspace = true
+
+# LM-13 — Harry Potter ↔ Alcatraz regression bench. Verifies that the
+# cross-context deny-list catches hand-labeled false-bridge pairs after
+# user feedback. Q2 target: TN rate ≥ 0.90 (deny-list only).
+# Q4 target: TN rate ≥ 0.98 (ontological typing layered on top).
+[[bin]]
+name = "tm-bench-context"
+path = "src/main.rs"
+
+[dependencies]
+tm-graph = { workspace = true }
+tm-types = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }

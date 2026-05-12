@@ -9,7 +9,7 @@ use tm_graph::GraphStore;
 use tm_ingest::IngestPipeline;
 use tm_rerank::ColbertReranker;
 use tm_retrieval::RetrievalEngine;
-use tm_types::{Procedure, ProcedureStep};
+use tm_types::{Entity, EntityType, Procedure, ProcedureStep};
 use uuid::Uuid;
 
 mod answerer;
@@ -41,6 +41,19 @@ enum Commands {
         /// wedge.
         #[arg(long)]
         cross_context: bool,
+        /// LM-11c — apply a saved Memory View (by name) before
+        /// returning results. Overrides the active view, if any.
+        /// Use `--view ''` to force-disable the active view for this
+        /// one query.
+        #[arg(long)]
+        view: Option<String>,
+        /// LM-11c — ad-hoc include this entity UUID in the splice for
+        /// this query only (not persisted to any view). Repeatable.
+        #[arg(long = "include-entity", value_name = "UUID")]
+        include_entity: Vec<String>,
+        /// LM-11c — ad-hoc exclude this entity UUID. Repeatable.
+        #[arg(long = "exclude-entity", value_name = "UUID")]
+        exclude_entity: Vec<String>,
     },
     /// Ask a question — clean prose answer with citations, dispatched
     /// through the tiered answer layer (Tier 0 always; Tier 1 / Tier 2
@@ -67,6 +80,15 @@ enum Commands {
         /// Sprint C-0.6 — bridge contexts when gathering grounding.
         #[arg(long)]
         cross_context: bool,
+        /// LM-11c — apply a saved Memory View by name before grounding.
+        #[arg(long)]
+        view: Option<String>,
+        /// LM-11c — ad-hoc include entity UUID for this question only.
+        #[arg(long = "include-entity", value_name = "UUID")]
+        include_entity: Vec<String>,
+        /// LM-11c — ad-hoc exclude entity UUID for this question only.
+        #[arg(long = "exclude-entity", value_name = "UUID")]
+        exclude_entity: Vec<String>,
     },
     /// Register a reward for a bandit arm
     Feedback { arm: u8, reward: f64 },
@@ -146,6 +168,15 @@ enum Commands {
         #[command(subcommand)]
         action: ContextAction,
     },
+    /// LM-11 — Memory Views: user-curated, saved splices of memory.
+    /// A view is an include/exclude list of entities, triples, and
+    /// contexts that gives the user surgical control over which
+    /// memories enter a session. See PROJECT_2026 §1c and
+    /// `docs/TASKS.md` LM-11.
+    View {
+        #[command(subcommand)]
+        action: ViewAction,
+    },
     /// Import files or directories into memory
     Import {
         /// Path to a file or directory to import
@@ -178,10 +209,20 @@ enum Commands {
         /// files inside are overwritten without prompting.
         #[arg(long)]
         output: PathBuf,
-        /// Reserved for LM-11f (Memory Views). Currently rejected with a
-        /// stub error so the CLI surface stays forward-compatible.
+        /// LM-11f — filter to a saved Memory View (by name or UUID).
+        /// Combines with `--context` (intersection).
         #[arg(long)]
         view: Option<String>,
+        /// LM-18 — filter to a single entity and its 1-hop neighbours.
+        /// Accepts a UUID or an exact entity name. Useful for sharing
+        /// a focused slice of memory ("here's everything I have on X").
+        #[arg(long)]
+        entity: Option<String>,
+        /// LM-19 — run a PII scrub on every name / triple / source_id
+        /// before writing. Uses `tm-governance::Governor`'s redactor.
+        /// Off by default.
+        #[arg(long, default_value_t = false)]
+        redact: bool,
         /// Cap the number of entities exported (most-recently-updated
         /// first). `None` means "export all".
         #[arg(long)]
@@ -377,6 +418,84 @@ enum Commands {
     Capture {
         #[command(subcommand)]
         action: CaptureAction,
+    },
+    /// LM-1 — show the backlinks panel for an entity: every typed
+    /// incoming edge with the source entity and confidence. Use to
+    /// answer "what links to this entity?" from the terminal, mirrors
+    /// the panel rendered in Brief / Dashboard / entity drawer.
+    Backlinks {
+        /// Entity UUID or exact name (case-insensitive).
+        entity: String,
+        /// Truncate to N rows. Default: 25.
+        #[arg(long, default_value = "25")]
+        limit: usize,
+        /// Include noisy `RelatedTo` co-occurrence edges. Off by default.
+        #[arg(long = "include-related-to")]
+        include_related_to: bool,
+        /// Emit JSON instead of formatted text.
+        #[arg(long)]
+        json: bool,
+    },
+    /// LM-9 — inspect and decide on triples in the pending pool.
+    /// Mid-confidence relations (extracted, not yet trusted) land in
+    /// `pending_relations`; this subcommand is the headless equivalent
+    /// of the Tauri "pending" panel.
+    Pending {
+        #[command(subcommand)]
+        action: PendingAction,
+    },
+    /// LM-5c — Karpathy-style daily note. Upserts a `DailyNote`
+    /// entity for today's local date (idempotent — re-running upserts),
+    /// auto-creates `RelatedTo` backlinks from every memory created
+    /// today, and prints the day's brief. No typing required.
+    Today {
+        /// Override the local date (YYYY-MM-DD). Defaults to today.
+        #[arg(long)]
+        date: Option<String>,
+        /// Emit JSON instead of formatted text.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(clap::Subcommand)]
+enum PendingAction {
+    /// List rows in the pending pool, sorted by confidence desc.
+    List {
+        /// Restrict to one status. Default: `pending`.
+        #[arg(long, default_value = "pending")]
+        status: String,
+        /// Truncate to N rows. Default: 25.
+        #[arg(long, default_value = "25")]
+        limit: usize,
+        /// Emit JSON instead of formatted text.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Accept a pending row — promotes it into `kg_relations` and
+    /// stamps the row `accepted`. The pending entry stays for audit.
+    Accept {
+        /// Pending row UUID (from `pending list`).
+        id: String,
+        /// Optional human-readable note recorded with the decision.
+        #[arg(long, default_value = "")]
+        note: String,
+    },
+    /// Reject a pending row — keeps the row out of the graph and
+    /// stamps it `rejected`. Stored for audit.
+    Reject {
+        /// Pending row UUID (from `pending list`).
+        id: String,
+        /// Optional human-readable note recorded with the decision.
+        #[arg(long, default_value = "")]
+        note: String,
+    },
+    /// Purge terminal-state (accepted/rejected) rows older than N days.
+    Purge {
+        /// Age in days. Rows decided more than `days` days ago are
+        /// removed. Default: 30.
+        #[arg(long, default_value = "30")]
+        days: i64,
     },
 }
 
@@ -673,6 +792,135 @@ enum ContextAction {
     Current,
     /// Clear the active context (back to unscoped behaviour).
     Clear,
+    /// LM-14 — merge two contexts. Every entity and triple tagged
+    /// `--from-a` or `--from-b` is re-tagged to the new (or existing)
+    /// `--into` context. Idempotent: re-running with the same triple
+    /// produces no extra rows.
+    Merge {
+        /// First source context name.
+        a: String,
+        /// Second source context name.
+        b: String,
+        /// Target context name. Created if it doesn't exist.
+        #[arg(long)]
+        into: String,
+        /// Emit JSON instead of formatted text.
+        #[arg(long)]
+        json: bool,
+    },
+    /// LM-14 — split a context. Moves every entity (and its outbound
+    /// triples) whose `EntityType` matches `--by-entity-type` to a new
+    /// context `--into`. The rest stay in the source context.
+    Split {
+        /// Source context name.
+        name: String,
+        /// Match `EntityType` (case-insensitive). Examples: `person`,
+        /// `project`, `daily_note`.
+        #[arg(long = "by-entity-type", value_name = "TYPE")]
+        by_entity_type: String,
+        /// Target context name. Created if it doesn't exist.
+        #[arg(long)]
+        into: String,
+        /// Emit JSON instead of formatted text.
+        #[arg(long)]
+        json: bool,
+    },
+    /// LM-14 — write a self-contained `.tmctx` snapshot of one context
+    /// to disk (entities + triples + metadata). Format: pretty JSON,
+    /// schema_version = 1. Use this for archive / share / "snapshot
+    /// before merging" workflows.
+    Snapshot {
+        /// Source context name.
+        name: String,
+        /// Output path. Default: `<context-name>.tmctx`.
+        #[arg(long)]
+        output: Option<String>,
+    },
+}
+
+/// LM-11b — Memory Views CLI subcommands.
+#[derive(clap::Subcommand)]
+enum ViewAction {
+    /// Create a new view. Name must be unique.
+    Create {
+        /// Short name (e.g. `rondo-only`, `high-trust`, `today`).
+        name: String,
+        /// Optional human-readable description.
+        #[arg(long, default_value = "")]
+        description: String,
+        /// Drop members whose triple confidence is below this floor
+        /// (0.0 disables). Default: 0.0.
+        #[arg(long, default_value = "0.0")]
+        confidence_floor: f32,
+        /// Include rows from `pending_relations` (LM-9 mid-confidence
+        /// pool). Default: off.
+        #[arg(long, default_value_t = false)]
+        include_pending: bool,
+    },
+    /// List every view, newest-updated first.
+    List,
+    /// Show one view's metadata + members.
+    Show {
+        /// View name or UUID.
+        name: String,
+    },
+    /// Add a member to a view.
+    Add {
+        /// View name or UUID.
+        name: String,
+        /// Member type: entity | triple | context.
+        #[arg(long, default_value = "entity")]
+        kind: String,
+        /// `include` or `exclude`. Default: include.
+        #[arg(long, default_value = "include")]
+        mode: String,
+        /// UUID of the entity / triple / context.
+        id: String,
+    },
+    /// Remove a member from a view.
+    Remove {
+        /// View name or UUID.
+        name: String,
+        /// Member type: entity | triple | context.
+        #[arg(long, default_value = "entity")]
+        kind: String,
+        /// `include` or `exclude`. Default: include.
+        #[arg(long, default_value = "include")]
+        mode: String,
+        /// UUID of the entity / triple / context.
+        id: String,
+    },
+    /// Delete a view and all of its members.
+    Delete {
+        /// View name or UUID.
+        name: String,
+    },
+    /// Edit a view's metadata (description / confidence floor /
+    /// include-pending flag). Pass any flag you want to change.
+    Edit {
+        /// View name or UUID.
+        name: String,
+        /// New description.
+        #[arg(long)]
+        description: Option<String>,
+        /// New confidence floor.
+        #[arg(long)]
+        confidence_floor: Option<f32>,
+        /// New include-pending flag.
+        #[arg(long)]
+        include_pending: Option<bool>,
+    },
+    /// Mark a view as the *active* one. Subsequent queries default to
+    /// this view's splice (overridable per-query). State persists to
+    /// `<data_dir>/active_view.json`.
+    Use {
+        /// View name.
+        name: String,
+    },
+    /// Print the active view (if any).
+    Current,
+    /// Clear the active view (back to no-view behaviour).
+    Clear,
 }
 
 #[derive(clap::Subcommand)]
@@ -963,12 +1211,26 @@ fn main() {
             }
         }
 
-        Commands::Query { text, cross_context } => {
+        Commands::Query {
+            text,
+            cross_context,
+            view,
+            include_entity,
+            exclude_entity,
+        } => {
             let reranker = ColbertReranker::auto_download_or_none(0.7);
             let mut engine = RetrievalEngine::open(&db_path, &trace_path, cli.hash_embed)
                 .expect("failed to open retrieval engine")
                 .with_reranker_instance(reranker);
             engine.set_cross_context(cross_context);
+            // LM-11c: resolve view (CLI override > active view) and
+            // attach ad-hoc include/exclude entity flags. An empty
+            // `--view ''` string force-disables the active view.
+            if let Some(filter) =
+                resolve_view_filter(&dir, &db_path, view.as_deref(), &include_entity, &exclude_entity)
+            {
+                engine.set_view_filter(Some(filter));
+            }
             let result = engine.query(&text).expect("query failed");
 
             // Sprint C-0.7 — surface the query_id so users can wire
@@ -1031,7 +1293,18 @@ fn main() {
             // Bandit stats are auto-saved by RetrievalEngine after each query.
         }
 
-        Commands::Ask { text, tier, task, max_tokens, grounding, json, cross_context } => {
+        Commands::Ask {
+            text,
+            tier,
+            task,
+            max_tokens,
+            grounding,
+            json,
+            cross_context,
+            view,
+            include_entity,
+            exclude_entity,
+        } => {
             cmd_ask(
                 &text,
                 tier.as_deref(),
@@ -1043,6 +1316,10 @@ fn main() {
                 &trace_path,
                 cli.hash_embed,
                 cross_context,
+                view.as_deref(),
+                &include_entity,
+                &exclude_entity,
+                &dir,
             );
         }
 
@@ -1264,8 +1541,25 @@ fn main() {
             cmd_import(&path, &ext, max_kb, dry_run, cli.hash_embed, &db_path);
         }
 
-        Commands::Export { context, format, output, view, limit } => {
-            if let Err(e) = cmd_export(&db_path, context.as_deref(), &format, &output, view.as_deref(), limit) {
+        Commands::Export {
+            context,
+            format,
+            output,
+            view,
+            entity,
+            redact,
+            limit,
+        } => {
+            if let Err(e) = cmd_export(
+                &db_path,
+                context.as_deref(),
+                &format,
+                &output,
+                view.as_deref(),
+                entity.as_deref(),
+                redact,
+                limit,
+            ) {
                 eprintln!("export failed: {e}");
                 std::process::exit(1);
             }
@@ -1458,8 +1752,777 @@ fn main() {
             let db_path = dir.join("memory.db").to_str().unwrap().to_string();
             cmd_context(&dir, &db_path, action);
         }
+        Commands::View { action } => {
+            let db_path = dir.join("memory.db").to_str().unwrap().to_string();
+            cmd_view(&dir, &db_path, action);
+        }
         Commands::Capture { action } => {
             cmd_capture(&dir, action);
+        }
+        Commands::Backlinks {
+            entity,
+            limit,
+            include_related_to,
+            json,
+        } => {
+            if let Err(e) = cmd_backlinks(&db_path, &entity, limit, include_related_to, json) {
+                eprintln!("backlinks failed: {e}");
+                std::process::exit(1);
+            }
+        }
+        Commands::Pending { action } => {
+            if let Err(e) = cmd_pending(&db_path, action) {
+                eprintln!("pending failed: {e}");
+                std::process::exit(1);
+            }
+        }
+        Commands::Today { date, json } => {
+            if let Err(e) = cmd_today(&db_path, date.as_deref(), json) {
+                eprintln!("today failed: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+}
+
+/// LM-1: `tracemind backlinks <entity>` — print every typed incoming
+/// edge for the resolved entity. Mirrors `GraphStore::backlinks` and
+/// reuses its sort/limit semantics. Accepts a UUID or an exact name
+/// (case-insensitive).
+fn cmd_backlinks(
+    db_path: &str,
+    entity_arg: &str,
+    limit: usize,
+    include_related_to: bool,
+    as_json: bool,
+) -> Result<(), String> {
+    let graph = GraphStore::open(db_path).map_err(|e| format!("open graph: {e}"))?;
+
+    let target = if let Ok(id) = Uuid::parse_str(entity_arg) {
+        graph
+            .get_entity(id)
+            .map_err(|_| format!("no entity with id '{entity_arg}'"))?
+    } else {
+        graph
+            .find_entity_by_name_icase(entity_arg)
+            .map_err(|e| format!("lookup entity '{entity_arg}': {e}"))?
+            .ok_or_else(|| format!("no entity named '{entity_arg}'"))?
+    };
+
+    let rows = graph
+        .backlinks(target.id, Some(limit), include_related_to)
+        .map_err(|e| format!("backlinks: {e}"))?;
+
+    if as_json {
+        let payload = serde_json::json!({
+            "entity": {
+                "id": target.id.to_string(),
+                "name": target.name,
+                "type": target.entity_type.to_string(),
+            },
+            "backlinks": rows.iter().map(|b| serde_json::json!({
+                "triple_id": b.triple_id.to_string(),
+                "source_id": b.source.id.to_string(),
+                "source_name": b.source.name,
+                "source_type": b.source.entity_type.to_string(),
+                "predicate": b.predicate.to_string(),
+                "confidence": b.confidence,
+            })).collect::<Vec<_>>(),
+            "count": rows.len(),
+        });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&payload)
+                .map_err(|e| format!("serialize: {e}"))?
+        );
+        return Ok(());
+    }
+
+    println!(
+        "Backlinks for [{}] {} ({})",
+        target.entity_type, target.name, target.id
+    );
+    if rows.is_empty() {
+        println!("  (none)");
+        return Ok(());
+    }
+    for b in &rows {
+        println!(
+            "  ← [{}] {} — {} _(conf {:.2})_",
+            b.source.entity_type, b.source.name, b.predicate, b.confidence
+        );
+    }
+    println!("  ({} total)", rows.len());
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// `tracemind pending …` — LM-9
+// ---------------------------------------------------------------------------
+
+/// Top-level dispatcher for the `tracemind pending` family of
+/// subcommands. The pending pool is the user-facing queue of
+/// mid-confidence triples that the ingest pipeline declined to write
+/// directly to `kg_relations` — `accept` promotes a row, `reject`
+/// keeps it out for good, and `purge` cleans up decided rows.
+fn cmd_pending(db_path: &str, action: PendingAction) -> Result<(), String> {
+    let graph = GraphStore::open(db_path).map_err(|e| format!("open graph: {e}"))?;
+    match action {
+        PendingAction::List { status, limit, json } => {
+            let filter = match status.as_str() {
+                "any" | "all" => None,
+                other => Some(
+                    tm_graph::PendingStatus::parse(other)
+                        .map_err(|e| format!("status filter: {e}"))?,
+                ),
+            };
+            let rows = graph
+                .list_pending(filter, Some(limit))
+                .map_err(|e| format!("list pending: {e}"))?;
+            if json {
+                let payload = serde_json::json!({
+                    "count": rows.len(),
+                    "rows": rows.iter().map(|r| serde_json::json!({
+                        "id": r.id.to_string(),
+                        "subject_id": r.subject_id.to_string(),
+                        "predicate": r.predicate,
+                        "object_id": r.object_id.to_string(),
+                        "confidence": r.confidence,
+                        "source_id": r.source_id,
+                        "status": r.status,
+                        "created_at": r.created_at.to_rfc3339(),
+                        "decided_at": r.decided_at.map(|d| d.to_rfc3339()),
+                        "note": r.note,
+                    })).collect::<Vec<_>>(),
+                });
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&payload)
+                        .map_err(|e| format!("serialize: {e}"))?
+                );
+                return Ok(());
+            }
+            if rows.is_empty() {
+                println!("(no pending rows)");
+                return Ok(());
+            }
+            for r in &rows {
+                let subj = graph
+                    .get_entity(r.subject_id)
+                    .map(|e| e.name)
+                    .unwrap_or_else(|_| r.subject_id.to_string());
+                let obj = graph
+                    .get_entity(r.object_id)
+                    .map(|e| e.name)
+                    .unwrap_or_else(|_| r.object_id.to_string());
+                println!(
+                    "  [{}] {} — {} → {}  _(conf {:.2}, id {})_",
+                    r.status.as_str(),
+                    subj,
+                    r.predicate,
+                    obj,
+                    r.confidence,
+                    r.id
+                );
+            }
+            println!("  ({} total)", rows.len());
+            Ok(())
+        }
+        PendingAction::Accept { id, note } => {
+            let uuid =
+                Uuid::parse_str(&id).map_err(|_| format!("invalid uuid '{id}'"))?;
+            let triple = graph
+                .accept_pending(uuid, &note)
+                .map_err(|e| format!("accept: {e}"))?;
+            println!(
+                "accepted: triple {} ({} → {} → {}) conf={:.2}",
+                triple.id,
+                triple.subject_id,
+                triple.predicate,
+                triple.object_id,
+                triple.confidence
+            );
+            Ok(())
+        }
+        PendingAction::Reject { id, note } => {
+            let uuid =
+                Uuid::parse_str(&id).map_err(|_| format!("invalid uuid '{id}'"))?;
+            let ok = graph
+                .reject_pending(uuid, &note)
+                .map_err(|e| format!("reject: {e}"))?;
+            if ok {
+                println!("rejected: {uuid}");
+            } else {
+                eprintln!("no pending row with id {uuid}");
+                std::process::exit(1);
+            }
+            Ok(())
+        }
+        PendingAction::Purge { days } => {
+            let n = graph
+                .purge_pending(days)
+                .map_err(|e| format!("purge: {e}"))?;
+            println!("purged {n} terminal-state rows older than {days} day(s)");
+            Ok(())
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// `tracemind today` — LM-5c
+// ---------------------------------------------------------------------------
+
+/// LM-5c — upsert a first-class `DailyNote` entity for today's local
+/// date (or `--date` override), then auto-create `RelatedTo` backlinks
+/// from every entity created on that day → the daily note. Idempotent:
+/// re-running on the same date upserts the entity and only adds
+/// missing backlinks. No typing required — this is the Karpathy daily
+/// note workflow.
+fn cmd_today(db_path: &str, date_override: Option<&str>, as_json: bool) -> Result<(), String> {
+    use chrono::{DateTime, Local, NaiveDate, TimeZone, Utc};
+
+    let target_date: NaiveDate = match date_override {
+        Some(s) => NaiveDate::parse_from_str(s, "%Y-%m-%d")
+            .map_err(|e| format!("invalid --date '{s}': {e} (want YYYY-MM-DD)"))?,
+        None => Local::now().date_naive(),
+    };
+    let note_name = target_date.format("%Y-%m-%d").to_string();
+
+    // UTC day window matching the local target date — the bitemporal
+    // store records `created_at` in UTC, so convert the local-day
+    // boundaries to UTC for the range check.
+    let day_start_local = Local
+        .from_local_datetime(&target_date.and_hms_opt(0, 0, 0).unwrap())
+        .single()
+        .ok_or_else(|| "ambiguous local midnight (DST)".to_string())?;
+    let day_end_local = day_start_local + chrono::Duration::days(1);
+    let day_start_utc: DateTime<Utc> = day_start_local.with_timezone(&Utc);
+    let day_end_utc: DateTime<Utc> = day_end_local.with_timezone(&Utc);
+
+    let graph = GraphStore::open(db_path).map_err(|e| format!("open graph: {e}"))?;
+
+    // Find-or-create the DailyNote entity (idempotent by name).
+    let daily = match graph
+        .find_entity_by_name_icase(&note_name)
+        .map_err(|e| format!("lookup daily note: {e}"))?
+    {
+        Some(e) if e.entity_type == EntityType::DailyNote => e,
+        Some(other) => {
+            return Err(format!(
+                "name '{note_name}' is already taken by a non-DailyNote entity ({})",
+                other.entity_type
+            ));
+        }
+        None => {
+            let mut new_note = Entity::new(&note_name, EntityType::DailyNote, 1.0);
+            new_note.source_id = Some("tracemind::today".to_string());
+            graph
+                .upsert_entity(&new_note)
+                .map_err(|e| format!("create daily note: {e}"))?;
+            new_note
+        }
+    };
+
+    // List entities created on the target day (excluding the daily
+    // note itself).
+    let all = graph
+        .list_all_entities()
+        .map_err(|e| format!("list entities: {e}"))?;
+    let same_day: Vec<Entity> = all
+        .into_iter()
+        .filter(|e| e.id != daily.id)
+        .filter(|e| e.created_at >= day_start_utc && e.created_at < day_end_utc)
+        .collect();
+
+    // Existing backlinks: triples where object is the daily note. We
+    // dedup by subject so re-running doesn't create another edge.
+    let existing = graph
+        .get_triples_for_entity(daily.id)
+        .map_err(|e| format!("read daily-note triples: {e}"))?;
+    let already_linked: std::collections::HashSet<Uuid> = existing
+        .iter()
+        .filter(|t| t.object_id == daily.id)
+        .map(|t| t.subject_id)
+        .collect();
+
+    let mut created = 0usize;
+    let mut skipped = 0usize;
+    for e in &same_day {
+        if already_linked.contains(&e.id) {
+            skipped += 1;
+            continue;
+        }
+        let mut t = tm_types::Triple::new(e.id, tm_types::Predicate::RelatedTo, daily.id, 1.0);
+        t.source_id = Some("tracemind::today".to_string());
+        graph
+            .upsert_triple(&t)
+            .map_err(|err| format!("link {} → daily note: {err}", e.id))?;
+        created += 1;
+    }
+
+    if as_json {
+        let payload = serde_json::json!({
+            "date": note_name,
+            "daily_note_id": daily.id.to_string(),
+            "memories_today": same_day.len(),
+            "backlinks_created": created,
+            "backlinks_existing": skipped,
+            "memories": same_day.iter().map(|e| serde_json::json!({
+                "id": e.id.to_string(),
+                "name": e.name,
+                "entity_type": e.entity_type.to_string(),
+                "confidence": e.confidence,
+                "created_at": e.created_at.to_rfc3339(),
+            })).collect::<Vec<_>>(),
+        });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&payload).map_err(|e| format!("serialize: {e}"))?
+        );
+        return Ok(());
+    }
+
+    println!("# Daily note · {note_name}");
+    println!("  id: {}", daily.id);
+    println!(
+        "  {} memor{} created on this day ({} new backlink{}, {} already linked)",
+        same_day.len(),
+        if same_day.len() == 1 { "y" } else { "ies" },
+        created,
+        if created == 1 { "" } else { "s" },
+        skipped,
+    );
+    if same_day.is_empty() {
+        println!("  (no other memories created on this day yet)");
+        return Ok(());
+    }
+    println!();
+    for e in &same_day {
+        println!(
+            "  - [{}] {}  _(conf {:.2}, id {})_",
+            e.entity_type, e.name, e.confidence, e.id
+        );
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// `tracemind view …` — LM-11b
+// ---------------------------------------------------------------------------
+
+/// Active view pointer, persisted to `<data_dir>/active_view.json`. We
+/// keep this in its own file (instead of folding it into
+/// `active_context.json`) so that "context" and "view" stay
+/// independent surfaces — a user can have an active view but no
+/// active context, or vice versa.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ActiveView {
+    id: Uuid,
+    name: String,
+}
+
+impl ActiveView {
+    fn load(path: &std::path::Path) -> std::io::Result<Option<Self>> {
+        match fs::read_to_string(path) {
+            Ok(s) => match serde_json::from_str::<Self>(&s) {
+                Ok(v) => Ok(Some(v)),
+                Err(_) => Ok(None),
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    fn save(&self, path: &std::path::Path) -> std::io::Result<()> {
+        let s = serde_json::to_string_pretty(self).unwrap();
+        fs::write(path, s)
+    }
+
+    fn clear(path: &std::path::Path) -> std::io::Result<()> {
+        match fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+}
+
+/// LM-11c — build a [`ViewFilter`] from CLI flags. Precedence:
+///
+/// 1. `--view '<name>'` (CLI override). Empty string explicitly disables
+///    the active view for this one call.
+/// 2. The active view stored at `<data_dir>/active_view.json`.
+/// 3. No view → returns `None` unless ad-hoc include/exclude flags are
+///    present, in which case a minimal filter with just the ad-hoc sets
+///    is returned.
+///
+/// Invalid UUIDs in `--include-entity` / `--exclude-entity` are
+/// reported via stderr and skipped (we don't exit — a partial filter
+/// is still useful and matches the spirit of the rest of the CLI).
+fn resolve_view_filter(
+    data_dir: &PathBuf,
+    db_path: &str,
+    view_name: Option<&str>,
+    include_entity: &[String],
+    exclude_entity: &[String],
+) -> Option<tm_graph::ViewFilter> {
+    // Resolve which view (if any) to load.
+    let view = match view_name {
+        Some("") => None, // explicit disable
+        Some(name) => match GraphStore::open(db_path) {
+            Ok(graph) => match resolve_view(&graph, name) {
+                Some(v) => Some(v),
+                None => {
+                    eprintln!("warning: no view named '{name}' — skipping view filter");
+                    None
+                }
+            },
+            Err(_) => None,
+        },
+        None => {
+            // Fall back to active view, if any.
+            let active_path = data_dir.join("active_view.json");
+            match ActiveView::load(&active_path).ok().flatten() {
+                Some(active) => match GraphStore::open(db_path) {
+                    Ok(graph) => graph.get_view(active.id).ok().flatten(),
+                    Err(_) => None,
+                },
+                None => None,
+            }
+        }
+    };
+
+    let mut filter = match view {
+        Some(v) => match GraphStore::open(db_path) {
+            Ok(graph) => match graph.load_view_filter(v.id) {
+                Ok(f) => f,
+                Err(e) => {
+                    eprintln!("warning: failed to load view '{}': {e}", v.name);
+                    return None;
+                }
+            },
+            Err(_) => return None,
+        },
+        None => tm_graph::ViewFilter::default(),
+    };
+
+    // Layer in ad-hoc include/exclude UUIDs (not persisted).
+    for s in include_entity {
+        match Uuid::parse_str(s) {
+            Ok(u) => {
+                filter.adhoc_include_entities.insert(u);
+            }
+            Err(_) => eprintln!("warning: --include-entity '{s}' is not a valid UUID"),
+        }
+    }
+    for s in exclude_entity {
+        match Uuid::parse_str(s) {
+            Ok(u) => {
+                filter.adhoc_exclude_entities.insert(u);
+            }
+            Err(_) => eprintln!("warning: --exclude-entity '{s}' is not a valid UUID"),
+        }
+    }
+
+    if filter.is_empty() {
+        None
+    } else {
+        Some(filter)
+    }
+}
+
+/// Resolve a `<name-or-uuid>` argument to a `MemoryView`.
+fn resolve_view(graph: &GraphStore, name_or_id: &str) -> Option<tm_graph::MemoryView> {
+    if let Ok(id) = Uuid::parse_str(name_or_id) {
+        if let Ok(Some(v)) = graph.get_view(id) {
+            return Some(v);
+        }
+    }
+    if let Ok(Some(v)) = graph.get_view_by_name(name_or_id) {
+        return Some(v);
+    }
+    None
+}
+
+fn parse_member_type(s: &str) -> Result<tm_graph::MemberType, String> {
+    match s {
+        "entity" => Ok(tm_graph::MemberType::Entity),
+        "triple" => Ok(tm_graph::MemberType::Triple),
+        "context" => Ok(tm_graph::MemberType::Context),
+        other => Err(format!(
+            "unknown kind '{other}' — expected entity | triple | context"
+        )),
+    }
+}
+
+fn parse_member_mode(s: &str) -> Result<tm_graph::MemberKind, String> {
+    match s {
+        "include" => Ok(tm_graph::MemberKind::Include),
+        "exclude" => Ok(tm_graph::MemberKind::Exclude),
+        other => Err(format!(
+            "unknown mode '{other}' — expected include | exclude"
+        )),
+    }
+}
+
+fn cmd_view(data_dir: &PathBuf, db_path: &str, action: ViewAction) {
+    let active_path = data_dir.join("active_view.json");
+    let graph = match GraphStore::open(db_path) {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("error: failed to open graph store: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    match action {
+        ViewAction::Create {
+            name,
+            description,
+            confidence_floor,
+            include_pending,
+        } => {
+            let mut view = tm_graph::MemoryView::new(name.clone(), description);
+            view.confidence_floor = confidence_floor;
+            view.include_pending = include_pending;
+            if let Err(e) = graph.create_view(&view) {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
+            println!("created view: {} ({})", view.name, view.id);
+        }
+        ViewAction::List => {
+            let views = match graph.list_views() {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("error: failed to list views: {e}");
+                    std::process::exit(1);
+                }
+            };
+            if views.is_empty() {
+                println!("no views yet — `tracemind view create <name>` to add one");
+                return;
+            }
+            let active = ActiveView::load(&active_path).ok().flatten();
+            for v in views {
+                let marker = match &active {
+                    Some(a) if a.id == v.id => "*",
+                    _ => " ",
+                };
+                let floor = if v.confidence_floor > 0.0 {
+                    format!(" floor={:.2}", v.confidence_floor)
+                } else {
+                    String::new()
+                };
+                let pending = if v.include_pending { " pending" } else { "" };
+                println!("{marker} {:<24} {}{}{}", v.name, v.id, floor, pending);
+                if !v.description.is_empty() {
+                    println!("     {}", v.description);
+                }
+            }
+        }
+        ViewAction::Show { name } => {
+            let view = match resolve_view(&graph, &name) {
+                Some(v) => v,
+                None => {
+                    eprintln!("error: no view named '{name}'");
+                    std::process::exit(1);
+                }
+            };
+            println!("view {} ({})", view.name, view.id);
+            if !view.description.is_empty() {
+                println!("description: {}", view.description);
+            }
+            println!("confidence_floor: {:.2}", view.confidence_floor);
+            println!("include_pending: {}", view.include_pending);
+            println!("created_at: {}", view.created_at.to_rfc3339());
+            println!("updated_at: {}", view.updated_at.to_rfc3339());
+            let members = match graph.list_view_members(view.id) {
+                Ok(m) => m,
+                Err(e) => {
+                    eprintln!("error: failed to list members: {e}");
+                    std::process::exit(1);
+                }
+            };
+            if members.is_empty() {
+                println!("(no members yet)");
+                return;
+            }
+            println!("members ({}):", members.len());
+            for m in members {
+                println!(
+                    "  {:>7}  {:<7}  {}",
+                    m.kind.as_str(),
+                    m.member_type.as_str(),
+                    m.member_id
+                );
+            }
+        }
+        ViewAction::Add { name, kind, mode, id } => {
+            let view = match resolve_view(&graph, &name) {
+                Some(v) => v,
+                None => {
+                    eprintln!("error: no view named '{name}'");
+                    std::process::exit(1);
+                }
+            };
+            let member_type = match parse_member_type(&kind) {
+                Ok(k) => k,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    std::process::exit(2);
+                }
+            };
+            let member_kind = match parse_member_mode(&mode) {
+                Ok(k) => k,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    std::process::exit(2);
+                }
+            };
+            let member_id = match Uuid::parse_str(&id) {
+                Ok(u) => u,
+                Err(_) => {
+                    eprintln!("error: '{id}' is not a valid UUID");
+                    std::process::exit(2);
+                }
+            };
+            if let Err(e) =
+                graph.add_view_member(view.id, member_kind, member_type, member_id)
+            {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
+            println!(
+                "added {} {} {} to view {}",
+                member_kind.as_str(),
+                member_type.as_str(),
+                member_id,
+                view.name
+            );
+        }
+        ViewAction::Remove { name, kind, mode, id } => {
+            let view = match resolve_view(&graph, &name) {
+                Some(v) => v,
+                None => {
+                    eprintln!("error: no view named '{name}'");
+                    std::process::exit(1);
+                }
+            };
+            let member_type = match parse_member_type(&kind) {
+                Ok(k) => k,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    std::process::exit(2);
+                }
+            };
+            let member_kind = match parse_member_mode(&mode) {
+                Ok(k) => k,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    std::process::exit(2);
+                }
+            };
+            let member_id = match Uuid::parse_str(&id) {
+                Ok(u) => u,
+                Err(_) => {
+                    eprintln!("error: '{id}' is not a valid UUID");
+                    std::process::exit(2);
+                }
+            };
+            match graph.remove_view_member(view.id, member_kind, member_type, member_id) {
+                Ok(true) => println!(
+                    "removed {} {} {} from view {}",
+                    member_kind.as_str(),
+                    member_type.as_str(),
+                    member_id,
+                    view.name
+                ),
+                Ok(false) => println!("no such member in view {}", view.name),
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        ViewAction::Delete { name } => {
+            let view = match resolve_view(&graph, &name) {
+                Some(v) => v,
+                None => {
+                    eprintln!("error: no view named '{name}'");
+                    std::process::exit(1);
+                }
+            };
+            match graph.delete_view(view.id) {
+                Ok(true) => {
+                    // If the active view was this one, clear the pointer.
+                    if let Ok(Some(active)) = ActiveView::load(&active_path) {
+                        if active.id == view.id {
+                            let _ = ActiveView::clear(&active_path);
+                        }
+                    }
+                    println!("deleted view: {}", view.name);
+                }
+                Ok(false) => println!("no such view: {}", view.name),
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        ViewAction::Edit {
+            name,
+            description,
+            confidence_floor,
+            include_pending,
+        } => {
+            let view = match resolve_view(&graph, &name) {
+                Some(v) => v,
+                None => {
+                    eprintln!("error: no view named '{name}'");
+                    std::process::exit(1);
+                }
+            };
+            if let Err(e) = graph.update_view_metadata(
+                view.id,
+                description.as_deref(),
+                confidence_floor,
+                include_pending,
+            ) {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
+            println!("updated view: {}", view.name);
+        }
+        ViewAction::Use { name } => {
+            let view = match resolve_view(&graph, &name) {
+                Some(v) => v,
+                None => {
+                    eprintln!("error: no view named '{name}'");
+                    std::process::exit(1);
+                }
+            };
+            let active = ActiveView { id: view.id, name: view.name.clone() };
+            if let Err(e) = active.save(&active_path) {
+                eprintln!("error: failed to save active view: {e}");
+                std::process::exit(1);
+            }
+            println!("active view → {} ({})", view.name, view.id);
+        }
+        ViewAction::Current => match ActiveView::load(&active_path) {
+            Ok(Some(a)) => println!("active view: {} ({})", a.name, a.id),
+            Ok(None) => println!("no active view"),
+            Err(e) => {
+                eprintln!("error: failed to read active view: {e}");
+                std::process::exit(1);
+            }
+        },
+        ViewAction::Clear => {
+            if let Err(e) = ActiveView::clear(&active_path) {
+                eprintln!("error: failed to clear active view: {e}");
+                std::process::exit(1);
+            }
+            println!("active view cleared");
         }
     }
 }
@@ -2082,7 +3145,230 @@ fn cmd_context(data_dir: &PathBuf, db_path: &str, action: ContextAction) {
             }
             println!("active context cleared");
         }
+        ContextAction::Merge { a, b, into, json } => {
+            if let Err(e) = cmd_context_merge(db_path, &a, &b, &into, json) {
+                eprintln!("merge failed: {e}");
+                std::process::exit(1);
+            }
+        }
+        ContextAction::Split {
+            name,
+            by_entity_type,
+            into,
+            json,
+        } => {
+            if let Err(e) = cmd_context_split(db_path, &name, &by_entity_type, &into, json) {
+                eprintln!("split failed: {e}");
+                std::process::exit(1);
+            }
+        }
+        ContextAction::Snapshot { name, output } => {
+            if let Err(e) = cmd_context_snapshot(db_path, &name, output.as_deref()) {
+                eprintln!("snapshot failed: {e}");
+                std::process::exit(1);
+            }
+        }
     }
+}
+
+// ---------------------------------------------------------------------------
+// LM-14 — `tracemind context merge/split/snapshot`
+// ---------------------------------------------------------------------------
+
+/// Resolve a context name to a Context row, creating it if absent. Used
+/// by `merge --into` and `split --into` so the user doesn't have to
+/// pre-create the target.
+fn resolve_or_create_context(
+    graph: &GraphStore,
+    name: &str,
+    tags: &str,
+) -> Result<tm_graph::context::Context, String> {
+    use tm_graph::context::Context;
+    if let Some(existing) = graph
+        .get_context_by_name(name)
+        .map_err(|e| format!("lookup context '{name}': {e}"))?
+    {
+        return Ok(existing);
+    }
+    let ctx = Context::new(name.to_string(), tags.to_string());
+    graph
+        .create_context(&ctx)
+        .map_err(|e| format!("create context '{name}': {e}"))?;
+    Ok(ctx)
+}
+
+fn cmd_context_merge(
+    db_path: &str,
+    a: &str,
+    b: &str,
+    into: &str,
+    as_json: bool,
+) -> Result<(), String> {
+    let graph = GraphStore::open(db_path).map_err(|e| format!("open graph: {e}"))?;
+    let ctx_a = graph
+        .get_context_by_name(a)
+        .map_err(|e| format!("lookup '{a}': {e}"))?
+        .ok_or_else(|| format!("no context named '{a}'"))?;
+    let ctx_b = graph
+        .get_context_by_name(b)
+        .map_err(|e| format!("lookup '{b}': {e}"))?
+        .ok_or_else(|| format!("no context named '{b}'"))?;
+    let ctx_into = resolve_or_create_context(&graph, into, "")?;
+
+    let mut entities_moved = 0usize;
+    for src in [&ctx_a, &ctx_b] {
+        let rows = graph
+            .list_entities_in_context(src.id)
+            .map_err(|e| format!("list entities in '{}': {e}", src.name))?;
+        for e in rows {
+            graph
+                .set_entity_context(e.id, Some(ctx_into.id))
+                .map_err(|err| format!("move entity {}: {err}", e.id))?;
+            entities_moved += 1;
+        }
+    }
+    let mut triples_moved = 0usize;
+    for src in [&ctx_a, &ctx_b] {
+        let rows = graph
+            .list_triples_in_context(src.id)
+            .map_err(|e| format!("list triples in '{}': {e}", src.name))?;
+        for t in rows {
+            graph
+                .set_triple_context(t.id, Some(ctx_into.id))
+                .map_err(|err| format!("move triple {}: {err}", t.id))?;
+            triples_moved += 1;
+        }
+    }
+
+    if as_json {
+        let payload = serde_json::json!({
+            "merged_from": [
+                { "name": a, "id": ctx_a.id.to_string() },
+                { "name": b, "id": ctx_b.id.to_string() }
+            ],
+            "merged_into": { "name": into, "id": ctx_into.id.to_string() },
+            "entities_moved": entities_moved,
+            "triples_moved": triples_moved,
+        });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&payload).map_err(|e| format!("serialize: {e}"))?
+        );
+    } else {
+        println!(
+            "merged '{a}' ({}) + '{b}' ({}) → '{into}' ({})",
+            ctx_a.id, ctx_b.id, ctx_into.id
+        );
+        println!("  {entities_moved} entit{}, {triples_moved} triple{}",
+            if entities_moved == 1 { "y" } else { "ies" },
+            if triples_moved == 1 { "" } else { "s" });
+    }
+    Ok(())
+}
+
+fn cmd_context_split(
+    db_path: &str,
+    name: &str,
+    by_entity_type: &str,
+    into: &str,
+    as_json: bool,
+) -> Result<(), String> {
+    let graph = GraphStore::open(db_path).map_err(|e| format!("open graph: {e}"))?;
+    let ctx_src = graph
+        .get_context_by_name(name)
+        .map_err(|e| format!("lookup '{name}': {e}"))?
+        .ok_or_else(|| format!("no context named '{name}'"))?;
+    let ctx_into = resolve_or_create_context(&graph, into, "")?;
+    if ctx_into.id == ctx_src.id {
+        return Err(format!("--into '{into}' must differ from source '{name}'"));
+    }
+
+    let needle = by_entity_type.trim().to_ascii_lowercase();
+
+    let rows = graph
+        .list_entities_in_context(ctx_src.id)
+        .map_err(|e| format!("list entities: {e}"))?;
+    let mut moved_ids: Vec<Uuid> = Vec::new();
+    for e in &rows {
+        if e.entity_type.to_string().to_ascii_lowercase() == needle {
+            graph
+                .set_entity_context(e.id, Some(ctx_into.id))
+                .map_err(|err| format!("move entity {}: {err}", e.id))?;
+            moved_ids.push(e.id);
+        }
+    }
+
+    // Move every triple whose subject moved with the entity; this keeps
+    // each entity's outgoing edges co-located with the entity itself.
+    let mut triples_moved = 0usize;
+    let src_triples = graph
+        .list_triples_in_context(ctx_src.id)
+        .map_err(|e| format!("list triples: {e}"))?;
+    let moved_set: std::collections::HashSet<Uuid> = moved_ids.iter().copied().collect();
+    for t in &src_triples {
+        if moved_set.contains(&t.subject_id) {
+            graph
+                .set_triple_context(t.id, Some(ctx_into.id))
+                .map_err(|err| format!("move triple {}: {err}", t.id))?;
+            triples_moved += 1;
+        }
+    }
+
+    if as_json {
+        let payload = serde_json::json!({
+            "split_from": { "name": name, "id": ctx_src.id.to_string() },
+            "split_into": { "name": into, "id": ctx_into.id.to_string() },
+            "by_entity_type": by_entity_type,
+            "entities_moved": moved_ids.len(),
+            "triples_moved": triples_moved,
+        });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&payload).map_err(|e| format!("serialize: {e}"))?
+        );
+    } else {
+        println!(
+            "split '{name}' ({}) by entity_type='{by_entity_type}' → '{into}' ({})",
+            ctx_src.id, ctx_into.id
+        );
+        println!(
+            "  {} entit{} moved, {} triple{} moved",
+            moved_ids.len(),
+            if moved_ids.len() == 1 { "y" } else { "ies" },
+            triples_moved,
+            if triples_moved == 1 { "" } else { "s" },
+        );
+    }
+    Ok(())
+}
+
+fn cmd_context_snapshot(
+    db_path: &str,
+    name: &str,
+    output: Option<&str>,
+) -> Result<(), String> {
+    let graph = GraphStore::open(db_path).map_err(|e| format!("open graph: {e}"))?;
+    let ctx = graph
+        .get_context_by_name(name)
+        .map_err(|e| format!("lookup '{name}': {e}"))?
+        .ok_or_else(|| format!("no context named '{name}'"))?;
+    let snapshot = graph
+        .snapshot_context(&ctx)
+        .map_err(|e| format!("snapshot '{name}': {e}"))?;
+
+    let default_path = format!("{name}.tmctx");
+    let out_path = output.unwrap_or(&default_path);
+    let pretty = serde_json::to_string_pretty(&snapshot)
+        .map_err(|e| format!("serialize snapshot: {e}"))?;
+    fs::write(out_path, pretty).map_err(|e| format!("write {out_path}: {e}"))?;
+
+    let n_ent = snapshot["counts"]["entities"].as_u64().unwrap_or(0);
+    let n_tri = snapshot["counts"]["triples"].as_u64().unwrap_or(0);
+    println!(
+        "wrote snapshot: {out_path}  ({n_ent} entities, {n_tri} triples, context {})",
+        ctx.id
+    );
+    Ok(())
 }
 
 /// `tracemind models …` handler. Reports tier-1 weight status and (when the
@@ -2196,6 +3482,10 @@ fn cmd_ask(
     trace_path: &str,
     hash_embed: bool,
     cross_context: bool,
+    view_name: Option<&str>,
+    include_entity: &[String],
+    exclude_entity: &[String],
+    data_dir: &PathBuf,
 ) {
     use tm_answer::{AnswerRequest, AnswerTier, TaskKind};
 
@@ -2241,6 +3531,15 @@ fn cmd_ask(
         .expect("failed to open retrieval engine")
         .with_reranker_instance(reranker);
     engine.set_cross_context(cross_context);
+    if let Some(filter) = resolve_view_filter(
+        data_dir,
+        db_path,
+        view_name,
+        include_entity,
+        exclude_entity,
+    ) {
+        engine.set_view_filter(Some(filter));
+    }
     let result = engine.query(text).expect("query failed");
 
     let answerer = answerer::build_answerer();
@@ -2447,6 +3746,185 @@ fn export_yaml_scalar(s: &str) -> String {
     format!("'{}'", escaped)
 }
 
+/// LM-19: scrub PII from a free-form string before it lands in the
+/// export bundle. We mirror the patterns that `tm-governance` *detects*
+/// (email, US phone, SSN, 16-digit credit card) and replace each match
+/// with a stable placeholder. This is best-effort: governance already
+/// prevents PII from entering the graph in the first place, but we
+/// re-scrub here because:
+///   1. Older databases predate the governance gate.
+///   2. Entity *names* (e.g. "Alice <alice@acme.com>") can carry an
+///      email that the gate may have admitted as a contact handle.
+///   3. Users sharing a bundle deserve a "no surprises" guarantee.
+///
+/// When `redact` is false this is a zero-cost passthrough.
+fn export_redact(s: &str, redact: bool) -> String {
+    if !redact || s.is_empty() {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len());
+
+    // Walk char-by-char. At each position we try (in order):
+    //   - email starting at this position
+    //   - US phone starting at this position
+    //   - SSN (DDD-DD-DDDD)
+    //   - 16-digit credit card (digits + spaces/dashes allowed)
+    // First match wins; otherwise emit the char and advance by 1.
+    let bytes = s.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if let Some(end) = match_email(s, i) {
+            out.push_str("[REDACTED-EMAIL]");
+            i = end;
+            continue;
+        }
+        if let Some(end) = match_ssn(s, i) {
+            out.push_str("[REDACTED-SSN]");
+            i = end;
+            continue;
+        }
+        if let Some(end) = match_credit_card(s, i) {
+            out.push_str("[REDACTED-CC]");
+            i = end;
+            continue;
+        }
+        if let Some(end) = match_phone(s, i) {
+            out.push_str("[REDACTED-PHONE]");
+            i = end;
+            continue;
+        }
+        // Push one UTF-8 char.
+        let ch = s[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
+/// Try to match an email starting at byte offset `pos`. Returns the
+/// end-byte-index on success.
+fn match_email(s: &str, pos: usize) -> Option<usize> {
+    let bytes = s.as_bytes();
+    // Local part: at least one of [A-Za-z0-9._%+-].
+    let mut end = pos;
+    while end < bytes.len() {
+        let c = bytes[end];
+        let ok = c.is_ascii_alphanumeric()
+            || matches!(c, b'.' | b'_' | b'%' | b'+' | b'-');
+        if !ok { break; }
+        end += 1;
+    }
+    if end == pos { return None; }
+    if end >= bytes.len() || bytes[end] != b'@' { return None; }
+    let at = end;
+    end += 1; // past '@'
+    // Domain: [A-Za-z0-9.-]+
+    let dom_start = end;
+    while end < bytes.len() {
+        let c = bytes[end];
+        if c.is_ascii_alphanumeric() || c == b'.' || c == b'-' { end += 1; } else { break; }
+    }
+    let domain = &s[dom_start..end];
+    if let Some(dot) = domain.rfind('.') {
+        if dot > 0 && domain.len() - dot - 1 >= 2 {
+            // Need at least one char before '@'.
+            if at > pos {
+                return Some(end);
+            }
+        }
+    }
+    None
+}
+
+/// SSN: DDD-DD-DDDD with no adjacent digits.
+fn match_ssn(s: &str, pos: usize) -> Option<usize> {
+    let bytes = s.as_bytes();
+    if pos + 11 > bytes.len() { return None; }
+    let slice = &bytes[pos..pos + 11];
+    let pat = [
+        slice[0].is_ascii_digit(), slice[1].is_ascii_digit(), slice[2].is_ascii_digit(),
+        slice[3] == b'-',
+        slice[4].is_ascii_digit(), slice[5].is_ascii_digit(),
+        slice[6] == b'-',
+        slice[7].is_ascii_digit(), slice[8].is_ascii_digit(),
+        slice[9].is_ascii_digit(), slice[10].is_ascii_digit(),
+    ];
+    if pat.iter().all(|b| *b) {
+        // Word boundary check on either side.
+        let before_ok = pos == 0 || !bytes[pos - 1].is_ascii_digit();
+        let after_ok = pos + 11 == bytes.len() || !bytes[pos + 11].is_ascii_digit();
+        if before_ok && after_ok {
+            return Some(pos + 11);
+        }
+    }
+    None
+}
+
+/// Credit card: 16 consecutive digits allowing spaces/dashes as
+/// separators. Returns the end position of the match (including
+/// separators).
+fn match_credit_card(s: &str, pos: usize) -> Option<usize> {
+    let bytes = s.as_bytes();
+    if pos >= bytes.len() || !bytes[pos].is_ascii_digit() {
+        return None;
+    }
+    let mut digits = 0usize;
+    let mut end = pos;
+    while end < bytes.len() && digits < 16 {
+        let c = bytes[end];
+        if c.is_ascii_digit() {
+            digits += 1;
+            end += 1;
+        } else if c == b' ' || c == b'-' {
+            end += 1;
+        } else {
+            break;
+        }
+    }
+    if digits == 16 {
+        // Word boundary: next char (if any) must not be a digit.
+        let after_ok = end == bytes.len() || !bytes[end].is_ascii_digit();
+        if after_ok {
+            return Some(end);
+        }
+    }
+    None
+}
+
+/// US phone: optional `+1`, then 10 digits with `-`, `.`, space, or
+/// `()` separators tolerated.
+fn match_phone(s: &str, pos: usize) -> Option<usize> {
+    let bytes = s.as_bytes();
+    let mut end = pos;
+    // Optional +1 prefix.
+    if end + 1 < bytes.len() && bytes[end] == b'+' && bytes[end + 1] == b'1' {
+        end += 2;
+        while end < bytes.len() && matches!(bytes[end], b' ' | b'-' | b'.') {
+            end += 1;
+        }
+    }
+    let mut digits = 0usize;
+    let mut k = end;
+    while k < bytes.len() && digits < 10 {
+        let c = bytes[k];
+        if c.is_ascii_digit() {
+            digits += 1;
+            k += 1;
+        } else if matches!(c, b' ' | b'-' | b'.' | b'(' | b')') {
+            k += 1;
+        } else {
+            break;
+        }
+    }
+    if digits == 10 {
+        let after_ok = k == bytes.len() || !bytes[k].is_ascii_digit();
+        if after_ok {
+            return Some(k);
+        }
+    }
+    None
+}
+
 /// Resolve a `--context` argument (name *or* UUID string) to a stored
 /// Context. Returns `Ok(None)` if the argument is `None` and the caller
 /// did not pass a filter. Returns `Err` if the argument was provided but
@@ -2476,12 +3954,15 @@ fn export_resolve_context(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_export(
     db_path: &str,
     context_arg: Option<&str>,
     format: &str,
     output: &std::path::Path,
     view: Option<&str>,
+    entity_arg: Option<&str>,
+    redact: bool,
     limit: Option<usize>,
 ) -> Result<(), String> {
     if format != "markdown" {
@@ -2489,17 +3970,26 @@ fn cmd_export(
             "unsupported --format '{format}' (only 'markdown' is implemented today)"
         ));
     }
-    if let Some(v) = view {
-        // LM-11f Memory Views is a separately-tracked task. Reject
-        // explicitly rather than silently ignore — investors using the
-        // bundle to validate "memory is portable" deserve a clear signal
-        // that the named view didn't actually get applied.
-        return Err(format!(
-            "--view '{v}' is not yet wired up (Memory Views land in LM-11f)"
-        ));
-    }
 
     let graph = GraphStore::open(db_path).map_err(|e| format!("open graph: {e}"))?;
+
+    // LM-11f Memory Views — resolve a named view to its ViewFilter so
+    // include/exclude entity & context lists apply during export. The
+    // bundle is the durable artefact users hand off, so the filter has
+    // to be honoured here just like at query time.
+    let view_filter: Option<tm_graph::ViewFilter> = match view {
+        None => None,
+        Some(name) => {
+            let v = graph
+                .get_view_by_name(name)
+                .map_err(|e| format!("lookup view '{name}': {e}"))?
+                .ok_or_else(|| format!("no view named '{name}'"))?;
+            let f = graph
+                .load_view_filter(v.id)
+                .map_err(|e| format!("load view '{name}': {e}"))?;
+            Some(f)
+        }
+    };
 
     let ctx_filter = export_resolve_context(&graph, context_arg)?;
 
@@ -2519,6 +4009,51 @@ fn cmd_export(
         });
     }
 
+    // LM-11f apply view filter on entities.
+    if let Some(ref vf) = view_filter {
+        entities.retain(|e| {
+            let ctx = graph.entity_context_id(e.id).ok().flatten();
+            !vf.rejects_entity(e.id, ctx)
+        });
+    }
+
+    // LM-18 --entity: keep only the named entity + its 1-hop neighbours.
+    // Accepts either a UUID or an exact name (case-insensitive). We
+    // expand the neighbour set *before* the limit so the slice always
+    // includes the focal entity even if it has many hops.
+    if let Some(arg) = entity_arg {
+        let focal_id: Uuid = if let Ok(id) = Uuid::parse_str(arg) {
+            // Make sure the UUID actually exists.
+            graph
+                .get_entity(id)
+                .map_err(|_| format!("no entity with id '{arg}'"))?;
+            id
+        } else {
+            let ent = graph
+                .find_entity_by_name_icase(arg)
+                .map_err(|e| format!("lookup entity '{arg}': {e}"))?
+                .ok_or_else(|| format!("no entity named '{arg}'"))?;
+            ent.id
+        };
+
+        let triples = graph
+            .get_triples_for_entity(focal_id)
+            .map_err(|e| format!("neighbours for {focal_id}: {e}"))?;
+        let mut keep: std::collections::HashSet<Uuid> =
+            std::collections::HashSet::new();
+        keep.insert(focal_id);
+        for t in &triples {
+            keep.insert(t.subject_id);
+            keep.insert(t.object_id);
+        }
+        entities.retain(|e| keep.contains(&e.id));
+        if entities.is_empty() {
+            return Err(format!(
+                "--entity '{arg}' resolved to {focal_id} but no entities remain after other filters"
+            ));
+        }
+    }
+
     // Sort by updated_at desc so `--limit` keeps the most recent slice.
     entities.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
     if let Some(n) = limit {
@@ -2528,12 +4063,20 @@ fn cmd_export(
     // Build a slug map up-front, disambiguating collisions with a
     // short-id suffix. We need stable slugs *before* writing any file so
     // that `[[wikilinks]]` between entities resolve correctly.
+    //
+    // LM-19: when `--redact` is set we slug from the *scrubbed* display
+    // name so an email like "alice@acme.com" doesn't leak through the
+    // filename. Disambiguation by UUID suffix is what keeps slugs unique
+    // when many names redact to the same placeholder.
     let mut slug_for: std::collections::HashMap<Uuid, String> =
+        std::collections::HashMap::with_capacity(entities.len());
+    let mut display_name: std::collections::HashMap<Uuid, String> =
         std::collections::HashMap::with_capacity(entities.len());
     let mut used: std::collections::HashSet<String> =
         std::collections::HashSet::with_capacity(entities.len());
     for e in &entities {
-        let base = export_slug(&e.name);
+        let shown = export_redact(&e.name, redact);
+        let base = export_slug(&shown);
         let mut slug = base.clone();
         if used.contains(&slug) {
             // Disambiguate with the first 8 chars of the UUID — enough
@@ -2543,6 +4086,7 @@ fn cmd_export(
         }
         used.insert(slug.clone());
         slug_for.insert(e.id, slug);
+        display_name.insert(e.id, shown);
     }
 
     // Compute backlinks: for each entity, the set of (other_entity_id,
@@ -2558,7 +4102,9 @@ fn cmd_export(
     fs::create_dir_all(&entities_dir)
         .map_err(|e| format!("mkdir {}: {e}", entities_dir.display()))?;
 
-    // First pass: build backlink map.
+    // First pass: build backlink map. Triples that the view filter
+    // rejects must not appear as backlinks either, otherwise the
+    // bundle would expose the excluded edge indirectly.
     for e in &entities {
         let triples = graph
             .get_triples_for_entity(e.id)
@@ -2574,6 +4120,11 @@ fn cmd_export(
             // Skip self-loops in the backlinks panel.
             if t.object_id == e.id {
                 continue;
+            }
+            if let Some(ref vf) = view_filter {
+                if vf.rejects_triple(t.id, t.confidence) {
+                    continue;
+                }
             }
             backlinks
                 .entry(t.object_id)
@@ -2593,16 +4144,24 @@ fn cmd_export(
         let slug = slug_for.get(&e.id).cloned().unwrap_or_else(|| "entity".into());
         let file_path = entities_dir.join(format!("{slug}.md"));
 
+        let shown_name = display_name
+            .get(&e.id)
+            .cloned()
+            .unwrap_or_else(|| export_redact(&e.name, redact));
+
         let mut body = String::new();
         body.push_str("---\n");
         body.push_str(&format!("id: '{}'\n", e.id));
-        body.push_str(&format!("name: {}\n", export_yaml_scalar(&e.name)));
+        body.push_str(&format!("name: {}\n", export_yaml_scalar(&shown_name)));
         body.push_str(&format!("type: {}\n", export_yaml_scalar(&e.entity_type.to_string())));
         body.push_str(&format!("confidence: {:.4}\n", e.confidence));
         body.push_str(&format!("created_at: '{}'\n", e.created_at.to_rfc3339()));
         body.push_str(&format!("updated_at: '{}'\n", e.updated_at.to_rfc3339()));
         if let Some(src) = &e.source_id {
-            body.push_str(&format!("source_id: {}\n", export_yaml_scalar(src)));
+            body.push_str(&format!(
+                "source_id: {}\n",
+                export_yaml_scalar(&export_redact(src, redact))
+            ));
         }
         if let Ok(Some(ctx_id)) = graph.entity_context_id(e.id) {
             body.push_str(&format!("context_id: '{}'\n", ctx_id));
@@ -2611,9 +4170,12 @@ fn cmd_export(
             "tags: ['tracemind', 'entity/{}']\n",
             e.entity_type.to_string().to_lowercase()
         ));
+        if redact {
+            body.push_str("redacted: true\n");
+        }
         body.push_str("---\n\n");
 
-        body.push_str(&format!("# {}\n\n", e.name));
+        body.push_str(&format!("# {}\n\n", shown_name));
         body.push_str(&format!(
             "Type: **{}**  ·  Confidence: **{:.2}**\n\n",
             e.entity_type, e.confidence
@@ -2626,7 +4188,18 @@ fn cmd_export(
         let mut outgoing: Vec<&tm_types::Triple> = triples
             .iter()
             .filter(|t| {
-                t.subject_id == e.id && !matches!(t.predicate, tm_types::Predicate::RelatedTo)
+                if t.subject_id != e.id {
+                    return false;
+                }
+                if matches!(t.predicate, tm_types::Predicate::RelatedTo) {
+                    return false;
+                }
+                if let Some(ref vf) = view_filter {
+                    if vf.rejects_triple(t.id, t.confidence) {
+                        return false;
+                    }
+                }
+                true
             })
             .collect();
         outgoing.sort_by(|a, b| {
@@ -2638,27 +4211,33 @@ fn cmd_export(
         if !outgoing.is_empty() {
             body.push_str("## Relations\n\n");
             for t in &outgoing {
-                let target_name = match slug_for.get(&t.object_id) {
-                    Some(s) => s.clone(),
+                let target_slug = slug_for.get(&t.object_id).cloned();
+                let target_display = match target_slug {
+                    Some(slug) => {
+                        let target_human = display_name
+                            .get(&t.object_id)
+                            .cloned()
+                            .unwrap_or_else(|| {
+                                graph
+                                    .get_entity(t.object_id)
+                                    .map(|x| export_redact(&x.name, redact))
+                                    .unwrap_or_else(|_| slug.clone())
+                            });
+                        format!("[[{slug}|{target_human}]]")
+                    }
                     None => {
                         // Target entity wasn't in our exported set (e.g.
                         // filtered out by context). Fall back to fetching
                         // its name; render as plain text rather than a
                         // dangling wikilink.
                         match graph.get_entity(t.object_id) {
-                            Ok(ent) => format!("`{}` _(not exported)_", ent.name),
+                            Ok(ent) => format!(
+                                "`{}` _(not exported)_",
+                                export_redact(&ent.name, redact)
+                            ),
                             Err(_) => format!("`<unknown {}>`", t.object_id),
                         }
                     }
-                };
-                let target_display = if slug_for.contains_key(&t.object_id) {
-                    let target_human = graph
-                        .get_entity(t.object_id)
-                        .map(|x| x.name)
-                        .unwrap_or_else(|_| target_name.clone());
-                    format!("[[{target_name}|{target_human}]]")
-                } else {
-                    target_name
                 };
                 body.push_str(&format!(
                     "- **{}** → {} _(conf {:.2})_\n",
@@ -2678,10 +4257,15 @@ fn cmd_export(
                     .get(src_id)
                     .cloned()
                     .unwrap_or_else(|| src_id.to_string());
-                let src_human = graph
-                    .get_entity(*src_id)
-                    .map(|x| x.name)
-                    .unwrap_or_else(|_| src_slug.clone());
+                let src_human = display_name
+                    .get(src_id)
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        graph
+                            .get_entity(*src_id)
+                            .map(|x| export_redact(&x.name, redact))
+                            .unwrap_or_else(|_| src_slug.clone())
+                    });
                 body.push_str(&format!("- [[{src_slug}|{src_human}]] — **{pred}**\n"));
             }
             body.push('\n');
@@ -2701,6 +4285,15 @@ fn cmd_export(
         index.push_str(&format!("context: {}\n", export_yaml_scalar(&c.name)));
         index.push_str(&format!("context_id: '{}'\n", c.id));
     }
+    if let Some(v) = view {
+        index.push_str(&format!("view: {}\n", export_yaml_scalar(v)));
+    }
+    if let Some(arg) = entity_arg {
+        index.push_str(&format!("entity_filter: {}\n", export_yaml_scalar(arg)));
+    }
+    if redact {
+        index.push_str("redacted: true\n");
+    }
     index.push_str(&format!("entity_count: {}\n", written));
     index.push_str("---\n\n");
     index.push_str("# TraceMind export\n\n");
@@ -2708,19 +4301,37 @@ fn cmd_export(
         Some(c) => index.push_str(&format!("Filtered to context **{}**.\n\n", c.name)),
         None => index.push_str("All contexts included.\n\n"),
     }
+    if let Some(v) = view {
+        index.push_str(&format!("View: **{v}**.\n\n"));
+    }
+    if let Some(arg) = entity_arg {
+        index.push_str(&format!("Entity filter: **{arg}** (+ 1-hop neighbours).\n\n"));
+    }
+    if redact {
+        index.push_str("PII redacted: emails, phone numbers, SSNs, credit-card numbers replaced with placeholders.\n\n");
+    }
     index.push_str(&format!("- Entities: **{}**\n", written));
     if let (Some(e), Some(l)) = (earliest, latest) {
         index.push_str(&format!("- Earliest: {}\n", e.to_rfc3339()));
         index.push_str(&format!("- Latest:   {}\n", l.to_rfc3339()));
     }
     index.push_str("\n## Entities\n\n");
-    // Stable alpha-sort for the index so diffs between exports stay
-    // small.
+    // Stable alpha-sort by the displayed (possibly redacted) name so
+    // diffs between exports stay small *and* don't leak ordering by
+    // PII.
     let mut sorted: Vec<&tm_types::Entity> = entities.iter().collect();
-    sorted.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    sorted.sort_by(|a, b| {
+        let an = display_name.get(&a.id).map(|s| s.as_str()).unwrap_or(&a.name);
+        let bn = display_name.get(&b.id).map(|s| s.as_str()).unwrap_or(&b.name);
+        an.to_lowercase().cmp(&bn.to_lowercase())
+    });
     for e in &sorted {
         let slug = slug_for.get(&e.id).cloned().unwrap_or_default();
-        index.push_str(&format!("- [[{slug}|{}]] — {}\n", e.name, e.entity_type));
+        let shown = display_name
+            .get(&e.id)
+            .cloned()
+            .unwrap_or_else(|| export_redact(&e.name, redact));
+        index.push_str(&format!("- [[{slug}|{shown}]] — {}\n", e.entity_type));
     }
     let index_path = output.join("index.md");
     fs::write(&index_path, index)
@@ -2892,7 +4503,7 @@ fn print_trace_detail(trace: &tm_types::Trace, db_path: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::{cmd_export, export_slug, export_yaml_scalar, strip_md_frontmatter};
+    use super::{cmd_export, export_redact, export_slug, export_yaml_scalar, strip_md_frontmatter};
     use tm_graph::GraphStore;
     use tm_types::{Entity, EntityType, Predicate, Triple};
 
@@ -2939,7 +4550,7 @@ mod tests {
         }
 
         let out_dir = tmp.join("bundle");
-        cmd_export(&db, None, "markdown", &out_dir, None, None)
+        cmd_export(&db, None, "markdown", &out_dir, None, None, false, None)
             .expect("export ok");
 
         let index = std::fs::read_to_string(out_dir.join("index.md")).expect("index.md");
@@ -2969,7 +4580,7 @@ mod tests {
             let _ = GraphStore::open(&db).expect("open graph");
         }
         let out_dir = tmp.join("bundle");
-        let err = cmd_export(&db, None, "json", &out_dir, None, None)
+        let err = cmd_export(&db, None, "json", &out_dir, None, None, false, None)
             .expect_err("must reject json");
         assert!(err.contains("unsupported --format"), "got: {err}");
     }
@@ -2982,22 +4593,235 @@ mod tests {
             let _ = GraphStore::open(&db).expect("open graph");
         }
         let out_dir = tmp.join("bundle");
-        let err = cmd_export(&db, Some("no-such-context"), "markdown", &out_dir, None, None)
-            .expect_err("must reject unknown context");
+        let err = cmd_export(
+            &db,
+            Some("no-such-context"),
+            "markdown",
+            &out_dir,
+            None,
+            None,
+            false,
+            None,
+        )
+        .expect_err("must reject unknown context");
         assert!(err.contains("no context named"), "got: {err}");
     }
 
     #[test]
-    fn export_view_flag_rejected_as_stub() {
+    fn export_view_unknown_rejected() {
         let tmp = tempdir_for_test("tm-cli-export-view");
         let db = tmp.join("memory.db").to_string_lossy().to_string();
         {
             let _ = GraphStore::open(&db).expect("open graph");
         }
         let out_dir = tmp.join("bundle");
-        let err = cmd_export(&db, None, "markdown", &out_dir, Some("focus-1-2-3"), None)
-            .expect_err("must reject --view stub");
-        assert!(err.contains("Memory Views"), "got: {err}");
+        let err = cmd_export(
+            &db,
+            None,
+            "markdown",
+            &out_dir,
+            Some("focus-1-2-3"),
+            None,
+            false,
+            None,
+        )
+        .expect_err("must reject unknown view");
+        assert!(err.contains("no view named"), "got: {err}");
+    }
+
+    /// LM-11f: when a Memory View excludes an entity, the export
+    /// bundle must not contain that entity's file or any backlink
+    /// referencing it.
+    #[test]
+    fn export_with_view_excludes_entities() {
+        use tm_graph::memory_view::{MemberKind, MemberType, MemoryView};
+        let tmp = tempdir_for_test("tm-cli-export-view-filter");
+        let db = tmp.join("memory.db").to_string_lossy().to_string();
+        let (alice_id, _acme_id) = {
+            let graph = GraphStore::open(&db).expect("open graph");
+            let alice = Entity::new("Alice", EntityType::Person, 0.95);
+            let acme = Entity::new("Acme Corp", EntityType::Organization, 0.9);
+            graph.upsert_entity(&alice).expect("alice");
+            graph.upsert_entity(&acme).expect("acme");
+            let t = Triple::new(alice.id, Predicate::WorksAt, acme.id, 0.88);
+            graph.upsert_triple(&t).expect("triple");
+            // Create a view that excludes Alice.
+            let view = MemoryView::new("acme-only", "exclude alice");
+            graph.create_view(&view).expect("create view");
+            graph
+                .add_view_member(
+                    view.id,
+                    MemberKind::Exclude,
+                    MemberType::Entity,
+                    alice.id,
+                )
+                .expect("add member");
+            (alice.id, acme.id)
+        };
+
+        let out_dir = tmp.join("bundle");
+        cmd_export(
+            &db,
+            None,
+            "markdown",
+            &out_dir,
+            Some("acme-only"),
+            None,
+            false,
+            None,
+        )
+        .expect("export ok");
+
+        let index = std::fs::read_to_string(out_dir.join("index.md")).expect("index");
+        assert!(index.contains("view: 'acme-only'"), "view tag in frontmatter: {index}");
+        assert!(index.contains("entity_count: 1"), "count is 1: {index}");
+        assert!(!out_dir.join("entities/alice.md").exists(), "alice.md must not exist");
+        assert!(out_dir.join("entities/acme-corp.md").exists(), "acme-corp.md exists");
+        let acme_md = std::fs::read_to_string(out_dir.join("entities/acme-corp.md"))
+            .expect("acme-corp.md");
+        assert!(
+            !acme_md.contains("Alice"),
+            "no Alice backlink should be present: {acme_md}"
+        );
+        // alice_id is unused beyond ensuring the entity exists; reference
+        // it so the binding doesn't trigger an unused-variable warning.
+        let _ = alice_id;
+    }
+
+    /// LM-18: `--entity` keeps only the named entity and its 1-hop
+    /// neighbours. Other entities are dropped from the bundle.
+    #[test]
+    fn export_entity_keeps_only_1hop_neighbours() {
+        let tmp = tempdir_for_test("tm-cli-export-entity");
+        let db = tmp.join("memory.db").to_string_lossy().to_string();
+        {
+            let graph = GraphStore::open(&db).expect("open graph");
+            let alice = Entity::new("Alice", EntityType::Person, 0.95);
+            let acme = Entity::new("Acme Corp", EntityType::Organization, 0.9);
+            let bob = Entity::new("Bob", EntityType::Person, 0.9);
+            graph.upsert_entity(&alice).expect("alice");
+            graph.upsert_entity(&acme).expect("acme");
+            graph.upsert_entity(&bob).expect("bob");
+            let t = Triple::new(alice.id, Predicate::WorksAt, acme.id, 0.88);
+            graph.upsert_triple(&t).expect("triple");
+            // Bob has no edges → must be dropped under --entity Alice.
+        }
+
+        let out_dir = tmp.join("bundle");
+        cmd_export(
+            &db,
+            None,
+            "markdown",
+            &out_dir,
+            None,
+            Some("Alice"),
+            false,
+            None,
+        )
+        .expect("export ok");
+
+        let index = std::fs::read_to_string(out_dir.join("index.md")).expect("index");
+        assert!(index.contains("entity_filter: 'Alice'"), "filter tag in fm: {index}");
+        assert!(index.contains("entity_count: 2"), "count is 2 (alice + acme): {index}");
+        assert!(out_dir.join("entities/alice.md").exists(), "alice.md kept");
+        assert!(out_dir.join("entities/acme-corp.md").exists(), "acme-corp.md kept");
+        assert!(!out_dir.join("entities/bob.md").exists(), "bob.md dropped");
+    }
+
+    /// LM-18: unknown `--entity` argument is a hard error.
+    #[test]
+    fn export_entity_unknown_rejected() {
+        let tmp = tempdir_for_test("tm-cli-export-entity-unknown");
+        let db = tmp.join("memory.db").to_string_lossy().to_string();
+        {
+            let _ = GraphStore::open(&db).expect("open graph");
+        }
+        let out_dir = tmp.join("bundle");
+        let err = cmd_export(
+            &db,
+            None,
+            "markdown",
+            &out_dir,
+            None,
+            Some("Nobody"),
+            false,
+            None,
+        )
+        .expect_err("must reject unknown entity");
+        assert!(err.contains("no entity"), "got: {err}");
+    }
+
+    /// LM-19: redact pure pattern coverage.
+    #[test]
+    fn redact_scrubs_pii_patterns() {
+        assert_eq!(
+            export_redact("contact alice@acme.com please", true),
+            "contact [REDACTED-EMAIL] please"
+        );
+        assert_eq!(
+            export_redact("ssn 123-45-6789 is private", true),
+            "ssn [REDACTED-SSN] is private"
+        );
+        assert_eq!(
+            export_redact("call +1 415-555-0123 now", true),
+            "call [REDACTED-PHONE] now"
+        );
+        assert_eq!(
+            export_redact("card 4111 1111 1111 1111 expired", true),
+            "card [REDACTED-CC] expired"
+        );
+        // Passthrough.
+        assert_eq!(export_redact("nothing to scrub here", true), "nothing to scrub here");
+        // redact=false is a no-op.
+        assert_eq!(
+            export_redact("alice@acme.com", false),
+            "alice@acme.com"
+        );
+    }
+
+    /// LM-19: when `--redact` is set the bundle must not leak the
+    /// original email out of an entity name.
+    #[test]
+    fn export_with_redact_scrubs_entity_names() {
+        let tmp = tempdir_for_test("tm-cli-export-redact");
+        let db = tmp.join("memory.db").to_string_lossy().to_string();
+        {
+            let graph = GraphStore::open(&db).expect("open graph");
+            let alice = Entity::new(
+                "Alice <alice@acme.com>",
+                EntityType::Person,
+                0.95,
+            );
+            graph.upsert_entity(&alice).expect("alice");
+        }
+        let out_dir = tmp.join("bundle");
+        cmd_export(
+            &db,
+            None,
+            "markdown",
+            &out_dir,
+            None,
+            None,
+            true,
+            None,
+        )
+        .expect("export ok");
+        let index = std::fs::read_to_string(out_dir.join("index.md")).expect("index");
+        assert!(index.contains("redacted: true"), "redacted flag: {index}");
+        assert!(!index.contains("alice@acme.com"), "raw email leaked: {index}");
+        assert!(index.contains("[REDACTED-EMAIL]"), "placeholder shown: {index}");
+        // Read the only entity file (slug derives from the redacted
+        // name, which collapses to something containing "redacted").
+        let entities_dir = out_dir.join("entities");
+        let mut files = std::fs::read_dir(&entities_dir)
+            .expect("read entities dir")
+            .map(|e| e.expect("dirent").path())
+            .collect::<Vec<_>>();
+        files.sort();
+        assert_eq!(files.len(), 1, "exactly one entity file");
+        let body = std::fs::read_to_string(&files[0]).expect("body");
+        assert!(!body.contains("alice@acme.com"), "raw email leaked in body: {body}");
+        assert!(body.contains("[REDACTED-EMAIL]"), "placeholder in body: {body}");
     }
 
     /// Build a uniquely-named directory under the OS temp dir. Avoids
@@ -3047,6 +4871,202 @@ mod tests {
     fn fence_inside_body_not_consumed() {
         let s = "no frontmatter\n---\nseparator\n---\nmore";
         assert_eq!(strip_md_frontmatter(s), s);
+    }
+
+    // -----------------------------------------------------------------
+    // LM-5c — DailyNote / `tracemind today`
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn today_creates_daily_note_idempotently() {
+        use super::cmd_today;
+        use chrono::Local;
+        let tmp = tempdir_for_test("tm-cli-today-idem");
+        let db = tmp.join("memory.db").to_string_lossy().to_string();
+        {
+            let _ = GraphStore::open(&db).expect("open graph");
+        }
+        let date = Local::now().date_naive().format("%Y-%m-%d").to_string();
+
+        // First run creates the entity.
+        cmd_today(&db, Some(&date), false).expect("first run");
+        let graph = GraphStore::open(&db).expect("reopen");
+        let first = graph
+            .find_entity_by_name_icase(&date)
+            .expect("lookup")
+            .expect("daily note exists");
+        assert_eq!(first.entity_type, EntityType::DailyNote);
+
+        // Second run should upsert — same id, still a DailyNote.
+        drop(graph);
+        cmd_today(&db, Some(&date), false).expect("second run");
+        let graph = GraphStore::open(&db).expect("reopen 2");
+        let second = graph
+            .find_entity_by_name_icase(&date)
+            .expect("lookup 2")
+            .expect("daily note still exists");
+        assert_eq!(second.id, first.id, "daily note must be idempotent");
+    }
+
+    // -----------------------------------------------------------------
+    // LM-14 — context merge / split / snapshot
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn context_merge_relabels_entities_and_triples() {
+        use super::cmd_context_merge;
+        use tm_graph::context::Context;
+        let tmp = tempdir_for_test("tm-cli-ctx-merge");
+        let db = tmp.join("memory.db").to_string_lossy().to_string();
+
+        // Two source contexts plus a target. Each source has one entity.
+        let (ent_a, ent_b, ctx_a, ctx_b, ctx_into) = {
+            let graph = GraphStore::open(&db).expect("open");
+            let a = Context::new("a".to_string(), String::new());
+            let b = Context::new("b".to_string(), String::new());
+            let into = Context::new("merged".to_string(), String::new());
+            graph.create_context(&a).unwrap();
+            graph.create_context(&b).unwrap();
+            graph.create_context(&into).unwrap();
+
+            graph.set_active_context(Some(a.id));
+            let ea = Entity::new("Alpha", EntityType::Person, 0.9);
+            graph.upsert_entity(&ea).unwrap();
+
+            graph.set_active_context(Some(b.id));
+            let eb = Entity::new("Beta", EntityType::Person, 0.9);
+            graph.upsert_entity(&eb).unwrap();
+
+            // Triple under context b: Alpha->RelatedTo->Beta. Tag it b.
+            let t = Triple::new(ea.id, Predicate::RelatedTo, eb.id, 0.8);
+            graph.upsert_triple(&t).unwrap();
+
+            (ea.id, eb.id, a.id, b.id, into.id)
+        };
+
+        cmd_context_merge(&db, "a", "b", "merged", false).expect("merge");
+
+        let graph = GraphStore::open(&db).expect("reopen");
+        // After merge, both entities point to ctx_into.
+        assert_eq!(graph.entity_context_id(ent_a).unwrap(), Some(ctx_into));
+        assert_eq!(graph.entity_context_id(ent_b).unwrap(), Some(ctx_into));
+        // Original ctx_a / ctx_b are now empty.
+        assert!(graph.list_entities_in_context(ctx_a).unwrap().is_empty());
+        assert!(graph.list_entities_in_context(ctx_b).unwrap().is_empty());
+        // ctx_into now owns both.
+        let merged = graph.list_entities_in_context(ctx_into).unwrap();
+        assert_eq!(merged.len(), 2);
+    }
+
+    #[test]
+    fn context_snapshot_writes_self_contained_bundle() {
+        use super::cmd_context_snapshot;
+        use tm_graph::context::Context;
+        let tmp = tempdir_for_test("tm-cli-ctx-snap");
+        let db = tmp.join("memory.db").to_string_lossy().to_string();
+        {
+            let graph = GraphStore::open(&db).expect("open");
+            let ctx = Context::new("rondo".to_string(), String::new());
+            graph.create_context(&ctx).unwrap();
+            graph.set_active_context(Some(ctx.id));
+            let e1 = Entity::new("Player1", EntityType::Person, 0.9);
+            let e2 = Entity::new("Team1", EntityType::Organization, 0.9);
+            graph.upsert_entity(&e1).unwrap();
+            graph.upsert_entity(&e2).unwrap();
+            let t = Triple::new(e1.id, Predicate::WorksAt, e2.id, 0.85);
+            graph.upsert_triple(&t).unwrap();
+        }
+        let out = tmp.join("rondo.tmctx");
+        cmd_context_snapshot(&db, "rondo", Some(out.to_str().unwrap())).expect("snapshot");
+
+        let raw = std::fs::read_to_string(&out).expect("read snapshot");
+        let v: serde_json::Value = serde_json::from_str(&raw).expect("parse snapshot");
+        assert_eq!(v["schema_version"], 1);
+        assert_eq!(v["kind"], "tracemind.context_snapshot");
+        assert_eq!(v["counts"]["entities"], 2);
+        assert_eq!(v["counts"]["triples"], 1);
+        assert!(v["entities"].as_array().unwrap().len() == 2);
+        assert!(v["triples"].as_array().unwrap().len() == 1);
+    }
+
+    #[test]
+    fn context_split_moves_only_matching_entity_type() {
+        use super::cmd_context_split;
+        use tm_graph::context::Context;
+        let tmp = tempdir_for_test("tm-cli-ctx-split");
+        let db = tmp.join("memory.db").to_string_lossy().to_string();
+        let (person_id, project_id, ctx_src_id, ctx_into_id) = {
+            let graph = GraphStore::open(&db).expect("open");
+            let src = Context::new("src".to_string(), String::new());
+            let into = Context::new("people".to_string(), String::new());
+            graph.create_context(&src).unwrap();
+            graph.create_context(&into).unwrap();
+            graph.set_active_context(Some(src.id));
+            let p = Entity::new("Alice", EntityType::Person, 0.9);
+            let pr = Entity::new("ProjectX", EntityType::Project, 0.9);
+            graph.upsert_entity(&p).unwrap();
+            graph.upsert_entity(&pr).unwrap();
+            (p.id, pr.id, src.id, into.id)
+        };
+        cmd_context_split(&db, "src", "person", "people", false).expect("split");
+
+        let graph = GraphStore::open(&db).expect("reopen");
+        assert_eq!(graph.entity_context_id(person_id).unwrap(), Some(ctx_into_id));
+        assert_eq!(graph.entity_context_id(project_id).unwrap(), Some(ctx_src_id));
+    }
+
+    #[test]
+    fn today_backlinks_memories_created_today() {
+        use super::cmd_today;
+        use chrono::Local;
+        let tmp = tempdir_for_test("tm-cli-today-backlinks");
+        let db = tmp.join("memory.db").to_string_lossy().to_string();
+
+        // Seed two entities created "today" (now).
+        let (alice_id, bob_id) = {
+            let graph = GraphStore::open(&db).expect("open graph");
+            let alice = Entity::new("Alice", EntityType::Person, 0.9);
+            let bob = Entity::new("Bob", EntityType::Person, 0.9);
+            graph.upsert_entity(&alice).expect("upsert alice");
+            graph.upsert_entity(&bob).expect("upsert bob");
+            (alice.id, bob.id)
+        };
+
+        let date = Local::now().date_naive().format("%Y-%m-%d").to_string();
+        cmd_today(&db, Some(&date), false).expect("today run");
+
+        let graph = GraphStore::open(&db).expect("reopen");
+        let daily = graph
+            .find_entity_by_name_icase(&date)
+            .expect("lookup")
+            .expect("daily note");
+
+        // Each of alice/bob should have a triple with object = daily note.
+        let alice_tr = graph
+            .get_triples_for_entity(alice_id)
+            .expect("alice triples");
+        assert!(
+            alice_tr.iter().any(|t| t.subject_id == alice_id && t.object_id == daily.id),
+            "alice → daily-note backlink missing"
+        );
+        let bob_tr = graph.get_triples_for_entity(bob_id).expect("bob triples");
+        assert!(
+            bob_tr.iter().any(|t| t.subject_id == bob_id && t.object_id == daily.id),
+            "bob → daily-note backlink missing"
+        );
+
+        // Running again must not duplicate edges.
+        drop(graph);
+        cmd_today(&db, Some(&date), false).expect("today rerun");
+        let graph = GraphStore::open(&db).expect("reopen 2");
+        let alice_tr2 = graph
+            .get_triples_for_entity(alice_id)
+            .expect("alice triples rerun");
+        let n_alice_links = alice_tr2
+            .iter()
+            .filter(|t| t.subject_id == alice_id && t.object_id == daily.id)
+            .count();
+        assert_eq!(n_alice_links, 1, "rerun must not duplicate alice backlink");
     }
 }
 

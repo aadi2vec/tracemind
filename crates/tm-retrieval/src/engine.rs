@@ -5,7 +5,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tm_controller::bandit::RetrievalParams;
 use tm_controller::{UcbBandit, LinUcbBandit, QueryPlanner, QueryPlan, PlanAction};
 use tm_episodic::{ProcedureStore, TraceStore, TrajectoryStore};
-use tm_graph::{context::ActiveContext, GraphStore};
+use tm_graph::{context::ActiveContext, GraphStore, ViewFilter};
 use tm_reason::CausalTrace;
 use tm_rerank::{ColbertReranker, RerankCandidate};
 use tm_types::{Entity, Procedure, Result, Trace, TraceEventType, TraceMindError, Triple};
@@ -268,6 +268,12 @@ pub struct RetrievalEngine {
     /// `graph.active_context_id()`. Unscoped rows (no tag) are always
     /// visible. When true, the active scope is ignored.
     cross_context: bool,
+    /// LM-11c — optional Memory View filter applied after the context
+    /// scope filter. When `Some` and non-empty, entities and triples
+    /// are passed through [`ViewFilter::rejects_entity`] /
+    /// [`ViewFilter::rejects_triple`] and dropped if the view rejects
+    /// them. Set via [`set_view_filter`].
+    view_filter: Option<ViewFilter>,
 }
 
 #[derive(Debug)]
@@ -365,6 +371,7 @@ impl RetrievalEngine {
             trajectory_store,
             prefetch: PrefetchCache::new(),
             cross_context: false,
+            view_filter: None,
         })
     }
 
@@ -379,6 +386,23 @@ impl RetrievalEngine {
     /// Read-only accessor for the current cross-context flag.
     pub fn cross_context(&self) -> bool {
         self.cross_context
+    }
+
+    /// LM-11c — install a Memory View filter for subsequent queries.
+    /// Pass `None` (or a filter with `is_empty()`) to disable. The
+    /// filter is applied after the Sprint C-0.6 context scope filter
+    /// and after primary candidate assembly, so it only ever shrinks
+    /// the result set — it never widens it.
+    pub fn set_view_filter(&mut self, filter: Option<ViewFilter>) {
+        self.view_filter = match filter {
+            Some(f) if !f.is_empty() => Some(f),
+            _ => None,
+        };
+    }
+
+    /// Read-only accessor for the currently-installed view filter.
+    pub fn view_filter(&self) -> Option<&ViewFilter> {
+        self.view_filter.as_ref()
     }
 
     /// Sprint D — hot-swap the active context on the live engine.
@@ -1085,6 +1109,30 @@ impl RetrievalEngine {
                 self.graph
                     .signal_in_active_scope(h.signal_id, false)
                     .unwrap_or(true)
+            });
+        }
+
+        // ── LM-11c: Memory View filter ──
+        // User-curated splice. Applied after the context scope filter
+        // so it only shrinks the result set — never widens it. A view
+        // with non-empty include sets drops every entity / triple not
+        // explicitly allowed; exclude sets drop matching rows
+        // unconditionally; confidence_floor drops below-threshold
+        // triples. The filter is skipped if `view_filter` is None or
+        // `is_empty()`.
+        if let Some(ref vf) = self.view_filter {
+            ws.entities.retain(|e| {
+                let ctx = self.graph.entity_context_id(e.id).unwrap_or(None);
+                !vf.rejects_entity(e.id, ctx)
+            });
+            let kept_entity_ids: HashSet<Uuid> =
+                ws.entities.iter().map(|e| e.id).collect();
+            ws.triples.retain(|t| {
+                if vf.rejects_triple(t.id, t.confidence) {
+                    return false;
+                }
+                kept_entity_ids.contains(&t.subject_id)
+                    && kept_entity_ids.contains(&t.object_id)
             });
         }
 
@@ -2097,6 +2145,7 @@ mod tests {
             trajectory_store: None,
             prefetch: PrefetchCache::new(),
             cross_context: false,
+            view_filter: None,
         };
 
         let result = engine.query("hello world").unwrap();
@@ -2142,6 +2191,7 @@ mod tests {
             trajectory_store: None,
             prefetch: PrefetchCache::new(),
             cross_context: false,
+            view_filter: None,
         };
 
         // Prime an entry for "hello world" — even on an empty graph
@@ -2298,6 +2348,7 @@ mod tests {
             trajectory_store: None,
             prefetch: PrefetchCache::new(),
             cross_context: false,
+            view_filter: None,
         };
 
         let now = chrono::Utc::now();
@@ -2394,6 +2445,7 @@ mod tests {
             trajectory_store: None,
             prefetch: PrefetchCache::new(),
             cross_context: false,
+            view_filter: None,
         };
 
         // Seed at least one entity so the query produces real candidates.
@@ -2469,6 +2521,7 @@ mod tests {
             trajectory_store: None,
             prefetch: PrefetchCache::new(),
             cross_context: false,
+            view_filter: None,
         };
 
         let now = chrono::Utc::now();
@@ -2536,6 +2589,7 @@ mod tests {
             trajectory_store: None,
             prefetch: PrefetchCache::new(),
             cross_context: true,
+            view_filter: None,
         };
 
         let now = chrono::Utc::now();

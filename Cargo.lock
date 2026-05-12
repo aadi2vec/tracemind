@@ -5786,6 +5786,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "tm-bench-context"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "serde",
+ "serde_json",
+ "tm-graph",
+ "tm-types",
+ "uuid",
+]
+
+[[package]]
 name = "tm-bench-locomo"
 version = "0.1.0"
 dependencies = [

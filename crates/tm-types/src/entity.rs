@@ -51,6 +51,10 @@ pub enum EntityType {
     Technology,
     Decision,
     Event,
+    /// LM-5c — first-class daily-note memory. One per local date,
+    /// auto-named `YYYY-MM-DD`, populated by `tracemind today`.
+    /// Existence is idempotent: re-running `today` upserts.
+    DailyNote,
     Custom(String),
 }
 

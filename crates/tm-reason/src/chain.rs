@@ -319,6 +319,7 @@ mod tests {
             source_id: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
+            predicate_confidence: None,
         };
         let t2 = Triple {
             id: Uuid::new_v4(),
@@ -329,6 +330,7 @@ mod tests {
             source_id: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
+            predicate_confidence: None,
         };
 
         graph.upsert_triple(&t1).unwrap();
@@ -361,6 +363,7 @@ mod tests {
             source_id: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
+            predicate_confidence: None,
         };
         graph.upsert_triple(&t1).unwrap();
 
@@ -390,6 +393,7 @@ mod tests {
             source_id: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
+            predicate_confidence: None,
         };
         graph.upsert_triple(&t1).unwrap();
 

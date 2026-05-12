@@ -221,6 +221,7 @@ mod tests {
             source_id: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
+            predicate_confidence: None,
         }).unwrap();
 
         // Python --UsedBy--> Django
@@ -233,6 +234,7 @@ mod tests {
             source_id: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
+            predicate_confidence: None,
         }).unwrap();
 
         let solver = AnalogySolver::new(&graph);

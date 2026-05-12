@@ -2473,6 +2473,61 @@ fn cmd_context_clear(state: State<AppState>) -> Result<(), String> {
 }
 
 // ---------------------------------------------------------------------------
+// LM-17 — Tauri "Export this context" command
+//
+// Wraps `GraphStore::snapshot_context` so the Settings panel / context-
+// switcher "Export" menu item can save a `.tmctx` JSON bundle without
+// shelling out to the CLI. The frontend opens a save dialog and passes
+// the chosen path here.
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize, Clone)]
+struct ExportContextResult {
+    /// Where the file was written (echoed back so the UI can show a
+    /// "saved to" toast).
+    output_path: String,
+    /// Canonical UUID of the context that was exported.
+    context_id: String,
+    /// Number of entities included in the snapshot.
+    entity_count: u64,
+    /// Number of triples included in the snapshot.
+    triple_count: u64,
+    /// Bytes on disk after pretty-printing.
+    bytes_written: u64,
+}
+
+/// LM-17-be — write a `.tmctx` snapshot of the named context to
+/// `output_path`. Errors when the context is unknown or the write
+/// fails. The frontend supplies `output_path` from a Tauri save dialog,
+/// so the backend never picks a path on its own.
+#[tauri::command]
+fn cmd_export_context(
+    state: State<AppState>,
+    name: String,
+    output_path: String,
+) -> Result<ExportContextResult, String> {
+    let graph = GraphStore::open(&state.db_path).map_err(|e| e.to_string())?;
+    let ctx = graph
+        .get_context_by_name(&name)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("no context named '{name}'"))?;
+    let snapshot = graph.snapshot_context(&ctx).map_err(|e| e.to_string())?;
+    let pretty =
+        serde_json::to_string_pretty(&snapshot).map_err(|e| format!("serialize: {e}"))?;
+    let bytes = pretty.len() as u64;
+    std::fs::write(&output_path, pretty)
+        .map_err(|e| format!("write {output_path}: {e}"))?;
+
+    Ok(ExportContextResult {
+        output_path,
+        context_id: ctx.id.to_string(),
+        entity_count: snapshot["counts"]["entities"].as_u64().unwrap_or(0),
+        triple_count: snapshot["counts"]["triples"].as_u64().unwrap_or(0),
+        bytes_written: bytes,
+    })
+}
+
+// ---------------------------------------------------------------------------
 // UI-13 — Capture permissions panel (per-source toggles + audit)
 // ---------------------------------------------------------------------------
 
@@ -2871,6 +2926,7 @@ fn main() {
             cmd_context_use,
             cmd_context_create,
             cmd_context_clear,
+            cmd_export_context,
             cmd_capture_permissions_list,
             cmd_capture_permissions_set,
             cmd_capture_forget_source,
