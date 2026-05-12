@@ -245,6 +245,7 @@ fn entity_type_to_label(t: &EntityType) -> String {
         EntityType::Decision => "Decision".into(),
         EntityType::Event => "Event".into(),
         EntityType::DailyNote => "DailyNote".into(),
+        EntityType::MapOfContent => "MapOfContent".into(),
         EntityType::Custom(s) => s.clone(),
     }
 }
