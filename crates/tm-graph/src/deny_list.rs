@@ -190,6 +190,21 @@ impl DenyList {
             .any(|r| r.blocked && r.entity_a == lo && r.entity_b == hi)
     }
 
+    /// LM-15 — true iff a bridge between two entities should be denied
+    /// purely on **ontological-domain** grounds (e.g. real person vs
+    /// fictional person). This is the **type-level** Harry Potter fix
+    /// that sits alongside the strike-based block list.
+    ///
+    /// Returns `false` for any pair where either side is
+    /// [`tm_types::OntologicalDomain::Unknown`] so the deny path stays
+    /// conservative when classification abstains.
+    pub fn is_bridge_blocked_by_ontology(
+        domain_a: tm_types::OntologicalDomain,
+        domain_b: tm_types::OntologicalDomain,
+    ) -> bool {
+        !domain_a.is_compatible_with(domain_b)
+    }
+
     /// Record a `wrong_context_suggestion` strike against a context
     /// pair. Auto-promotes to `blocked` when `strikes >= strike_threshold`.
     ///

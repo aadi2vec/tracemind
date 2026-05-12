@@ -3,6 +3,8 @@ pub mod context;
 pub mod deny_list;
 pub mod entity_resolve;
 pub mod memory_view;
+pub mod moc;
+pub mod ontology;
 pub mod pending_relations;
 pub mod store;
 
@@ -18,6 +20,8 @@ pub use entity_resolve::{resolve_in_text, EntityMention};
 pub use memory_view::{
     MemberKind, MemberType, MemoryView, ViewFilter, ViewMember, VIEW_SCHEMA_VERSION,
 };
+pub use moc::{generate_moc_for_cluster, heuristic_moc_groups, upsert_moc, MocUpsert};
+pub use ontology::classify as classify_ontology;
 pub use pending_relations::{
     PendingRelation, PendingStatus, ACCEPT_THRESHOLD as PENDING_ACCEPT_THRESHOLD,
     PENDING_FLOOR, SCHEMA_VERSION as PENDING_RELATIONS_SCHEMA_VERSION,

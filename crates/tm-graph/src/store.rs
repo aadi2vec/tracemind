@@ -2700,6 +2700,219 @@ impl GraphStore {
         Ok(rows)
     }
 
+    /// LM-20 — Memory Garden: cluster buckets over `captured_signals`.
+    /// Returns `(cluster_id, count)` pairs sorted by count desc. A
+    /// `None` cluster_id is the outlier bucket. `-1` is HDBSCAN's
+    /// canonical "noise" assignment; `-2` is our manual "ignore"
+    /// triage outcome (LM-22) — both fold into the unsorted tray.
+    pub fn cluster_buckets(&self, limit: usize) -> Result<Vec<(Option<i64>, usize)>> {
+        let conn = self.kg.connection();
+        let mut stmt = conn
+            .prepare(
+                "SELECT cluster_id, COUNT(*) FROM captured_signals \
+                 GROUP BY cluster_id ORDER BY COUNT(*) DESC LIMIT ?1",
+            )
+            .map_err(|e| TraceMindError::Storage(format!("cluster_buckets prepare: {e}")))?;
+        let rows = stmt
+            .query_map(params![limit as i64], |row| {
+                let cid: Option<i64> = row.get(0)?;
+                let count: i64 = row.get(1)?;
+                Ok((cid, count as usize))
+            })
+            .map_err(|e| TraceMindError::Storage(format!("cluster_buckets query: {e}")))?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(
+                r.map_err(|e| TraceMindError::Storage(format!("cluster_buckets row: {e}")))?,
+            );
+        }
+        Ok(out)
+    }
+
+    /// LM-20 — sample raw_text rows for a specific cluster. When
+    /// `cluster_id` is `None` or `-1`/`-2` the outlier bucket is used.
+    pub fn cluster_samples(&self, cluster_id: Option<i64>, limit: usize) -> Result<Vec<String>> {
+        let conn = self.kg.connection();
+        let is_outlier = matches!(cluster_id, None | Some(-1) | Some(-2));
+        let mut samples = Vec::new();
+        if is_outlier {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT raw_text FROM captured_signals \
+                     WHERE cluster_id IS NULL OR cluster_id = -1 OR cluster_id = -2 \
+                     ORDER BY id DESC LIMIT ?1",
+                )
+                .map_err(|e| TraceMindError::Storage(format!("cluster_samples prep: {e}")))?;
+            let rows = stmt
+                .query_map(params![limit as i64], |row| row.get::<_, String>(0))
+                .map_err(|e| TraceMindError::Storage(format!("cluster_samples q: {e}")))?;
+            for r in rows {
+                samples.push(
+                    r.map_err(|e| TraceMindError::Storage(format!("cluster_samples row: {e}")))?,
+                );
+            }
+        } else {
+            let cid = cluster_id.unwrap();
+            let mut stmt = conn
+                .prepare(
+                    "SELECT raw_text FROM captured_signals \
+                     WHERE cluster_id = ?1 ORDER BY id DESC LIMIT ?2",
+                )
+                .map_err(|e| TraceMindError::Storage(format!("cluster_samples prep: {e}")))?;
+            let rows = stmt
+                .query_map(params![cid, limit as i64], |row| row.get::<_, String>(0))
+                .map_err(|e| TraceMindError::Storage(format!("cluster_samples q: {e}")))?;
+            for r in rows {
+                samples.push(
+                    r.map_err(|e| TraceMindError::Storage(format!("cluster_samples row: {e}")))?,
+                );
+            }
+        }
+        Ok(samples)
+    }
+
+    /// LM-22 — Outlier "Unsorted" tray rows. `(signal_id, raw_text,
+    /// source, created_at)`. Includes `cluster_id IS NULL`, `-1`
+    /// (HDBSCAN noise) and `-2` (manual ignore) so the user can
+    /// re-triage anything previously dismissed.
+    pub fn list_outlier_signals(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<(i64, String, String, String)>> {
+        let conn = self.kg.connection();
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, raw_text, source, created_at FROM captured_signals \
+                 WHERE cluster_id IS NULL OR cluster_id = -1 OR cluster_id = -2 \
+                 ORDER BY id DESC LIMIT ?1",
+            )
+            .map_err(|e| TraceMindError::Storage(format!("list_outliers prep: {e}")))?;
+        let rows = stmt
+            .query_map(params![limit as i64], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })
+            .map_err(|e| TraceMindError::Storage(format!("list_outliers q: {e}")))?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(|e| TraceMindError::Storage(format!("list_outliers row: {e}")))?);
+        }
+        Ok(out)
+    }
+
+    /// LM-22 — assign one signal to a cluster. Returns the new
+    /// cluster_id so the caller can echo it back to the UI.
+    pub fn assign_signal_to_cluster(&self, signal_id: i64, cluster_id: i64) -> Result<()> {
+        let conn = self.kg.connection();
+        conn.execute(
+            "UPDATE captured_signals SET cluster_id = ?1 WHERE id = ?2",
+            params![cluster_id, signal_id],
+        )
+        .map_err(|e| TraceMindError::Storage(format!("assign_signal_to_cluster: {e}")))?;
+        Ok(())
+    }
+
+    /// LM-22 — next cluster id for a "new_cluster" triage action.
+    /// Returns `MAX(cluster_id) + 1` over the captured_signals table,
+    /// or `0` when the table has no clusters yet.
+    pub fn next_cluster_id(&self) -> Result<i64> {
+        let conn = self.kg.connection();
+        let max: Option<i64> = conn
+            .query_row("SELECT MAX(cluster_id) FROM captured_signals", [], |row| {
+                row.get(0)
+            })
+            .ok();
+        Ok(max.unwrap_or(0) + 1)
+    }
+
+    /// LM-23 — community-overlay buckets. Returns `(community_id,
+    /// count, sample_names)` tuples. When the `community_id` column
+    /// doesn't exist yet (CLU-* hasn't populated it) returns a single
+    /// `(None, total, top3)` tuple so the frontend renders the empty
+    /// state.
+    pub fn community_buckets(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<(Option<i64>, usize, Vec<String>)>> {
+        let conn = self.kg.connection();
+        let has_col: bool = conn
+            .query_row(
+                "SELECT 1 FROM pragma_table_info('kg_entities') WHERE name = 'community_id'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|_| true)
+            .unwrap_or(false);
+        if !has_col {
+            let count: i64 = conn
+                .query_row("SELECT COUNT(*) FROM kg_entities", [], |row| row.get(0))
+                .unwrap_or(0);
+            let mut names_stmt = conn
+                .prepare("SELECT name FROM kg_entities ORDER BY id DESC LIMIT 3")
+                .map_err(|e| TraceMindError::Storage(format!("community names prep: {e}")))?;
+            let samples: Vec<String> = names_stmt
+                .query_map([], |row| row.get::<_, String>(0))
+                .map_err(|e| TraceMindError::Storage(format!("community names q: {e}")))?
+                .filter_map(|r| r.ok())
+                .collect();
+            return Ok(vec![(None, count as usize, samples)]);
+        }
+        let mut stmt = conn
+            .prepare(
+                "SELECT community_id, COUNT(*) FROM kg_entities \
+                 GROUP BY community_id ORDER BY COUNT(*) DESC LIMIT ?1",
+            )
+            .map_err(|e| TraceMindError::Storage(format!("community prep: {e}")))?;
+        let rows: Vec<(Option<i64>, usize)> = stmt
+            .query_map(params![limit as i64], |row| {
+                let cid: Option<i64> = row.get(0)?;
+                let count: i64 = row.get(1)?;
+                Ok((cid, count as usize))
+            })
+            .map_err(|e| TraceMindError::Storage(format!("community q: {e}")))?
+            .filter_map(|r| r.ok())
+            .collect();
+        let mut out = Vec::new();
+        for (cid, count) in rows {
+            let names: Vec<String> = match cid {
+                Some(c) => {
+                    let mut s = conn
+                        .prepare(
+                            "SELECT name FROM kg_entities WHERE community_id = ?1 \
+                             ORDER BY id DESC LIMIT 3",
+                        )
+                        .map_err(|e| TraceMindError::Storage(format!("c names prep: {e}")))?;
+                    let collected: Vec<String> = s
+                        .query_map(params![c], |row| row.get::<_, String>(0))
+                        .map_err(|e| TraceMindError::Storage(format!("c names q: {e}")))?
+                        .filter_map(|r| r.ok())
+                        .collect();
+                    collected
+                }
+                None => {
+                    let mut s = conn
+                        .prepare(
+                            "SELECT name FROM kg_entities WHERE community_id IS NULL \
+                             ORDER BY id DESC LIMIT 3",
+                        )
+                        .map_err(|e| TraceMindError::Storage(format!("c names prep: {e}")))?;
+                    let collected: Vec<String> = s
+                        .query_map([], |row| row.get::<_, String>(0))
+                        .map_err(|e| TraceMindError::Storage(format!("c names q: {e}")))?
+                        .filter_map(|r| r.ok())
+                        .collect();
+                    collected
+                }
+            };
+            out.push((cid, count, names));
+        }
+        Ok(out)
+    }
+
     /// KG-R1 Action 3: Follow a specific predicate forward from an entity.
     /// Returns all target entities reachable via `predicate` from `entity_id`.
     pub fn follow_predicate(&self, entity_id: Uuid, predicate: &Predicate) -> Result<Vec<Entity>> {

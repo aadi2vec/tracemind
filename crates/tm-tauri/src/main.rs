@@ -7,7 +7,7 @@ use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tauri::{Emitter, State};
 use uuid::Uuid;
 
@@ -1024,6 +1024,18 @@ struct CaptureEvent {
     text: String,
     entities_count: usize,
     triples_count: usize,
+}
+
+/// LM-4 — emitted whenever an ingest touches one or more entities so
+/// that any open entity drawer can refresh itself without a poll.
+/// Listeners filter on `entity_ids` for the entity they're showing.
+#[derive(Clone, Serialize)]
+struct EntityUpdatedEvent {
+    /// The entities (as stringified UUIDs) the most recent ingest
+    /// upserted or referenced.
+    entity_ids: Vec<String>,
+    /// Ingest source label so the UI can show a small chip.
+    source: String,
 }
 
 /// Toggle live capture on/off.
@@ -2841,6 +2853,403 @@ fn cmd_daily_note_today(
 }
 
 // ---------------------------------------------------------------------------
+// LM-3 — Entity drawer composite view (header + backlinks + relations + tags)
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize, Clone)]
+struct EntityDrawerHeader {
+    entity_id: String,
+    name: String,
+    entity_type: String,
+    ontological_domain: String,
+    confidence: f64,
+    created_at: String,
+    updated_at: String,
+}
+
+#[derive(Serialize, Clone)]
+struct EntityDrawerBacklink {
+    triple_id: String,
+    source_id: String,
+    source_name: String,
+    predicate: String,
+    confidence: f64,
+}
+
+#[derive(Serialize, Clone)]
+struct EntityDrawerRelation {
+    triple_id: String,
+    target_id: String,
+    target_name: String,
+    predicate: String,
+    confidence: f64,
+}
+
+#[derive(Serialize, Clone)]
+struct EntityDrawerView {
+    header: EntityDrawerHeader,
+    backlinks: Vec<EntityDrawerBacklink>,
+    relations: Vec<EntityDrawerRelation>,
+    tags: Vec<String>,
+}
+
+/// LM-3 — composite entity drawer payload. Resolves `entity_id` (UUID
+/// or name), fetches header + backlinks + outgoing relations + tags
+/// in one call so the frontend isn't waterfalling 4 invokes.
+#[tauri::command]
+fn cmd_entity_drawer(
+    entity_id: String,
+    backlink_limit: Option<usize>,
+    state: State<AppState>,
+) -> Result<EntityDrawerView, String> {
+    let graph = GraphStore::open(&state.db_path).map_err(|e| e.to_string())?;
+    // Resolve UUID-or-name.
+    let ent = if let Ok(id) = Uuid::parse_str(&entity_id) {
+        graph.get_entity(id).map_err(|e| e.to_string())?
+    } else {
+        graph
+            .find_entity_by_name_icase(&entity_id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("entity not found: {entity_id}"))?
+    };
+
+    let domain = tm_graph::classify_ontology(&ent.entity_type, &ent.name);
+    let header = EntityDrawerHeader {
+        entity_id: ent.id.to_string(),
+        name: ent.name.clone(),
+        entity_type: format!("{:?}", ent.entity_type),
+        ontological_domain: domain.to_string(),
+        confidence: ent.confidence,
+        created_at: ent.created_at.to_rfc3339(),
+        updated_at: ent.updated_at.to_rfc3339(),
+    };
+
+    let mut backlinks = Vec::new();
+    for b in graph
+        .backlinks(ent.id, Some(backlink_limit.unwrap_or(50)), true)
+        .map_err(|e| e.to_string())?
+    {
+        backlinks.push(EntityDrawerBacklink {
+            triple_id: b.triple_id.to_string(),
+            source_id: b.source.id.to_string(),
+            source_name: b.source.name,
+            predicate: format!("{}", b.predicate),
+            confidence: b.confidence,
+        });
+    }
+
+    let mut relations = Vec::new();
+    let outgoing = graph
+        .get_triples_for_entity(ent.id)
+        .map_err(|e| e.to_string())?;
+    for t in outgoing {
+        if t.subject_id != ent.id {
+            continue;
+        }
+        let target_name = graph
+            .get_entity(t.object_id)
+            .ok()
+            .map(|e| e.name)
+            .unwrap_or_else(|| t.object_id.to_string());
+        relations.push(EntityDrawerRelation {
+            triple_id: t.id.to_string(),
+            target_id: t.object_id.to_string(),
+            target_name,
+            predicate: format!("{}", t.predicate),
+            confidence: t.confidence,
+        });
+    }
+
+    // Tags: just the entity-type fallback today. When LM-5b's
+    // ingest-time tag persistence is added, swap in the stored set.
+    let tags = vec![tm_ingest::entity_type_tag(&ent.entity_type)];
+
+    Ok(EntityDrawerView {
+        header,
+        backlinks,
+        relations,
+        tags,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// LM-5a — Transclusion resolver (`![[entity_id]]` → inline memory text)
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize, Clone)]
+struct TransclusionSpan {
+    /// Byte offset of the `![[` in the source string.
+    start: usize,
+    /// Byte offset just after the closing `]]`.
+    end: usize,
+    /// Resolved entity (None when the target id doesn't resolve).
+    entity_id: Option<String>,
+    entity_name: Option<String>,
+    /// Short preview of the target entity's own description / source.
+    preview: Option<String>,
+}
+
+/// LM-5a — find every `![[entity_id]]` transclusion in `text` and
+/// return resolved spans the frontend can replace inline.
+#[tauri::command]
+fn cmd_resolve_transclusion(
+    text: String,
+    state: State<AppState>,
+) -> Result<Vec<TransclusionSpan>, String> {
+    let graph = GraphStore::open(&state.db_path).map_err(|e| e.to_string())?;
+    let mut out: Vec<TransclusionSpan> = Vec::new();
+    let mut i = 0;
+    let bytes = text.as_bytes();
+    while i + 3 < bytes.len() {
+        if &bytes[i..i + 3] == b"![[" {
+            // Find the closing `]]`.
+            if let Some(rel_end) = text[i + 3..].find("]]") {
+                let body_start = i + 3;
+                let body_end = body_start + rel_end;
+                let body = &text[body_start..body_end];
+                let span_end = body_end + 2;
+                let resolved = if let Ok(uuid) = Uuid::parse_str(body.trim()) {
+                    graph.get_entity(uuid).ok()
+                } else {
+                    graph.find_entity_by_name_icase(body.trim()).ok().flatten()
+                };
+                let (entity_id, entity_name, preview) = match resolved {
+                    Some(e) => {
+                        let preview = e.source_id.clone();
+                        (Some(e.id.to_string()), Some(e.name), preview)
+                    }
+                    None => (None, None, None),
+                };
+                out.push(TransclusionSpan {
+                    start: i,
+                    end: span_end,
+                    entity_id,
+                    entity_name,
+                    preview,
+                });
+                i = span_end;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    Ok(out)
+}
+
+// ---------------------------------------------------------------------------
+// LM-11e — Session-scoped splice: per-thread saved view state
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize, Deserialize, Clone, Default)]
+struct ThreadViewState {
+    view_name: Option<String>,
+    include_ids: Vec<String>,
+    exclude_ids: Vec<String>,
+}
+
+fn thread_views_path(state: &AppState) -> PathBuf {
+    data_dir(state).join("thread_views.json")
+}
+
+fn load_thread_views(
+    state: &AppState,
+) -> Result<std::collections::HashMap<String, ThreadViewState>, String> {
+    let path = thread_views_path(state);
+    if !path.exists() {
+        return Ok(Default::default());
+    }
+    let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
+    if bytes.is_empty() {
+        return Ok(Default::default());
+    }
+    serde_json::from_slice(&bytes).map_err(|e| e.to_string())
+}
+
+fn save_thread_views(
+    state: &AppState,
+    map: &std::collections::HashMap<String, ThreadViewState>,
+) -> Result<(), String> {
+    let path = thread_views_path(state);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let bytes = serde_json::to_vec_pretty(map).map_err(|e| e.to_string())?;
+    std::fs::write(&path, bytes).map_err(|e| e.to_string())
+}
+
+/// LM-11e — persist the active splice for `thread_id`.
+#[tauri::command]
+fn cmd_thread_view_save(
+    thread_id: String,
+    view_name: Option<String>,
+    include_ids: Vec<String>,
+    exclude_ids: Vec<String>,
+    state: State<AppState>,
+) -> Result<(), String> {
+    let mut map = load_thread_views(&state)?;
+    map.insert(
+        thread_id,
+        ThreadViewState {
+            view_name,
+            include_ids,
+            exclude_ids,
+        },
+    );
+    save_thread_views(&state, &map)
+}
+
+/// LM-11e — load the splice previously saved for `thread_id` (returns
+/// an empty state when the thread has never been spliced).
+#[tauri::command]
+fn cmd_thread_view_load(
+    thread_id: String,
+    state: State<AppState>,
+) -> Result<ThreadViewState, String> {
+    let map = load_thread_views(&state)?;
+    Ok(map.get(&thread_id).cloned().unwrap_or_default())
+}
+
+/// LM-11e — forget the per-thread state (e.g. when the thread is
+/// closed permanently).
+#[tauri::command]
+fn cmd_thread_view_clear(thread_id: String, state: State<AppState>) -> Result<bool, String> {
+    let mut map = load_thread_views(&state)?;
+    let removed = map.remove(&thread_id).is_some();
+    save_thread_views(&state, &map)?;
+    Ok(removed)
+}
+
+// ---------------------------------------------------------------------------
+// LM-20/22/23 — Memory Garden, outliers, community overlay
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize, Clone)]
+struct GardenCard {
+    /// Cluster bucket; `None` for "unclustered" / outlier.
+    cluster_id: Option<i64>,
+    /// Human label. Until CLU-6 lands this is `"cluster {id}"` or
+    /// `"unsorted"`.
+    label: String,
+    count: usize,
+    sample_texts: Vec<String>,
+}
+
+/// LM-20 — Memory Garden cards. Groups `captured_signals` by their
+/// `cluster_id` (the column already exists; populated by the future
+/// `tm-cluster` HDBSCAN pass). A `cluster_id = -1` or `NULL` row is
+/// treated as an outlier and shown as the "Unsorted" tray (LM-22
+/// reads the same data).
+#[tauri::command]
+fn cmd_memory_garden(state: State<AppState>) -> Result<Vec<GardenCard>, String> {
+    let graph = GraphStore::open(&state.db_path).map_err(|e| e.to_string())?;
+    let buckets = graph.cluster_buckets(50).map_err(|e| e.to_string())?;
+    let mut cards = Vec::new();
+    for (cluster_id, count) in buckets {
+        let (label, is_outlier) = match cluster_id {
+            None => ("unsorted".to_string(), true),
+            Some(-1) => ("unsorted".to_string(), true),
+            Some(id) => (format!("cluster {id}"), false),
+        };
+        let lookup = if is_outlier { None } else { cluster_id };
+        let raw_samples = graph
+            .cluster_samples(lookup, 3)
+            .map_err(|e| e.to_string())?;
+        let samples: Vec<String> = raw_samples
+            .into_iter()
+            .map(|t| if t.len() > 120 { format!("{}…", &t[..120]) } else { t })
+            .collect();
+        cards.push(GardenCard {
+            cluster_id,
+            label,
+            count,
+            sample_texts: samples,
+        });
+    }
+    Ok(cards)
+}
+
+#[derive(Serialize, Clone)]
+struct OutlierRow {
+    signal_id: i64,
+    raw_text: String,
+    source: String,
+    created_at: String,
+}
+
+/// LM-22 — list the outlier tray (captured signals with no cluster).
+#[tauri::command]
+fn cmd_outliers_list(
+    limit: Option<usize>,
+    state: State<AppState>,
+) -> Result<Vec<OutlierRow>, String> {
+    let graph = GraphStore::open(&state.db_path).map_err(|e| e.to_string())?;
+    let lim = limit.unwrap_or(50).min(500);
+    let rows = graph
+        .list_outlier_signals(lim)
+        .map_err(|e| e.to_string())?;
+    Ok(rows
+        .into_iter()
+        .map(|(signal_id, raw_text, source, created_at)| OutlierRow {
+            signal_id,
+            raw_text,
+            source,
+            created_at,
+        })
+        .collect())
+}
+
+/// LM-22 — triage one outlier into an existing cluster, into a new
+/// cluster, or mark "ignore" (which sets `cluster_id = -2` so the
+/// next HDBSCAN pass treats it as a deliberate single-point group).
+#[tauri::command]
+fn cmd_outlier_triage(
+    signal_id: i64,
+    action: String,         // "add_to" | "new_cluster" | "ignore"
+    target_cluster: Option<i64>,
+    state: State<AppState>,
+) -> Result<i64, String> {
+    let graph = GraphStore::open(&state.db_path).map_err(|e| e.to_string())?;
+    let new_cluster: i64 = match action.as_str() {
+        "add_to" => target_cluster
+            .ok_or_else(|| "add_to action requires target_cluster".to_string())?,
+        "new_cluster" => graph.next_cluster_id().map_err(|e| e.to_string())?,
+        "ignore" => -2,
+        other => return Err(format!("unknown triage action: {other}")),
+    };
+    graph
+        .assign_signal_to_cluster(signal_id, new_cluster)
+        .map_err(|e| e.to_string())?;
+    Ok(new_cluster)
+}
+
+#[derive(Serialize, Clone)]
+struct CommunityRow {
+    /// Louvain `community_id`. `None` means the entity hasn't been
+    /// community-tagged yet (waiting on CLU-* work in `tm-graph`).
+    community_id: Option<i64>,
+    entity_count: usize,
+    sample_names: Vec<String>,
+}
+
+/// LM-23 — community-overlay toggle. Groups entities by their stored
+/// Louvain `community_id`. Until that column is populated this
+/// returns a single `None` bucket covering every entity — the call
+/// stays stable, the data shape doesn't change when CLU-* lands.
+#[tauri::command]
+fn cmd_community_overlay(state: State<AppState>) -> Result<Vec<CommunityRow>, String> {
+    let graph = GraphStore::open(&state.db_path).map_err(|e| e.to_string())?;
+    let buckets = graph.community_buckets(50).map_err(|e| e.to_string())?;
+    Ok(buckets
+        .into_iter()
+        .map(|(community_id, entity_count, sample_names)| CommunityRow {
+            community_id,
+            entity_count,
+            sample_names,
+        })
+        .collect())
+}
+
+// ---------------------------------------------------------------------------
 // UI-13 — Capture permissions panel (per-source toggles + audit)
 // ---------------------------------------------------------------------------
 
@@ -3255,6 +3664,15 @@ fn main() {
             cmd_usage_stats,
             cmd_usage_share_payload,
             cmd_context_suggest,
+            cmd_entity_drawer,
+            cmd_resolve_transclusion,
+            cmd_thread_view_save,
+            cmd_thread_view_load,
+            cmd_thread_view_clear,
+            cmd_memory_garden,
+            cmd_outliers_list,
+            cmd_outlier_triage,
+            cmd_community_overlay,
         ])
         .setup(move |app| {
             let handle = app.handle().clone();
@@ -3308,6 +3726,14 @@ fn main() {
                                         text: if text.len() > 80 { format!("{}...", &text[..80]) } else { text.clone() },
                                         entities_count: result.entities.len(),
                                         triples_count: result.triples.len(),
+                                    });
+                                    // LM-4 — also emit per-entity refresh so any
+                                    // open entity drawer can self-update.
+                                    let _ = handle.emit("entity-updated", EntityUpdatedEvent {
+                                        entity_ids: result.entities.iter()
+                                            .map(|e| e.id.to_string())
+                                            .collect(),
+                                        source: "clipboard".to_string(),
                                     });
                                 }
                             }
