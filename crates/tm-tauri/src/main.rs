@@ -14,7 +14,7 @@ use uuid::Uuid;
 use tm_controller::UcbBandit;
 use tm_episodic::TraceStore;
 use tm_graph::GraphStore;
-use tm_ingest::IngestPipeline;
+use tm_ingest::{IngestPipeline, TripleJob, TripleWorker, TripleWorkerHandle, WorkerDb};
 use tm_retrieval::RetrievalEngine;
 
 // ---------------------------------------------------------------------------
@@ -30,6 +30,13 @@ struct AppState {
     retrieval: Mutex<RetrievalEngine>,
     trace_store: Arc<Mutex<TraceStore>>,
     capture_enabled: Arc<Mutex<bool>>,
+    /// LM-8 — async triple-extraction worker. The hot ingest path
+    /// enqueues a [`TripleJob`] after fast-path entity extraction
+    /// returns; the worker thread runs the (slower) triple extractor
+    /// + `route_triple_by_confidence` off the main thread so the UI
+    /// stays snappy. `Arc` so capture/ingest paths can share one
+    /// handle.
+    triple_worker: Arc<TripleWorkerHandle>,
 }
 
 // ---------------------------------------------------------------------------
@@ -144,6 +151,12 @@ struct GraphData {
     nodes: Vec<GraphNode>,
     edges: Vec<GraphEdge>,
     community_count: usize,
+    /// 2026-05-12 — searchable community labels. Maps stringified
+    /// community_id → a "Top1 · Top2 · Top3" string built from the
+    /// highest-degree entity names in that community. Lets the user
+    /// scan the legend and know what each community *is* instead of
+    /// reading "Community 0" / "Community 1" / ...
+    community_labels: HashMap<String, String>,
 }
 
 #[derive(Serialize)]
@@ -197,6 +210,25 @@ fn arm_name(arm: u8) -> String {
 /// `cmd_query` / `cmd_ingest` to populate the `context_name` field on
 /// every returned `EntityInfo`. Cheap: contexts are small (< 100 rows
 /// in practice) and the call is one SELECT.
+/// 2026-05-12 — build a "Top1 · Top2 · Top3" label from an ordered list
+/// of entity names (caller passes them already ranked by degree /
+/// recency). Returns the empty string for an empty input. Names are
+/// taken verbatim — community labels read best when they're the actual
+/// entities ("Aaditya · TraceMind · Rust") rather than tokenised
+/// keywords. Used by both `cmd_community_overlay` and (indirectly)
+/// `cmd_graph`.
+fn label_from_names(names: &[String]) -> String {
+    let mut seen = std::collections::HashSet::new();
+    let picked: Vec<String> = names
+        .iter()
+        .filter(|n| !n.trim().is_empty())
+        .filter(|n| seen.insert(n.to_lowercase()))
+        .take(3)
+        .cloned()
+        .collect();
+    picked.join(" · ")
+}
+
 fn context_name_map(graph: &GraphStore) -> HashMap<Uuid, String> {
     graph
         .list_contexts()
@@ -217,6 +249,18 @@ fn cmd_ingest(text: String, state: State<AppState>) -> Result<IngestResponse, St
     // Persist trace
     let trace_store = state.trace_store.lock().map_err(|e| e.to_string())?;
     let _ = trace_store.append(&result.trace);
+
+    // LM-8 — kick the async triple worker. Best-effort: if the
+    // channel is full we drop the job (counter tracks the backpressure
+    // event). The synchronous pipeline above already produced the
+    // co-occurrence triples; this worker re-runs the (slower) typed
+    // extractor + `route_triple_by_confidence` off the hot path so
+    // mid-confidence triples accumulate in the pending pool over time.
+    let _ = state.triple_worker.try_enqueue(TripleJob {
+        text: text.clone(),
+        entities: result.entities.clone(),
+        session_id,
+    });
 
     // 2026-05-11 — mine intent phrases from the ingested text and persist
     // any hits as `pending` candidates. The capture daemon already does
@@ -558,7 +602,39 @@ fn cmd_graph(state: State<AppState>) -> Result<GraphData, String> {
         });
     }
 
-    Ok(GraphData { nodes, edges, community_count })
+    // 2026-05-12 — searchable community labels. Count degree per node
+    // from the edge list, group (name, degree) by community, sort each
+    // group by degree desc, take top-3 names. The resulting label is
+    // both a glance description ("Aaditya · TraceMind · Rust" tells you
+    // instantly what Community 0 is about) and a search query the user
+    // can paste into the Query view to drill into the community's
+    // captures.
+    let mut degree: HashMap<String, usize> = HashMap::new();
+    for e in &edges {
+        *degree.entry(e.source.clone()).or_insert(0) += 1;
+        *degree.entry(e.target.clone()).or_insert(0) += 1;
+    }
+    let mut by_community: HashMap<i32, Vec<(String, usize)>> = HashMap::new();
+    for n in &nodes {
+        if let Some(cid) = n.community {
+            let d = degree.get(&n.id).copied().unwrap_or(0);
+            by_community
+                .entry(cid)
+                .or_default()
+                .push((n.name.clone(), d));
+        }
+    }
+    let mut community_labels: HashMap<String, String> = HashMap::new();
+    for (cid, mut members) in by_community {
+        // Sort by degree desc, then by name asc for determinism.
+        members.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        let top: Vec<String> = members.into_iter().take(3).map(|(n, _)| n).collect();
+        if !top.is_empty() {
+            community_labels.insert(cid.to_string(), top.join(" · "));
+        }
+    }
+
+    Ok(GraphData { nodes, edges, community_count, community_labels })
 }
 
 /// Batch-ingest curated demo data to populate the knowledge graph.
@@ -3119,6 +3195,40 @@ fn cmd_thread_view_clear(thread_id: String, state: State<AppState>) -> Result<bo
     Ok(removed)
 }
 
+/// Listed view row for the Views sidebar surface.
+#[derive(Serialize, Clone)]
+struct ThreadViewRow {
+    thread_id: String,
+    view_name: Option<String>,
+    include_count: usize,
+    exclude_count: usize,
+}
+
+/// LM-11e — list every saved per-thread splice. Powers the Views surface
+/// so saved splices are discoverable, not buried behind a query.
+/// Named views come first (sorted by name), unnamed views after.
+#[tauri::command]
+fn cmd_thread_views_list(state: State<AppState>) -> Result<Vec<ThreadViewRow>, String> {
+    let map = load_thread_views(&state)?;
+    let mut rows: Vec<ThreadViewRow> = map
+        .into_iter()
+        .filter(|(_, v)| !v.include_ids.is_empty() || !v.exclude_ids.is_empty() || v.view_name.is_some())
+        .map(|(thread_id, v)| ThreadViewRow {
+            thread_id,
+            view_name: v.view_name,
+            include_count: v.include_ids.len(),
+            exclude_count: v.exclude_ids.len(),
+        })
+        .collect();
+    rows.sort_by(|a, b| match (&a.view_name, &b.view_name) {
+        (Some(x), Some(y)) => x.to_lowercase().cmp(&y.to_lowercase()),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => a.thread_id.cmp(&b.thread_id),
+    });
+    Ok(rows)
+}
+
 // ---------------------------------------------------------------------------
 // LM-20/22/23 — Memory Garden, outliers, community overlay
 // ---------------------------------------------------------------------------
@@ -3143,12 +3253,22 @@ struct GardenCard {
 fn cmd_memory_garden(state: State<AppState>) -> Result<Vec<GardenCard>, String> {
     let graph = GraphStore::open(&state.db_path).map_err(|e| e.to_string())?;
     let buckets = graph.cluster_buckets(50).map_err(|e| e.to_string())?;
+    // LM-21 — c-TF-IDF labels for real clusters. Outlier buckets get
+    // the static "unsorted" / "ignored" labels below.
+    let labels = graph.cluster_labels(25).map_err(|e| e.to_string())?;
     let mut cards = Vec::new();
     for (cluster_id, count) in buckets {
         let (label, is_outlier) = match cluster_id {
             None => ("unsorted".to_string(), true),
             Some(-1) => ("unsorted".to_string(), true),
-            Some(id) => (format!("cluster {id}"), false),
+            Some(-2) => ("ignored".to_string(), true),
+            Some(id) => {
+                let label = labels
+                    .get(&id)
+                    .map(|cl| cl.label.clone())
+                    .unwrap_or_else(|| format!("cluster {id}"));
+                (label, false)
+            }
         };
         let lookup = if is_outlier { None } else { cluster_id };
         let raw_samples = graph
@@ -3229,6 +3349,11 @@ struct CommunityRow {
     community_id: Option<i64>,
     entity_count: usize,
     sample_names: Vec<String>,
+    /// 2026-05-12 — short "Top1 · Top2 · Top3" label for this
+    /// community, picked from `sample_names`. Lets the Garden card
+    /// say "Aaditya · TraceMind · Rust" instead of "Community 0".
+    /// Empty string for the unassigned bucket.
+    label: String,
 }
 
 /// LM-23 — community-overlay toggle. Groups entities by their stored
@@ -3239,14 +3364,79 @@ struct CommunityRow {
 fn cmd_community_overlay(state: State<AppState>) -> Result<Vec<CommunityRow>, String> {
     let graph = GraphStore::open(&state.db_path).map_err(|e| e.to_string())?;
     let buckets = graph.community_buckets(50).map_err(|e| e.to_string())?;
-    Ok(buckets
+    // LM-22 fix — if the stored column hasn't been populated yet (no CLU-*
+    // pass has run), `community_buckets` returns a single `None` bucket.
+    // The Graph view computes Louvain on-the-fly via `graph.louvain()` and
+    // surfaces 12+ communities; the Garden overlay was lagging behind.
+    // Fall back to on-the-fly Louvain so the two views agree and so the
+    // "view in graph" drill-down actually has something to drill into.
+    let unassigned =
+        buckets.len() == 1 && buckets[0].0.is_none();
+    if !buckets.is_empty() && !unassigned {
+        return Ok(buckets
+            .into_iter()
+            .map(|(community_id, entity_count, sample_names)| {
+                let label = community_id
+                    .map(|_| label_from_names(&sample_names))
+                    .unwrap_or_default();
+                CommunityRow {
+                    community_id,
+                    entity_count,
+                    sample_names,
+                    label,
+                }
+            })
+            .collect());
+    }
+
+    // On-the-fly Louvain path. Mirrors `cmd_graph` so node communities
+    // match exactly.
+    let communities = graph.louvain().unwrap_or_default();
+    if communities.is_empty() {
+        // No graph data yet — propagate the original single-bucket result.
+        return Ok(buckets
+            .into_iter()
+            .map(|(community_id, entity_count, sample_names)| CommunityRow {
+                community_id,
+                entity_count,
+                sample_names,
+                label: String::new(),
+            })
+            .collect());
+    }
+    let entities = graph
+        .inner()
+        .list_entities(None, None)
+        .map_err(|e| format!("list entities: {e}"))?;
+    use std::collections::HashMap;
+    let mut by_community: HashMap<i32, Vec<String>> = HashMap::new();
+    for ent in &entities {
+        let uuid_str = ent
+            .get_property("uuid")
+            .and_then(|v| v.as_str().map(|s| s.to_string()))
+            .unwrap_or_default();
+        let Ok(u) = uuid::Uuid::parse_str(&uuid_str) else { continue };
+        if let Some(&cid) = communities.get(&u) {
+            by_community.entry(cid).or_default().push(ent.name.clone());
+        }
+    }
+    let mut rows: Vec<CommunityRow> = by_community
         .into_iter()
-        .map(|(community_id, entity_count, sample_names)| CommunityRow {
-            community_id,
-            entity_count,
-            sample_names,
+        .map(|(cid, mut names)| {
+            let entity_count = names.len();
+            names.truncate(8);
+            let label = label_from_names(&names);
+            CommunityRow {
+                community_id: Some(cid as i64),
+                entity_count,
+                sample_names: names,
+                label,
+            }
         })
-        .collect())
+        .collect();
+    rows.sort_by(|a, b| b.entity_count.cmp(&a.entity_count));
+    rows.truncate(50);
+    Ok(rows)
 }
 
 // ---------------------------------------------------------------------------
@@ -3594,6 +3784,22 @@ fn main() {
     let trace_store = Arc::new(Mutex::new(trace_store));
     let capture_enabled = Arc::new(Mutex::new(true));
 
+    // LM-8 — spawn the async triple worker before anything else can
+    // race ingest. Capacity 64 is generous: even bulk ingest should
+    // not produce sustained backpressure, and the bounded channel
+    // means a stuck worker can never balloon RAM. The worker opens
+    // its own GraphStore handle (SQLite WAL handles concurrency).
+    // LM-6: Qwen LLM extractor on the slow path when weights are present.
+    // Falls back to heuristic when the GGUF is missing so the worker
+    // always runs. Drop the GGUF at ~/.tracemind/models/qwen2.5-1.5b-instruct-q4_k_m.gguf
+    // to enable LLM-quality triples; NER stays deterministic on the hot path.
+    let triple_worker = Arc::new(TripleWorker::spawn_qwen_or_default(
+        WorkerDb::Path(db_path.clone()),
+        64,
+        &dir,
+    ));
+    let cap_triple_worker = Arc::clone(&triple_worker);
+
     // Clone Arcs for capture thread before moving into AppState
     let cap_ingest = Arc::clone(&ingest);
     let cap_trace_store = Arc::clone(&trace_store);
@@ -3607,6 +3813,7 @@ fn main() {
         retrieval: Mutex::new(retrieval),
         trace_store,
         capture_enabled,
+        triple_worker,
     };
 
     tauri::Builder::default()
@@ -3669,6 +3876,7 @@ fn main() {
             cmd_thread_view_save,
             cmd_thread_view_load,
             cmd_thread_view_clear,
+            cmd_thread_views_list,
             cmd_memory_garden,
             cmd_outliers_list,
             cmd_outlier_triage,
@@ -3682,6 +3890,11 @@ fn main() {
                 let pipeline = cap_ingest;
                 let trace_store = cap_trace_store;
                 let capture_flag = cap_enabled;
+                // LM-8 — capture-loop ingests also feed the async
+                // triple worker so background extraction runs over
+                // clipboard/window/editor text too, not just user-typed
+                // IPC ingests.
+                let triple_worker = cap_triple_worker;
 
                 let mut seen_hashes: HashSet<u64> = HashSet::new();
                 let mut last_clip_hash: u64 = 0;
@@ -3721,6 +3934,12 @@ fn main() {
                                     if let Ok(ts) = trace_store.lock() {
                                         let _ = ts.append(&result.trace);
                                     }
+                                    // LM-8 — enqueue background triple extraction
+                                    let _ = triple_worker.try_enqueue(TripleJob {
+                                        text: text.clone(),
+                                        entities: result.entities.clone(),
+                                        session_id: session,
+                                    });
                                     let _ = handle.emit("capture-event", CaptureEvent {
                                         source: "clipboard".to_string(),
                                         text: if text.len() > 80 { format!("{}...", &text[..80]) } else { text.clone() },
@@ -3760,6 +3979,12 @@ fn main() {
                                             if let Ok(ts) = trace_store.lock() {
                                                 let _ = ts.append(&result.trace);
                                             }
+                                            // LM-8 — slow-path triple extraction off the capture loop.
+                                            let _ = triple_worker.try_enqueue(TripleJob {
+                                                text: context.clone(),
+                                                entities: result.entities.clone(),
+                                                session_id: session,
+                                            });
                                             let _ = handle.emit("capture-event", CaptureEvent {
                                                 source: "window".to_string(),
                                                 text: window,
@@ -3784,6 +4009,12 @@ fn main() {
                                         if let Ok(ts) = trace_store.lock() {
                                             let _ = ts.append(&result.trace);
                                         }
+                                        // LM-8 — enqueue slow-path triple extraction.
+                                        let _ = triple_worker.try_enqueue(TripleJob {
+                                            text: context.clone(),
+                                            entities: result.entities.clone(),
+                                            session_id: session,
+                                        });
                                         let _ = handle.emit("capture-event", CaptureEvent {
                                             source: "editor".to_string(),
                                             text: editor_ctx,
@@ -3823,6 +4054,12 @@ fn main() {
                                             if let Ok(ts) = trace_store.lock() {
                                                 let _ = ts.append(&result.trace);
                                             }
+                                            // LM-8 — fan out slow-path triple extraction per chunk.
+                                            let _ = triple_worker.try_enqueue(TripleJob {
+                                                text: chunk.clone(),
+                                                entities: result.entities.clone(),
+                                                session_id: session,
+                                            });
                                             total_entities += result.entities.len();
                                             total_triples += result.triples.len();
                                         }

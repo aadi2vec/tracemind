@@ -5951,6 +5951,7 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "hf-hub",
+ "llama-cpp-2",
  "ndarray 0.16.1",
  "ort",
  "seahash",

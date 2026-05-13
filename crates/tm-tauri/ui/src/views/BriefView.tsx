@@ -27,6 +27,8 @@ import {
   type TripleDetailView,
   type OutcomePolarity,
 } from "../api";
+import EntityDrawer from "./EntityDrawer";
+import TransclusionText from "./TransclusionText";
 
 function shortId(id: string): string {
   return id.slice(0, 8);
@@ -72,6 +74,8 @@ export default function BriefView() {
   const [contradictionDrawer, setContradictionDrawer] =
     useState<ContradictionRow | null>(null);
   const [outcomeDrawer, setOutcomeDrawer] = useState<BriefRow | null>(null);
+  // LM-3 — entity drawer opened from a transclusion chip click.
+  const [entityDrawer, setEntityDrawer] = useState<string | null>(null);
 
   // UI-9 — read / dismissed / archived markers (localStorage).
   const [readIds, setReadIds] = useState<Set<string>>(() => loadSet(LS_READ));
@@ -289,6 +293,7 @@ export default function BriefView() {
                 }}
                 onDismiss={() => dismiss(r.id)}
                 onArchive={() => archive(r.id)}
+                onOpenEntity={(id) => setEntityDrawer(id)}
                 accent="overdue"
               />
             ))}
@@ -313,6 +318,7 @@ export default function BriefView() {
                 }}
                 onDismiss={() => dismiss(r.id)}
                 onArchive={() => archive(r.id)}
+                onOpenEntity={(id) => setEntityDrawer(id)}
               />
             ))}
           </ul>
@@ -333,6 +339,7 @@ export default function BriefView() {
                 onOpen={() => markRead(r.id)}
                 onDismiss={() => dismiss(r.id)}
                 onArchive={() => archive(r.id)}
+                onOpenEntity={(id) => setEntityDrawer(id)}
                 accent="resolved"
               />
             ))}
@@ -406,6 +413,14 @@ export default function BriefView() {
           }}
         />
       )}
+
+      {entityDrawer && (
+        <EntityDrawer
+          entityId={entityDrawer}
+          onClose={() => setEntityDrawer(null)}
+          onOpenEntity={(t) => setEntityDrawer(t)}
+        />
+      )}
     </div>
   );
 }
@@ -422,6 +437,7 @@ function BriefRowItem({
   onOpen,
   onDismiss,
   onArchive,
+  onOpenEntity,
   accent,
 }: {
   row: BriefRow;
@@ -429,6 +445,7 @@ function BriefRowItem({
   onOpen: () => void;
   onDismiss: () => void;
   onArchive: () => void;
+  onOpenEntity?: (id: string) => void;
   accent?: "overdue" | "resolved";
 }) {
   return (
@@ -458,7 +475,11 @@ function BriefRowItem({
             {row.polarity}
           </span>
         )}
-        <span className={read ? "text-tm-muted" : "text-tm-text"}>{row.title}</span>
+        <TransclusionText
+          text={row.title}
+          onOpenEntity={onOpenEntity}
+          className={read ? "text-tm-muted" : "text-tm-text"}
+        />
         {row.horizon && (
           <span className="ml-auto text-xs text-tm-muted">{row.horizon}</span>
         )}

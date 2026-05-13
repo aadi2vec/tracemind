@@ -41,5 +41,12 @@ tauri-build = { version = "2", features = [] }
 # unless Vite is running. We default-enable it so plain `cargo build --release`
 # produces a working desktop binary. For `cargo run` against the Vite dev
 # server, use `--no-default-features`.
-default = ["custom-protocol"]
+default = ["custom-protocol", "local-llm"]
 custom-protocol = ["tauri/custom-protocol"]
+# Build with the Qwen 2.5 1.5B Q4_K_M extractor wired into the slow-path
+# triple worker. Requires `cmake` (for llama-cpp-sys-2) at build time.
+# Disable with `--no-default-features --features custom-protocol` to fall
+# back to the heuristic extractor only (no cmake / no LLM weights).
+# Runtime fallback to heuristic also kicks in automatically when the GGUF
+# weights are missing — see `TripleWorker::spawn_qwen_or_default`.
+local-llm = ["tm-ingest/local-llm"]

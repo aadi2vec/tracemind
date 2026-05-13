@@ -282,7 +282,21 @@ impl GraphStore {
                 dim         INTEGER NOT NULL,
                 embeddings  BLOB NOT NULL,
                 created_at  TEXT NOT NULL DEFAULT (datetime('now'))
-            );"
+            );
+
+            -- LM-5b: auto-tags. Each entity carries 0..N tags derived from
+            -- hashtags / entity-type / future cluster-label sources. Tag
+            -- source is tracked so the user can untag a heuristic without
+            -- losing manual tags.
+            CREATE TABLE IF NOT EXISTS kg_entity_tags (
+                entity_id   TEXT NOT NULL,
+                tag         TEXT NOT NULL,
+                source      TEXT NOT NULL DEFAULT 'auto',
+                created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+                PRIMARY KEY (entity_id, tag)
+            );
+            CREATE INDEX IF NOT EXISTS idx_tags_entity ON kg_entity_tags(entity_id);
+            CREATE INDEX IF NOT EXISTS idx_tags_tag ON kg_entity_tags(tag);"
         )
         .map_err(|e| TraceMindError::Storage(format!("create tables: {e}")))?;
 
@@ -2700,6 +2714,94 @@ impl GraphStore {
         Ok(rows)
     }
 
+    /// List every triple currently in `kg_relations`. Used by the
+    /// MOC generator (LM-5d) and by the cluster labeler (LM-21).
+    pub fn list_all_triples(&self) -> Result<Vec<Triple>> {
+        let ids: Vec<Uuid> = self.triple_map.borrow().keys().copied().collect();
+        let mut out = Vec::with_capacity(ids.len());
+        for id in ids {
+            if let Ok(Some(t)) = self.find_triple_by_id(id) {
+                out.push(t);
+            }
+        }
+        Ok(out)
+    }
+
+    /// LM-5b — upsert one tag for an entity. Idempotent on
+    /// `(entity_id, tag)`. `source` is informational
+    /// ("auto" | "hashtag" | "type" | "cluster" | "manual").
+    pub fn upsert_entity_tag(
+        &self,
+        entity_id: Uuid,
+        tag: &str,
+        source: &str,
+    ) -> Result<()> {
+        let conn = self.kg.connection();
+        conn.execute(
+            "INSERT OR IGNORE INTO kg_entity_tags (entity_id, tag, source) \
+             VALUES (?1, ?2, ?3)",
+            params![entity_id.to_string(), tag, source],
+        )
+        .map_err(|e| TraceMindError::Storage(format!("upsert_entity_tag: {e}")))?;
+        Ok(())
+    }
+
+    /// LM-5b — bulk upsert. Returns count of newly inserted rows.
+    pub fn upsert_entity_tags(
+        &self,
+        entity_id: Uuid,
+        tags: &[String],
+        source: &str,
+    ) -> Result<usize> {
+        let mut new_rows = 0;
+        for tag in tags {
+            if tag.is_empty() {
+                continue;
+            }
+            let conn = self.kg.connection();
+            let changes = conn
+                .execute(
+                    "INSERT OR IGNORE INTO kg_entity_tags (entity_id, tag, source) \
+                     VALUES (?1, ?2, ?3)",
+                    params![entity_id.to_string(), tag, source],
+                )
+                .map_err(|e| TraceMindError::Storage(format!("upsert_entity_tags: {e}")))?;
+            if changes > 0 {
+                new_rows += 1;
+            }
+        }
+        Ok(new_rows)
+    }
+
+    /// LM-5b — list tags for an entity, ordered alphabetically.
+    pub fn tags_for_entity(&self, entity_id: Uuid) -> Result<Vec<String>> {
+        let conn = self.kg.connection();
+        let mut stmt = conn
+            .prepare(
+                "SELECT tag FROM kg_entity_tags WHERE entity_id = ?1 \
+                 ORDER BY tag ASC",
+            )
+            .map_err(|e| TraceMindError::Storage(format!("tags_for_entity prep: {e}")))?;
+        let rows: Vec<String> = stmt
+            .query_map(params![entity_id.to_string()], |r| r.get::<_, String>(0))
+            .map_err(|e| TraceMindError::Storage(format!("tags_for_entity q: {e}")))?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(rows)
+    }
+
+    /// LM-5b — drop one tag from an entity (used by user "untag").
+    pub fn delete_entity_tag(&self, entity_id: Uuid, tag: &str) -> Result<bool> {
+        let conn = self.kg.connection();
+        let n = conn
+            .execute(
+                "DELETE FROM kg_entity_tags WHERE entity_id = ?1 AND tag = ?2",
+                params![entity_id.to_string(), tag],
+            )
+            .map_err(|e| TraceMindError::Storage(format!("delete_entity_tag: {e}")))?;
+        Ok(n > 0)
+    }
+
     /// LM-20 — Memory Garden: cluster buckets over `captured_signals`.
     /// Returns `(cluster_id, count)` pairs sorted by count desc. A
     /// `None` cluster_id is the outlier bucket. `-1` is HDBSCAN's
@@ -2769,6 +2871,59 @@ impl GraphStore {
             }
         }
         Ok(samples)
+    }
+
+    /// LM-21 — compute c-TF-IDF labels for every populated cluster.
+    /// Walks `captured_signals`, groups by `cluster_id`, asks
+    /// [`crate::labeler::label_clusters`] for a top-K topic phrase per
+    /// cluster, and returns `cluster_id → label`. Outlier buckets
+    /// (`NULL`, `-1`, `-2`) are skipped — the UI labels those as
+    /// "unsorted" / "ignored" without TF-IDF.
+    ///
+    /// `sample_cap` bounds how many rows per cluster we pull when
+    /// computing labels. 25 is a good default — labels stabilise at
+    /// ~10 samples and we don't want this query to scan the full
+    /// signal log on a huge memory.
+    pub fn cluster_labels(
+        &self,
+        sample_cap: usize,
+    ) -> Result<std::collections::HashMap<i64, crate::labeler::ClusterLabel>> {
+        let conn = self.kg.connection();
+        // Pull cluster ids first so we can issue one focused fetch per
+        // bucket and keep memory bounded even on huge tables.
+        let mut id_stmt = conn
+            .prepare(
+                "SELECT DISTINCT cluster_id FROM captured_signals \
+                 WHERE cluster_id IS NOT NULL AND cluster_id >= 0",
+            )
+            .map_err(|e| TraceMindError::Storage(format!("cluster_labels prep ids: {e}")))?;
+        let ids: Vec<i64> = id_stmt
+            .query_map([], |r| r.get::<_, i64>(0))
+            .map_err(|e| TraceMindError::Storage(format!("cluster_labels q ids: {e}")))?
+            .filter_map(|r| r.ok())
+            .collect();
+        drop(id_stmt);
+
+        let mut samples: std::collections::HashMap<i64, Vec<String>> =
+            std::collections::HashMap::new();
+        for cid in ids {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT raw_text FROM captured_signals \
+                     WHERE cluster_id = ?1 ORDER BY id DESC LIMIT ?2",
+                )
+                .map_err(|e| TraceMindError::Storage(format!("cluster_labels prep s: {e}")))?;
+            let texts: Vec<String> = stmt
+                .query_map(params![cid, sample_cap as i64], |r| r.get::<_, String>(0))
+                .map_err(|e| TraceMindError::Storage(format!("cluster_labels q s: {e}")))?
+                .filter_map(|r| r.ok())
+                .collect();
+            samples.insert(cid, texts);
+        }
+        Ok(crate::labeler::label_clusters(
+            &samples,
+            crate::labeler::LabelerConfig::default(),
+        ))
     }
 
     /// LM-22 — Outlier "Unsorted" tray rows. `(signal_id, raw_text,

@@ -26,5 +26,18 @@ tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
 ndarray = { version = "0.16" }
 hf-hub = { version = "0.4" }
 
+# LM-6 — optional Qwen 2.5 1.5B Q4 triple extractor. Behind `local-llm`
+# feature; pulls llama-cpp-2 (heavy native build, ~30s cold compile) so
+# default builds stay fast. The pure prompt/parser helpers in
+# `crate::qwen` are always compiled and unit-tested without the model.
+llama-cpp-2 = { version = "0.1", optional = true }
+
 [dev-dependencies]
 tempfile = "3"
+
+[features]
+default = []
+# Tier 1: Qwen 2.5 1.5B Q4_K_M relation extractor (opt-in, ~900 MB weights).
+local-llm = ["dep:llama-cpp-2"]
+# Apple Silicon Metal acceleration for the slow-path extractor.
+local-llm-metal = ["local-llm", "llama-cpp-2/metal"]

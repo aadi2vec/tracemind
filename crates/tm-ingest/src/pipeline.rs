@@ -10,6 +10,7 @@ use tm_governance::GovernanceFilter;
 
 use crate::extractor::{EntityExtractor, HeuristicExtractor};
 use crate::rate_limit::RateLimiter;
+use crate::tags::tags_for_memory;
 
 pub struct IngestPipeline {
     graph: GraphStore,
@@ -379,6 +380,19 @@ impl IngestPipeline {
             }
         }
         let triples = accepted_triples;
+
+        // 7b. LM-5b — derive + persist auto-tags. Hashtags from raw text
+        // + entity-type label per entity. Cluster-label tags layer in
+        // later from the consolidator once CLU-6 backfills cluster_id.
+        let auto_tags = tags_for_memory(text, &entities);
+        for ent in &entities {
+            let mut combined = auto_tags.clone();
+            // Also attach the entity-type tag specifically to this entity.
+            combined.push(crate::tags::entity_type_tag(&ent.entity_type));
+            combined.sort();
+            combined.dedup();
+            let _ = self.graph.upsert_entity_tags(ent.id, &combined, "auto");
+        }
 
         // 8. Build trace record with full provenance.
         let mut trace = Trace::new(session_id, TraceEventType::Ingest, &content_hash);

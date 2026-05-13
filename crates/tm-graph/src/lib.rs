@@ -2,6 +2,7 @@ pub mod belief;
 pub mod context;
 pub mod deny_list;
 pub mod entity_resolve;
+pub mod labeler;
 pub mod memory_view;
 pub mod moc;
 pub mod ontology;
@@ -17,6 +18,10 @@ pub use deny_list::{
     DEFAULT_STRIKE_THRESHOLD, SCHEMA_VERSION as DENY_LIST_SCHEMA_VERSION,
 };
 pub use entity_resolve::{resolve_in_text, EntityMention};
+pub use labeler::{
+    label_clusters, ClusterLabel, LabelTerm, LabelerConfig, BIGRAM_BOOST, DEFAULT_MIN_TOKEN_LEN,
+    DEFAULT_TOP_K,
+};
 pub use memory_view::{
     MemberKind, MemberType, MemoryView, ViewFilter, ViewMember, VIEW_SCHEMA_VERSION,
 };
