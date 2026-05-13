@@ -96,6 +96,10 @@ const fn default_gpu_layers() -> i32 {
 pub struct QwenTripleExtractor {
     config: QwenTripleConfig,
     fallback: HeuristicExtractor,
+    /// Optional NER override. When set, `extract_entities` delegates here
+    /// instead of the heuristic fallback. Lets us pair GLiNER NER with
+    /// Qwen triple extraction in the same `Box<dyn EntityExtractor>`.
+    ner_override: Option<Box<dyn EntityExtractor>>,
     #[cfg(feature = "local-llm")]
     inner: std::sync::Mutex<QwenLoaded>,
 }
@@ -110,9 +114,49 @@ impl QwenTripleExtractor {
         Self {
             config,
             fallback: HeuristicExtractor,
+            ner_override: None,
             #[cfg(feature = "local-llm")]
             inner: std::sync::Mutex::new(QwenLoaded { model: None }),
         }
+    }
+
+    /// Best-effort constructor for the boot path: returns `Some` only when
+    /// the `local-llm` feature is compiled in **and** the GGUF weights
+    /// exist at `<data_dir>/models/<filename>`. Returns `None` otherwise
+    /// so the caller falls back to the heuristic-only extractor.
+    ///
+    /// `data_dir` is typically `~/.tracemind`. The model filename is the
+    /// canonical Qwen 2.5 1.5B Q4_K_M GGUF.
+    pub fn auto_load(data_dir: &std::path::Path) -> Option<Self> {
+        #[cfg(not(feature = "local-llm"))]
+        {
+            let _ = data_dir;
+            tracing::info!("[qwen] local-llm feature disabled at build time");
+            return None;
+        }
+        #[cfg(feature = "local-llm")]
+        {
+            let model_path = data_dir
+                .join("models")
+                .join("qwen2.5-1.5b-instruct-q4_k_m.gguf");
+            if !model_path.exists() {
+                tracing::info!(
+                    "[qwen] weights not found at {} — falling back to heuristic. \
+                     Drop the GGUF there to enable LLM triple extraction.",
+                    model_path.display()
+                );
+                return None;
+            }
+            tracing::info!("[qwen] enabling LLM triple extractor with weights at {}", model_path.display());
+            Some(Self::new(QwenTripleConfig::primary(model_path)))
+        }
+    }
+
+    /// Builder: override the NER stage with a richer extractor (e.g. GLiNER).
+    /// Triples still go through Qwen.
+    pub fn with_ner(mut self, ner: Box<dyn EntityExtractor>) -> Self {
+        self.ner_override = Some(ner);
+        self
     }
 
     /// True if the GGUF weights exist on disk. When false, the extractor
@@ -124,8 +168,14 @@ impl QwenTripleExtractor {
 
 impl EntityExtractor for QwenTripleExtractor {
     fn extract_entities(&self, text: &str) -> Vec<Entity> {
-        // NER is always heuristic — runs on every capture, never gated.
-        self.fallback.extract_entities(text)
+        // NER stays on the deterministic / per-capture path. When an
+        // override is configured (typically GLiNER), use it; otherwise
+        // fall through to the heuristic pass. Qwen never runs on NER.
+        if let Some(ner) = &self.ner_override {
+            ner.extract_entities(text)
+        } else {
+            self.fallback.extract_entities(text)
+        }
     }
 
     fn extract_triples(&self, text: &str, entities: &[Entity]) -> Vec<Triple> {

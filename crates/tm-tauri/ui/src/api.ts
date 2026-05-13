@@ -634,6 +634,18 @@ export async function clearThreadView(threadId: string): Promise<boolean> {
   return invoke("cmd_thread_view_clear", { threadId });
 }
 
+// LM-11e — Views surface: list every saved splice
+export interface ThreadViewRow {
+  thread_id: string;
+  view_name: string | null;
+  include_count: number;
+  exclude_count: number;
+}
+
+export async function listThreadViews(): Promise<ThreadViewRow[]> {
+  return invoke("cmd_thread_views_list");
+}
+
 // LM-20/22 — Memory Garden cards (cluster buckets + outlier tray)
 export interface GardenCard {
   cluster_id: number | null;

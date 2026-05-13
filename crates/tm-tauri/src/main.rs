@@ -3138,6 +3138,40 @@ fn cmd_thread_view_clear(thread_id: String, state: State<AppState>) -> Result<bo
     Ok(removed)
 }
 
+/// Listed view row for the Views sidebar surface.
+#[derive(Serialize, Clone)]
+struct ThreadViewRow {
+    thread_id: String,
+    view_name: Option<String>,
+    include_count: usize,
+    exclude_count: usize,
+}
+
+/// LM-11e — list every saved per-thread splice. Powers the Views surface
+/// so saved splices are discoverable, not buried behind a query.
+/// Named views come first (sorted by name), unnamed views after.
+#[tauri::command]
+fn cmd_thread_views_list(state: State<AppState>) -> Result<Vec<ThreadViewRow>, String> {
+    let map = load_thread_views(&state)?;
+    let mut rows: Vec<ThreadViewRow> = map
+        .into_iter()
+        .filter(|(_, v)| !v.include_ids.is_empty() || !v.exclude_ids.is_empty() || v.view_name.is_some())
+        .map(|(thread_id, v)| ThreadViewRow {
+            thread_id,
+            view_name: v.view_name,
+            include_count: v.include_ids.len(),
+            exclude_count: v.exclude_ids.len(),
+        })
+        .collect();
+    rows.sort_by(|a, b| match (&a.view_name, &b.view_name) {
+        (Some(x), Some(y)) => x.to_lowercase().cmp(&y.to_lowercase()),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => a.thread_id.cmp(&b.thread_id),
+    });
+    Ok(rows)
+}
+
 // ---------------------------------------------------------------------------
 // LM-20/22/23 — Memory Garden, outliers, community overlay
 // ---------------------------------------------------------------------------
@@ -3268,14 +3302,70 @@ struct CommunityRow {
 fn cmd_community_overlay(state: State<AppState>) -> Result<Vec<CommunityRow>, String> {
     let graph = GraphStore::open(&state.db_path).map_err(|e| e.to_string())?;
     let buckets = graph.community_buckets(50).map_err(|e| e.to_string())?;
-    Ok(buckets
+    // LM-22 fix — if the stored column hasn't been populated yet (no CLU-*
+    // pass has run), `community_buckets` returns a single `None` bucket.
+    // The Graph view computes Louvain on-the-fly via `graph.louvain()` and
+    // surfaces 12+ communities; the Garden overlay was lagging behind.
+    // Fall back to on-the-fly Louvain so the two views agree and so the
+    // "view in graph" drill-down actually has something to drill into.
+    let unassigned =
+        buckets.len() == 1 && buckets[0].0.is_none();
+    if !buckets.is_empty() && !unassigned {
+        return Ok(buckets
+            .into_iter()
+            .map(|(community_id, entity_count, sample_names)| CommunityRow {
+                community_id,
+                entity_count,
+                sample_names,
+            })
+            .collect());
+    }
+
+    // On-the-fly Louvain path. Mirrors `cmd_graph` so node communities
+    // match exactly.
+    let communities = graph.louvain().unwrap_or_default();
+    if communities.is_empty() {
+        // No graph data yet — propagate the original single-bucket result.
+        return Ok(buckets
+            .into_iter()
+            .map(|(community_id, entity_count, sample_names)| CommunityRow {
+                community_id,
+                entity_count,
+                sample_names,
+            })
+            .collect());
+    }
+    let entities = graph
+        .inner()
+        .list_entities(None, None)
+        .map_err(|e| format!("list entities: {e}"))?;
+    use std::collections::HashMap;
+    let mut by_community: HashMap<i32, Vec<String>> = HashMap::new();
+    for ent in &entities {
+        let uuid_str = ent
+            .get_property("uuid")
+            .and_then(|v| v.as_str().map(|s| s.to_string()))
+            .unwrap_or_default();
+        let Ok(u) = uuid::Uuid::parse_str(&uuid_str) else { continue };
+        if let Some(&cid) = communities.get(&u) {
+            by_community.entry(cid).or_default().push(ent.name.clone());
+        }
+    }
+    let mut rows: Vec<CommunityRow> = by_community
         .into_iter()
-        .map(|(community_id, entity_count, sample_names)| CommunityRow {
-            community_id,
-            entity_count,
-            sample_names,
+        .map(|(cid, mut names)| {
+            let entity_count = names.len();
+            names.truncate(8);
+            CommunityRow {
+                community_id: Some(cid as i64),
+                entity_count,
+                sample_names: names,
+            }
         })
-        .collect())
+        .collect();
+    rows.sort_by(|a, b| b.entity_count.cmp(&a.entity_count));
+    rows.truncate(50);
+    Ok(rows)
 }
 
 // ---------------------------------------------------------------------------
@@ -3628,9 +3718,14 @@ fn main() {
     // not produce sustained backpressure, and the bounded channel
     // means a stuck worker can never balloon RAM. The worker opens
     // its own GraphStore handle (SQLite WAL handles concurrency).
-    let triple_worker = Arc::new(TripleWorker::spawn_default(
+    // LM-6: Qwen LLM extractor on the slow path when weights are present.
+    // Falls back to heuristic when the GGUF is missing so the worker
+    // always runs. Drop the GGUF at ~/.tracemind/models/qwen2.5-1.5b-instruct-q4_k_m.gguf
+    // to enable LLM-quality triples; NER stays deterministic on the hot path.
+    let triple_worker = Arc::new(TripleWorker::spawn_qwen_or_default(
         WorkerDb::Path(db_path.clone()),
         64,
+        &dir,
     ));
     let cap_triple_worker = Arc::clone(&triple_worker);
 
@@ -3710,6 +3805,7 @@ fn main() {
             cmd_thread_view_save,
             cmd_thread_view_load,
             cmd_thread_view_clear,
+            cmd_thread_views_list,
             cmd_memory_garden,
             cmd_outliers_list,
             cmd_outlier_triage,

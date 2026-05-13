@@ -51,7 +51,17 @@ export default function GraphView() {
   const [hovered, setHovered] = useState<SimNode | null>(null);
   const [filter, setFilter] = useState<string>("all");
   const [showLabels, setShowLabels] = useState(true);
-  const [colorMode, setColorMode] = useState<"type" | "community">("type");
+  // Default to community coloring: with 100s of nodes, type alone reads as
+  // noise; community-grouping is the legibility win.
+  const [colorMode, setColorMode] = useState<"type" | "community">("community");
+  // LM-22 — minimum-degree threshold. Hides leaves so the graph stops
+  // looking like a hairball when the user has 400+ nodes. 1 = drop fully
+  // isolated nodes (the most common source of visual noise).
+  const [minDegree, setMinDegree] = useState<number>(1);
+  // LM-22 — community drill-down. Set via the `tm:focus-community` event
+  // dispatched by MemoryGardenView, or via the per-community pill below.
+  // null = show every community.
+  const [focusCommunity, setFocusCommunity] = useState<number | null>(null);
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number; node: SimNode } | null>(null);
   const nodesRef = useRef<SimNode[]>([]);
   const edgesRef = useRef<GraphEdge[]>([]);
@@ -151,45 +161,82 @@ export default function GraphView() {
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
 
-    // Filter nodes
-    const filteredNodes = filter === "all"
+    // Stage 1 — type/community filter.
+    let stage1 = filter === "all"
       ? data.nodes
       : data.nodes.filter((n) => n.entity_type === filter);
-    const nodeIds = new Set(filteredNodes.map((n) => n.id));
-
-    // Filter edges to only include edges between visible nodes
-    const filteredEdges = data.edges.filter(
-      (e) => nodeIds.has(e.source) && nodeIds.has(e.target)
+    if (focusCommunity !== null) {
+      stage1 = stage1.filter((n) => n.community === focusCommunity);
+    }
+    const stage1Ids = new Set(stage1.map((n) => n.id));
+    const stage1Edges = data.edges.filter(
+      (e) => stage1Ids.has(e.source) && stage1Ids.has(e.target),
     );
 
-    // Compute node degrees for sizing
+    // Stage 2 — degree-pruning. Drop nodes whose connectivity is below
+    // the threshold. We compute degree on the post-filter graph so the
+    // pruning matches what's actually visible.
+    const preDegree = new Map<string, number>();
+    for (const e of stage1Edges) {
+      preDegree.set(e.source, (preDegree.get(e.source) || 0) + 1);
+      preDegree.set(e.target, (preDegree.get(e.target) || 0) + 1);
+    }
+    const filteredNodes = minDegree > 0
+      ? stage1.filter((n) => (preDegree.get(n.id) || 0) >= minDegree)
+      : stage1;
+    const nodeIds = new Set(filteredNodes.map((n) => n.id));
+    const filteredEdges = stage1Edges.filter(
+      (e) => nodeIds.has(e.source) && nodeIds.has(e.target),
+    );
+
+    // Final degree map (sizing uses this).
     const degreeMap = new Map<string, number>();
     for (const e of filteredEdges) {
       degreeMap.set(e.source, (degreeMap.get(e.source) || 0) + 1);
       degreeMap.set(e.target, (degreeMap.get(e.target) || 0) + 1);
     }
 
+    // LM-22 — community anchors. Each Louvain community gets a target
+    // position on a circle around the canvas center; per-frame gravity
+    // pulls members toward their anchor instead of the global center.
+    // This is what makes communities form *visible* clusters rather
+    // than blurring into a hairball.
+    const communityIds = Array.from(
+      new Set(filteredNodes.map((n) => n.community).filter((c): c is number => c !== null)),
+    );
+    const communityAnchors = new Map<number, { x: number; y: number }>();
+    const anchorRadius = Math.min(sizeRef.current.w, sizeRef.current.h) * 0.32;
+    communityIds.forEach((cid, idx) => {
+      const angle = (idx / Math.max(communityIds.length, 1)) * Math.PI * 2;
+      communityAnchors.set(cid, {
+        x: sizeRef.current.w / 2 + Math.cos(angle) * anchorRadius,
+        y: sizeRef.current.h / 2 + Math.sin(angle) * anchorRadius,
+      });
+    });
+
     const { w, h } = sizeRef.current;
 
     // Init nodes on a concentric circle layout — much faster to settle
     // than random scatter, and avoids the "explosion" of the first ~200
     // frames where everything was bouncing off the boundaries.
-    const N = filteredNodes.length;
-    const baseRadius = Math.min(w, h) * 0.32;
-    const nodes: SimNode[] = filteredNodes.map((n, idx) => {
+    const baseRadius = Math.min(w, h) * 0.18;
+    // Seed each node *near* its community anchor (with a small random
+    // jitter) so the force loop only has to refine, not discover, the
+    // clusters. This is the single biggest legibility win for >100 nodes.
+    const nodes: SimNode[] = filteredNodes.map((n) => {
       const degree = degreeMap.get(n.id) || 0;
-      // High-degree nodes start nearer the center; low-degree at the rim.
-      // This is a cheap proxy for "communities first, leaves last".
-      const tier = degree > 3 ? 0.35 : degree > 0 ? 0.75 : 1.0;
-      const angle = (idx / Math.max(N, 1)) * Math.PI * 2;
+      const anchor = n.community !== null ? communityAnchors.get(n.community) : null;
+      const seedX = anchor ? anchor.x : w / 2;
+      const seedY = anchor ? anchor.y : h / 2;
+      const jitter = baseRadius * (degree > 3 ? 0.3 : 0.7);
       return {
         id: n.id,
         name: n.name,
         entity_type: n.entity_type,
         confidence: n.confidence,
         community: n.community,
-        x: w / 2 + Math.cos(angle) * baseRadius * tier,
-        y: h / 2 + Math.sin(angle) * baseRadius * tier,
+        x: seedX + (Math.random() - 0.5) * jitter,
+        y: seedY + (Math.random() - 0.5) * jitter,
         vx: 0,
         vy: 0,
         radius: Math.max(5, Math.min(22, 6 + Math.sqrt(degree) * 3 + n.confidence * 4)),
@@ -232,13 +279,26 @@ export default function GraphView() {
           ? 1.0 - (frameCount / maxSimFrames) * 0.9
           : Math.max(0, 0.1 - (frameCount - maxSimFrames) / 200);
 
-      // Center gravity
+      // LM-22 — community-anchored gravity. Each node feels gravity
+      // toward its community's anchor point (with a soft pull toward
+      // the global center as a fallback for uncommunitied nodes).
+      // The anchor gravity is ~3x weaker than the old global gravity
+      // since it acts over much smaller distances; the global tether
+      // keeps anchors themselves from drifting apart.
+      const anchorGravity = gravity * 2.2;
+      const centerGravity = gravity * 0.25;
       for (const n of nodes) {
-        n.vx += (w / 2 - n.x) * gravity * cooling;
-        n.vy += (h / 2 - n.y) * gravity * cooling;
+        const a = n.community !== null ? communityAnchors.get(n.community) : null;
+        if (a) {
+          n.vx += (a.x - n.x) * anchorGravity * cooling;
+          n.vy += (a.y - n.y) * anchorGravity * cooling;
+        }
+        n.vx += (w / 2 - n.x) * centerGravity * cooling;
+        n.vy += (h / 2 - n.y) * centerGravity * cooling;
       }
 
-      // Repulsion (with spatial cutoff for large graphs)
+      // Repulsion (with spatial cutoff for large graphs). Pairs in
+      // *different* communities repel ~1.6x harder so clusters separate.
       const cutoff = isLargeGraph ? k * 4 : Infinity;
       for (let i = 0; i < nodeCount; i++) {
         for (let j = i + 1; j < nodeCount; j++) {
@@ -247,9 +307,13 @@ export default function GraphView() {
           const distSq = dx * dx + dy * dy;
           if (distSq > cutoff * cutoff) continue;
           const dist = Math.max(Math.sqrt(distSq), 1);
+          const sameCommunity =
+            nodes[i].community !== null &&
+            nodes[i].community === nodes[j].community;
+          const communityScale = sameCommunity ? 1.0 : 1.6;
           const force = (k * k) / dist;
-          const fx = (dx / dist) * force * repulsionScale * cooling;
-          const fy = (dy / dist) * force * repulsionScale * cooling;
+          const fx = (dx / dist) * force * repulsionScale * cooling * communityScale;
+          const fy = (dy / dist) * force * repulsionScale * cooling * communityScale;
           nodes[i].vx -= fx;
           nodes[i].vy -= fy;
           nodes[j].vx += fx;
@@ -257,7 +321,9 @@ export default function GraphView() {
         }
       }
 
-      // Attraction along edges
+      // Attraction along edges. Intra-community edges pull ~1.5x harder
+      // so members of a community cohere visibly even when only weakly
+      // linked.
       for (const edge of filteredEdges) {
         const src = idToNode.get(edge.source);
         const tgt = idToNode.get(edge.target);
@@ -265,7 +331,10 @@ export default function GraphView() {
         const dx = tgt.x - src.x;
         const dy = tgt.y - src.y;
         const dist = Math.max(Math.sqrt(dx * dx + dy * dy), 1);
-        const force = (dist - k) * 0.015 * cooling;
+        const sameCommunity =
+          src.community !== null && src.community === tgt.community;
+        const attractScale = sameCommunity ? 1.5 : 0.7;
+        const force = (dist - k) * 0.015 * cooling * attractScale;
         const fx = (dx / dist) * force;
         const fy = (dy / dist) * force;
         src.vx += fx;
@@ -390,7 +459,22 @@ export default function GraphView() {
     // NOTE: `hovered` is intentionally NOT a dep — see hoveredRef above.
     // Listing it would restart the simulation (and the "explosion" reset)
     // on every mouse move.
-  }, [data, filter, showLabels, colorMode, fitToScreen]);
+  }, [data, filter, showLabels, colorMode, minDegree, focusCommunity, fitToScreen]);
+
+  // LM-22 — Garden drill-down. MemoryGardenView dispatches
+  // `tm:focus-community` when a community card is clicked; we focus
+  // the graph on that community + switch coloring so the cluster is
+  // immediately legible.
+  useEffect(() => {
+    const handler = (e: Event) => {
+      const detail = (e as CustomEvent).detail as { community_id?: number } | undefined;
+      if (!detail || typeof detail.community_id !== "number") return;
+      setColorMode("community");
+      setFocusCommunity(detail.community_id);
+    };
+    window.addEventListener("tm:focus-community", handler);
+    return () => window.removeEventListener("tm:focus-community", handler);
+  }, []);
 
   // Mouse interaction
   useEffect(() => {
@@ -542,6 +626,29 @@ export default function GraphView() {
               <option key={t} value={t}>{t}</option>
             ))}
           </select>
+          <label className="flex items-center gap-2 text-xs text-tm-muted">
+            min&nbsp;deg
+            <input
+              type="range"
+              min={0}
+              max={5}
+              step={1}
+              value={minDegree}
+              onChange={(e) => setMinDegree(Number(e.target.value))}
+              className="w-20"
+              title="Hide nodes with fewer connections than this"
+            />
+            <span className="font-mono text-tm-text w-3 text-right">{minDegree}</span>
+          </label>
+          {focusCommunity !== null && (
+            <button
+              onClick={() => setFocusCommunity(null)}
+              className="text-xs px-2 py-1 rounded border bg-emerald-500/20 border-emerald-500/40 text-emerald-300 hover:bg-emerald-500/30 transition-colors"
+              title="Clear community focus"
+            >
+              Community {focusCommunity} ×
+            </button>
+          )}
           <button
             onClick={() => setColorMode(colorMode === "type" ? "community" : "type")}
             className={`text-xs px-3 py-1 rounded border transition-colors ${

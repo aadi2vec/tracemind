@@ -161,6 +161,30 @@ impl TripleWorker {
     pub fn spawn_default(db: WorkerDb, capacity: usize) -> TripleWorkerHandle {
         Self::spawn(db, Box::new(HeuristicExtractor), capacity)
     }
+
+    /// Convenience: spawn a worker pre-wired with the Qwen LLM extractor
+    /// when the `local-llm` feature is compiled in **and** the GGUF
+    /// weights exist at `<data_dir>/models/qwen2.5-1.5b-instruct-q4_k_m.gguf`.
+    /// Otherwise falls back to [`HeuristicExtractor`] so the worker
+    /// always runs.
+    ///
+    /// This is the boot-path constructor for the Tauri app.
+    pub fn spawn_qwen_or_default(
+        db: WorkerDb,
+        capacity: usize,
+        data_dir: &std::path::Path,
+    ) -> TripleWorkerHandle {
+        match crate::QwenTripleExtractor::auto_load(data_dir) {
+            Some(qwen) => {
+                tracing::info!("[triple-worker] using Qwen LLM extractor");
+                Self::spawn(db, Box::new(qwen), capacity)
+            }
+            None => {
+                tracing::info!("[triple-worker] using heuristic extractor (no Qwen weights)");
+                Self::spawn_default(db, capacity)
+            }
+        }
+    }
 }
 
 impl TripleWorkerHandle {

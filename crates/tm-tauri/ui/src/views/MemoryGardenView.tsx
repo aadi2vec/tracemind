@@ -188,9 +188,38 @@ export default function MemoryGardenView() {
                   {c.community_id === null ? "—" : `c${c.community_id}`}
                 </span>
                 <span className="text-tm-text">{c.entity_count} entities</span>
-                <span className="text-xs text-tm-muted truncate">
+                <span className="text-xs text-tm-muted truncate flex-1">
                   {c.sample_names.slice(0, 5).join(" · ")}
                 </span>
+                {c.community_id !== null && (
+                  // LM-22 — drill-down: open the graph view focused on this
+                  // community. App.tsx listens for `tm:next-action` with
+                  // target_kind=entity to route to the Graph view, and
+                  // GraphView listens for `tm:focus-community` to apply the
+                  // filter. Dispatching both keeps this view independent.
+                  <button
+                    onClick={() => {
+                      window.dispatchEvent(
+                        new CustomEvent("tm:next-action", {
+                          detail: { target_kind: "entity" },
+                        }),
+                      );
+                      // Defer the focus event one tick so GraphView has
+                      // mounted and registered its listener.
+                      setTimeout(() => {
+                        window.dispatchEvent(
+                          new CustomEvent("tm:focus-community", {
+                            detail: { community_id: c.community_id },
+                          }),
+                        );
+                      }, 50);
+                    }}
+                    className="text-xs px-2 py-0.5 rounded border border-emerald-500/40 bg-emerald-500/10 text-emerald-300 hover:bg-emerald-500/20 transition-colors shrink-0"
+                    title="Open in Graph view, focused on this community"
+                  >
+                    view in graph →
+                  </button>
+                )}
               </li>
             ))}
           </ul>
