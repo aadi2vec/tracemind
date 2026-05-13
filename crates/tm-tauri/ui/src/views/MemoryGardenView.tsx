@@ -184,10 +184,19 @@ export default function MemoryGardenView() {
                 key={`${c.community_id ?? "unassigned"}-${i}`}
                 className="text-sm border-b border-tm-border/40 py-2 flex items-baseline gap-3"
               >
-                <span className="text-xs font-mono text-tm-muted w-16 shrink-0">
+                <span className="text-xs font-mono text-tm-muted w-12 shrink-0">
                   {c.community_id === null ? "—" : `c${c.community_id}`}
                 </span>
-                <span className="text-tm-text">{c.entity_count} entities</span>
+                {/* 2026-05-12 — show the human-readable label as the
+                   primary title; the raw sample tail goes muted next
+                   to it so the user can still scan the wider membership
+                   without losing the "what is this community" anchor. */}
+                <span className="text-tm-text font-medium truncate max-w-xs">
+                  {c.label || `Community ${c.community_id ?? ""}`}
+                </span>
+                <span className="text-tm-muted text-xs shrink-0">
+                  {c.entity_count} entities
+                </span>
                 <span className="text-xs text-tm-muted truncate flex-1">
                   {c.sample_names.slice(0, 5).join(" · ")}
                 </span>

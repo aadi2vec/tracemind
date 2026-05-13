@@ -151,6 +151,12 @@ struct GraphData {
     nodes: Vec<GraphNode>,
     edges: Vec<GraphEdge>,
     community_count: usize,
+    /// 2026-05-12 — searchable community labels. Maps stringified
+    /// community_id → a "Top1 · Top2 · Top3" string built from the
+    /// highest-degree entity names in that community. Lets the user
+    /// scan the legend and know what each community *is* instead of
+    /// reading "Community 0" / "Community 1" / ...
+    community_labels: HashMap<String, String>,
 }
 
 #[derive(Serialize)]
@@ -204,6 +210,25 @@ fn arm_name(arm: u8) -> String {
 /// `cmd_query` / `cmd_ingest` to populate the `context_name` field on
 /// every returned `EntityInfo`. Cheap: contexts are small (< 100 rows
 /// in practice) and the call is one SELECT.
+/// 2026-05-12 — build a "Top1 · Top2 · Top3" label from an ordered list
+/// of entity names (caller passes them already ranked by degree /
+/// recency). Returns the empty string for an empty input. Names are
+/// taken verbatim — community labels read best when they're the actual
+/// entities ("Aaditya · TraceMind · Rust") rather than tokenised
+/// keywords. Used by both `cmd_community_overlay` and (indirectly)
+/// `cmd_graph`.
+fn label_from_names(names: &[String]) -> String {
+    let mut seen = std::collections::HashSet::new();
+    let picked: Vec<String> = names
+        .iter()
+        .filter(|n| !n.trim().is_empty())
+        .filter(|n| seen.insert(n.to_lowercase()))
+        .take(3)
+        .cloned()
+        .collect();
+    picked.join(" · ")
+}
+
 fn context_name_map(graph: &GraphStore) -> HashMap<Uuid, String> {
     graph
         .list_contexts()
@@ -577,7 +602,39 @@ fn cmd_graph(state: State<AppState>) -> Result<GraphData, String> {
         });
     }
 
-    Ok(GraphData { nodes, edges, community_count })
+    // 2026-05-12 — searchable community labels. Count degree per node
+    // from the edge list, group (name, degree) by community, sort each
+    // group by degree desc, take top-3 names. The resulting label is
+    // both a glance description ("Aaditya · TraceMind · Rust" tells you
+    // instantly what Community 0 is about) and a search query the user
+    // can paste into the Query view to drill into the community's
+    // captures.
+    let mut degree: HashMap<String, usize> = HashMap::new();
+    for e in &edges {
+        *degree.entry(e.source.clone()).or_insert(0) += 1;
+        *degree.entry(e.target.clone()).or_insert(0) += 1;
+    }
+    let mut by_community: HashMap<i32, Vec<(String, usize)>> = HashMap::new();
+    for n in &nodes {
+        if let Some(cid) = n.community {
+            let d = degree.get(&n.id).copied().unwrap_or(0);
+            by_community
+                .entry(cid)
+                .or_default()
+                .push((n.name.clone(), d));
+        }
+    }
+    let mut community_labels: HashMap<String, String> = HashMap::new();
+    for (cid, mut members) in by_community {
+        // Sort by degree desc, then by name asc for determinism.
+        members.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        let top: Vec<String> = members.into_iter().take(3).map(|(n, _)| n).collect();
+        if !top.is_empty() {
+            community_labels.insert(cid.to_string(), top.join(" · "));
+        }
+    }
+
+    Ok(GraphData { nodes, edges, community_count, community_labels })
 }
 
 /// Batch-ingest curated demo data to populate the knowledge graph.
@@ -3292,6 +3349,11 @@ struct CommunityRow {
     community_id: Option<i64>,
     entity_count: usize,
     sample_names: Vec<String>,
+    /// 2026-05-12 — short "Top1 · Top2 · Top3" label for this
+    /// community, picked from `sample_names`. Lets the Garden card
+    /// say "Aaditya · TraceMind · Rust" instead of "Community 0".
+    /// Empty string for the unassigned bucket.
+    label: String,
 }
 
 /// LM-23 — community-overlay toggle. Groups entities by their stored
@@ -3313,10 +3375,16 @@ fn cmd_community_overlay(state: State<AppState>) -> Result<Vec<CommunityRow>, St
     if !buckets.is_empty() && !unassigned {
         return Ok(buckets
             .into_iter()
-            .map(|(community_id, entity_count, sample_names)| CommunityRow {
-                community_id,
-                entity_count,
-                sample_names,
+            .map(|(community_id, entity_count, sample_names)| {
+                let label = community_id
+                    .map(|_| label_from_names(&sample_names))
+                    .unwrap_or_default();
+                CommunityRow {
+                    community_id,
+                    entity_count,
+                    sample_names,
+                    label,
+                }
             })
             .collect());
     }
@@ -3332,6 +3400,7 @@ fn cmd_community_overlay(state: State<AppState>) -> Result<Vec<CommunityRow>, St
                 community_id,
                 entity_count,
                 sample_names,
+                label: String::new(),
             })
             .collect());
     }
@@ -3356,10 +3425,12 @@ fn cmd_community_overlay(state: State<AppState>) -> Result<Vec<CommunityRow>, St
         .map(|(cid, mut names)| {
             let entity_count = names.len();
             names.truncate(8);
+            let label = label_from_names(&names);
             CommunityRow {
                 community_id: Some(cid as i64),
                 entity_count,
                 sample_names: names,
+                label,
             }
         })
         .collect();

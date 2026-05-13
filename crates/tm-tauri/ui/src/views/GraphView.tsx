@@ -643,10 +643,10 @@ export default function GraphView() {
           {focusCommunity !== null && (
             <button
               onClick={() => setFocusCommunity(null)}
-              className="text-xs px-2 py-1 rounded border bg-emerald-500/20 border-emerald-500/40 text-emerald-300 hover:bg-emerald-500/30 transition-colors"
-              title="Clear community focus"
+              className="text-xs px-2 py-1 rounded border bg-emerald-500/20 border-emerald-500/40 text-emerald-300 hover:bg-emerald-500/30 transition-colors max-w-xs truncate"
+              title={`Clear focus on community ${focusCommunity}`}
             >
-              Community {focusCommunity} ×
+              {data?.community_labels?.[String(focusCommunity)] ?? `Community ${focusCommunity}`} ×
             </button>
           )}
           <button
@@ -710,7 +710,7 @@ export default function GraphView() {
           <span className="text-tm-muted text-xs">{hovered.degree} connections</span>
           {hovered.community !== null && (
             <span className="text-xs" style={{ color: communityColor(hovered.community) }}>
-              community {hovered.community}
+              {data?.community_labels?.[String(hovered.community)] ?? `community ${hovered.community}`}
             </span>
           )}
           <span className="text-tm-muted text-xs ml-auto">Drag to reposition &middot; Right-click for options</span>
@@ -718,13 +718,45 @@ export default function GraphView() {
       )}
 
       {data && data.community_count > 0 && colorMode === "community" && (
-        <div className="flex flex-wrap gap-3">
-          {Array.from({ length: Math.min(data.community_count, 12) }, (_, i) => (
-            <div key={i} className="flex items-center gap-1.5 text-xs">
-              <div className="w-2.5 h-2.5 rounded-full" style={{ backgroundColor: COMMUNITY_COLORS[i] }} />
-              <span className="text-tm-muted">Community {i}</span>
-            </div>
-          ))}
+        // 2026-05-12 — labeled, clickable legend. Each pill shows the
+        // community's top entities ("Aaditya · TraceMind · Rust") so
+        // the user can read what each cluster is *about* instead of
+        // memorising colors. Clicking a pill focuses the graph on that
+        // community; clicking the focused pill clears the focus.
+        <div className="flex flex-wrap gap-1.5">
+          {Array.from(
+            new Set(
+              data.nodes
+                .map((n) => n.community)
+                .filter((c): c is number => c !== null),
+            ),
+          )
+            .sort((a, b) => a - b)
+            .slice(0, 12)
+            .map((cid) => {
+              const label = data.community_labels?.[String(cid)] ?? `Community ${cid}`;
+              const active = focusCommunity === cid;
+              return (
+                <button
+                  key={cid}
+                  onClick={() =>
+                    setFocusCommunity((cur) => (cur === cid ? null : cid))
+                  }
+                  className={`flex items-center gap-1.5 text-xs px-2 py-1 rounded border transition-colors max-w-xs ${
+                    active
+                      ? "bg-emerald-500/20 border-emerald-500/40 text-emerald-300"
+                      : "bg-tm-surface border-tm-border text-tm-muted hover:text-tm-text hover:border-tm-accent/40"
+                  }`}
+                  title={`Focus on this community · ${label}`}
+                >
+                  <span
+                    className="w-2.5 h-2.5 rounded-full flex-shrink-0"
+                    style={{ backgroundColor: COMMUNITY_COLORS[cid % 12] }}
+                  />
+                  <span className="truncate">{label}</span>
+                </button>
+              );
+            })}
         </div>
       )}
 

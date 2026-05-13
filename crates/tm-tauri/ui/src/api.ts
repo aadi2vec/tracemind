@@ -127,6 +127,11 @@ export interface GraphData {
   nodes: GraphNode[];
   edges: GraphEdge[];
   community_count: number;
+  /// 2026-05-12 — stringified community_id → "Top1 · Top2 · Top3"
+  /// label built from highest-degree entity names in that community.
+  /// Used by the Graph legend so each community is human-readable
+  /// instead of "Community 0/1/2/…".
+  community_labels: Record<string, string>;
 }
 
 export interface SurprisingEntity {
@@ -685,6 +690,9 @@ export interface CommunityRow {
   community_id: number | null;
   entity_count: number;
   sample_names: string[];
+  /// 2026-05-12 — short "Top1 · Top2 · Top3" label (top sample
+  /// entities). Empty for the unassigned bucket.
+  label: string;
 }
 
 export async function getCommunityOverlay(): Promise<CommunityRow[]> {
