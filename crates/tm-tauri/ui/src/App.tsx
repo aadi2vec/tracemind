@@ -12,6 +12,7 @@ import CommitmentTimelineView from "./views/CommitmentTimelineView";
 import CalibrationView from "./views/CalibrationView";
 import MemoryGardenView from "./views/MemoryGardenView";
 import ViewsView from "./views/ViewsView";
+import ContextDashboardView from "./views/ContextDashboardView";
 import { getUsageStats } from "./api";
 
 type View =
@@ -22,6 +23,7 @@ type View =
   | "traces"
   | "graph"
   | "garden"
+  | "context"
   | "views"
   | "commitments"
   | "calibration"
@@ -38,6 +40,7 @@ const NAV_ITEMS: { id: View; label: string; icon: string }[] = [
   { id: "ingest", label: "Ingest", icon: "plus" },
   { id: "graph", label: "Graph", icon: "graph" },
   { id: "garden", label: "Garden", icon: "garden" },
+  { id: "context", label: "Context", icon: "context" },
   { id: "views", label: "Views", icon: "views" },
   { id: "commitments", label: "Commitments", icon: "timeline" },
   { id: "calibration", label: "Calibration", icon: "gauge" },
@@ -115,6 +118,13 @@ function NavIcon({ type }: { type: string }) {
           <circle cx="18" cy="18" r="2" strokeWidth={2} />
         </svg>
       );
+    case "context":
+      return (
+        <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <circle cx="12" cy="12" r="3" strokeWidth={2} />
+          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 3v3M12 18v3M3 12h3M18 12h3M5.6 5.6l2.1 2.1M16.3 16.3l2.1 2.1M5.6 18.4l2.1-2.1M16.3 7.7l2.1-2.1" />
+        </svg>
+      );
     case "gauge":
       return (
         <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -162,6 +172,7 @@ export default function App() {
       if (detail.target_kind === "commitment") setView("commitments");
       else if (detail.target_kind === "contradiction") setView("brief");
       else if (detail.target_kind === "entity") setView("graph");
+      else if (detail.target_kind === "context") setView("context");
     };
     window.addEventListener("tm:next-action", handler);
     return () => window.removeEventListener("tm:next-action", handler);
@@ -229,6 +240,7 @@ export default function App() {
         {view === "ingest" && <IngestView />}
         {view === "graph" && <GraphView />}
         {view === "garden" && <MemoryGardenView />}
+        {view === "context" && <ContextDashboardView />}
         {view === "views" && <ViewsView />}
         {view === "commitments" && <CommitmentTimelineView />}
         {view === "calibration" && <CalibrationView />}

@@ -777,6 +777,30 @@ export default function GraphView() {
             {contextMenu.node.name}
           </div>
           <button
+            className="w-full text-left px-3 py-1.5 text-xs text-tm-accent hover:bg-tm-accent/10 transition-colors"
+            onClick={() => {
+              const target = contextMenu.node;
+              setContextMenu(null);
+              // Cross-view focus: ContextDashboardView listens for this
+              // event and re-targets in place. We also dispatch the
+              // generic next-action route so App.tsx switches views.
+              window.dispatchEvent(
+                new CustomEvent("tm:next-action", {
+                  detail: { target_kind: "context" },
+                }),
+              );
+              setTimeout(() => {
+                window.dispatchEvent(
+                  new CustomEvent("tm:focus-entity", {
+                    detail: { entity_id: target.id, entity_name: target.name },
+                  }),
+                );
+              }, 50);
+            }}
+          >
+            Open in Context →
+          </button>
+          <button
             className="w-full text-left px-3 py-1.5 text-xs text-red-400 hover:bg-red-500/10 transition-colors"
             onClick={async () => {
               await deleteEntity(contextMenu.node.id);

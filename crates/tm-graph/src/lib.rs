@@ -10,6 +10,11 @@ pub mod pending_relations;
 pub mod store;
 
 pub use belief::{effective_confidence, BeliefStore, ContradictionView, ResolveChoice};
+// Re-export so downstream crates (tm-tauri, tm-mcp) can pattern-match
+// the result of `GraphStore::belief_status_for` without taking a direct
+// dependency on `tm-tms`. The status type itself lives in `tm-tms` —
+// this is a thin pass-through.
+pub use tm_tms::BeliefStatus;
 pub use context::{
     ActiveContext, Context, NegativeSignal, PositiveSignal,
 };

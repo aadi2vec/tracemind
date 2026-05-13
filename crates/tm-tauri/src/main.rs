@@ -3440,6 +3440,447 @@ fn cmd_community_overlay(state: State<AppState>) -> Result<Vec<CommunityRow>, St
 }
 
 // ---------------------------------------------------------------------------
+// Context Dashboard (post-P5) — one-call fat payload that surfaces every
+// brain layer for a single entity: header, decay, graph neighborhoods,
+// vector neighbors, k-hop, community, belief status, contradictions,
+// bitemporal provenance, recent traces, and signal-level neighbors.
+//
+// Why a single command:
+//   - The previous `cmd_entity_drawer` only returned header + relations +
+//     backlinks + tags. The user feedback (May 2026) was "I want all the
+//     context we have on X" — graph is *one* part of the brain. The fat
+//     dump joins data the UI was previously waterfalling 5–6 invokes for,
+//     and surfaces decay scores (recency / novelty / value / frequency)
+//     prominently so the user can see "what TraceMind still values" at a
+//     glance.
+//   - No new storage; every field maps to an existing GraphStore /
+//     TraceStore method. Safe to add — `cmd_entity_drawer` is untouched.
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize, Clone)]
+struct ContextDecay {
+    /// exp(-0.05 * hours_since_last_access). 1.0 = just touched, 0.0 = cold.
+    recency: f64,
+    /// 1.0 / (1.0 + ln(1 + access_count)). Higher = less seen.
+    novelty: f64,
+    /// retrieval feedback value score (0..1). 0 = never given feedback.
+    value: f64,
+    /// 1.0 / (retrieved + 1). 1.0 = never retrieved, decays toward 0.
+    frequency: f64,
+    /// Total entries in access_log for this entity.
+    access_count: i64,
+    /// RFC-3339 timestamp of the most recent access, or None.
+    last_access: Option<String>,
+}
+
+#[derive(Serialize, Clone)]
+struct ContextNeighbor {
+    entity_id: String,
+    name: String,
+    entity_type: String,
+    similarity: f64,
+}
+
+#[derive(Serialize, Clone)]
+struct ContextHop {
+    entity_id: String,
+    name: String,
+    entity_type: String,
+}
+
+#[derive(Serialize, Clone)]
+struct ContextBeliefRow {
+    triple_id: String,
+    subject: String,
+    predicate: String,
+    object: String,
+    /// "In" | "Out" | "Contradicted" | "Unknown"
+    status: String,
+}
+
+#[derive(Serialize, Clone)]
+struct ContextContradiction {
+    id: String,
+    triple_a: String,
+    triple_b: String,
+    detected_at: String,
+    cosine_similarity: f32,
+    /// "KeepA" | "KeepB" | "KeepBoth" | None
+    resolution: Option<String>,
+}
+
+#[derive(Serialize, Clone)]
+struct ContextProvenanceRow {
+    name: String,
+    entity_type: String,
+    confidence: f64,
+    valid_from: String,
+    recorded_at: String,
+    superseded_at: Option<String>,
+}
+
+#[derive(Serialize, Clone)]
+struct ContextTraceRow {
+    trace_id: String,
+    event_type: String,
+    raw_text: Option<String>,
+    retrieval_arm: Option<u8>,
+    created_at: String,
+}
+
+#[derive(Serialize, Clone)]
+struct ContextSignal {
+    signal_id: i64,
+    raw_text: String,
+    source: String,
+    similarity: f32,
+    created_at: String,
+}
+
+#[derive(Serialize, Clone)]
+struct ContextCommunity {
+    /// Louvain community id, None if community detection hasn't been run
+    /// or the entity is orphaned in the graph.
+    community_id: Option<i64>,
+    /// "Top1 · Top2 · Top3" label drawn from siblings, "" if unassigned.
+    label: String,
+    sibling_count: usize,
+    /// Up to 8 sibling entity names (excluding self).
+    sibling_names: Vec<String>,
+}
+
+#[derive(Serialize, Clone)]
+struct EntityContextDump {
+    header: EntityDrawerHeader,
+    decay: ContextDecay,
+    relations_out: Vec<EntityDrawerRelation>,
+    relations_in: Vec<EntityDrawerBacklink>,
+    vector_neighbors: Vec<ContextNeighbor>,
+    k_hop_neighbors: Vec<ContextHop>,
+    community: ContextCommunity,
+    belief_rows: Vec<ContextBeliefRow>,
+    contradictions: Vec<ContextContradiction>,
+    provenance: Vec<ContextProvenanceRow>,
+    recent_traces: Vec<ContextTraceRow>,
+    signal_neighbors: Vec<ContextSignal>,
+}
+
+/// Returns the full context dump for one entity in a single call.
+/// Resolves `entity_id` as either a UUID or a case-insensitive name.
+#[tauri::command]
+fn cmd_entity_context_dump(
+    entity_id: String,
+    state: State<AppState>,
+) -> Result<EntityContextDump, String> {
+    let graph = GraphStore::open(&state.db_path).map_err(|e| e.to_string())?;
+    // ── Resolve UUID-or-name ─────────────────────────────────────────────
+    let ent = if let Ok(id) = Uuid::parse_str(&entity_id) {
+        graph.get_entity(id).map_err(|e| e.to_string())?
+    } else {
+        graph
+            .find_entity_by_name_icase(&entity_id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("entity not found: {entity_id}"))?
+    };
+
+    // ── Header ───────────────────────────────────────────────────────────
+    let domain = tm_graph::classify_ontology(&ent.entity_type, &ent.name);
+    let header = EntityDrawerHeader {
+        entity_id: ent.id.to_string(),
+        name: ent.name.clone(),
+        entity_type: format!("{:?}", ent.entity_type),
+        ontological_domain: domain.to_string(),
+        confidence: ent.confidence,
+        created_at: ent.created_at.to_rfc3339(),
+        updated_at: ent.updated_at.to_rfc3339(),
+    };
+
+    // ── Decay: recency / novelty / value / frequency ─────────────────────
+    let recency = graph.recency_score(ent.id);
+    let novelty = graph.novelty_score(ent.id);
+    let value_map = graph.batch_value_scores(&[ent.id]);
+    let freq_map = graph.batch_frequency_scores(&[ent.id]);
+    let value = value_map.get(&ent.id).copied().unwrap_or(0.0);
+    let frequency = freq_map.get(&ent.id).copied().unwrap_or(1.0);
+    // Back-fill access_count via the novelty formula:
+    // novelty = 1/(1 + ln(1 + n))  ⇒  n = exp(1/novelty - 1) - 1.
+    // recency_score (just queried above) already covers `last_access`
+    // semantically — we expose the raw count + leave last_access None
+    // because GraphStore doesn't yet expose a public accessor for the
+    // access_log timestamp; adding one is a follow-up if the UI needs it.
+    let access_count: i64 = if novelty > 0.0 && novelty < 1.0 {
+        let n = ((1.0 / novelty) - 1.0).exp() - 1.0;
+        n.round() as i64
+    } else {
+        0
+    };
+    let last_access: Option<String> = None;
+    let decay = ContextDecay {
+        recency,
+        novelty,
+        value,
+        frequency,
+        access_count,
+        last_access,
+    };
+
+    // ── Relations (outgoing) + backlinks ─────────────────────────────────
+    let mut relations_out = Vec::new();
+    let outgoing = graph
+        .get_triples_for_entity(ent.id)
+        .map_err(|e| e.to_string())?;
+    // Keep the triple list around for belief/contradiction lookups so we
+    // only pay one `get_triples_for_entity` per call.
+    let mut owned_triples: Vec<tm_types::Triple> = Vec::new();
+    for t in &outgoing {
+        if t.subject_id != ent.id {
+            continue;
+        }
+        let target_name = graph
+            .get_entity(t.object_id)
+            .ok()
+            .map(|e| e.name)
+            .unwrap_or_else(|| t.object_id.to_string());
+        relations_out.push(EntityDrawerRelation {
+            triple_id: t.id.to_string(),
+            target_id: t.object_id.to_string(),
+            target_name,
+            predicate: format!("{}", t.predicate),
+            confidence: t.confidence,
+        });
+        owned_triples.push(t.clone());
+    }
+
+    let mut relations_in = Vec::new();
+    for b in graph
+        .backlinks(ent.id, Some(50), true)
+        .map_err(|e| e.to_string())?
+    {
+        relations_in.push(EntityDrawerBacklink {
+            triple_id: b.triple_id.to_string(),
+            source_id: b.source.id.to_string(),
+            source_name: b.source.name,
+            predicate: format!("{}", b.predicate),
+            confidence: b.confidence,
+        });
+    }
+
+    // ── Vector neighbors ────────────────────────────────────────────────
+    let mut vector_neighbors = Vec::new();
+    let self_vector = graph.get_vector(ent.id).map_err(|e| e.to_string())?;
+    if let Some(v) = &self_vector {
+        let hits = graph.search_vectors(v, 11).map_err(|e| e.to_string())?;
+        for (uid, sim) in hits {
+            if uid == ent.id {
+                continue;
+            }
+            if let Ok(e) = graph.get_entity(uid) {
+                vector_neighbors.push(ContextNeighbor {
+                    entity_id: uid.to_string(),
+                    name: e.name,
+                    entity_type: format!("{:?}", e.entity_type),
+                    similarity: sim as f64,
+                });
+            }
+            if vector_neighbors.len() >= 10 {
+                break;
+            }
+        }
+    }
+
+    // ── K-hop graph neighbors (2 hops, capped) ──────────────────────────
+    let mut k_hop_neighbors = Vec::new();
+    if let Ok(hops) = graph.k_hop_neighbors(ent.id, 2) {
+        for e in hops.into_iter().take(20) {
+            if e.id == ent.id {
+                continue;
+            }
+            k_hop_neighbors.push(ContextHop {
+                entity_id: e.id.to_string(),
+                name: e.name,
+                entity_type: format!("{:?}", e.entity_type),
+            });
+        }
+    }
+
+    // ── Community ────────────────────────────────────────────────────────
+    let community = match graph.louvain() {
+        Ok(map) => {
+            let my_cid = map.get(&ent.id).copied();
+            if let Some(cid) = my_cid {
+                let mut siblings: Vec<String> = map
+                    .iter()
+                    .filter(|(uid, &c)| **uid != ent.id && c == cid)
+                    .filter_map(|(uid, _)| graph.get_entity(*uid).ok().map(|e| e.name))
+                    .collect();
+                let sibling_count = siblings.len();
+                siblings.sort();
+                siblings.truncate(8);
+                let label = label_from_names(&siblings);
+                ContextCommunity {
+                    community_id: Some(cid as i64),
+                    label,
+                    sibling_count,
+                    sibling_names: siblings,
+                }
+            } else {
+                ContextCommunity {
+                    community_id: None,
+                    label: String::new(),
+                    sibling_count: 0,
+                    sibling_names: vec![],
+                }
+            }
+        }
+        Err(_) => ContextCommunity {
+            community_id: None,
+            label: String::new(),
+            sibling_count: 0,
+            sibling_names: vec![],
+        },
+    };
+
+    // ── Belief status per triple touching this entity ───────────────────
+    let mut belief_rows = Vec::new();
+    let mut triple_id_set: HashSet<Uuid> = HashSet::new();
+    for t in &owned_triples {
+        triple_id_set.insert(t.id);
+        let subj_name = graph
+            .get_entity(t.subject_id)
+            .ok()
+            .map(|e| e.name)
+            .unwrap_or_else(|| t.subject_id.to_string());
+        let obj_name = graph
+            .get_entity(t.object_id)
+            .ok()
+            .map(|e| e.name)
+            .unwrap_or_else(|| t.object_id.to_string());
+        let status = match graph.belief_status_for(t.id) {
+            Some(tm_graph::BeliefStatus::In) => "In",
+            Some(tm_graph::BeliefStatus::Out) => "Out",
+            Some(tm_graph::BeliefStatus::Contradicted) => "Contradicted",
+            None => "Unknown",
+        }
+        .to_string();
+        belief_rows.push(ContextBeliefRow {
+            triple_id: t.id.to_string(),
+            subject: subj_name,
+            predicate: format!("{}", t.predicate),
+            object: obj_name,
+            status,
+        });
+    }
+    // Belief rows for incoming triples (where this entity is the object).
+    for b in &relations_in {
+        if let Ok(tid) = Uuid::parse_str(&b.triple_id) {
+            if !triple_id_set.contains(&tid) {
+                triple_id_set.insert(tid);
+                let status = match graph.belief_status_for(tid) {
+                    Some(tm_graph::BeliefStatus::In) => "In",
+                    Some(tm_graph::BeliefStatus::Out) => "Out",
+                    Some(tm_graph::BeliefStatus::Contradicted) => "Contradicted",
+                    None => "Unknown",
+                }
+                .to_string();
+                belief_rows.push(ContextBeliefRow {
+                    triple_id: b.triple_id.clone(),
+                    subject: b.source_name.clone(),
+                    predicate: b.predicate.clone(),
+                    object: header.name.clone(),
+                    status,
+                });
+            }
+        }
+    }
+
+    // ── Contradictions involving any of this entity's triples ───────────
+    let mut contradictions = Vec::new();
+    for c in graph.contradictions() {
+        if triple_id_set.contains(&c.triple_a) || triple_id_set.contains(&c.triple_b) {
+            contradictions.push(ContextContradiction {
+                id: c.id.to_string(),
+                triple_a: c.triple_a.to_string(),
+                triple_b: c.triple_b.to_string(),
+                detected_at: c.detected_at.to_rfc3339(),
+                cosine_similarity: c.cosine_similarity,
+                resolution: c.resolution.map(|r| format!("{:?}", r)),
+            });
+        }
+    }
+
+    // ── Provenance: full version history for this entity ────────────────
+    let mut provenance = Vec::new();
+    if let Ok(history) = graph.entity_history(ent.id) {
+        for (e, valid_from, recorded_at, superseded_at) in history {
+            provenance.push(ContextProvenanceRow {
+                name: e.name,
+                entity_type: format!("{:?}", e.entity_type),
+                confidence: e.confidence,
+                valid_from: valid_from.to_rfc3339(),
+                recorded_at: recorded_at.to_rfc3339(),
+                superseded_at: superseded_at.map(|t| t.to_rfc3339()),
+            });
+        }
+    }
+
+    // ── Recent traces touching this entity ──────────────────────────────
+    let mut recent_traces = Vec::new();
+    if let Ok(ts) = state.trace_store.lock() {
+        if let Ok(traces) = ts.recent(500) {
+            for tr in traces {
+                if tr.entities_extracted.contains(&ent.id) {
+                    recent_traces.push(ContextTraceRow {
+                        trace_id: tr.id.to_string(),
+                        event_type: format!("{:?}", tr.event_type),
+                        raw_text: tr.raw_text.clone(),
+                        retrieval_arm: tr.retrieval_arm,
+                        created_at: tr.created_at.to_rfc3339(),
+                    });
+                    if recent_traces.len() >= 30 {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    // ── Signal neighbors: raw captures semantically near this entity ────
+    let mut signal_neighbors = Vec::new();
+    if let Some(v) = &self_vector {
+        if let Ok(hits) = graph.search_signals(v, 10, 0.35) {
+            for (s, sim) in hits {
+                signal_neighbors.push(ContextSignal {
+                    signal_id: s.id,
+                    raw_text: if s.raw_text.len() > 240 {
+                        format!("{}…", &s.raw_text[..240])
+                    } else {
+                        s.raw_text
+                    },
+                    source: s.source,
+                    similarity: sim,
+                    created_at: s.created_at.to_rfc3339(),
+                });
+            }
+        }
+    }
+
+    Ok(EntityContextDump {
+        header,
+        decay,
+        relations_out,
+        relations_in,
+        vector_neighbors,
+        k_hop_neighbors,
+        community,
+        belief_rows,
+        contradictions,
+        provenance,
+        recent_traces,
+        signal_neighbors,
+    })
+}
+
+// ---------------------------------------------------------------------------
 // UI-13 — Capture permissions panel (per-source toggles + audit)
 // ---------------------------------------------------------------------------
 
@@ -3881,6 +4322,7 @@ fn main() {
             cmd_outliers_list,
             cmd_outlier_triage,
             cmd_community_overlay,
+            cmd_entity_context_dump,
         ])
         .setup(move |app| {
             let handle = app.handle().clone();

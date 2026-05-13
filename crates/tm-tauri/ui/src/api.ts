@@ -698,3 +698,101 @@ export interface CommunityRow {
 export async function getCommunityOverlay(): Promise<CommunityRow[]> {
   return invoke("cmd_community_overlay");
 }
+
+// ───────────────────────────────────────────────────────────────────────
+// Context Dashboard — fat one-call payload for "everything we know about X"
+// ───────────────────────────────────────────────────────────────────────
+
+export interface ContextDecay {
+  recency: number;
+  novelty: number;
+  value: number;
+  frequency: number;
+  access_count: number;
+  last_access: string | null;
+}
+
+export interface ContextNeighbor {
+  entity_id: string;
+  name: string;
+  entity_type: string;
+  similarity: number;
+}
+
+export interface ContextHop {
+  entity_id: string;
+  name: string;
+  entity_type: string;
+}
+
+export interface ContextBeliefRow {
+  triple_id: string;
+  subject: string;
+  predicate: string;
+  object: string;
+  /** "In" | "Out" | "Contradicted" | "Unknown" */
+  status: string;
+}
+
+export interface ContextContradiction {
+  id: string;
+  triple_a: string;
+  triple_b: string;
+  detected_at: string;
+  cosine_similarity: number;
+  /** "KeepA" | "KeepB" | "KeepBoth" | null */
+  resolution: string | null;
+}
+
+export interface ContextProvenanceRow {
+  name: string;
+  entity_type: string;
+  confidence: number;
+  valid_from: string;
+  recorded_at: string;
+  superseded_at: string | null;
+}
+
+export interface ContextTraceRow {
+  trace_id: string;
+  event_type: string;
+  raw_text: string | null;
+  retrieval_arm: number | null;
+  created_at: string;
+}
+
+export interface ContextSignal {
+  signal_id: number;
+  raw_text: string;
+  source: string;
+  similarity: number;
+  created_at: string;
+}
+
+export interface ContextCommunity {
+  community_id: number | null;
+  label: string;
+  sibling_count: number;
+  sibling_names: string[];
+}
+
+export interface EntityContextDump {
+  header: EntityDrawerHeader;
+  decay: ContextDecay;
+  relations_out: EntityDrawerRelation[];
+  relations_in: EntityDrawerBacklink[];
+  vector_neighbors: ContextNeighbor[];
+  k_hop_neighbors: ContextHop[];
+  community: ContextCommunity;
+  belief_rows: ContextBeliefRow[];
+  contradictions: ContextContradiction[];
+  provenance: ContextProvenanceRow[];
+  recent_traces: ContextTraceRow[];
+  signal_neighbors: ContextSignal[];
+}
+
+export async function getEntityContext(
+  entityId: string,
+): Promise<EntityContextDump> {
+  return invoke("cmd_entity_context_dump", { entityId });
+}
