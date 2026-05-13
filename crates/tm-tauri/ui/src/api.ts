@@ -541,3 +541,140 @@ export interface ContextSuggestion {
 export async function suggestContext(queryText: string): Promise<ContextSuggestion | null> {
   return invoke("cmd_context_suggest", { queryText });
 }
+
+// ---------------------------------------------------------------------------
+// P5 legibility primitives — Entity Drawer / Transclusion / Thread View /
+// Memory Garden / Outliers / Community Overlay
+// ---------------------------------------------------------------------------
+
+// LM-3 — Entity Drawer composite view
+export interface EntityDrawerHeader {
+  entity_id: string;
+  name: string;
+  entity_type: string;
+  ontological_domain: string;
+  confidence: number;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface EntityDrawerBacklink {
+  triple_id: string;
+  source_id: string;
+  source_name: string;
+  predicate: string;
+  confidence: number;
+}
+
+export interface EntityDrawerRelation {
+  triple_id: string;
+  target_id: string;
+  target_name: string;
+  predicate: string;
+  confidence: number;
+}
+
+export interface EntityDrawerView {
+  header: EntityDrawerHeader;
+  backlinks: EntityDrawerBacklink[];
+  relations: EntityDrawerRelation[];
+  tags: string[];
+}
+
+export async function getEntityDrawer(
+  entityId: string,
+  backlinkLimit?: number,
+): Promise<EntityDrawerView> {
+  return invoke("cmd_entity_drawer", { entityId, backlinkLimit });
+}
+
+// LM-4 — entity-updated event payload (emitted by capture loop)
+export interface EntityUpdatedEvent {
+  entity_ids: string[];
+  source: string;
+}
+
+// LM-5a — Transclusion (`![[entity_id]]`) resolver
+export interface TransclusionSpan {
+  start: number;
+  end: number;
+  entity_id: string | null;
+  entity_name: string | null;
+  preview: string | null;
+}
+
+export async function resolveTransclusion(text: string): Promise<TransclusionSpan[]> {
+  return invoke("cmd_resolve_transclusion", { text });
+}
+
+// LM-11e — per-thread saved splice state
+export interface ThreadViewState {
+  view_name: string | null;
+  include_ids: string[];
+  exclude_ids: string[];
+}
+
+export async function saveThreadView(
+  threadId: string,
+  state: ThreadViewState,
+): Promise<void> {
+  return invoke("cmd_thread_view_save", {
+    threadId,
+    viewName: state.view_name,
+    includeIds: state.include_ids,
+    excludeIds: state.exclude_ids,
+  });
+}
+
+export async function loadThreadView(threadId: string): Promise<ThreadViewState> {
+  return invoke("cmd_thread_view_load", { threadId });
+}
+
+export async function clearThreadView(threadId: string): Promise<boolean> {
+  return invoke("cmd_thread_view_clear", { threadId });
+}
+
+// LM-20/22 — Memory Garden cards (cluster buckets + outlier tray)
+export interface GardenCard {
+  cluster_id: number | null;
+  label: string;
+  count: number;
+  sample_texts: string[];
+}
+
+export async function getMemoryGarden(): Promise<GardenCard[]> {
+  return invoke("cmd_memory_garden");
+}
+
+// LM-22 — outlier tray rows
+export interface OutlierRow {
+  signal_id: number;
+  raw_text: string;
+  source: string;
+  created_at: string;
+}
+
+export async function listOutliers(limit?: number): Promise<OutlierRow[]> {
+  return invoke("cmd_outliers_list", { limit });
+}
+
+export type OutlierAction = "add_to" | "new_cluster" | "ignore";
+
+export async function triageOutlier(
+  signalId: number,
+  action: OutlierAction,
+  targetCluster?: number,
+): Promise<number> {
+  return invoke("cmd_outlier_triage", { signalId, action, targetCluster });
+}
+
+// LM-23 — Community overlay rows
+export interface CommunityRow {
+  community_id: number | null;
+  entity_count: number;
+  sample_names: string[];
+}
+
+export async function getCommunityOverlay(): Promise<CommunityRow[]> {
+  return invoke("cmd_community_overlay");
+}

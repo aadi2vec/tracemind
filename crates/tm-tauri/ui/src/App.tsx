@@ -10,6 +10,7 @@ import SettingsView from "./views/SettingsView";
 import OnboardingView from "./views/OnboardingView";
 import CommitmentTimelineView from "./views/CommitmentTimelineView";
 import CalibrationView from "./views/CalibrationView";
+import MemoryGardenView from "./views/MemoryGardenView";
 import { getUsageStats } from "./api";
 
 type View =
@@ -19,6 +20,7 @@ type View =
   | "ingest"
   | "traces"
   | "graph"
+  | "garden"
   | "commitments"
   | "calibration"
   | "settings"
@@ -33,6 +35,7 @@ const NAV_ITEMS: { id: View; label: string; icon: string }[] = [
   { id: "query", label: "Query", icon: "search" },
   { id: "ingest", label: "Ingest", icon: "plus" },
   { id: "graph", label: "Graph", icon: "graph" },
+  { id: "garden", label: "Garden", icon: "garden" },
   { id: "commitments", label: "Commitments", icon: "timeline" },
   { id: "calibration", label: "Calibration", icon: "gauge" },
   { id: "traces", label: "Traces", icon: "list" },
@@ -90,6 +93,16 @@ function NavIcon({ type }: { type: string }) {
       return (
         <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
           <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 3v18M5 8h6M5 14h10M5 20h4" />
+        </svg>
+      );
+    case "garden":
+      return (
+        <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <circle cx="6" cy="10" r="2" strokeWidth={2} />
+          <circle cx="12" cy="6" r="2" strokeWidth={2} />
+          <circle cx="18" cy="10" r="2" strokeWidth={2} />
+          <circle cx="9" cy="16" r="2" strokeWidth={2} />
+          <circle cx="15" cy="16" r="2" strokeWidth={2} />
         </svg>
       );
     case "gauge":
@@ -205,6 +218,7 @@ export default function App() {
         {view === "query" && <QueryView />}
         {view === "ingest" && <IngestView />}
         {view === "graph" && <GraphView />}
+        {view === "garden" && <MemoryGardenView />}
         {view === "commitments" && <CommitmentTimelineView />}
         {view === "calibration" && <CalibrationView />}
         {view === "traces" && <TracesView />}

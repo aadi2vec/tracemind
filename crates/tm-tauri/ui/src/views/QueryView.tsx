@@ -9,12 +9,16 @@ import {
   getRecommendations,
   suggestContext,
   useContext,
+  loadThreadView,
+  saveThreadView,
+  clearThreadView,
   type QueryResponse,
   type AttributionInfo,
   type RecentQueryInfo,
   type RecommendationInfo,
   type ContextSuggestion,
 } from "../api";
+import EntityDrawer from "./EntityDrawer";
 
 type RowFeedback = "helpful" | "not_related" | "wrong_context";
 
@@ -57,6 +61,21 @@ export default function QueryView() {
   const [ctxSuggestion, setCtxSuggestion] = useState<ContextSuggestion | null>(null);
   const [ctxDismissed, setCtxDismissed] = useState(false);
 
+  // LM-11e — thread-scoped splice. The user can mark entities as
+  // included (focus) or excluded (mute) for this thread. State
+  // persists per query_id so re-running the same query restores the
+  // user's splice. `viewName` is an optional label the user can attach
+  // to share a splice across threads.
+  const [splice, setSplice] = useState<{
+    include: Set<string>;
+    exclude: Set<string>;
+    viewName: string | null;
+  }>({ include: new Set(), exclude: new Set(), viewName: null });
+  const [spliceMode, setSpliceMode] = useState(false);
+
+  // LM-3 — entity drawer launched from query entity rows.
+  const [entityDrawer, setEntityDrawer] = useState<string | null>(null);
+
   const refreshSticky = async () => {
     try {
       const [rq, sr] = await Promise.all([
@@ -90,6 +109,17 @@ export default function QueryView() {
     try {
       const res = await queryMemory(text.trim());
       setResult(res);
+      // LM-11e — hydrate any previously-saved splice for this thread.
+      try {
+        const state = await loadThreadView(res.query_id);
+        setSplice({
+          include: new Set(state.include_ids),
+          exclude: new Set(state.exclude_ids),
+          viewName: state.view_name,
+        });
+      } catch {
+        setSplice({ include: new Set(), exclude: new Set(), viewName: null });
+      }
     } catch (e) {
       setError(String(e));
     } finally {
@@ -97,6 +127,64 @@ export default function QueryView() {
       // Refresh the sticky panel so the just-run query shows up.
       refreshSticky();
     }
+  };
+
+  // LM-11e — persist the splice to disk. Fires after every toggle so
+  // the state survives reloads + future queries with the same id.
+  const persistSplice = (
+    threadId: string,
+    next: { include: Set<string>; exclude: Set<string>; viewName: string | null },
+  ) => {
+    saveThreadView(threadId, {
+      view_name: next.viewName,
+      include_ids: [...next.include],
+      exclude_ids: [...next.exclude],
+    }).catch((e) => console.error("saveThreadView failed:", e));
+  };
+
+  const toggleSplice = (entityId: string, kind: "include" | "exclude") => {
+    if (!result) return;
+    setSplice((prev) => {
+      const include = new Set(prev.include);
+      const exclude = new Set(prev.exclude);
+      // Toggling a marker clears the other one — an entity can't be
+      // both included and excluded.
+      if (kind === "include") {
+        if (include.has(entityId)) include.delete(entityId);
+        else {
+          include.add(entityId);
+          exclude.delete(entityId);
+        }
+      } else {
+        if (exclude.has(entityId)) exclude.delete(entityId);
+        else {
+          exclude.add(entityId);
+          include.delete(entityId);
+        }
+      }
+      const next = { include, exclude, viewName: prev.viewName };
+      persistSplice(result.query_id, next);
+      return next;
+    });
+  };
+
+  const clearSplice = async () => {
+    if (!result) return;
+    try {
+      await clearThreadView(result.query_id);
+    } catch (e) {
+      console.error("clearThreadView failed:", e);
+    }
+    setSplice({ include: new Set(), exclude: new Set(), viewName: null });
+  };
+
+  const renameSplice = (name: string) => {
+    if (!result) return;
+    setSplice((prev) => {
+      const next = { ...prev, viewName: name || null };
+      persistSplice(result.query_id, next);
+      return next;
+    });
   };
 
   // UI-14 — accept the suggestion: switch the active context, dismiss
@@ -354,24 +442,84 @@ export default function QueryView() {
             </div>
           )}
 
-          {/* Entity rows — per-row feedback (Sprint D / UI-5) */}
+          {/* Entity rows — per-row feedback (Sprint D / UI-5) +
+              thread-view splice toggle (LM-11e). The splice bar lets
+              the user focus or mute individual entities for *this*
+              thread; state persists per query_id. */}
           <div className="bg-tm-surface border border-tm-border rounded-lg p-5">
-            <h3 className="text-sm font-medium text-tm-muted uppercase tracking-wider mb-3">
-              Entities
-            </h3>
+            <div className="flex items-baseline justify-between mb-3">
+              <h3 className="text-sm font-medium text-tm-muted uppercase tracking-wider">
+                Entities
+                {(splice.include.size > 0 || splice.exclude.size > 0) && (
+                  <span className="ml-2 text-tm-accent normal-case font-normal">
+                    splice · {splice.include.size} focus · {splice.exclude.size} mute
+                    {splice.viewName && (
+                      <span className="text-tm-muted"> · {splice.viewName}</span>
+                    )}
+                  </span>
+                )}
+              </h3>
+              <div className="flex items-center gap-2">
+                <button
+                  onClick={() => setSpliceMode((v) => !v)}
+                  className={`text-xs px-2 py-1 rounded border transition-colors ${
+                    spliceMode
+                      ? "bg-tm-accent/20 border-tm-accent/40 text-tm-accent"
+                      : "border-tm-border text-tm-muted hover:text-tm-text"
+                  }`}
+                >
+                  {spliceMode ? "exit splice" : "splice"}
+                </button>
+                {(splice.include.size > 0 || splice.exclude.size > 0) && (
+                  <button
+                    onClick={clearSplice}
+                    className="text-xs px-2 py-1 rounded border border-rose-500/40 text-rose-300 hover:bg-rose-500/10 transition-colors"
+                  >
+                    clear
+                  </button>
+                )}
+              </div>
+            </div>
+
+            {spliceMode && (
+              <div className="mb-3 px-2 py-1.5 bg-tm-bg/40 border border-tm-border rounded text-xs text-tm-muted">
+                <label className="flex items-center gap-2">
+                  <span>name this view (optional):</span>
+                  <input
+                    type="text"
+                    placeholder="e.g. interview-prep"
+                    value={splice.viewName ?? ""}
+                    onChange={(e) => renameSplice(e.target.value)}
+                    className="flex-1 bg-tm-bg border border-tm-border rounded px-2 py-0.5 text-xs text-tm-text placeholder-tm-muted focus:outline-none focus:border-tm-accent"
+                  />
+                </label>
+                <p className="mt-1 text-[10px]">
+                  Click an entity to focus (●) or mute (×) it. The splice
+                  saves automatically and rehydrates next time this query runs.
+                </p>
+              </div>
+            )}
+
             <div className="space-y-1.5">
               {uniqueEntities.map((e) => {
                 const fb = rowFeedback[e.id];
-                const dim = fb !== undefined;
+                const isIncluded = splice.include.has(e.id);
+                const isExcluded = splice.exclude.has(e.id);
+                const dim = fb !== undefined || isExcluded;
                 return (
                   <div
                     key={e.id}
                     className={`flex items-center gap-2 px-2 py-1.5 rounded hover:bg-white/5 transition-colors ${
                       dim ? "opacity-60" : ""
-                    }`}
+                    } ${
+                      isIncluded ? "ring-1 ring-tm-accent/40 bg-tm-accent/5" : ""
+                    } ${isExcluded ? "line-through" : ""}`}
                   >
                     <button
-                      onClick={() => entityClick(e.id)}
+                      onClick={() => {
+                        entityClick(e.id);
+                        setEntityDrawer(e.id);
+                      }}
                       className={`px-2.5 py-1 rounded-full text-xs font-medium cursor-pointer hover:ring-2 hover:ring-tm-accent/50 transition-all ${typeColor(
                         e.entity_type,
                       )}`}
@@ -379,6 +527,32 @@ export default function QueryView() {
                       {e.name}
                       <span className="ml-1 opacity-60">{e.entity_type}</span>
                     </button>
+                    {spliceMode && (
+                      <div className="flex items-center gap-1">
+                        <button
+                          onClick={() => toggleSplice(e.id, "include")}
+                          title="focus on this entity"
+                          className={`px-1.5 py-0.5 text-xs rounded transition-colors ${
+                            isIncluded
+                              ? "bg-tm-accent/30 text-tm-accent"
+                              : "text-tm-muted hover:bg-tm-accent/10 hover:text-tm-accent"
+                          }`}
+                        >
+                          ●
+                        </button>
+                        <button
+                          onClick={() => toggleSplice(e.id, "exclude")}
+                          title="mute this entity"
+                          className={`px-1.5 py-0.5 text-xs rounded transition-colors ${
+                            isExcluded
+                              ? "bg-rose-500/30 text-rose-300"
+                              : "text-tm-muted hover:bg-rose-500/10 hover:text-rose-300"
+                          }`}
+                        >
+                          ×
+                        </button>
+                      </div>
+                    )}
                     {/* 2026-05-11 UX (#1) — origin-context pill so the
                         user can see *which* project a hit came from. */}
                     {e.context_name && (
@@ -498,6 +672,14 @@ export default function QueryView() {
             </div>
           )}
         </div>
+      )}
+
+      {entityDrawer && (
+        <EntityDrawer
+          entityId={entityDrawer}
+          onClose={() => setEntityDrawer(null)}
+          onOpenEntity={(t) => setEntityDrawer(t)}
+        />
       )}
     </div>
   );

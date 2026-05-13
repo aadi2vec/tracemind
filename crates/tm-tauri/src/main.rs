@@ -14,7 +14,7 @@ use uuid::Uuid;
 use tm_controller::UcbBandit;
 use tm_episodic::TraceStore;
 use tm_graph::GraphStore;
-use tm_ingest::IngestPipeline;
+use tm_ingest::{IngestPipeline, TripleJob, TripleWorker, TripleWorkerHandle, WorkerDb};
 use tm_retrieval::RetrievalEngine;
 
 // ---------------------------------------------------------------------------
@@ -30,6 +30,13 @@ struct AppState {
     retrieval: Mutex<RetrievalEngine>,
     trace_store: Arc<Mutex<TraceStore>>,
     capture_enabled: Arc<Mutex<bool>>,
+    /// LM-8 — async triple-extraction worker. The hot ingest path
+    /// enqueues a [`TripleJob`] after fast-path entity extraction
+    /// returns; the worker thread runs the (slower) triple extractor
+    /// + `route_triple_by_confidence` off the main thread so the UI
+    /// stays snappy. `Arc` so capture/ingest paths can share one
+    /// handle.
+    triple_worker: Arc<TripleWorkerHandle>,
 }
 
 // ---------------------------------------------------------------------------
@@ -217,6 +224,18 @@ fn cmd_ingest(text: String, state: State<AppState>) -> Result<IngestResponse, St
     // Persist trace
     let trace_store = state.trace_store.lock().map_err(|e| e.to_string())?;
     let _ = trace_store.append(&result.trace);
+
+    // LM-8 — kick the async triple worker. Best-effort: if the
+    // channel is full we drop the job (counter tracks the backpressure
+    // event). The synchronous pipeline above already produced the
+    // co-occurrence triples; this worker re-runs the (slower) typed
+    // extractor + `route_triple_by_confidence` off the hot path so
+    // mid-confidence triples accumulate in the pending pool over time.
+    let _ = state.triple_worker.try_enqueue(TripleJob {
+        text: text.clone(),
+        entities: result.entities.clone(),
+        session_id,
+    });
 
     // 2026-05-11 — mine intent phrases from the ingested text and persist
     // any hits as `pending` candidates. The capture daemon already does
@@ -3143,12 +3162,22 @@ struct GardenCard {
 fn cmd_memory_garden(state: State<AppState>) -> Result<Vec<GardenCard>, String> {
     let graph = GraphStore::open(&state.db_path).map_err(|e| e.to_string())?;
     let buckets = graph.cluster_buckets(50).map_err(|e| e.to_string())?;
+    // LM-21 — c-TF-IDF labels for real clusters. Outlier buckets get
+    // the static "unsorted" / "ignored" labels below.
+    let labels = graph.cluster_labels(25).map_err(|e| e.to_string())?;
     let mut cards = Vec::new();
     for (cluster_id, count) in buckets {
         let (label, is_outlier) = match cluster_id {
             None => ("unsorted".to_string(), true),
             Some(-1) => ("unsorted".to_string(), true),
-            Some(id) => (format!("cluster {id}"), false),
+            Some(-2) => ("ignored".to_string(), true),
+            Some(id) => {
+                let label = labels
+                    .get(&id)
+                    .map(|cl| cl.label.clone())
+                    .unwrap_or_else(|| format!("cluster {id}"));
+                (label, false)
+            }
         };
         let lookup = if is_outlier { None } else { cluster_id };
         let raw_samples = graph
@@ -3594,6 +3623,17 @@ fn main() {
     let trace_store = Arc::new(Mutex::new(trace_store));
     let capture_enabled = Arc::new(Mutex::new(true));
 
+    // LM-8 — spawn the async triple worker before anything else can
+    // race ingest. Capacity 64 is generous: even bulk ingest should
+    // not produce sustained backpressure, and the bounded channel
+    // means a stuck worker can never balloon RAM. The worker opens
+    // its own GraphStore handle (SQLite WAL handles concurrency).
+    let triple_worker = Arc::new(TripleWorker::spawn_default(
+        WorkerDb::Path(db_path.clone()),
+        64,
+    ));
+    let cap_triple_worker = Arc::clone(&triple_worker);
+
     // Clone Arcs for capture thread before moving into AppState
     let cap_ingest = Arc::clone(&ingest);
     let cap_trace_store = Arc::clone(&trace_store);
@@ -3607,6 +3647,7 @@ fn main() {
         retrieval: Mutex::new(retrieval),
         trace_store,
         capture_enabled,
+        triple_worker,
     };
 
     tauri::Builder::default()
@@ -3682,6 +3723,11 @@ fn main() {
                 let pipeline = cap_ingest;
                 let trace_store = cap_trace_store;
                 let capture_flag = cap_enabled;
+                // LM-8 — capture-loop ingests also feed the async
+                // triple worker so background extraction runs over
+                // clipboard/window/editor text too, not just user-typed
+                // IPC ingests.
+                let triple_worker = cap_triple_worker;
 
                 let mut seen_hashes: HashSet<u64> = HashSet::new();
                 let mut last_clip_hash: u64 = 0;
@@ -3721,6 +3767,12 @@ fn main() {
                                     if let Ok(ts) = trace_store.lock() {
                                         let _ = ts.append(&result.trace);
                                     }
+                                    // LM-8 — enqueue background triple extraction
+                                    let _ = triple_worker.try_enqueue(TripleJob {
+                                        text: text.clone(),
+                                        entities: result.entities.clone(),
+                                        session_id: session,
+                                    });
                                     let _ = handle.emit("capture-event", CaptureEvent {
                                         source: "clipboard".to_string(),
                                         text: if text.len() > 80 { format!("{}...", &text[..80]) } else { text.clone() },
@@ -3760,6 +3812,12 @@ fn main() {
                                             if let Ok(ts) = trace_store.lock() {
                                                 let _ = ts.append(&result.trace);
                                             }
+                                            // LM-8 — slow-path triple extraction off the capture loop.
+                                            let _ = triple_worker.try_enqueue(TripleJob {
+                                                text: context.clone(),
+                                                entities: result.entities.clone(),
+                                                session_id: session,
+                                            });
                                             let _ = handle.emit("capture-event", CaptureEvent {
                                                 source: "window".to_string(),
                                                 text: window,
@@ -3784,6 +3842,12 @@ fn main() {
                                         if let Ok(ts) = trace_store.lock() {
                                             let _ = ts.append(&result.trace);
                                         }
+                                        // LM-8 — enqueue slow-path triple extraction.
+                                        let _ = triple_worker.try_enqueue(TripleJob {
+                                            text: context.clone(),
+                                            entities: result.entities.clone(),
+                                            session_id: session,
+                                        });
                                         let _ = handle.emit("capture-event", CaptureEvent {
                                             source: "editor".to_string(),
                                             text: editor_ctx,
@@ -3823,6 +3887,12 @@ fn main() {
                                             if let Ok(ts) = trace_store.lock() {
                                                 let _ = ts.append(&result.trace);
                                             }
+                                            // LM-8 — fan out slow-path triple extraction per chunk.
+                                            let _ = triple_worker.try_enqueue(TripleJob {
+                                                text: chunk.clone(),
+                                                entities: result.entities.clone(),
+                                                session_id: session,
+                                            });
                                             total_entities += result.entities.len();
                                             total_triples += result.triples.len();
                                         }
