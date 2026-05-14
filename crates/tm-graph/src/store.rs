@@ -369,6 +369,13 @@ impl GraphStore {
             active_context_id: RefCell::new(None),
         };
 
+        // Sprint GRAPH: install threads / event graph / ontology / LGM /
+        // bridge / view-expression schema. Idempotent — see graph_sprint.rs.
+        {
+            let conn = store.kg.connection();
+            crate::graph_sprint::ensure_schema(conn)?;
+        }
+
         // One-time backfill: emit a temporal fact for any entity / triple
         // that doesn't yet have one. Idempotent — `current_fact_id` skips
         // anything already tracked. Cheap (linear in #rows missing a fact).
@@ -389,6 +396,14 @@ impl GraphStore {
         }
 
         Ok(store)
+    }
+
+    /// Borrow the underlying SQLite connection. Used by sibling
+    /// modules in this crate (algebra, event_graph, thread_graph,
+    /// ontology_types, portable_export) that operate on Sprint GRAPH
+    /// tables co-located in `memory.db`.
+    pub fn connection(&self) -> &rusqlite::Connection {
+        self.kg.connection()
     }
 
     /// Detect a contradiction between two triples and persist it so it

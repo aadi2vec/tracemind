@@ -562,6 +562,62 @@ fn tools_list() -> Value {
                         "note": {"type": "string", "description": "Optional human-readable note recorded alongside the rejection decision."}
                     }
                 }
+            },
+            {
+                "name": "memory_thread_start",
+                "description": "Sprint GRAPH — mint a new conversation thread (first-class composable graph). Returns the thread_id. Every capture/query/commitment made under this thread is auto-tagged for later slicing.",
+                "inputSchema": {
+                    "type": "object",
+                    "required": ["title"],
+                    "properties": {
+                        "title":      {"type": "string"},
+                        "source":     {"type": "string", "enum": ["claude","cursor","goose","tracemind","mcp","other"], "default": "mcp"},
+                        "context_id": {"type": "string"}
+                    }
+                }
+            },
+            {
+                "name": "memory_threads_list",
+                "description": "Sprint GRAPH — list recent threads (newest first).",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": { "limit": {"type": "integer", "default": 50} }
+                }
+            },
+            {
+                "name": "memory_thread_attach_view",
+                "description": "Sprint GRAPH — attach a memory view (graph-algebra expression) as the default scope for queries originating from this thread. Generalizes LM-11d per-query scoping to thread-level default. Use this to route 'Window 4' so it sees only the (Window 1 ∪ Window 3) \\ Window 2 slice.",
+                "inputSchema": {
+                    "type": "object",
+                    "required": ["thread_id","view_id"],
+                    "properties": {
+                        "thread_id": {"type": "string"},
+                        "view_id":   {"type": "string"}
+                    }
+                }
+            },
+            {
+                "name": "memory_compose",
+                "description": "Sprint GRAPH — evaluate a graph-algebra expression and return the materialized thread graph (entities + topics + commitments + captures). Expression is the same JSON shape as `GraphExpr` (node:thread / set_op / filter / bridge).",
+                "inputSchema": {
+                    "type": "object",
+                    "required": ["expression"],
+                    "properties": {
+                        "expression": {"type": "object"}
+                    }
+                }
+            },
+            {
+                "name": "memory_portable_export",
+                "description": "Sprint GRAPH — export a composed graph as portable JSON for routing into another AI host (Claude / Cursor / Goose). Returns the graph payload + approx token count + optional disk path.",
+                "inputSchema": {
+                    "type": "object",
+                    "required": ["expression"],
+                    "properties": {
+                        "expression":    {"type": "object"},
+                        "write_to_disk": {"type": "boolean", "default": false}
+                    }
+                }
             }
         ]
     })
@@ -2128,6 +2184,142 @@ fn handle_memory_pending_reject(params: &Value, db_path: &str) -> Result<Value, 
     Ok(json!({ "ok": ok, "id": id.to_string() }))
 }
 
+// ---------------------------------------------------------------------------
+// Sprint GRAPH — thread / compose / attach_view / portable_export
+// ---------------------------------------------------------------------------
+
+fn handle_memory_thread_start(params: &Value, db_path: &str) -> Result<Value, String> {
+    use tm_graph::thread_graph::{Thread, ThreadGraphStore, ThreadSource};
+    let title = params
+        .get("title")
+        .and_then(|v| v.as_str())
+        .ok_or("missing 'title'")?
+        .to_string();
+    let source = params
+        .get("source")
+        .and_then(|v| v.as_str())
+        .unwrap_or("mcp");
+    let mut t = Thread::new(title, ThreadSource::parse(source));
+    if let Some(cid) = params.get("context_id").and_then(|v| v.as_str()) {
+        t.context_id = uuid::Uuid::parse_str(cid).ok();
+    }
+    let graph = tm_graph::GraphStore::open(db_path)
+        .map_err(|e| format!("open graph: {e}"))?;
+    ThreadGraphStore::upsert(graph.connection(), &t).map_err(|e| e.to_string())?;
+    Ok(json!({
+        "thread_id": t.id.to_string(),
+        "title": t.title,
+        "source": t.source.as_str(),
+        "started_at": t.started_at.to_rfc3339(),
+    }))
+}
+
+fn handle_memory_threads_list(params: &Value, db_path: &str) -> Result<Value, String> {
+    use tm_graph::thread_graph::ThreadGraphStore;
+    let limit = params
+        .get("limit")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(50) as usize;
+    let graph = tm_graph::GraphStore::open(db_path)
+        .map_err(|e| format!("open graph: {e}"))?;
+    let xs = ThreadGraphStore::list(graph.connection(), limit).map_err(|e| e.to_string())?;
+    let arr: Vec<Value> = xs
+        .iter()
+        .map(|t| {
+            json!({
+                "id": t.id.to_string(),
+                "title": t.title,
+                "source": t.source.as_str(),
+                "started_at": t.started_at.to_rfc3339(),
+                "ended_at": t.ended_at.map(|d| d.to_rfc3339()),
+            })
+        })
+        .collect();
+    Ok(json!({ "threads": arr }))
+}
+
+fn handle_memory_thread_attach_view(params: &Value, db_path: &str) -> Result<Value, String> {
+    use tm_graph::thread_graph::ThreadGraphStore;
+    let tid_s = params
+        .get("thread_id")
+        .and_then(|v| v.as_str())
+        .ok_or("missing 'thread_id'")?;
+    let vid_s = params
+        .get("view_id")
+        .and_then(|v| v.as_str())
+        .ok_or("missing 'view_id'")?;
+    let tid = uuid::Uuid::parse_str(tid_s).map_err(|e| e.to_string())?;
+    let vid = uuid::Uuid::parse_str(vid_s).map_err(|e| e.to_string())?;
+    let graph = tm_graph::GraphStore::open(db_path)
+        .map_err(|e| format!("open graph: {e}"))?;
+    ThreadGraphStore::attach_view(graph.connection(), tid, vid).map_err(|e| e.to_string())?;
+    Ok(json!({ "ok": true, "thread_id": tid.to_string(), "view_id": vid.to_string() }))
+}
+
+fn handle_memory_compose(params: &Value, db_path: &str) -> Result<Value, String> {
+    use tm_graph::algebra::{Algebra, GraphExpr};
+    let expr_val = params
+        .get("expression")
+        .ok_or("missing 'expression'")?
+        .clone();
+    let expr: GraphExpr = serde_json::from_value(expr_val)
+        .map_err(|e| format!("bad expression: {e}"))?;
+    let graph = tm_graph::GraphStore::open(db_path)
+        .map_err(|e| format!("open graph: {e}"))?;
+    let g = Algebra::eval(graph.connection(), &expr).map_err(|e| e.to_string())?;
+    Ok(json!({
+        "thread_id":      g.thread_id.to_string(),
+        "entity_ids":     g.entity_ids.iter().map(|u| u.to_string()).collect::<Vec<_>>(),
+        "event_node_ids": g.event_node_ids.iter().map(|u| u.to_string()).collect::<Vec<_>>(),
+        "topic_clusters": g.topic_clusters,
+        "commitment_ids": g.commitment_ids.iter().map(|u| u.to_string()).collect::<Vec<_>>(),
+        "capture_signal_ids": g.capture_signal_ids,
+    }))
+}
+
+fn handle_memory_portable_export(params: &Value, db_path: &str) -> Result<Value, String> {
+    use tm_graph::algebra::{Algebra, GraphExpr};
+    use tm_graph::portable_export::{approx_token_count, export_portable, write_to_path};
+    let expr_val = params
+        .get("expression")
+        .ok_or("missing 'expression'")?
+        .clone();
+    let expr: GraphExpr = serde_json::from_value(expr_val)
+        .map_err(|e| format!("bad expression: {e}"))?;
+    let write = params
+        .get("write_to_disk")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    let graph = tm_graph::GraphStore::open(db_path)
+        .map_err(|e| format!("open graph: {e}"))?;
+    let conn = graph.connection();
+    let g = Algebra::eval(conn, &expr).map_err(|e| e.to_string())?;
+    let portable = export_portable(conn, &g).map_err(|e| e.to_string())?;
+    let approx = approx_token_count(&portable);
+
+    let mut path: Option<String> = None;
+    if write {
+        let parent = std::path::Path::new(db_path)
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."));
+        let dir = parent.join("portable");
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        let p = dir.join(format!(
+            "graph-{}.json",
+            chrono::Utc::now().timestamp_millis()
+        ));
+        write_to_path(&portable, &p).map_err(|e| e.to_string())?;
+        path = Some(p.to_string_lossy().to_string());
+    }
+
+    Ok(json!({
+        "graph": serde_json::to_value(&portable).map_err(|e| e.to_string())?,
+        "approx_tokens": approx,
+        "path": path,
+    }))
+}
+
 /// `memory_brief` — render the daily brief from the system of intents
 /// (`docs/INTENT_SYSTEM.md` §9.1).
 ///
@@ -3009,6 +3201,26 @@ async fn handle_request(
                 }
                 "memory_pending_reject" => {
                     handle_memory_pending_reject(&args, db_path)
+                        .map_err(|e| anyhow::anyhow!(e))?
+                }
+                "memory_thread_start" => {
+                    handle_memory_thread_start(&args, db_path)
+                        .map_err(|e| anyhow::anyhow!(e))?
+                }
+                "memory_threads_list" => {
+                    handle_memory_threads_list(&args, db_path)
+                        .map_err(|e| anyhow::anyhow!(e))?
+                }
+                "memory_thread_attach_view" => {
+                    handle_memory_thread_attach_view(&args, db_path)
+                        .map_err(|e| anyhow::anyhow!(e))?
+                }
+                "memory_compose" => {
+                    handle_memory_compose(&args, db_path)
+                        .map_err(|e| anyhow::anyhow!(e))?
+                }
+                "memory_portable_export" => {
+                    handle_memory_portable_export(&args, db_path)
                         .map_err(|e| anyhow::anyhow!(e))?
                 }
                 unknown => {
