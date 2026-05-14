@@ -6023,6 +6023,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "tm-pgm"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tm-types",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "tm-reason"
 version = "0.1.0"
 dependencies = [
@@ -6103,6 +6116,7 @@ dependencies = [
  "tm-graph",
  "tm-ingest",
  "tm-intent",
+ "tm-pgm",
  "tm-reason",
  "tm-reflect",
  "tm-retrieval",

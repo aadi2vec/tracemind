@@ -1,13 +1,19 @@
+pub mod algebra;
 pub mod belief;
 pub mod context;
 pub mod deny_list;
 pub mod entity_resolve;
+pub mod event_graph;
+pub mod graph_sprint;
 pub mod labeler;
 pub mod memory_view;
 pub mod moc;
 pub mod ontology;
+pub mod ontology_types;
 pub mod pending_relations;
+pub mod portable_export;
 pub mod store;
+pub mod thread_graph;
 
 pub use belief::{effective_confidence, BeliefStore, ContradictionView, ResolveChoice};
 // Re-export so downstream crates (tm-tauri, tm-mcp) can pattern-match
@@ -37,6 +43,15 @@ pub use pending_relations::{
     PENDING_FLOOR, SCHEMA_VERSION as PENDING_RELATIONS_SCHEMA_VERSION,
 };
 pub use store::{Backlink, CapturedSignal, GraphStore, PendingRouteOutcome, TripleDetail};
+
+pub use algebra::{Algebra, GraphExpr, SetOp};
+pub use event_graph::{EventEdge, EventEdgeKind, EventGraphStore, EventNode, EventNodeKind};
+pub use graph_sprint::{ensure_schema as ensure_sprint_graph_schema, GRAPH_SPRINT_SCHEMA_VERSION};
+pub use ontology_types::{
+    LinkType, ObjectType, OntologyStore, ObjectTypeAssignment, TypeCheckOutcome,
+};
+pub use portable_export::{export_portable, PortableEdge, PortableGraph, PortableNode};
+pub use thread_graph::{Thread, ThreadGraph, ThreadGraphStore, ThreadSource};
 
 use tm_types::Predicate;
 use uuid::Uuid;

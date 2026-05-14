@@ -14,6 +14,10 @@ import MemoryGardenView from "./views/MemoryGardenView";
 import ViewsView from "./views/ViewsView";
 import ContextDashboardView from "./views/ContextDashboardView";
 import InspectorView from "./views/InspectorView";
+import ThreadsView from "./views/ThreadsView";
+import ComposerView from "./views/ComposerView";
+import EventGraphView from "./views/EventGraphView";
+import OntologyView from "./views/OntologyView";
 import { getUsageStats } from "./api";
 
 type View =
@@ -28,6 +32,10 @@ type View =
   | "views"
   | "commitments"
   | "calibration"
+  | "threads"
+  | "composer"
+  | "events"
+  | "ontology"
   | "inspector"
   | "settings"
   | "onboarding";
@@ -50,6 +58,10 @@ const BASE_NAV_ITEMS: NavItem[] = [
   { id: "garden", label: "Garden", icon: "garden" },
   { id: "context", label: "Context", icon: "context" },
   { id: "views", label: "Views", icon: "views" },
+  { id: "threads", label: "Threads", icon: "timeline" },
+  { id: "composer", label: "Composer", icon: "graph" },
+  { id: "events", label: "Events", icon: "graph" },
+  { id: "ontology", label: "Ontology", icon: "views" },
   { id: "commitments", label: "Commitments", icon: "timeline" },
   { id: "calibration", label: "Calibration", icon: "gauge" },
   { id: "traces", label: "Traces", icon: "list" },
@@ -285,6 +297,10 @@ export default function App() {
         {view === "garden" && <MemoryGardenView />}
         {view === "context" && <ContextDashboardView />}
         {view === "views" && <ViewsView />}
+        {view === "threads" && <ThreadsView />}
+        {view === "composer" && <ComposerView />}
+        {view === "events" && <EventGraphView />}
+        {view === "ontology" && <OntologyView />}
         {view === "commitments" && <CommitmentTimelineView />}
         {view === "calibration" && <CalibrationView />}
         {view === "traces" && <TracesView />}

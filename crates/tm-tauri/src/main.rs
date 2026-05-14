@@ -17,6 +17,8 @@ use tm_graph::GraphStore;
 use tm_ingest::{IngestPipeline, TripleJob, TripleWorker, TripleWorkerHandle, WorkerDb};
 use tm_retrieval::RetrievalEngine;
 
+mod sprint_commands;
+
 // ---------------------------------------------------------------------------
 // App state
 // ---------------------------------------------------------------------------
@@ -5452,6 +5454,28 @@ fn main() {
             cmd_trace_why,
             cmd_inspector_layer,
             cmd_export_entity_markdown,
+            // ─── Sprint GRAPH ─────────────────────────────────────
+            sprint_commands::cmd_thread_start,
+            sprint_commands::cmd_thread_end,
+            sprint_commands::cmd_threads_list,
+            sprint_commands::cmd_thread_materialize,
+            sprint_commands::cmd_graph_compose,
+            sprint_commands::cmd_compose_simple,
+            sprint_commands::cmd_ontology_list,
+            sprint_commands::cmd_ontology_assign,
+            sprint_commands::cmd_ontology_create_object_type,
+            sprint_commands::cmd_ontology_create_link_type,
+            sprint_commands::cmd_event_graph,
+            sprint_commands::cmd_event_record,
+            sprint_commands::cmd_event_edge,
+            sprint_commands::cmd_event_promote,
+            sprint_commands::cmd_lgm_upsert_variable,
+            sprint_commands::cmd_lgm_observe,
+            sprint_commands::cmd_lgm_posterior,
+            sprint_commands::cmd_lgm_list,
+            sprint_commands::cmd_export_portable,
+            sprint_commands::cmd_thread_attach_view,
+            sprint_commands::cmd_thread_attached_view,
         ])
         .setup(move |app| {
             let handle = app.handle().clone();

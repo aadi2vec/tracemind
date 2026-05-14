@@ -27,6 +27,7 @@ members = [
     "crates/tm-modal",
     "crates/tm-tms",
     "crates/tm-engram",
+    "crates/tm-pgm",
 ]
 
 [workspace.package]
@@ -91,6 +92,7 @@ tm-temporal = { path = "crates/tm-temporal" }
 tm-modal = { path = "crates/tm-modal" }
 tm-tms = { path = "crates/tm-tms" }
 tm-engram = { path = "crates/tm-engram" }
+tm-pgm = { path = "crates/tm-pgm" }
 
 [profile.release]
 opt-level = 3

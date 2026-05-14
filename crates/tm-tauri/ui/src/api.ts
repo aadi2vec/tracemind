@@ -954,3 +954,262 @@ export async function exportEntityMarkdown(
 ): Promise<ExportEntityMarkdownResult> {
   return invoke("cmd_export_entity_markdown", { entityId, outputPath });
 }
+
+// ─── Sprint GRAPH ────────────────────────────────────────────────────
+
+export type ThreadSource = "claude" | "cursor" | "goose" | "tracemind" | "mcp" | "other";
+
+export interface ThreadDto {
+  id: string;
+  title: string;
+  source: ThreadSource;
+  started_at: string;
+  ended_at: string | null;
+  context_id: string | null;
+}
+
+export interface ThreadGraphDto {
+  thread_id: string;
+  event_node_ids: string[];
+  entity_ids: string[];
+  topic_clusters: number[];
+  commitment_ids: string[];
+  capture_signal_ids: number[];
+}
+
+export async function threadStart(
+  title: string,
+  source: ThreadSource = "tracemind",
+  contextId?: string,
+): Promise<ThreadDto> {
+  return invoke("cmd_thread_start", {
+    req: { title, source, context_id: contextId ?? null },
+  });
+}
+
+export async function threadEnd(threadId: string): Promise<void> {
+  return invoke("cmd_thread_end", { threadId });
+}
+
+export async function threadsList(limit = 50): Promise<ThreadDto[]> {
+  return invoke("cmd_threads_list", { limit });
+}
+
+export async function threadMaterialize(threadId: string): Promise<ThreadGraphDto> {
+  return invoke("cmd_thread_materialize", { threadId });
+}
+
+export type SetOp = "union" | "intersect" | "diff";
+
+export async function composeSimple(
+  op: SetOp,
+  left: string,
+  right: string,
+): Promise<ThreadGraphDto> {
+  return invoke("cmd_compose_simple", { req: { op, left, right } });
+}
+
+// Generic expression dispatch (matches Rust GraphExpr serde tag = "node")
+export type GraphExpr =
+  | { node: "thread"; thread_id: string }
+  | { node: "set_op"; op: SetOp; left: GraphExpr; right: GraphExpr }
+  | { node: "filter"; inner: GraphExpr; predicate: FilterPredicate }
+  | {
+      node: "bridge";
+      left: GraphExpr;
+      right: GraphExpr;
+      approved_pairs: [string, string][];
+    };
+
+export type FilterPredicate =
+  | { kind: "object_type_any"; types: string[] }
+  | { kind: "cluster_any"; clusters: number[] }
+  | { kind: "only_captures" }
+  | { kind: "only_commitments" };
+
+export async function graphCompose(expression: GraphExpr): Promise<ThreadGraphDto> {
+  return invoke("cmd_graph_compose", { expression });
+}
+
+export interface OntologyLinkTypeDto {
+  name: string;
+  from: string;
+  to: string;
+}
+
+export interface OntologyDto {
+  object_types: string[];
+  link_types: OntologyLinkTypeDto[];
+}
+
+export async function ontologyList(): Promise<OntologyDto> {
+  return invoke("cmd_ontology_list");
+}
+
+export async function ontologyAssign(
+  entityId: string,
+  objectType: string,
+): Promise<void> {
+  return invoke("cmd_ontology_assign", {
+    req: { entity_id: entityId, object_type: objectType },
+  });
+}
+
+export async function ontologyCreateObjectType(
+  name: string,
+  parent?: string,
+): Promise<string> {
+  return invoke("cmd_ontology_create_object_type", {
+    req: { name, parent: parent ?? null },
+  });
+}
+
+export async function ontologyCreateLinkType(
+  name: string,
+  from: string,
+  to: string,
+  cardinality: string = "many_to_many",
+): Promise<string> {
+  return invoke("cmd_ontology_create_link_type", {
+    req: { name, from, to, cardinality },
+  });
+}
+
+export interface EventNodeDto {
+  id: string;
+  kind: string;
+  ts: number;
+  payload_ref: string;
+  cluster_id: number | null;
+  thread_id: string | null;
+  salience: number;
+}
+
+export interface EventEdgeDto {
+  from: string;
+  to: string;
+  kind: string;
+  strength: number;
+  support_count: number;
+}
+
+export interface EventGraphDto {
+  nodes: EventNodeDto[];
+  edges: EventEdgeDto[];
+}
+
+export async function eventGraphFetch(limit = 500): Promise<EventGraphDto> {
+  return invoke("cmd_event_graph", { limit });
+}
+
+export async function eventRecord(req: {
+  kind: string;
+  payload_ref: string;
+  thread_id?: string;
+  context_id?: string;
+  cluster_id?: number;
+  salience?: number;
+}): Promise<string> {
+  return invoke("cmd_event_record", { req });
+}
+
+export async function eventEdgeRecord(req: {
+  from: string;
+  to: string;
+  kind: string;
+  strength: number;
+}): Promise<void> {
+  return invoke("cmd_event_edge", { req });
+}
+
+export async function eventPromote(): Promise<number> {
+  return invoke("cmd_event_promote");
+}
+
+export interface LgmVariableDto {
+  id: string;
+  name: string;
+  kind: string;
+  domain: string[];
+}
+
+export interface LgmPosteriorDto {
+  value: string;
+  probability: number;
+}
+
+export async function lgmUpsertVariable(req: {
+  name: string;
+  kind: string;
+  domain: string[];
+}): Promise<string> {
+  return invoke("cmd_lgm_upsert_variable", { req });
+}
+
+export async function lgmObserve(
+  assignments: Record<string, string>,
+): Promise<void> {
+  return invoke("cmd_lgm_observe", { req: { assignments } });
+}
+
+export async function lgmPosterior(
+  target: string,
+  evidence: Record<string, string>,
+): Promise<LgmPosteriorDto[]> {
+  return invoke("cmd_lgm_posterior", { req: { target, evidence } });
+}
+
+export async function lgmList(): Promise<LgmVariableDto[]> {
+  return invoke("cmd_lgm_list");
+}
+
+export interface PortableGraph {
+  schema_version: number;
+  origin: string;
+  thread_id: string;
+  nodes: Array<{
+    id: string;
+    kind: string;
+    label: string | null;
+    object_type: string | null;
+    properties: Record<string, unknown>;
+  }>;
+  edges: Array<{
+    from: string;
+    to: string;
+    kind: string;
+    strength: number;
+    support_count: number;
+  }>;
+  object_types: string[];
+  link_types: string[];
+  topic_clusters: number[];
+}
+
+export interface PortableExportResp {
+  graph: PortableGraph;
+  approx_tokens: number;
+  path: string | null;
+}
+
+export async function exportPortable(
+  expression: GraphExpr,
+  writeToDisk: boolean = false,
+): Promise<PortableExportResp> {
+  return invoke("cmd_export_portable", {
+    req: { expression, write_to_disk: writeToDisk },
+  });
+}
+
+export async function threadAttachView(
+  threadId: string,
+  viewId: string,
+): Promise<void> {
+  return invoke("cmd_thread_attach_view", {
+    req: { thread_id: threadId, view_id: viewId },
+  });
+}
+
+export async function threadAttachedView(threadId: string): Promise<string | null> {
+  return invoke("cmd_thread_attached_view", { threadId });
+}
