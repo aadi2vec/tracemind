@@ -1583,6 +1583,26 @@ impl RetrievalEngine {
         self.linucb.arm_stats()
     }
 
+    /// Inspector helper — current annealed LinUCB exploration coefficient.
+    pub fn linucb_alpha(&self) -> f64 {
+        self.linucb.alpha()
+    }
+
+    /// Inspector helper — embed arbitrary text using the engine's
+    /// configured embedder. Used by `cmd_trace_why` to recompute the
+    /// LinUCB context features for a past trace without spinning up a
+    /// second `Embedder` (the ONNX model load is non-trivial).
+    pub fn embed_query(&self, text: &str) -> Vec<f32> {
+        self.embedder.embed(text)
+    }
+
+    /// Inspector helper — produce the QueryPlanner's classification for
+    /// arbitrary text. Used by `cmd_trace_why` to surface plan.action /
+    /// plan.complexity / plan.confidence for a recorded trace.
+    pub fn plan_query(&self, text: &str) -> QueryPlan {
+        self.planner.plan(text)
+    }
+
     /// Register a click on a result entity (implicit positive feedback).
     pub fn register_click(&mut self, entity_id: Uuid) {
         if let Some(ref mut pending) = self.pending_reward {

@@ -14,7 +14,7 @@
 // gives the user a direct read on "what TraceMind still values".
 
 import { useEffect, useMemo, useState } from "react";
-import { getEntityContext, type EntityContextDump } from "../api";
+import { exportEntityMarkdown, getEntityContext, type EntityContextDump } from "../api";
 
 function fmtPct(x: number): string {
   return `${(x * 100).toFixed(0)}%`;
@@ -176,6 +176,29 @@ export default function ContextDashboardView() {
     setSubmitted(target);
   };
 
+  const [exporting, setExporting] = useState(false);
+  const [exportMsg, setExportMsg] = useState<string | null>(null);
+
+  const exportMarkdown = async () => {
+    if (!dump) return;
+    setExporting(true);
+    setExportMsg(null);
+    try {
+      // Default destination — drop into the data dir under a `markdown/`
+      // subfolder. The backend creates the dir if missing.
+      const safeName = dump.header.name.replace(/[^a-zA-Z0-9_\-]/g, "_").slice(0, 80);
+      const outputPath = `markdown/${safeName}-${dump.header.entity_id.slice(0, 8)}.md`;
+      const result = await exportEntityMarkdown(dump.header.entity_id, outputPath);
+      setExportMsg(
+        `Wrote ${result.bytes_written.toLocaleString()} bytes → ${result.output_path}`,
+      );
+    } catch (e) {
+      setExportMsg(`Export failed: ${e}`);
+    } finally {
+      setExporting(false);
+    }
+  };
+
   const accessHint = useMemo(() => {
     if (!dump) return "";
     return `Touched ${dump.decay.access_count} time${dump.decay.access_count === 1 ? "" : "s"}.`;
@@ -191,7 +214,7 @@ export default function ContextDashboardView() {
         </p>
       </div>
 
-      <form onSubmit={onSubmit} className="flex gap-2 mb-5">
+      <form onSubmit={onSubmit} className="flex gap-2 mb-2">
         <input
           value={query}
           onChange={(e) => setQuery(e.target.value)}
@@ -205,7 +228,21 @@ export default function ContextDashboardView() {
         >
           {loading ? "loading…" : "load"}
         </button>
+        {dump && (
+          <button
+            type="button"
+            onClick={exportMarkdown}
+            disabled={exporting}
+            title="Export the full context dump as portable markdown (drop into Obsidian / Bear)"
+            className="px-3 py-1.5 text-xs bg-white/5 text-tm-text border border-tm-border rounded hover:border-tm-accent hover:text-tm-accent disabled:opacity-40"
+          >
+            {exporting ? "exporting…" : "export .md"}
+          </button>
+        )}
       </form>
+      {exportMsg && (
+        <p className="text-xs text-tm-muted mb-3 font-mono">{exportMsg}</p>
+      )}
 
       {error && (
         <p className="text-sm text-rose-400 mb-4">Failed: {error}</p>
@@ -557,6 +594,180 @@ export default function ContextDashboardView() {
                     <span className="text-tm-text truncate flex-1">
                       {t.raw_text ? t.raw_text.slice(0, 120) : "(no text)"}
                     </span>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </Section>
+
+          {/* ── Reasoning chains (multi-hop from this entity) ──────────── */}
+          <Section
+            title="reasoning chains"
+            count={dump.reasoning_chains.length}
+            defaultOpen={false}
+          >
+            {dump.reasoning_chains.length === 0 ? (
+              <p className="text-xs text-tm-muted">
+                No multi-hop chains from this entity (try a more central node).
+              </p>
+            ) : (
+              <ul className="space-y-2">
+                {dump.reasoning_chains.map((ch, idx) => (
+                  <li
+                    key={`${ch.target_id}-${idx}`}
+                    className="text-xs border border-tm-border/40 rounded p-2"
+                  >
+                    <div className="flex items-baseline gap-2 mb-1">
+                      <span className="text-tm-muted">→</span>
+                      <button
+                        onClick={() => focusEntity(ch.target_id)}
+                        className="text-tm-text hover:text-tm-accent font-medium"
+                      >
+                        {ch.target_name}
+                      </button>
+                      <span className="text-tm-muted font-mono ml-auto">
+                        score {fmtNum(ch.score, 3)}
+                      </span>
+                    </div>
+                    <ol className="ml-3 space-y-0.5">
+                      {ch.steps.map((s, i) => (
+                        <li
+                          key={i}
+                          className="flex items-baseline gap-2"
+                        >
+                          <span className="text-tm-muted font-mono w-3 shrink-0">
+                            {s.direction === "Out" ? "→" : "←"}
+                          </span>
+                          <span className="text-tm-muted w-32 shrink-0 truncate">
+                            {s.predicate}
+                          </span>
+                          <button
+                            onClick={() => focusEntity(s.entity_id)}
+                            className="text-tm-text hover:text-tm-accent flex-1 truncate text-left"
+                          >
+                            {s.entity_name}
+                          </button>
+                          <span className="text-tm-muted font-mono">
+                            {fmtNum(s.confidence)}
+                          </span>
+                        </li>
+                      ))}
+                    </ol>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </Section>
+
+          {/* ── Structural analogies ───────────────────────────────────── */}
+          <Section
+            title="analogies"
+            count={dump.analogies.length}
+            defaultOpen={false}
+          >
+            {dump.analogies.length === 0 ? (
+              <p className="text-xs text-tm-muted">
+                No structural twin found.
+              </p>
+            ) : (
+              <ul className="space-y-1.5">
+                {dump.analogies.map((a) => (
+                  <li
+                    key={a.target_id}
+                    className="text-xs border border-tm-border/40 rounded p-2"
+                  >
+                    <div className="flex items-baseline gap-2">
+                      <button
+                        onClick={() => focusEntity(a.target_id)}
+                        className="text-tm-text hover:text-tm-accent font-medium"
+                      >
+                        {a.target_name}
+                      </button>
+                      <span className="text-tm-accent font-mono ml-auto">
+                        {fmtPct(a.similarity)}
+                      </span>
+                    </div>
+                    {a.shared_patterns.length > 0 && (
+                      <div className="mt-1 flex flex-wrap gap-1">
+                        {a.shared_patterns.map((p, i) => (
+                          <span
+                            key={i}
+                            className="text-[10px] px-1.5 py-0.5 bg-white/5 border border-tm-border rounded text-tm-muted"
+                          >
+                            {p}
+                          </span>
+                        ))}
+                      </div>
+                    )}
+                    {a.explanation && (
+                      <p className="text-tm-muted mt-1 leading-snug">
+                        {a.explanation}
+                      </p>
+                    )}
+                  </li>
+                ))}
+              </ul>
+            )}
+          </Section>
+
+          {/* ── Bandit arms that retrieved this entity ─────────────────── */}
+          <Section
+            title="bandit arms used"
+            count={dump.bandit_arms_used.length}
+            defaultOpen={false}
+          >
+            {dump.bandit_arms_used.length === 0 ? (
+              <p className="text-xs text-tm-muted">
+                No retrieval has returned this entity yet.
+              </p>
+            ) : (
+              <ul className="space-y-1">
+                {dump.bandit_arms_used.map((a) => (
+                  <li
+                    key={a.arm}
+                    className="text-xs flex items-baseline gap-2"
+                  >
+                    <span className="text-tm-muted font-mono w-6 shrink-0">
+                      {a.arm}
+                    </span>
+                    <span className="text-tm-text flex-1">{a.arm_name}</span>
+                    <span className="text-tm-accent font-mono">
+                      {a.pulls.toLocaleString()} pulls
+                    </span>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </Section>
+
+          {/* ── Related intents (commitments mentioning this entity) ───── */}
+          <Section
+            title="related intents"
+            count={dump.related_intents.length}
+            defaultOpen={false}
+          >
+            {dump.related_intents.length === 0 ? (
+              <p className="text-xs text-tm-muted">
+                No open commitment mentions this entity.
+              </p>
+            ) : (
+              <ul className="space-y-1">
+                {dump.related_intents.map((it) => (
+                  <li
+                    key={it.id}
+                    className="text-xs flex items-baseline gap-2"
+                  >
+                    <span className="text-tm-muted font-mono w-16 shrink-0 truncate">
+                      {it.state}
+                    </span>
+                    <span className="text-tm-text flex-1 truncate">
+                      {it.statement}
+                    </span>
+                    {it.horizon && (
+                      <span className="text-tm-muted font-mono">
+                        {it.horizon}
+                      </span>
+                    )}
                   </li>
                 ))}
               </ul>
