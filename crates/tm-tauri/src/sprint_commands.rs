@@ -14,12 +14,13 @@ use uuid::Uuid;
 use tm_graph::{
     algebra::{Algebra, GraphExpr, SetOp},
     event_graph::{EventEdgeKind, EventGraphStore, EventNode, EventNodeKind},
+    ontology_proposals::ProposalStore,
     ontology_types::OntologyStore,
     portable_export::{approx_token_count, export_portable, write_to_path, PortableGraph},
     thread_graph::{Thread, ThreadGraph, ThreadGraphStore, ThreadSource},
     GraphStore,
 };
-use tm_pgm::{observe, posterior, Observation, PgmStore, Variable, VariableKind};
+use tm_pgm::{anticipate, observe, posterior, AnticipateRow, Observation, PgmStore, Variable, VariableKind};
 
 use crate::AppState;
 
@@ -565,3 +566,113 @@ pub fn cmd_thread_attached_view(
         .map_err(|e| e.to_string())?
         .map(|u| u.to_string()))
 }
+
+// ─── ONT-2 — proposal accept/reject ──────────────────────────────────
+
+#[derive(Serialize)]
+pub struct OntologyProposalDto {
+    pub id: String,
+    pub kind: String,
+    pub name: String,
+    pub top_terms: Vec<String>,
+    pub support_count: u32,
+    pub created_at: String,
+}
+
+#[tauri::command]
+pub fn cmd_ontology_proposals(
+    state: State<'_, AppState>,
+) -> std::result::Result<Vec<OntologyProposalDto>, String> {
+    let g = open_graph(&state)?;
+    let rows = ProposalStore::list_pending(g.connection()).map_err(|e| e.to_string())?;
+    let out = rows
+        .into_iter()
+        .map(|p| {
+            let top_terms: Vec<String> = p
+                .evidence
+                .get("top_terms")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                        .collect()
+                })
+                .unwrap_or_default();
+            OntologyProposalDto {
+                id: p.id.to_string(),
+                kind: format!("{:?}", p.kind).to_lowercase(),
+                name: p.name,
+                top_terms,
+                support_count: p.support_count,
+                created_at: p.created_at,
+            }
+        })
+        .collect();
+    Ok(out)
+}
+
+#[tauri::command]
+pub fn cmd_ontology_accept_proposal(
+    state: State<'_, AppState>,
+    proposal_id: String,
+) -> std::result::Result<(), String> {
+    let id = Uuid::parse_str(&proposal_id).map_err(|e| e.to_string())?;
+    let g = open_graph(&state)?;
+    ProposalStore::accept(g.connection(), id).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn cmd_ontology_reject_proposal(
+    state: State<'_, AppState>,
+    proposal_id: String,
+) -> std::result::Result<(), String> {
+    let id = Uuid::parse_str(&proposal_id).map_err(|e| e.to_string())?;
+    let g = open_graph(&state)?;
+    ProposalStore::reject(g.connection(), id).map_err(|e| e.to_string())
+}
+
+// ─── LGM-2 — Anticipate verb card ───────────────────────────────────
+
+#[derive(Deserialize)]
+pub struct AnticipateReq {
+    pub target: String,
+    /// `variable_name -> value`
+    #[serde(default)]
+    pub evidence: std::collections::HashMap<String, String>,
+    #[serde(default = "default_anticipate_top_k")]
+    pub top_k: usize,
+}
+
+fn default_anticipate_top_k() -> usize {
+    3
+}
+
+#[derive(Serialize)]
+pub struct AnticipateRowDto {
+    pub value: String,
+    pub probability: f64,
+    pub support: u32,
+}
+
+#[tauri::command]
+pub fn cmd_anticipate(
+    state: State<'_, AppState>,
+    req: AnticipateReq,
+) -> std::result::Result<Vec<AnticipateRowDto>, String> {
+    let g = open_graph(&state)?;
+    let mut obs = Observation::default();
+    for (k, v) in req.evidence {
+        obs.values.insert(k, v);
+    }
+    let rows: Vec<AnticipateRow> =
+        anticipate(g.connection(), &req.target, &obs, req.top_k).map_err(|e| e.to_string())?;
+    Ok(rows
+        .into_iter()
+        .map(|r| AnticipateRowDto {
+            value: r.value,
+            probability: r.probability,
+            support: r.support,
+        })
+        .collect())
+}
+

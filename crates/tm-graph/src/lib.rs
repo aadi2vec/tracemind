@@ -9,6 +9,7 @@ pub mod labeler;
 pub mod memory_view;
 pub mod moc;
 pub mod ontology;
+pub mod ontology_proposals;
 pub mod ontology_types;
 pub mod pending_relations;
 pub mod portable_export;
@@ -47,6 +48,9 @@ pub use store::{Backlink, CapturedSignal, GraphStore, PendingRouteOutcome, Tripl
 pub use algebra::{Algebra, GraphExpr, SetOp};
 pub use event_graph::{EventEdge, EventEdgeKind, EventGraphStore, EventNode, EventNodeKind};
 pub use graph_sprint::{ensure_schema as ensure_sprint_graph_schema, GRAPH_SPRINT_SCHEMA_VERSION};
+pub use ontology_proposals::{
+    OntologyProposal, ProposalKind, ProposalStatus, ProposalStore,
+};
 pub use ontology_types::{
     LinkType, ObjectType, OntologyStore, ObjectTypeAssignment, TypeCheckOutcome,
 };

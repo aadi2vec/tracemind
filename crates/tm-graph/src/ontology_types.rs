@@ -52,6 +52,16 @@ pub enum TypeCheckOutcome {
     Untyped,
 }
 
+/// Normalize a link-type or object-type name for tolerant comparison.
+/// Strips underscores + lowercases so `Predicate::WorksAt` (Display → "WorksAt")
+/// matches a schema entry stored as either "WorksAt" or "works_at".
+fn normalize_name(s: &str) -> String {
+    s.chars()
+        .filter(|c| *c != '_')
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
 pub struct OntologyStore;
 
 impl OntologyStore {
@@ -184,7 +194,9 @@ impl OntologyStore {
     }
 
     /// Type-check a proposed edge. Untyped endpoints are *not* errors —
-    /// we don't force ontology adoption.
+    /// we don't force ontology adoption. Link-type name matching is
+    /// tolerant of casing + underscores so `Predicate::WorksAt` matches
+    /// either "WorksAt" or "works_at" in the seeded schema.
     pub fn check_edge(
         conn: &Connection,
         from_entity: Uuid,
@@ -197,23 +209,93 @@ impl OntologyStore {
             return Ok(TypeCheckOutcome::Untyped);
         };
 
-        let allowed: std::result::Result<i64, _> = conn.query_row(
-            "SELECT 1 FROM ontology_link_types lt
-             JOIN ontology_object_types ot_from ON ot_from.id = lt.from_object_type_id
-             JOIN ontology_object_types ot_to   ON ot_to.id   = lt.to_object_type_id
-             WHERE lt.name = ? AND ot_from.name = ? AND ot_to.name = ?",
-            params![link_type_name, from_ot, to_ot],
-            |r| r.get(0),
-        );
-        match allowed {
-            Ok(_) => Ok(TypeCheckOutcome::Allowed),
-            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(TypeCheckOutcome::Rejected {
+        let want = normalize_name(link_type_name);
+        let mut stmt = conn
+            .prepare(
+                "SELECT lt.name FROM ontology_link_types lt
+                 JOIN ontology_object_types ot_from ON ot_from.id = lt.from_object_type_id
+                 JOIN ontology_object_types ot_to   ON ot_to.id   = lt.to_object_type_id
+                 WHERE ot_from.name = ? AND ot_to.name = ?",
+            )
+            .map_err(|e| TraceMindError::Storage(format!("prep check_edge: {e}")))?;
+        let mut allowed = false;
+        let rows = stmt
+            .query_map(params![from_ot, to_ot], |r| r.get::<_, String>(0))
+            .map_err(|e| TraceMindError::Storage(format!("check_edge query: {e}")))?;
+        for r in rows {
+            let n = r.map_err(|e| TraceMindError::Storage(e.to_string()))?;
+            if normalize_name(&n) == want {
+                allowed = true;
+                break;
+            }
+        }
+
+        if allowed {
+            Ok(TypeCheckOutcome::Allowed)
+        } else {
+            Ok(TypeCheckOutcome::Rejected {
                 reason: format!(
                     "no link type '{link_type_name}' between {from_ot} → {to_ot}"
                 ),
-            }),
-            Err(e) => Err(TraceMindError::Storage(format!("check edge: {e}"))),
+            })
         }
+    }
+
+    /// Convenience wrapper for the triple-write path. Pulls the
+    /// predicate-as-string out and delegates to [`check_edge`].
+    pub fn check_triple(
+        conn: &Connection,
+        subject_id: Uuid,
+        object_id: Uuid,
+        predicate_label: &str,
+    ) -> Result<TypeCheckOutcome> {
+        Self::check_edge(conn, subject_id, object_id, predicate_label)
+    }
+
+    /// Create an object type with an explicit `source` tag.
+    /// Use this when materializing accepted ONT-2 proposals
+    /// (source = "statistical") so the schema editor can distinguish
+    /// user-authored types from proposer-grown types.
+    pub fn create_object_type_with_source(
+        conn: &Connection,
+        name: &str,
+        parent_name: Option<&str>,
+        property_schema: serde_json::Value,
+        source: &str,
+    ) -> Result<Uuid> {
+        let parent_id: Option<String> = if let Some(pn) = parent_name {
+            let r: std::result::Result<String, _> = conn.query_row(
+                "SELECT id FROM ontology_object_types WHERE name = ?",
+                params![pn],
+                |r| r.get(0),
+            );
+            r.ok()
+        } else {
+            None
+        };
+        let now = Utc::now().to_rfc3339();
+        let id = Uuid::new_v4();
+        conn.execute(
+            "INSERT INTO ontology_object_types
+              (id, name, version, parent_id, property_schema, source, created_at, updated_at)
+             VALUES (?, ?, 1, ?, ?, ?, ?, ?)
+             ON CONFLICT(name) DO UPDATE SET
+               version = ontology_object_types.version + 1,
+               property_schema = excluded.property_schema,
+               source = excluded.source,
+               updated_at = excluded.updated_at",
+            params![
+                id.to_string(),
+                name,
+                parent_id,
+                property_schema.to_string(),
+                source,
+                now,
+                now,
+            ],
+        )
+        .map_err(|e| TraceMindError::Storage(format!("create ot: {e}")))?;
+        Ok(id)
     }
 
     /// Create a *user-defined* object type. Bumps version on conflict.

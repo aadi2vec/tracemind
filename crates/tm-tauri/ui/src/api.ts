@@ -1075,6 +1075,47 @@ export async function ontologyCreateLinkType(
   });
 }
 
+// ── ONT-2 — proposals ────────────────────────────────────────────────
+
+export interface OntologyProposalDto {
+  id: string;
+  kind: string;
+  name: string;
+  top_terms: string[];
+  support_count: number;
+  created_at: string;
+}
+
+export async function ontologyProposals(): Promise<OntologyProposalDto[]> {
+  return invoke("cmd_ontology_proposals");
+}
+
+export async function ontologyAcceptProposal(id: string): Promise<void> {
+  return invoke("cmd_ontology_accept_proposal", { proposalId: id });
+}
+
+export async function ontologyRejectProposal(id: string): Promise<void> {
+  return invoke("cmd_ontology_reject_proposal", { proposalId: id });
+}
+
+// ── LGM-2 — Anticipate ───────────────────────────────────────────────
+
+export interface AnticipateRowDto {
+  value: string;
+  probability: number;
+  support: number;
+}
+
+export async function anticipate(
+  target: string,
+  evidence: Record<string, string> = {},
+  topK: number = 3,
+): Promise<AnticipateRowDto[]> {
+  return invoke("cmd_anticipate", {
+    req: { target, evidence, top_k: topK },
+  });
+}
+
 export interface EventNodeDto {
   id: string;
   kind: string;

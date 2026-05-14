@@ -27,6 +27,7 @@ import {
   type TripleDetailView,
   type OutcomePolarity,
 } from "../api";
+import AnticipateCard from "./AnticipateCard";
 import EntityDrawer from "./EntityDrawer";
 import TransclusionText from "./TransclusionText";
 
@@ -222,6 +223,8 @@ export default function BriefView() {
           contradictions: <span className="font-mono">{c.contradictions}</span>
         </span>
       </div>
+
+      <AnticipateCard />
 
       {brief.contradictions.filter((r) => !dismissedIds.has(r.id)).length > 0 && (
         <section className="mb-6">
