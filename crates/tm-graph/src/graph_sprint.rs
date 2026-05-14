@@ -44,6 +44,19 @@ pub fn ensure_schema(conn: &Connection) -> Result<()> {
         })?;
     }
 
+    // Sprint EVG-Followup: LGM random variables now reference an Object
+    // Type from the ontology (optional — Custom variables can stay free-form,
+    // but Activity/Topic/etc. nail down to a typed Object Type).
+    if !column_exists(conn, "lgm_variables", "object_type")? {
+        conn.execute(
+            "ALTER TABLE lgm_variables ADD COLUMN object_type TEXT",
+            [],
+        )
+        .map_err(|e| {
+            TraceMindError::Storage(format!("alter lgm_variables.object_type: {e}"))
+        })?;
+    }
+
     seed_builtin_ontology(conn)?;
     Ok(())
 }
@@ -278,6 +291,23 @@ CREATE TABLE IF NOT EXISTS thread_attached_view (
   view_id    TEXT NOT NULL,
   attached_at TEXT NOT NULL
 );
+
+-- ─── ONT-2 — Statistical ontology proposals (accept / reject) ────────
+-- `tm-reflect` writes rows here when a recurring cluster looks like a new
+-- Object Type. The user accepts or rejects in Settings; accepted rows
+-- become real `ontology_object_types` entries with source='statistical'.
+CREATE TABLE IF NOT EXISTS ontology_proposals (
+  id            TEXT PRIMARY KEY,
+  proposal_kind TEXT NOT NULL,           -- 'object_type' | 'link_type'
+  name          TEXT NOT NULL,
+  evidence      TEXT NOT NULL DEFAULT '{}',  -- JSON: cluster_id, sample event_ids, top terms
+  support_count INTEGER NOT NULL DEFAULT 0,
+  status        TEXT NOT NULL DEFAULT 'pending',  -- pending | accepted | rejected
+  created_at    TEXT NOT NULL,
+  decided_at    TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_ont_prop_status ON ontology_proposals(status);
+CREATE INDEX IF NOT EXISTS idx_ont_prop_kind ON ontology_proposals(proposal_kind);
 "#;
 
 #[cfg(test)]

@@ -1521,6 +1521,28 @@ impl GraphStore {
         let predicate_str = serde_json::to_string(&triple.predicate)
             .map_err(|e| TraceMindError::Storage(e.to_string()))?;
 
+        // ONT-1 gate: if both endpoints are bound to Object Types and the
+        // predicate isn't an allowed Link Type between them, reject. Untyped
+        // endpoints pass through unchanged (we don't force ontology adoption).
+        {
+            let conn = self.kg.connection();
+            let predicate_label = triple.predicate.to_string();
+            match crate::ontology_types::OntologyStore::check_triple(
+                conn,
+                triple.subject_id,
+                triple.object_id,
+                &predicate_label,
+            )? {
+                crate::ontology_types::TypeCheckOutcome::Allowed
+                | crate::ontology_types::TypeCheckOutcome::Untyped => {}
+                crate::ontology_types::TypeCheckOutcome::Rejected { reason } => {
+                    return Err(TraceMindError::Storage(format!(
+                        "ontology rejected triple: {reason}"
+                    )));
+                }
+            }
+        }
+
         let entity_map = self.entity_map.borrow();
         let &subj_skg = entity_map.get(&triple.subject_id).ok_or_else(|| {
             TraceMindError::Storage(format!("subject {} not in entity map", triple.subject_id))

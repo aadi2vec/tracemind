@@ -17,7 +17,8 @@ import InspectorView from "./views/InspectorView";
 import ThreadsView from "./views/ThreadsView";
 import ComposerView from "./views/ComposerView";
 import EventGraphView from "./views/EventGraphView";
-import OntologyView from "./views/OntologyView";
+// OntologyView demoted 2026-05-13 — now imported only from SettingsView
+// behind the Schema sub-panel (power users). Not in primary nav.
 import { getUsageStats } from "./api";
 
 type View =
@@ -35,7 +36,6 @@ type View =
   | "threads"
   | "composer"
   | "events"
-  | "ontology"
   | "inspector"
   | "settings"
   | "onboarding";
@@ -61,7 +61,9 @@ const BASE_NAV_ITEMS: NavItem[] = [
   { id: "threads", label: "Threads", icon: "timeline" },
   { id: "composer", label: "Composer", icon: "graph" },
   { id: "events", label: "Events", icon: "graph" },
-  { id: "ontology", label: "Ontology", icon: "views" },
+  // Ontology nav removed 2026-05-13. Ontology is internal infra, not a
+  // primary surface. Schema editor moved behind Settings → Schema for
+  // power users only. Verb cards stay the visible surface.
   { id: "commitments", label: "Commitments", icon: "timeline" },
   { id: "calibration", label: "Calibration", icon: "gauge" },
   { id: "traces", label: "Traces", icon: "list" },
@@ -300,7 +302,6 @@ export default function App() {
         {view === "threads" && <ThreadsView />}
         {view === "composer" && <ComposerView />}
         {view === "events" && <EventGraphView />}
-        {view === "ontology" && <OntologyView />}
         {view === "commitments" && <CommitmentTimelineView />}
         {view === "calibration" && <CalibrationView />}
         {view === "traces" && <TracesView />}

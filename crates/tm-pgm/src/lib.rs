@@ -21,7 +21,7 @@
 //! Tables (`lgm_variables`, `lgm_dependencies`) live in `memory.db` —
 //! schema is owned by `tm_graph::graph_sprint`.
 
-use chrono::Utc;
+use chrono::{DateTime, TimeZone, Utc};
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
@@ -72,6 +72,13 @@ pub struct Variable {
     pub kind: VariableKind,
     /// Discrete domain (values the variable can take).
     pub domain: Vec<String>,
+    /// Optional Object Type from the ontology that this RV ranges over.
+    /// `None` means the variable is free-form (legacy / `Custom`).
+    /// `Some("Topic")` ties the variable's *meaning* to an Object Type so
+    /// LGM-2's "Anticipate" surface can talk about "topic" rather than
+    /// a raw string.
+    #[serde(default)]
+    pub object_type: Option<String>,
 }
 
 impl Variable {
@@ -81,7 +88,13 @@ impl Variable {
             name: name.into(),
             kind,
             domain,
+            object_type: None,
         }
+    }
+
+    pub fn with_object_type(mut self, ot: impl Into<String>) -> Self {
+        self.object_type = Some(ot.into());
+        self
     }
 }
 
@@ -115,16 +128,20 @@ pub struct Observation {
 pub struct PgmStore;
 
 impl PgmStore {
-    /// Create or update a variable.
+    /// Create or update a variable. Object Type column is optional and
+    /// is *not* validated against the ontology here — callers using the
+    /// `Variable::with_object_type` helper are responsible for naming a
+    /// real Object Type. Validation is cheap to add later.
     pub fn upsert_variable(conn: &Connection, v: &Variable) -> Result<()> {
         let domain = serde_json::to_string(&v.domain)
             .map_err(|e| TraceMindError::Storage(format!("domain: {e}")))?;
         conn.execute(
-            "INSERT INTO lgm_variables (id, name, kind, domain, observed_at)
-             VALUES (?,?,?,?,?)
+            "INSERT INTO lgm_variables (id, name, kind, domain, observed_at, object_type)
+             VALUES (?,?,?,?,?,?)
              ON CONFLICT(name) DO UPDATE SET
                kind        = excluded.kind,
                domain      = excluded.domain,
+               object_type = excluded.object_type,
                observed_at = excluded.observed_at",
             params![
                 v.id.to_string(),
@@ -132,6 +149,7 @@ impl PgmStore {
                 v.kind.as_str(),
                 domain,
                 Utc::now().to_rfc3339(),
+                v.object_type,
             ],
         )
         .map_err(|e| TraceMindError::Storage(format!("upsert var: {e}")))?;
@@ -140,7 +158,10 @@ impl PgmStore {
 
     pub fn list_variables(conn: &Connection) -> Result<Vec<Variable>> {
         let mut stmt = conn
-            .prepare("SELECT id, name, kind, domain FROM lgm_variables ORDER BY name ASC")
+            .prepare(
+                "SELECT id, name, kind, domain, object_type
+                 FROM lgm_variables ORDER BY name ASC",
+            )
             .map_err(|e| TraceMindError::Storage(format!("prep vars: {e}")))?;
         let rows = stmt
             .query_map([], |row| {
@@ -148,12 +169,13 @@ impl PgmStore {
                 let name: String = row.get(1)?;
                 let kind: String = row.get(2)?;
                 let domain: String = row.get(3)?;
-                Ok((id, name, kind, domain))
+                let ot: Option<String> = row.get(4)?;
+                Ok((id, name, kind, domain, ot))
             })
             .map_err(|e| TraceMindError::Storage(format!("vars query: {e}")))?;
         let mut out = Vec::new();
         for r in rows {
-            let (id, name, kind, domain) =
+            let (id, name, kind, domain, ot) =
                 r.map_err(|e| TraceMindError::Storage(e.to_string()))?;
             out.push(Variable {
                 id: Uuid::parse_str(&id)
@@ -161,6 +183,7 @@ impl PgmStore {
                 name,
                 kind: VariableKind::parse(&kind),
                 domain: serde_json::from_str(&domain).unwrap_or_default(),
+                object_type: ot,
             });
         }
         Ok(out)
@@ -226,20 +249,31 @@ impl PgmStore {
     }
 
     pub fn get_variable_by_name(conn: &Connection, name: &str) -> Result<Option<Variable>> {
-        let r: std::result::Result<(String, String, String, String), _> = conn.query_row(
-            "SELECT id, name, kind, domain FROM lgm_variables WHERE name = ?",
+        let r: std::result::Result<
+            (String, String, String, String, Option<String>),
+            _,
+        > = conn.query_row(
+            "SELECT id, name, kind, domain, object_type
+             FROM lgm_variables WHERE name = ?",
             params![name],
             |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
             },
         );
         match r {
-            Ok((id, name, kind, domain)) => Ok(Some(Variable {
+            Ok((id, name, kind, domain, ot)) => Ok(Some(Variable {
                 id: Uuid::parse_str(&id)
                     .map_err(|e| TraceMindError::Storage(format!("uuid: {e}")))?,
                 name,
                 kind: VariableKind::parse(&kind),
                 domain: serde_json::from_str(&domain).unwrap_or_default(),
+                object_type: ot,
             })),
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(TraceMindError::Storage(format!("var by name: {e}"))),
@@ -345,6 +379,145 @@ pub fn observe(conn: &Connection, obs: &Observation) -> Result<()> {
     Ok(())
 }
 
+/// Bucket a wall-clock timestamp into one of four named windows.
+/// Cheap & deterministic; matches the `time_window` variable's domain
+/// when seeded via [`ensure_baseline_variables`].
+pub fn time_window_bucket(ts: DateTime<Utc>) -> &'static str {
+    let h = ts.hour_local_naive();
+    match h {
+        5..=11 => "morning",
+        12..=17 => "afternoon",
+        18..=22 => "evening",
+        _ => "night",
+    }
+}
+
+/// Lightweight DateTime extension so we don't pull `chrono::Timelike`
+/// into the public API; equivalent to `.hour() as u8`.
+trait LocalHour {
+    fn hour_local_naive(self) -> u8;
+}
+impl LocalHour for DateTime<Utc> {
+    fn hour_local_naive(self) -> u8 {
+        use chrono::Timelike;
+        self.hour() as u8
+    }
+}
+
+/// Make sure the baseline RVs that `observe_from_event_graph` writes
+/// against exist. Idempotent — safe to call at LGM init.
+///
+/// Tied-to-ontology mapping:
+///   - `event_kind`   → no ObjectType (it's a verb, not an entity)
+///   - `time_window`  → no ObjectType (sub-attribute of an Event)
+///   - `context_id`   → ObjectType: "Thread"
+pub fn ensure_baseline_variables(conn: &Connection) -> Result<()> {
+    let kind = Variable {
+        id: Uuid::new_v4(),
+        name: "event_kind".into(),
+        kind: VariableKind::Activity,
+        domain: vec![
+            "capture".into(),
+            "query".into(),
+            "commitment".into(),
+            "outcome".into(),
+            "decision".into(),
+        ],
+        object_type: None,
+    };
+    let tw = Variable {
+        id: Uuid::new_v4(),
+        name: "time_window".into(),
+        kind: VariableKind::TimeWindow,
+        domain: vec![
+            "morning".into(),
+            "afternoon".into(),
+            "evening".into(),
+            "night".into(),
+        ],
+        object_type: None,
+    };
+    let ctx = Variable {
+        id: Uuid::new_v4(),
+        name: "context_id".into(),
+        kind: VariableKind::Context,
+        // Domain populated lazily as new contexts are observed; start empty.
+        domain: vec![],
+        object_type: Some("Thread".into()),
+    };
+    PgmStore::upsert_variable(conn, &kind)?;
+    PgmStore::upsert_variable(conn, &tw)?;
+    PgmStore::upsert_variable(conn, &ctx)?;
+    Ok(())
+}
+
+/// Scan `event_nodes` in `[start, end]` and feed each event into the PGM
+/// as an `Observation` over (event_kind, time_window, context_id). This
+/// is how LGM "sees" the event graph — it is the inverse of the
+/// LGM-2 *forecast* surface that reads marginals back out.
+///
+/// Returns the number of events ingested. Idempotent: re-running over
+/// the same window deepens the prior — every event contributes one
+/// Bayesian count. Callers that don't want double-counting should
+/// move the window forward each run.
+pub fn observe_from_event_graph(
+    conn: &Connection,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+) -> Result<usize> {
+    ensure_baseline_variables(conn)?;
+
+    let start_ms = start.timestamp_millis();
+    let end_ms = end.timestamp_millis();
+    let mut stmt = conn
+        .prepare(
+            "SELECT kind, ts, context_id FROM event_nodes
+             WHERE ts BETWEEN ? AND ? ORDER BY ts ASC",
+        )
+        .map_err(|e| TraceMindError::Storage(format!("prep ev scan: {e}")))?;
+    let rows = stmt
+        .query_map(params![start_ms, end_ms], |row| {
+            let kind: String = row.get(0)?;
+            let ts: i64 = row.get(1)?;
+            let ctx: Option<String> = row.get(2)?;
+            Ok((kind, ts, ctx))
+        })
+        .map_err(|e| TraceMindError::Storage(format!("ev scan: {e}")))?;
+
+    // Materialize first so we can drop the borrow before calling observe()
+    // (observe() reopens the conn for read).
+    let mut buf: Vec<(String, i64, Option<String>)> = Vec::new();
+    for r in rows {
+        buf.push(r.map_err(|e| TraceMindError::Storage(e.to_string()))?);
+    }
+    drop(stmt);
+
+    let mut count = 0usize;
+    for (kind, ts_ms, ctx) in buf {
+        let ts = Utc
+            .timestamp_millis_opt(ts_ms)
+            .single()
+            .unwrap_or_else(Utc::now);
+        let mut o = Observation::default();
+        o.values.insert("event_kind".into(), kind);
+        o.values
+            .insert("time_window".into(), time_window_bucket(ts).into());
+        if let Some(c) = ctx {
+            // Grow context_id domain on first sight so observe() can score it.
+            if let Some(mut var) = PgmStore::get_variable_by_name(conn, "context_id")? {
+                if !var.domain.iter().any(|d| d == &c) {
+                    var.domain.push(c.clone());
+                    PgmStore::upsert_variable(conn, &var)?;
+                }
+            }
+            o.values.insert("context_id".into(), c);
+        }
+        observe(conn, &o)?;
+        count += 1;
+    }
+    Ok(count)
+}
+
 fn normalize(rows: &mut [Cpd], domain: &[String]) {
     for row in rows.iter_mut() {
         // Dirichlet α=1: every domain value gets +1 base mass.
@@ -435,6 +608,56 @@ pub fn posterior(
     Ok(out)
 }
 
+// ── LGM-2 — Anticipate API ───────────────────────────────────────────────
+//
+// Top-level surface for the "what's likely next?" question. Returns a
+// short, ranked list of `(value, prob, support)` rows so the Brief view
+// can render lines like
+//
+//   "73% — event_kind=query (morning, ctx=acme-launch) — 12 obs"
+//
+// This is intentionally tiny — the heavy lifting is in `posterior()`.
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AnticipateRow {
+    pub value: String,
+    pub probability: f64,
+    /// Total support behind the posterior (sum across parents).
+    pub support: u32,
+}
+
+/// "Given this evidence, what's likely next?" — reads PGM marginals.
+/// `target` is the variable name to predict (e.g. `"event_kind"`).
+/// `evidence` is a map of `variable_name -> value` (e.g.
+/// `{"time_window": "morning"}`). Returns the top `top_k` outcomes.
+pub fn anticipate(
+    conn: &Connection,
+    target: &str,
+    evidence: &Observation,
+    top_k: usize,
+) -> Result<Vec<AnticipateRow>> {
+    let post = posterior(conn, target, evidence)?;
+    let support: u32 = match PgmStore::get_variable_by_name(conn, target)? {
+        Some(v) => PgmStore::parents_of(conn, v.id)?
+            .into_iter()
+            .map(|d| d.support_count)
+            .sum(),
+        None => 0,
+    };
+    let mut out: Vec<AnticipateRow> = post
+        .into_iter()
+        .map(|(value, probability)| AnticipateRow {
+            value,
+            probability,
+            support,
+        })
+        .collect();
+    if out.len() > top_k {
+        out.truncate(top_k);
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -444,7 +667,8 @@ mod tests {
         c.execute_batch(
             "CREATE TABLE lgm_variables (
                id TEXT PRIMARY KEY, name TEXT UNIQUE,
-               kind TEXT, domain TEXT, observed_at TEXT
+               kind TEXT, domain TEXT, observed_at TEXT,
+               object_type TEXT
              );
              CREATE TABLE lgm_dependencies (
                child_id TEXT, parent_id TEXT, cpd TEXT,
@@ -492,6 +716,64 @@ mod tests {
         let t = post.iter().find(|(k, _)| k == "tracemind").unwrap().1;
         let r = post.iter().find(|(k, _)| k == "rondo").unwrap().1;
         assert!(t > r);
+    }
+
+    #[test]
+    fn variable_carries_object_type_round_trip() {
+        let c = fresh();
+        let v = Variable::new(
+            "topic",
+            VariableKind::Topic,
+            vec!["rondo".into(), "tracemind".into()],
+        )
+        .with_object_type("Topic");
+        PgmStore::upsert_variable(&c, &v).unwrap();
+        let got = PgmStore::get_variable_by_name(&c, "topic").unwrap().unwrap();
+        assert_eq!(got.object_type.as_deref(), Some("Topic"));
+    }
+
+    #[test]
+    fn observe_from_event_graph_ingests_window() {
+        let c = fresh();
+        // Mimic the slice of event_nodes schema we read from.
+        c.execute_batch(
+            "CREATE TABLE event_nodes (
+               id TEXT PRIMARY KEY, kind TEXT, ts INTEGER,
+               payload_ref TEXT, cluster_id INTEGER,
+               context_id TEXT, thread_id TEXT, salience REAL
+             );",
+        )
+        .unwrap();
+
+        let now = Utc::now();
+        for off in &[0i64, -1000, -2000] {
+            c.execute(
+                "INSERT INTO event_nodes (id, kind, ts, payload_ref, salience)
+                 VALUES (?, 'query', ?, '', 0.0)",
+                params![Uuid::new_v4().to_string(), now.timestamp_millis() + *off],
+            )
+            .unwrap();
+        }
+        let count = observe_from_event_graph(
+            &c,
+            now - chrono::Duration::seconds(10),
+            now + chrono::Duration::seconds(10),
+        )
+        .unwrap();
+        assert_eq!(count, 3);
+
+        // With only queries observed, the marginal should favor `query`
+        // over every other event_kind in the domain.
+        let ev = Observation::default();
+        let rows = anticipate(&c, "event_kind", &ev, 5).unwrap();
+        let q = rows.iter().find(|r| r.value == "query").unwrap().probability;
+        for r in &rows {
+            if r.value != "query" {
+                assert!(q > r.probability, "query ({q}) should beat {} ({})", r.value, r.probability);
+            }
+        }
+        // The Anticipate row should also carry a non-zero support count.
+        assert!(rows.iter().any(|r| r.value == "query" && r.support >= 1));
     }
 
     #[test]

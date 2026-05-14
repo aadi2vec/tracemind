@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { lazy, Suspense, useEffect, useState } from "react";
 import {
   CapturePermissionRow,
   ForgetSourceResult,
@@ -9,6 +9,11 @@ import {
   listCapturePermissions,
   setCapturePermission,
 } from "../api";
+import OntologyProposals from "./OntologyProposals";
+
+// Schema editor is power-user-only. Lazy so first paint of Settings
+// stays cheap and we don't load the full ontology editor unless asked.
+const OntologyView = lazy(() => import("./OntologyView"));
 
 // UI-12 + UI-13: settings + privacy panel. Per-source capture
 // toggles, audit counters, "forget all from this source," + DP-3
@@ -63,6 +68,7 @@ export default function SettingsView() {
   const [forgotMsg, setForgotMsg] = useState<string | null>(null);
   const [sharePayload, setSharePayload] = useState<string | null>(null);
   const [devMode, setDevMode] = useState<boolean>(() => readDevMode());
+  const [schemaOpen, setSchemaOpen] = useState(false);
 
   async function reload() {
     setLoading(true);
@@ -264,6 +270,40 @@ export default function SettingsView() {
             }}
           />
         </div>
+      </section>
+
+      {/* ONT-2 — Ontology proposals (statistical Object Type proposals
+          from tm-reflect cluster signatures). Inline list, accept/reject
+          buttons. Surfaces always — but quiet when there are none. */}
+      <OntologyProposals />
+
+      {/* Schema editor — power users only. Folded by default; opening
+          loads the full ontology editor (the demoted OntologyView).
+          Per the no-Foundry-UI rule, schema is internal infra. */}
+      <section className="bg-tm-surface border border-tm-border rounded-lg p-5">
+        <div className="flex items-start justify-between gap-4">
+          <div>
+            <h3 className="text-lg font-medium text-tm-text">Schema (power users)</h3>
+            <p className="text-xs text-tm-muted mt-1 max-w-xl">
+              View and edit Object Types + Link Types — the typed schema
+              that gates every new triple. Most users won't touch this.
+              Statistical proposals appear above.
+            </p>
+          </div>
+          <button
+            onClick={() => setSchemaOpen((v) => !v)}
+            className="text-xs px-3 py-1.5 border border-tm-border rounded text-tm-text hover:border-tm-accent"
+          >
+            {schemaOpen ? "Hide" : "Open"}
+          </button>
+        </div>
+        {schemaOpen && (
+          <div className="mt-4 pt-4 border-t border-tm-border">
+            <Suspense fallback={<p className="text-sm text-tm-muted">Loading schema editor…</p>}>
+              <OntologyView />
+            </Suspense>
+          </div>
+        )}
       </section>
 
       {/* Privacy invariants */}

@@ -5476,6 +5476,10 @@ fn main() {
             sprint_commands::cmd_export_portable,
             sprint_commands::cmd_thread_attach_view,
             sprint_commands::cmd_thread_attached_view,
+            sprint_commands::cmd_ontology_proposals,
+            sprint_commands::cmd_ontology_accept_proposal,
+            sprint_commands::cmd_ontology_reject_proposal,
+            sprint_commands::cmd_anticipate,
         ])
         .setup(move |app| {
             let handle = app.handle().clone();

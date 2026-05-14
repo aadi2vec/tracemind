@@ -28,6 +28,7 @@
 pub mod brief;
 pub mod insights;
 pub mod matcher;
+pub mod ontology_proposer;
 pub mod outcome_prompt;
 pub mod pattern;
 
@@ -38,6 +39,10 @@ pub use brief::{
 };
 pub use insights::{detect_insights, BaselineRate, InsightBriefRow, InsightConfig};
 pub use matcher::{propose_outcomes, MatcherConfig, OutcomeProposal};
+pub use ontology_proposer::{
+    persist_proposals as persist_object_type_proposals, propose_object_types,
+    ProposedObjectType, ProposerConfig,
+};
 pub use outcome_prompt::{
     OutcomePrompt, OutcomePromptScheduler, PromptSchedulerConfig, PromptUrgency,
 };
