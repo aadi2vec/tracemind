@@ -6,12 +6,14 @@ import TracesView from "./views/TracesView";
 import IngestView from "./views/IngestView";
 import GraphView from "./views/GraphView";
 import ContextSwitcher from "./views/ContextSwitcher";
-import SettingsView from "./views/SettingsView";
+import SettingsView, { readDevMode } from "./views/SettingsView";
 import OnboardingView from "./views/OnboardingView";
 import CommitmentTimelineView from "./views/CommitmentTimelineView";
 import CalibrationView from "./views/CalibrationView";
 import MemoryGardenView from "./views/MemoryGardenView";
 import ViewsView from "./views/ViewsView";
+import ContextDashboardView from "./views/ContextDashboardView";
+import InspectorView from "./views/InspectorView";
 import { getUsageStats } from "./api";
 
 type View =
@@ -22,28 +24,43 @@ type View =
   | "traces"
   | "graph"
   | "garden"
+  | "context"
   | "views"
   | "commitments"
   | "calibration"
+  | "inspector"
   | "settings"
   | "onboarding";
 
 // Reason nav removed 2026-05-11 — reasoning primitives now surface as action
 // cards in Dashboard (Next Actions) and inline in Query/Brief. See
 // `tracemind_reason_to_proactive.md` memory.
-const NAV_ITEMS: { id: View; label: string; icon: string }[] = [
+//
+// Inspector is gated behind Settings → Developer mode (off by default). We
+// build NAV_ITEMS dynamically so toggling dev mode hides/shows the entry
+// without a reload.
+type NavItem = { id: View; label: string; icon: string };
+
+const BASE_NAV_ITEMS: NavItem[] = [
   { id: "brief", label: "Brief", icon: "brief" },
   { id: "dashboard", label: "Dashboard", icon: "grid" },
   { id: "query", label: "Query", icon: "search" },
   { id: "ingest", label: "Ingest", icon: "plus" },
   { id: "graph", label: "Graph", icon: "graph" },
   { id: "garden", label: "Garden", icon: "garden" },
+  { id: "context", label: "Context", icon: "context" },
   { id: "views", label: "Views", icon: "views" },
   { id: "commitments", label: "Commitments", icon: "timeline" },
   { id: "calibration", label: "Calibration", icon: "gauge" },
   { id: "traces", label: "Traces", icon: "list" },
   { id: "settings", label: "Settings", icon: "settings" },
 ];
+
+const INSPECTOR_NAV_ITEM: NavItem = {
+  id: "inspector",
+  label: "Inspector",
+  icon: "inspect",
+};
 
 function NavIcon({ type }: { type: string }) {
   switch (type) {
@@ -115,6 +132,13 @@ function NavIcon({ type }: { type: string }) {
           <circle cx="18" cy="18" r="2" strokeWidth={2} />
         </svg>
       );
+    case "context":
+      return (
+        <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <circle cx="12" cy="12" r="3" strokeWidth={2} />
+          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 3v3M12 18v3M3 12h3M18 12h3M5.6 5.6l2.1 2.1M16.3 16.3l2.1 2.1M5.6 18.4l2.1-2.1M16.3 7.7l2.1-2.1" />
+        </svg>
+      );
     case "gauge":
       return (
         <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -128,6 +152,13 @@ function NavIcon({ type }: { type: string }) {
           <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
         </svg>
       );
+    case "inspect":
+      return (
+        <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <circle cx="11" cy="11" r="6" strokeWidth={2} />
+          <path strokeLinecap="round" strokeWidth={2} d="M15 15l5 5M11 8v6M8 11h6" />
+        </svg>
+      );
     default:
       return null;
   }
@@ -136,6 +167,28 @@ function NavIcon({ type }: { type: string }) {
 export default function App() {
   const [view, setView] = useState<View>("brief");
   const [firstRunChecked, setFirstRunChecked] = useState(false);
+  const [devMode, setDevMode] = useState<boolean>(() => readDevMode());
+
+  // SettingsView fires `tm:dev-mode-changed` whenever the toggle flips —
+  // we update local state so the sidebar shows/hides the Inspector entry
+  // immediately.
+  useEffect(() => {
+    const handler = (e: Event) => {
+      setDevMode(Boolean((e as CustomEvent).detail));
+    };
+    window.addEventListener("tm:dev-mode-changed", handler);
+    return () => window.removeEventListener("tm:dev-mode-changed", handler);
+  }, []);
+
+  const navItems = devMode
+    ? [...BASE_NAV_ITEMS.slice(0, -1), INSPECTOR_NAV_ITEM, BASE_NAV_ITEMS[BASE_NAV_ITEMS.length - 1]]
+    : BASE_NAV_ITEMS;
+
+  // If dev mode is turned off while the user is in the Inspector, route
+  // them back to Brief — otherwise they'd be stranded.
+  useEffect(() => {
+    if (!devMode && view === "inspector") setView("brief");
+  }, [devMode, view]);
 
   // UI-8 — route first-run users to onboarding. We detect "first run"
   // as having no usage history yet (first_seen is null).
@@ -162,6 +215,7 @@ export default function App() {
       if (detail.target_kind === "commitment") setView("commitments");
       else if (detail.target_kind === "contradiction") setView("brief");
       else if (detail.target_kind === "entity") setView("graph");
+      else if (detail.target_kind === "context") setView("context");
     };
     window.addEventListener("tm:next-action", handler);
     return () => window.removeEventListener("tm:next-action", handler);
@@ -193,7 +247,7 @@ export default function App() {
         </div>
 
         <div className="flex-1 py-3 overflow-y-auto">
-          {NAV_ITEMS.map((item) => (
+          {navItems.map((item) => (
             <button
               key={item.id}
               onClick={() => setView(item.id)}
@@ -229,10 +283,12 @@ export default function App() {
         {view === "ingest" && <IngestView />}
         {view === "graph" && <GraphView />}
         {view === "garden" && <MemoryGardenView />}
+        {view === "context" && <ContextDashboardView />}
         {view === "views" && <ViewsView />}
         {view === "commitments" && <CommitmentTimelineView />}
         {view === "calibration" && <CalibrationView />}
         {view === "traces" && <TracesView />}
+        {view === "inspector" && <InspectorView />}
         {view === "settings" && <SettingsView />}
       </main>
     </div>

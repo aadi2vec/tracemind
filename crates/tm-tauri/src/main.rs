@@ -3440,6 +3440,1572 @@ fn cmd_community_overlay(state: State<AppState>) -> Result<Vec<CommunityRow>, St
 }
 
 // ---------------------------------------------------------------------------
+// Context Dashboard (post-P5) — one-call fat payload that surfaces every
+// brain layer for a single entity: header, decay, graph neighborhoods,
+// vector neighbors, k-hop, community, belief status, contradictions,
+// bitemporal provenance, recent traces, and signal-level neighbors.
+//
+// Why a single command:
+//   - The previous `cmd_entity_drawer` only returned header + relations +
+//     backlinks + tags. The user feedback (May 2026) was "I want all the
+//     context we have on X" — graph is *one* part of the brain. The fat
+//     dump joins data the UI was previously waterfalling 5–6 invokes for,
+//     and surfaces decay scores (recency / novelty / value / frequency)
+//     prominently so the user can see "what TraceMind still values" at a
+//     glance.
+//   - No new storage; every field maps to an existing GraphStore /
+//     TraceStore method. Safe to add — `cmd_entity_drawer` is untouched.
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize, Clone)]
+struct ContextDecay {
+    /// exp(-0.05 * hours_since_last_access). 1.0 = just touched, 0.0 = cold.
+    recency: f64,
+    /// 1.0 / (1.0 + ln(1 + access_count)). Higher = less seen.
+    novelty: f64,
+    /// retrieval feedback value score (0..1). 0 = never given feedback.
+    value: f64,
+    /// 1.0 / (retrieved + 1). 1.0 = never retrieved, decays toward 0.
+    frequency: f64,
+    /// Total entries in access_log for this entity.
+    access_count: i64,
+    /// RFC-3339 timestamp of the most recent access, or None.
+    last_access: Option<String>,
+}
+
+#[derive(Serialize, Clone)]
+struct ContextNeighbor {
+    entity_id: String,
+    name: String,
+    entity_type: String,
+    similarity: f64,
+}
+
+#[derive(Serialize, Clone)]
+struct ContextHop {
+    entity_id: String,
+    name: String,
+    entity_type: String,
+}
+
+#[derive(Serialize, Clone)]
+struct ContextBeliefRow {
+    triple_id: String,
+    subject: String,
+    predicate: String,
+    object: String,
+    /// "In" | "Out" | "Contradicted" | "Unknown"
+    status: String,
+}
+
+#[derive(Serialize, Clone)]
+struct ContextContradiction {
+    id: String,
+    triple_a: String,
+    triple_b: String,
+    detected_at: String,
+    cosine_similarity: f32,
+    /// "KeepA" | "KeepB" | "KeepBoth" | None
+    resolution: Option<String>,
+}
+
+#[derive(Serialize, Clone)]
+struct ContextProvenanceRow {
+    name: String,
+    entity_type: String,
+    confidence: f64,
+    valid_from: String,
+    recorded_at: String,
+    superseded_at: Option<String>,
+}
+
+#[derive(Serialize, Clone)]
+struct ContextTraceRow {
+    trace_id: String,
+    event_type: String,
+    raw_text: Option<String>,
+    retrieval_arm: Option<u8>,
+    created_at: String,
+}
+
+#[derive(Serialize, Clone)]
+struct ContextSignal {
+    signal_id: i64,
+    raw_text: String,
+    source: String,
+    similarity: f32,
+    created_at: String,
+}
+
+#[derive(Serialize, Clone)]
+struct ContextCommunity {
+    /// Louvain community id, None if community detection hasn't been run
+    /// or the entity is orphaned in the graph.
+    community_id: Option<i64>,
+    /// "Top1 · Top2 · Top3" label drawn from siblings, "" if unassigned.
+    label: String,
+    sibling_count: usize,
+    /// Up to 8 sibling entity names (excluding self).
+    sibling_names: Vec<String>,
+}
+
+#[derive(Serialize, Clone)]
+struct ContextReasoningStep {
+    entity_id: String,
+    entity_name: String,
+    predicate: String,
+    direction: String,
+    confidence: f64,
+}
+
+#[derive(Serialize, Clone)]
+struct ContextReasoningChain {
+    target_id: String,
+    target_name: String,
+    score: f64,
+    steps: Vec<ContextReasoningStep>,
+}
+
+#[derive(Serialize, Clone)]
+struct ContextAnalogy {
+    target_id: String,
+    target_name: String,
+    similarity: f64,
+    shared_patterns: Vec<String>,
+    explanation: String,
+}
+
+#[derive(Serialize, Clone)]
+struct ContextBanditUse {
+    arm: u8,
+    arm_name: String,
+    pulls: u64,
+}
+
+#[derive(Serialize, Clone)]
+struct ContextIntentRow {
+    id: String,
+    statement: String,
+    state: String,
+    horizon: Option<String>,
+}
+
+#[derive(Serialize, Clone)]
+struct EntityContextDump {
+    header: EntityDrawerHeader,
+    decay: ContextDecay,
+    relations_out: Vec<EntityDrawerRelation>,
+    relations_in: Vec<EntityDrawerBacklink>,
+    vector_neighbors: Vec<ContextNeighbor>,
+    k_hop_neighbors: Vec<ContextHop>,
+    community: ContextCommunity,
+    belief_rows: Vec<ContextBeliefRow>,
+    contradictions: Vec<ContextContradiction>,
+    provenance: Vec<ContextProvenanceRow>,
+    recent_traces: Vec<ContextTraceRow>,
+    signal_neighbors: Vec<ContextSignal>,
+    /// Inspector P3 — multi-hop reasoning chains starting from this entity
+    /// (top N by score). Surfaced as the "Reasoning paths" panel.
+    reasoning_chains: Vec<ContextReasoningChain>,
+    /// Inspector P3 — structural analogies for this entity.
+    analogies: Vec<ContextAnalogy>,
+    /// Inspector P3 — which retrieval arms have returned this entity, by
+    /// pull count. Derived from scanning recent retrieval traces whose
+    /// `entities_extracted` set includes this entity.
+    bandit_arms_used: Vec<ContextBanditUse>,
+    /// Inspector P3 — commitments / intents whose statement mentions this
+    /// entity name. Empty if no such intent exists.
+    related_intents: Vec<ContextIntentRow>,
+}
+
+/// Returns the full context dump for one entity in a single call.
+/// Resolves `entity_id` as either a UUID or a case-insensitive name.
+#[tauri::command]
+fn cmd_entity_context_dump(
+    entity_id: String,
+    state: State<AppState>,
+) -> Result<EntityContextDump, String> {
+    let graph = GraphStore::open(&state.db_path).map_err(|e| e.to_string())?;
+    // ── Resolve UUID-or-name ─────────────────────────────────────────────
+    let ent = if let Ok(id) = Uuid::parse_str(&entity_id) {
+        graph.get_entity(id).map_err(|e| e.to_string())?
+    } else {
+        graph
+            .find_entity_by_name_icase(&entity_id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("entity not found: {entity_id}"))?
+    };
+
+    // ── Header ───────────────────────────────────────────────────────────
+    let domain = tm_graph::classify_ontology(&ent.entity_type, &ent.name);
+    let header = EntityDrawerHeader {
+        entity_id: ent.id.to_string(),
+        name: ent.name.clone(),
+        entity_type: format!("{:?}", ent.entity_type),
+        ontological_domain: domain.to_string(),
+        confidence: ent.confidence,
+        created_at: ent.created_at.to_rfc3339(),
+        updated_at: ent.updated_at.to_rfc3339(),
+    };
+
+    // ── Decay: recency / novelty / value / frequency ─────────────────────
+    let recency = graph.recency_score(ent.id);
+    let novelty = graph.novelty_score(ent.id);
+    let value_map = graph.batch_value_scores(&[ent.id]);
+    let freq_map = graph.batch_frequency_scores(&[ent.id]);
+    let value = value_map.get(&ent.id).copied().unwrap_or(0.0);
+    let frequency = freq_map.get(&ent.id).copied().unwrap_or(1.0);
+    // Back-fill access_count via the novelty formula:
+    // novelty = 1/(1 + ln(1 + n))  ⇒  n = exp(1/novelty - 1) - 1.
+    // recency_score (just queried above) already covers `last_access`
+    // semantically — we expose the raw count + leave last_access None
+    // because GraphStore doesn't yet expose a public accessor for the
+    // access_log timestamp; adding one is a follow-up if the UI needs it.
+    let access_count: i64 = if novelty > 0.0 && novelty < 1.0 {
+        let n = ((1.0 / novelty) - 1.0).exp() - 1.0;
+        n.round() as i64
+    } else {
+        0
+    };
+    let last_access: Option<String> = None;
+    let decay = ContextDecay {
+        recency,
+        novelty,
+        value,
+        frequency,
+        access_count,
+        last_access,
+    };
+
+    // ── Relations (outgoing) + backlinks ─────────────────────────────────
+    let mut relations_out = Vec::new();
+    let outgoing = graph
+        .get_triples_for_entity(ent.id)
+        .map_err(|e| e.to_string())?;
+    // Keep the triple list around for belief/contradiction lookups so we
+    // only pay one `get_triples_for_entity` per call.
+    let mut owned_triples: Vec<tm_types::Triple> = Vec::new();
+    for t in &outgoing {
+        if t.subject_id != ent.id {
+            continue;
+        }
+        let target_name = graph
+            .get_entity(t.object_id)
+            .ok()
+            .map(|e| e.name)
+            .unwrap_or_else(|| t.object_id.to_string());
+        relations_out.push(EntityDrawerRelation {
+            triple_id: t.id.to_string(),
+            target_id: t.object_id.to_string(),
+            target_name,
+            predicate: format!("{}", t.predicate),
+            confidence: t.confidence,
+        });
+        owned_triples.push(t.clone());
+    }
+
+    let mut relations_in = Vec::new();
+    for b in graph
+        .backlinks(ent.id, Some(50), true)
+        .map_err(|e| e.to_string())?
+    {
+        relations_in.push(EntityDrawerBacklink {
+            triple_id: b.triple_id.to_string(),
+            source_id: b.source.id.to_string(),
+            source_name: b.source.name,
+            predicate: format!("{}", b.predicate),
+            confidence: b.confidence,
+        });
+    }
+
+    // ── Vector neighbors ────────────────────────────────────────────────
+    let mut vector_neighbors = Vec::new();
+    let self_vector = graph.get_vector(ent.id).map_err(|e| e.to_string())?;
+    if let Some(v) = &self_vector {
+        let hits = graph.search_vectors(v, 11).map_err(|e| e.to_string())?;
+        for (uid, sim) in hits {
+            if uid == ent.id {
+                continue;
+            }
+            if let Ok(e) = graph.get_entity(uid) {
+                vector_neighbors.push(ContextNeighbor {
+                    entity_id: uid.to_string(),
+                    name: e.name,
+                    entity_type: format!("{:?}", e.entity_type),
+                    similarity: sim as f64,
+                });
+            }
+            if vector_neighbors.len() >= 10 {
+                break;
+            }
+        }
+    }
+
+    // ── K-hop graph neighbors (2 hops, capped) ──────────────────────────
+    let mut k_hop_neighbors = Vec::new();
+    if let Ok(hops) = graph.k_hop_neighbors(ent.id, 2) {
+        for e in hops.into_iter().take(20) {
+            if e.id == ent.id {
+                continue;
+            }
+            k_hop_neighbors.push(ContextHop {
+                entity_id: e.id.to_string(),
+                name: e.name,
+                entity_type: format!("{:?}", e.entity_type),
+            });
+        }
+    }
+
+    // ── Community ────────────────────────────────────────────────────────
+    let community = match graph.louvain() {
+        Ok(map) => {
+            let my_cid = map.get(&ent.id).copied();
+            if let Some(cid) = my_cid {
+                let mut siblings: Vec<String> = map
+                    .iter()
+                    .filter(|(uid, &c)| **uid != ent.id && c == cid)
+                    .filter_map(|(uid, _)| graph.get_entity(*uid).ok().map(|e| e.name))
+                    .collect();
+                let sibling_count = siblings.len();
+                siblings.sort();
+                siblings.truncate(8);
+                let label = label_from_names(&siblings);
+                ContextCommunity {
+                    community_id: Some(cid as i64),
+                    label,
+                    sibling_count,
+                    sibling_names: siblings,
+                }
+            } else {
+                ContextCommunity {
+                    community_id: None,
+                    label: String::new(),
+                    sibling_count: 0,
+                    sibling_names: vec![],
+                }
+            }
+        }
+        Err(_) => ContextCommunity {
+            community_id: None,
+            label: String::new(),
+            sibling_count: 0,
+            sibling_names: vec![],
+        },
+    };
+
+    // ── Belief status per triple touching this entity ───────────────────
+    let mut belief_rows = Vec::new();
+    let mut triple_id_set: HashSet<Uuid> = HashSet::new();
+    for t in &owned_triples {
+        triple_id_set.insert(t.id);
+        let subj_name = graph
+            .get_entity(t.subject_id)
+            .ok()
+            .map(|e| e.name)
+            .unwrap_or_else(|| t.subject_id.to_string());
+        let obj_name = graph
+            .get_entity(t.object_id)
+            .ok()
+            .map(|e| e.name)
+            .unwrap_or_else(|| t.object_id.to_string());
+        let status = match graph.belief_status_for(t.id) {
+            Some(tm_graph::BeliefStatus::In) => "In",
+            Some(tm_graph::BeliefStatus::Out) => "Out",
+            Some(tm_graph::BeliefStatus::Contradicted) => "Contradicted",
+            None => "Unknown",
+        }
+        .to_string();
+        belief_rows.push(ContextBeliefRow {
+            triple_id: t.id.to_string(),
+            subject: subj_name,
+            predicate: format!("{}", t.predicate),
+            object: obj_name,
+            status,
+        });
+    }
+    // Belief rows for incoming triples (where this entity is the object).
+    for b in &relations_in {
+        if let Ok(tid) = Uuid::parse_str(&b.triple_id) {
+            if !triple_id_set.contains(&tid) {
+                triple_id_set.insert(tid);
+                let status = match graph.belief_status_for(tid) {
+                    Some(tm_graph::BeliefStatus::In) => "In",
+                    Some(tm_graph::BeliefStatus::Out) => "Out",
+                    Some(tm_graph::BeliefStatus::Contradicted) => "Contradicted",
+                    None => "Unknown",
+                }
+                .to_string();
+                belief_rows.push(ContextBeliefRow {
+                    triple_id: b.triple_id.clone(),
+                    subject: b.source_name.clone(),
+                    predicate: b.predicate.clone(),
+                    object: header.name.clone(),
+                    status,
+                });
+            }
+        }
+    }
+
+    // ── Contradictions involving any of this entity's triples ───────────
+    let mut contradictions = Vec::new();
+    for c in graph.contradictions() {
+        if triple_id_set.contains(&c.triple_a) || triple_id_set.contains(&c.triple_b) {
+            contradictions.push(ContextContradiction {
+                id: c.id.to_string(),
+                triple_a: c.triple_a.to_string(),
+                triple_b: c.triple_b.to_string(),
+                detected_at: c.detected_at.to_rfc3339(),
+                cosine_similarity: c.cosine_similarity,
+                resolution: c.resolution.map(|r| format!("{:?}", r)),
+            });
+        }
+    }
+
+    // ── Provenance: full version history for this entity ────────────────
+    let mut provenance = Vec::new();
+    if let Ok(history) = graph.entity_history(ent.id) {
+        for (e, valid_from, recorded_at, superseded_at) in history {
+            provenance.push(ContextProvenanceRow {
+                name: e.name,
+                entity_type: format!("{:?}", e.entity_type),
+                confidence: e.confidence,
+                valid_from: valid_from.to_rfc3339(),
+                recorded_at: recorded_at.to_rfc3339(),
+                superseded_at: superseded_at.map(|t| t.to_rfc3339()),
+            });
+        }
+    }
+
+    // ── Recent traces touching this entity ──────────────────────────────
+    let mut recent_traces = Vec::new();
+    if let Ok(ts) = state.trace_store.lock() {
+        if let Ok(traces) = ts.recent(500) {
+            for tr in traces {
+                if tr.entities_extracted.contains(&ent.id) {
+                    recent_traces.push(ContextTraceRow {
+                        trace_id: tr.id.to_string(),
+                        event_type: format!("{:?}", tr.event_type),
+                        raw_text: tr.raw_text.clone(),
+                        retrieval_arm: tr.retrieval_arm,
+                        created_at: tr.created_at.to_rfc3339(),
+                    });
+                    if recent_traces.len() >= 30 {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    // ── Signal neighbors: raw captures semantically near this entity ────
+    let mut signal_neighbors = Vec::new();
+    if let Some(v) = &self_vector {
+        if let Ok(hits) = graph.search_signals(v, 10, 0.35) {
+            for (s, sim) in hits {
+                signal_neighbors.push(ContextSignal {
+                    signal_id: s.id,
+                    raw_text: if s.raw_text.len() > 240 {
+                        format!("{}…", &s.raw_text[..240])
+                    } else {
+                        s.raw_text
+                    },
+                    source: s.source,
+                    similarity: sim,
+                    created_at: s.created_at.to_rfc3339(),
+                });
+            }
+        }
+    }
+
+    // ── Reasoning chains: explore outward from this entity ──────────────
+    let mut reasoning_chains: Vec<ContextReasoningChain> = Vec::new();
+    {
+        let builder = tm_reason::ChainBuilder::with_defaults(&graph);
+        let chains = builder.explore(&[ent.id], 6);
+        for c in chains.iter().take(6) {
+            let steps: Vec<ContextReasoningStep> = c
+                .steps
+                .iter()
+                .map(|s| ContextReasoningStep {
+                    entity_id: s.entity_id.to_string(),
+                    entity_name: s.entity_name.clone(),
+                    predicate: s.predicate.clone(),
+                    direction: format!("{:?}", s.direction),
+                    confidence: s.confidence,
+                })
+                .collect();
+            let target_name = steps
+                .last()
+                .map(|s| s.entity_name.clone())
+                .unwrap_or_else(|| header.name.clone());
+            reasoning_chains.push(ContextReasoningChain {
+                target_id: c.destination_id.to_string(),
+                target_name,
+                score: c.score,
+                steps,
+            });
+        }
+    }
+
+    // ── Analogies: structural similarity ────────────────────────────────
+    let mut analogies: Vec<ContextAnalogy> = Vec::new();
+    {
+        let solver = tm_reason::AnalogySolver::new(&graph);
+        let results = solver.find_analogies(ent.id, 5);
+        for r in results {
+            analogies.push(ContextAnalogy {
+                target_id: r.target_id.to_string(),
+                target_name: r.target_name,
+                similarity: r.similarity,
+                shared_patterns: r.shared_patterns,
+                explanation: r.explanation,
+            });
+        }
+    }
+
+    // ── Bandit arms used: count retrievals that returned this entity ────
+    let bandit_arms_used: Vec<ContextBanditUse> = {
+        let mut counts: HashMap<u8, u64> = HashMap::new();
+        if let Ok(ts) = state.trace_store.lock() {
+            if let Ok(traces) = ts.recent(5000) {
+                for tr in &traces {
+                    if matches!(tr.event_type, tm_types::TraceEventType::Retrieve)
+                        && tr.entities_extracted.contains(&ent.id)
+                    {
+                        if let Some(a) = tr.retrieval_arm {
+                            *counts.entry(a).or_insert(0) += 1;
+                        }
+                    }
+                }
+            }
+        }
+        let mut by_arm: Vec<ContextBanditUse> = counts
+            .into_iter()
+            .map(|(arm, pulls)| ContextBanditUse {
+                arm,
+                arm_name: UcbBandit::arm_name(arm).to_string(),
+                pulls,
+            })
+            .collect();
+        by_arm.sort_by(|a, b| b.pulls.cmp(&a.pulls));
+        by_arm
+    };
+
+    // ── Related intents: commitments whose statement mentions this name ─
+    let mut related_intents: Vec<ContextIntentRow> = Vec::new();
+    {
+        let dir = data_dir(&state);
+        let intents_path = dir.join("intents.db");
+        if let Ok(store) = tm_intent::IntentStore::open(
+            intents_path.to_str().unwrap_or_default(),
+        ) {
+            if let Ok(open) = store.list_open(200) {
+                let needle = header.name.to_lowercase();
+                for c in open
+                    .into_iter()
+                    .filter(|c| c.statement.to_lowercase().contains(&needle))
+                    .take(10)
+                {
+                    related_intents.push(ContextIntentRow {
+                        id: c.id.to_string(),
+                        statement: c.statement,
+                        state: format!("{:?}", c.state),
+                        horizon: c.horizon.map(|h| h.format("%Y-%m-%d").to_string()),
+                    });
+                }
+            }
+        }
+    }
+
+    Ok(EntityContextDump {
+        header,
+        decay,
+        relations_out,
+        relations_in,
+        vector_neighbors,
+        k_hop_neighbors,
+        community,
+        belief_rows,
+        contradictions,
+        provenance,
+        recent_traces,
+        signal_neighbors,
+        reasoning_chains,
+        analogies,
+        bandit_arms_used,
+        related_intents,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Inspector — Brain Snapshot, Why This Answer, Layer Browser, Entity Export
+// (dev_mode gated UI)
+//
+// The Inspector is the developer-mode surface for staring directly at every
+// layer of TraceMind's brain at once. It piggy-backs on real state from
+// disk + the running engine — no stubs, no mocks. Three of its four panels
+// are commands defined here; the fourth (Context dump) reuses the existing
+// `cmd_entity_context_dump`.
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize)]
+struct BrainArmRow {
+    arm: u8,
+    name: String,
+    ucb_pulls: u64,
+    ucb_avg_reward: f64,
+    linucb_pulls: u64,
+    linucb_weight_mag: f64,
+}
+
+#[derive(Serialize)]
+struct BrainEventBreakdown {
+    event_type: String,
+    count: u64,
+}
+
+#[derive(Serialize)]
+struct BrainSnapshot {
+    /// RFC-3339 generation timestamp.
+    generated_at: String,
+    /// Absolute path to the data dir.
+    data_dir: String,
+
+    // Graph layer
+    entity_count: usize,
+    triple_count: usize,
+    contradiction_count: usize,
+    pending_relation_count: usize,
+    /// Louvain community count (0 if not yet detected).
+    community_count: usize,
+
+    // Vector layer
+    vector_dim: usize,
+    /// Number of entities with embeddings populated.
+    entities_with_vector: usize,
+
+    // Bandit layer
+    bandit_arms: Vec<BrainArmRow>,
+    /// Live annealed exploration coefficient from LinUCB.
+    linucb_alpha: f64,
+
+    // Episodic layer
+    total_traces: u64,
+    by_event: Vec<BrainEventBreakdown>,
+    recent_buffer_size: usize,
+    /// Capacity of the ring buffer (`RecentStore::DEFAULT_CAPACITY` unless
+    /// overridden).
+    recent_buffer_capacity: usize,
+
+    // Governance / Captures
+    governance_blocks_today: u64,
+    /// Captures since the start of the local day.
+    captures_today: u64,
+
+    // Intent layer
+    open_commitments: usize,
+    overdue_commitments: usize,
+    pending_candidates: usize,
+    pattern_silences_active: usize,
+}
+
+#[tauri::command]
+fn cmd_brain_snapshot(state: State<AppState>) -> Result<BrainSnapshot, String> {
+    let dir = data_dir(&state);
+    let graph = GraphStore::open(&state.db_path).map_err(|e| e.to_string())?;
+
+    let entity_count = graph.entity_count().unwrap_or(0);
+    let triple_count = graph.triple_count().unwrap_or(0);
+    let contradiction_count = graph.contradictions().len();
+    let pending_relation_count = graph
+        .list_pending(None, None)
+        .map(|v: Vec<tm_graph::PendingRelation>| v.len())
+        .unwrap_or(0);
+    let community_count = graph
+        .louvain()
+        .map(|m| {
+            let mut set: HashSet<i64> = HashSet::new();
+            for &c in m.values() {
+                set.insert(c as i64);
+            }
+            set.len()
+        })
+        .unwrap_or(0);
+
+    // Vector layer: count entities that have an embedding. GraphStore does
+    // not expose a direct count, so iterate (bounded — entity_count is
+    // already small in practice for local-only mode).
+    let entities_with_vector: usize = graph
+        .list_all_entities()
+        .map(|ents| {
+            ents.into_iter()
+                .filter(|e| graph.get_vector(e.id).map(|v| v.is_some()).unwrap_or(false))
+                .count()
+        })
+        .unwrap_or(0);
+
+    // Bandit layer — load from disk for the most-recent persisted state.
+    let ucb = UcbBandit::load(&state.bandit_path);
+    let linucb_path = dir.join("linucb.json");
+    let linucb = tm_controller::LinUcbBandit::load(&linucb_path);
+    let ucb_stats = ucb.arm_stats();
+    let linucb_stats = linucb.arm_stats();
+    let linucb_alpha = linucb.alpha();
+    let bandit_arms: Vec<BrainArmRow> = (0..tm_controller::NUM_ARMS as u8)
+        .map(|arm| {
+            let i = arm as usize;
+            BrainArmRow {
+                arm,
+                name: UcbBandit::arm_name(arm).to_string(),
+                ucb_pulls: ucb_stats[i].0,
+                ucb_avg_reward: ucb_stats[i].1,
+                linucb_pulls: linucb_stats[i].0,
+                linucb_weight_mag: linucb_stats[i].1,
+            }
+        })
+        .collect();
+
+    // Episodic layer — break down by event type and compute today's
+    // governance blocks + capture totals.
+    let mut by_event_map: HashMap<String, u64> = HashMap::new();
+    let mut total_traces: u64 = 0;
+    let mut governance_blocks_today: u64 = 0;
+    let mut captures_today: u64 = 0;
+    let today_start = chrono::Local::now()
+        .date_naive()
+        .and_hms_opt(0, 0, 0)
+        .unwrap()
+        .and_local_timezone(chrono::Local)
+        .single()
+        .map(|d| d.with_timezone(&chrono::Utc))
+        .unwrap_or_else(chrono::Utc::now);
+    if let Ok(ts) = state.trace_store.lock() {
+        if let Ok(traces) = ts.recent(usize::MAX) {
+            total_traces = traces.len() as u64;
+            for t in &traces {
+                let ev = format!("{:?}", t.event_type);
+                *by_event_map.entry(ev).or_insert(0) += 1;
+                if t.created_at >= today_start {
+                    if matches!(t.event_type, tm_types::TraceEventType::Ingest) {
+                        captures_today += 1;
+                        if !t.confidence_gate_passed {
+                            governance_blocks_today += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let mut by_event: Vec<BrainEventBreakdown> = by_event_map
+        .into_iter()
+        .map(|(k, v)| BrainEventBreakdown {
+            event_type: k,
+            count: v,
+        })
+        .collect();
+    by_event.sort_by(|a, b| b.count.cmp(&a.count));
+
+    // Recent ring buffer depth — open the same path the capture daemon
+    // writes to. Missing file → depth 0.
+    let recent_path = dir.join("recent.jsonl");
+    let (recent_buffer_size, recent_buffer_capacity) =
+        match tm_episodic::RecentStore::open(&recent_path) {
+            Ok(rs) => {
+                let depth = rs.read_all().map(|v| v.len()).unwrap_or(0);
+                (depth, rs.capacity())
+            }
+            Err(_) => (0, tm_episodic::RECENT_DEFAULT_CAPACITY),
+        };
+
+    // Intent layer — open the intents.db and pull counts. Each call is one
+    // bounded SELECT.
+    let mut open_commitments = 0usize;
+    let mut overdue_commitments = 0usize;
+    let mut pending_candidates = 0usize;
+    let mut pattern_silences_active = 0usize;
+    let intents_path = dir.join("intents.db");
+    if let Ok(store) =
+        tm_intent::IntentStore::open(intents_path.to_str().unwrap_or_default())
+    {
+        open_commitments = store.list_open(10_000).map(|v| v.len()).unwrap_or(0);
+        overdue_commitments = store
+            .list_overdue_open(chrono::Utc::now(), 10_000)
+            .map(|v| v.len())
+            .unwrap_or(0);
+        pending_candidates = store
+            .list_pending_candidates(10_000)
+            .map(|v| v.len())
+            .unwrap_or(0);
+        pattern_silences_active = store
+            .list_active_pattern_silences(chrono::Utc::now())
+            .map(|v| v.len())
+            .unwrap_or(0);
+    }
+
+    Ok(BrainSnapshot {
+        generated_at: chrono::Utc::now().to_rfc3339(),
+        data_dir: dir.to_string_lossy().to_string(),
+        entity_count,
+        triple_count,
+        contradiction_count,
+        pending_relation_count,
+        community_count,
+        vector_dim: 384,
+        entities_with_vector,
+        bandit_arms,
+        linucb_alpha,
+        total_traces,
+        by_event,
+        recent_buffer_size,
+        recent_buffer_capacity,
+        governance_blocks_today,
+        captures_today,
+        open_commitments,
+        overdue_commitments,
+        pending_candidates,
+        pattern_silences_active,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Why-this-answer: per-trace deep dive (Inspector Panel 2)
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize)]
+struct WhyArmRow {
+    arm: u8,
+    name: String,
+    top_k: usize,
+    hops: u32,
+    include_episodic: bool,
+    include_colbert: bool,
+    /// LinUCB exploit term (w_a · x).
+    exploit_score: f64,
+    /// LinUCB exploration term (α · sqrt(Σ x²/(v+1))).
+    explore_score: f64,
+    /// Sum: exploit + α·explore.
+    total_score: f64,
+    /// Current per-arm pull count from the persisted LinUCB state.
+    pulls: u64,
+}
+
+#[derive(Serialize)]
+struct WhyEntityRow {
+    entity_id: String,
+    name: String,
+    entity_type: String,
+    confidence: f64,
+}
+
+#[derive(Serialize)]
+struct WhyTraceView {
+    /// Selected trace's UUID, echoed back.
+    trace_id: String,
+    /// Trace event type (Ingest, Retrieve, Feedback, ...).
+    event_type: String,
+    /// Trace creation timestamp (RFC-3339).
+    created_at: String,
+    /// Raw query / capture text (None if `raw_text` was None in trace).
+    raw_text: Option<String>,
+    /// QueryPlanner.plan(raw_text) output (action / complexity / confidence
+    /// / entity_hints) when raw_text is present. None otherwise.
+    plan_action: Option<String>,
+    plan_complexity: Option<String>,
+    plan_confidence: Option<f64>,
+    plan_entity_hints: Vec<String>,
+    /// Arm the trace was issued under (only present for Retrieve traces).
+    selected_arm: Option<u8>,
+    selected_arm_name: Option<String>,
+    /// Per-arm LinUCB scores computed from the *current* LinUCB state +
+    /// the trace's raw_text re-embedded. Empty when raw_text is None.
+    arm_scores: Vec<WhyArmRow>,
+    /// Entities the trace returned (resolved to current names; entities
+    /// that have since been deleted are skipped).
+    entities: Vec<WhyEntityRow>,
+    /// Recorded retrieval latency in ms (Retrieve traces only).
+    latency_ms: Option<u32>,
+    /// Whether ingest's PII / confidence gate passed (Ingest traces only).
+    confidence_gate_passed: bool,
+    /// Current annealed LinUCB α — context for the explore_score column.
+    linucb_alpha: f64,
+}
+
+/// Inspector Panel 2 — "Why this answer?" for a single trace.
+///
+/// Given a trace UUID, returns:
+///  * The trace's event type / arm / latency / text
+///  * The planner classification for the raw text (re-run now)
+///  * Per-arm LinUCB scores recomputed from the *current* LinUCB state
+///    using the raw text's embedding as the context vector
+///  * The entities the trace returned, resolved to current names
+///
+/// We can't perfectly reconstruct the *historical* per-arm scores at the
+/// moment of decision (we don't store them). We surface the *current*
+/// LinUCB state's read on the same context, which lets the user reason
+/// about why the model would choose differently today.
+#[tauri::command]
+fn cmd_trace_why(
+    trace_id: String,
+    state: State<AppState>,
+) -> Result<WhyTraceView, String> {
+    let target_uuid = Uuid::parse_str(&trace_id)
+        .map_err(|_| format!("invalid trace_id: {trace_id}"))?;
+
+    // ── Locate the trace ────────────────────────────────────────────────
+    let trace = {
+        let ts = state.trace_store.lock().map_err(|e| e.to_string())?;
+        let traces = ts.recent(20_000).map_err(|e| e.to_string())?;
+        traces
+            .into_iter()
+            .find(|t| t.id == target_uuid)
+            .ok_or_else(|| format!("trace not found: {trace_id}"))?
+    };
+
+    let raw_text = trace.raw_text.clone();
+    let selected_arm = trace.retrieval_arm;
+    let selected_arm_name = selected_arm.map(|a| UcbBandit::arm_name(a).to_string());
+
+    // ── Planner classification (only if raw_text is available) ──────────
+    let (plan_action, plan_complexity, plan_confidence, plan_entity_hints) =
+        if let Some(text) = raw_text.as_ref() {
+            let engine = state.retrieval.lock().map_err(|e| e.to_string())?;
+            let plan = engine.plan_query(text);
+            (
+                Some(format!("{:?}", plan.action)),
+                Some(plan.complexity),
+                Some(plan.confidence),
+                plan.entity_hints,
+            )
+        } else {
+            (None, None, None, Vec::new())
+        };
+
+    // ── Per-arm LinUCB score recomputation ──────────────────────────────
+    let dir = data_dir(&state);
+    let linucb_path = dir.join("linucb.json");
+    let linucb_state: serde_json::Value = std::fs::read_to_string(&linucb_path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or(serde_json::Value::Null);
+
+    let alpha = linucb_state
+        .get("alpha")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.5);
+    let weights = linucb_state
+        .get("weights")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let variances = linucb_state
+        .get("variances")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let arm_bias = linucb_state
+        .get("arm_bias")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let counts_arr = linucb_state
+        .get("counts")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    let mut arm_scores: Vec<WhyArmRow> = Vec::new();
+    if let Some(text) = raw_text.as_ref() {
+        let engine = state.retrieval.lock().map_err(|e| e.to_string())?;
+        let ctx: Vec<f32> = engine.embed_query(text);
+        if ctx.len() == 384 {
+            let x: Vec<f64> = ctx.iter().map(|&v| v as f64).collect();
+            for arm in 0..tm_controller::NUM_ARMS as u8 {
+                let i = arm as usize;
+                let params = UcbBandit::params_for_arm(arm);
+                let w_row = weights.get(i).and_then(|v| v.as_array());
+                let v_row = variances.get(i).and_then(|v| v.as_array());
+                let bias = arm_bias
+                    .get(i)
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(0.0);
+                let pulls = counts_arr
+                    .get(i)
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                let (exploit, explore) = match (w_row, v_row) {
+                    (Some(w), Some(v)) if w.len() == 384 && v.len() == 384 => {
+                        let exploit: f64 = w
+                            .iter()
+                            .zip(x.iter())
+                            .map(|(wj, xj)| {
+                                wj.as_f64().unwrap_or(0.0) * xj
+                            })
+                            .sum::<f64>()
+                            + bias;
+                        let explore: f64 = x
+                            .iter()
+                            .zip(v.iter())
+                            .map(|(xj, vj)| {
+                                let vv = vj.as_f64().unwrap_or(1.0);
+                                (xj * xj) / (vv + 1.0)
+                            })
+                            .sum::<f64>()
+                            .sqrt();
+                        (exploit, explore)
+                    }
+                    _ => (bias, 0.0),
+                };
+                let total = exploit + alpha * explore;
+                arm_scores.push(WhyArmRow {
+                    arm,
+                    name: UcbBandit::arm_name(arm).to_string(),
+                    top_k: params.top_k,
+                    hops: params.hops,
+                    include_episodic: params.include_episodic,
+                    include_colbert: params.include_colbert,
+                    exploit_score: exploit,
+                    explore_score: explore,
+                    total_score: total,
+                    pulls,
+                });
+            }
+        }
+    }
+
+    // ── Resolve entities the trace returned ─────────────────────────────
+    let mut entities: Vec<WhyEntityRow> = Vec::new();
+    if !trace.entities_extracted.is_empty() {
+        let graph = GraphStore::open(&state.db_path).map_err(|e| e.to_string())?;
+        for eid in &trace.entities_extracted {
+            if let Ok(e) = graph.get_entity(*eid) {
+                entities.push(WhyEntityRow {
+                    entity_id: e.id.to_string(),
+                    name: e.name,
+                    entity_type: format!("{:?}", e.entity_type),
+                    confidence: e.confidence,
+                });
+            }
+        }
+    }
+
+    Ok(WhyTraceView {
+        trace_id: trace.id.to_string(),
+        event_type: format!("{:?}", trace.event_type),
+        created_at: trace.created_at.to_rfc3339(),
+        raw_text,
+        plan_action,
+        plan_complexity,
+        plan_confidence,
+        plan_entity_hints,
+        selected_arm,
+        selected_arm_name,
+        arm_scores,
+        entities,
+        latency_ms: trace.retrieval_latency_ms,
+        confidence_gate_passed: trace.confidence_gate_passed,
+        linucb_alpha: alpha,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Layer browser: raw per-layer state inspection (Inspector Panel 4)
+// ---------------------------------------------------------------------------
+//
+// `cmd_inspector_layer(layer)` returns a JSON object describing the raw
+// state of one layer. The frontend renders it as a pretty-printed payload
+// + a few summary stats. Layers: "vector", "graph", "episodic", "bandit",
+// "governance", "reason".
+//
+// We return `serde_json::Value` so each layer can ship whatever shape
+// fits — the layer browser's job is to expose the truth, not normalize
+// it. The frontend renders the JSON in a syntax-highlighted block.
+
+#[tauri::command]
+fn cmd_inspector_layer(
+    layer: String,
+    state: State<AppState>,
+) -> Result<serde_json::Value, String> {
+    let dir = data_dir(&state);
+    match layer.as_str() {
+        "vector" => {
+            let graph = GraphStore::open(&state.db_path).map_err(|e| e.to_string())?;
+            let entity_count = graph.entity_count().unwrap_or(0);
+            // Walk entities and check each for a vector. Bounded by entity_count.
+            let all_ents = graph.list_all_entities().unwrap_or_default();
+            let with_vectors = all_ents
+                .iter()
+                .filter(|e| graph.get_vector(e.id).map(|v| v.is_some()).unwrap_or(false))
+                .count();
+            // Sample 25 most-recently-created entities for a "neighborhood preview".
+            let mut sorted = all_ents;
+            sorted.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+            let sample_names = sorted
+                .into_iter()
+                .take(25)
+                .map(|e| e.name)
+                .collect::<Vec<_>>();
+            Ok(serde_json::json!({
+                "layer": "vector",
+                "dimension": 384,
+                "model": "BGE-small-en-v1.5 (fastembed)",
+                "entity_count": entity_count,
+                "entities_with_vector": with_vectors,
+                "coverage_pct": if entity_count > 0 {
+                    (with_vectors as f64 / entity_count as f64) * 100.0
+                } else { 0.0 },
+                "sample_entities": sample_names,
+            }))
+        }
+        "graph" => {
+            let graph = GraphStore::open(&state.db_path).map_err(|e| e.to_string())?;
+            let entity_count = graph.entity_count().unwrap_or(0);
+            let triple_count = graph.triple_count().unwrap_or(0);
+            let contradictions = graph.contradictions();
+            let pending = graph
+                .list_pending(None, Some(50))
+                .unwrap_or_default();
+            let louvain = graph.louvain().unwrap_or_default();
+            let mut by_cluster: HashMap<i64, usize> = HashMap::new();
+            for &c in louvain.values() {
+                *by_cluster.entry(c as i64).or_insert(0) += 1;
+            }
+            let mut community_sizes: Vec<(i64, usize)> =
+                by_cluster.into_iter().collect();
+            community_sizes.sort_by(|a, b| b.1.cmp(&a.1));
+            community_sizes.truncate(20);
+            Ok(serde_json::json!({
+                "layer": "graph",
+                "entity_count": entity_count,
+                "triple_count": triple_count,
+                "contradiction_count": contradictions.len(),
+                "pending_relations": pending.len(),
+                "community_count": community_sizes.len(),
+                "top_communities": community_sizes
+                    .iter()
+                    .map(|(c, n)| serde_json::json!({"community_id": c, "size": n}))
+                    .collect::<Vec<_>>(),
+            }))
+        }
+        "episodic" => {
+            let mut total = 0usize;
+            let mut by_type: HashMap<String, u64> = HashMap::new();
+            let mut recent_arm: HashMap<u8, u64> = HashMap::new();
+            let mut last_at: Option<String> = None;
+            if let Ok(ts) = state.trace_store.lock() {
+                if let Ok(traces) = ts.recent(usize::MAX) {
+                    total = traces.len();
+                    for t in &traces {
+                        *by_type.entry(format!("{:?}", t.event_type)).or_insert(0) += 1;
+                        if let Some(a) = t.retrieval_arm {
+                            *recent_arm.entry(a).or_insert(0) += 1;
+                        }
+                    }
+                    if let Some(last) = traces.last() {
+                        last_at = Some(last.created_at.to_rfc3339());
+                    }
+                }
+            }
+            let recent_path = dir.join("recent.jsonl");
+            let recent_depth = tm_episodic::RecentStore::open(&recent_path)
+                .ok()
+                .and_then(|rs| rs.read_all().ok())
+                .map(|v| v.len())
+                .unwrap_or(0);
+            Ok(serde_json::json!({
+                "layer": "episodic",
+                "total_traces": total,
+                "last_trace_at": last_at,
+                "by_event_type": by_type,
+                "by_retrieval_arm": recent_arm
+                    .into_iter()
+                    .map(|(arm, n)| serde_json::json!({
+                        "arm": arm,
+                        "name": UcbBandit::arm_name(arm),
+                        "pulls": n,
+                    }))
+                    .collect::<Vec<_>>(),
+                "recent_buffer_size": recent_depth,
+                "recent_buffer_capacity": tm_episodic::RECENT_DEFAULT_CAPACITY,
+            }))
+        }
+        "bandit" => {
+            let ucb = UcbBandit::load(&state.bandit_path);
+            let linucb_path = dir.join("linucb.json");
+            let linucb = tm_controller::LinUcbBandit::load(&linucb_path);
+            let ucb_stats = ucb.arm_stats();
+            let linucb_stats = linucb.arm_stats();
+            let arms: Vec<serde_json::Value> = (0..tm_controller::NUM_ARMS as u8)
+                .map(|arm| {
+                    let i = arm as usize;
+                    let p = UcbBandit::params_for_arm(arm);
+                    serde_json::json!({
+                        "arm": arm,
+                        "name": UcbBandit::arm_name(arm),
+                        "config": {
+                            "top_k": p.top_k,
+                            "hops": p.hops,
+                            "include_episodic": p.include_episodic,
+                            "include_colbert": p.include_colbert,
+                        },
+                        "ucb": {
+                            "pulls": ucb_stats[i].0,
+                            "avg_reward": ucb_stats[i].1,
+                        },
+                        "linucb": {
+                            "pulls": linucb_stats[i].0,
+                            "avg_weight_magnitude": linucb_stats[i].1,
+                        },
+                    })
+                })
+                .collect();
+            Ok(serde_json::json!({
+                "layer": "bandit",
+                "ucb_state_path": state.bandit_path.to_string_lossy(),
+                "linucb_state_path": linucb_path.to_string_lossy(),
+                "linucb_alpha": linucb.alpha(),
+                "linucb_dim": 384,
+                "arms": arms,
+            }))
+        }
+        "governance" => {
+            // Walk the trace log and bucket gate failures by source / day.
+            let mut blocked_total = 0u64;
+            let mut blocked_today = 0u64;
+            let today_start = chrono::Local::now()
+                .date_naive()
+                .and_hms_opt(0, 0, 0)
+                .unwrap()
+                .and_local_timezone(chrono::Local)
+                .single()
+                .map(|d| d.with_timezone(&chrono::Utc))
+                .unwrap_or_else(chrono::Utc::now);
+            let mut last_blocked: Option<String> = None;
+            if let Ok(ts) = state.trace_store.lock() {
+                if let Ok(traces) = ts.recent(usize::MAX) {
+                    for t in &traces {
+                        if !t.confidence_gate_passed {
+                            blocked_total += 1;
+                            if t.created_at >= today_start {
+                                blocked_today += 1;
+                            }
+                            last_blocked = Some(t.created_at.to_rfc3339());
+                        }
+                    }
+                }
+            }
+            Ok(serde_json::json!({
+                "layer": "governance",
+                "policy": "PII regex + confidence gate (stdlib-only)",
+                "blocked_total": blocked_total,
+                "blocked_today": blocked_today,
+                "last_blocked_at": last_blocked,
+                "trace_log": dir.join("traces.jsonl").to_string_lossy(),
+            }))
+        }
+        "reason" => {
+            // Surface what the reasoning surface can do over the current graph:
+            // contradictions detected, MOC clusters, ChainBuilder hops.
+            let graph = GraphStore::open(&state.db_path).map_err(|e| e.to_string())?;
+            let contradictions = graph.contradictions();
+            let resolved = contradictions
+                .iter()
+                .filter(|c| c.resolution.is_some())
+                .count();
+            let unresolved = contradictions.len() - resolved;
+            // Recent entities to seed an "explore from" — give the user a
+            // tangible hint of what reason chains exist *right now*. Walk
+            // list_all_entities() and sort by created_at desc (bounded).
+            let mut all_ents = graph.list_all_entities().unwrap_or_default();
+            all_ents.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+            let seeds = all_ents
+                .into_iter()
+                .take(8)
+                .map(|e| {
+                    serde_json::json!({"id": e.id.to_string(), "name": e.name})
+                })
+                .collect::<Vec<_>>();
+            Ok(serde_json::json!({
+                "layer": "reason",
+                "contradictions_total": contradictions.len(),
+                "contradictions_resolved": resolved,
+                "contradictions_open": unresolved,
+                "chain_builder": "tm_reason::ChainBuilder (BFS over typed predicates)",
+                "analogy_solver": "tm_reason::AnalogySolver (shared pattern matching)",
+                "seed_entities": seeds,
+            }))
+        }
+        other => Err(format!(
+            "unknown layer '{other}' — expected one of: vector, graph, episodic, bandit, governance, reason"
+        )),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Inspector Panel 3 — markdown export for one entity's full context
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize)]
+struct ExportEntityMarkdownResult {
+    /// Where the file was written on disk.
+    output_path: String,
+    /// Bytes written.
+    bytes_written: u64,
+    /// UUID of the entity that was exported.
+    entity_id: String,
+}
+
+/// Take the same dump cmd_entity_context_dump produces and render it as
+/// portable markdown. Used by the Inspector's "export" button — the user
+/// can drop the file straight into Obsidian / Bear / any plain-text PKM.
+#[tauri::command]
+fn cmd_export_entity_markdown(
+    entity_id: String,
+    output_path: String,
+    state: State<AppState>,
+) -> Result<ExportEntityMarkdownResult, String> {
+    let dump = cmd_entity_context_dump(entity_id.clone(), state)?;
+
+    let mut md = String::new();
+    md.push_str(&format!("# {}\n\n", dump.header.name));
+    md.push_str(&format!(
+        "- **Entity ID**: `{}`\n- **Type**: {}\n- **Ontological domain**: {}\n- **Confidence**: {:.2}\n- **Created**: {}\n- **Updated**: {}\n\n",
+        dump.header.entity_id,
+        dump.header.entity_type,
+        dump.header.ontological_domain,
+        dump.header.confidence,
+        dump.header.created_at,
+        dump.header.updated_at,
+    ));
+
+    md.push_str("## Temporal Decay\n\n");
+    md.push_str(&format!(
+        "| Axis | Value |\n|---|---|\n| Recency | {:.2} |\n| Novelty | {:.2} |\n| Value (feedback) | {:.2} |\n| Frequency | {:.2} |\n| Access count | {} |\n\n",
+        dump.decay.recency,
+        dump.decay.novelty,
+        dump.decay.value,
+        dump.decay.frequency,
+        dump.decay.access_count,
+    ));
+
+    if dump.community.community_id.is_some() {
+        md.push_str(&format!(
+            "## Community\n\n**{}** (#{}) — {} siblings\n\n{}\n\n",
+            if dump.community.label.is_empty() {
+                "(unlabelled)".to_string()
+            } else {
+                dump.community.label.clone()
+            },
+            dump.community.community_id.unwrap_or(-1),
+            dump.community.sibling_count,
+            dump.community
+                .sibling_names
+                .iter()
+                .map(|n| format!("- [[{}]]", n))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        ));
+    }
+
+    if !dump.relations_out.is_empty() {
+        md.push_str("## Outgoing relations\n\n");
+        for r in &dump.relations_out {
+            md.push_str(&format!(
+                "- `{}` → [[{}]] _(conf {:.2})_\n",
+                r.predicate, r.target_name, r.confidence
+            ));
+        }
+        md.push('\n');
+    }
+
+    if !dump.relations_in.is_empty() {
+        md.push_str("## Backlinks\n\n");
+        for b in &dump.relations_in {
+            md.push_str(&format!(
+                "- [[{}]] `{}` _(conf {:.2})_\n",
+                b.source_name, b.predicate, b.confidence
+            ));
+        }
+        md.push('\n');
+    }
+
+    if !dump.vector_neighbors.is_empty() {
+        md.push_str("## Vector neighbors\n\n");
+        for n in &dump.vector_neighbors {
+            md.push_str(&format!(
+                "- [[{}]] _({}, sim {:.0}%)_\n",
+                n.name,
+                n.entity_type,
+                n.similarity * 100.0,
+            ));
+        }
+        md.push('\n');
+    }
+
+    if !dump.k_hop_neighbors.is_empty() {
+        md.push_str("## 2-hop neighborhood\n\n");
+        for h in &dump.k_hop_neighbors {
+            md.push_str(&format!("- [[{}]] _({})_\n", h.name, h.entity_type));
+        }
+        md.push('\n');
+    }
+
+    if !dump.belief_rows.is_empty() {
+        md.push_str("## Belief state\n\n");
+        for r in &dump.belief_rows {
+            md.push_str(&format!(
+                "- **{}** {} {} {} — _{}_\n",
+                r.status, r.subject, r.predicate, r.object, r.triple_id
+            ));
+        }
+        md.push('\n');
+    }
+
+    if !dump.contradictions.is_empty() {
+        md.push_str("## Contradictions\n\n");
+        for c in &dump.contradictions {
+            md.push_str(&format!(
+                "- `{}` ⇄ `{}` (sim {:.2}, detected {}{})\n",
+                &c.triple_a[..8.min(c.triple_a.len())],
+                &c.triple_b[..8.min(c.triple_b.len())],
+                c.cosine_similarity,
+                &c.detected_at[..10.min(c.detected_at.len())],
+                c.resolution
+                    .as_ref()
+                    .map(|r| format!(" → {}", r))
+                    .unwrap_or_default(),
+            ));
+        }
+        md.push('\n');
+    }
+
+    if !dump.reasoning_chains.is_empty() {
+        md.push_str("## Reasoning paths\n\n");
+        for c in &dump.reasoning_chains {
+            md.push_str(&format!(
+                "- _(score {:.2})_ → [[{}]]: ",
+                c.score, c.target_name
+            ));
+            let path = c
+                .steps
+                .iter()
+                .map(|s| format!("[[{}]]({})", s.entity_name, s.predicate))
+                .collect::<Vec<_>>()
+                .join(" → ");
+            md.push_str(&path);
+            md.push('\n');
+        }
+        md.push('\n');
+    }
+
+    if !dump.analogies.is_empty() {
+        md.push_str("## Analogies\n\n");
+        for a in &dump.analogies {
+            md.push_str(&format!(
+                "- [[{}]] _(sim {:.2})_ — {}\n",
+                a.target_name, a.similarity, a.explanation
+            ));
+        }
+        md.push('\n');
+    }
+
+    if !dump.bandit_arms_used.is_empty() {
+        md.push_str("## Bandit arms that retrieved this\n\n");
+        for a in &dump.bandit_arms_used {
+            md.push_str(&format!(
+                "- arm {} ({}) — {} pulls\n",
+                a.arm, a.arm_name, a.pulls
+            ));
+        }
+        md.push('\n');
+    }
+
+    if !dump.related_intents.is_empty() {
+        md.push_str("## Related commitments\n\n");
+        for i in &dump.related_intents {
+            md.push_str(&format!(
+                "- _{}_ — {}{}\n",
+                i.state,
+                i.statement,
+                i.horizon
+                    .as_ref()
+                    .map(|h| format!(" (by {h})"))
+                    .unwrap_or_default(),
+            ));
+        }
+        md.push('\n');
+    }
+
+    if !dump.provenance.is_empty() {
+        md.push_str("## Provenance\n\n");
+        for p in &dump.provenance {
+            md.push_str(&format!(
+                "- `{}` — {} _(conf {:.2}{})_\n",
+                &p.recorded_at[..16.min(p.recorded_at.len())],
+                p.name,
+                p.confidence,
+                p.superseded_at
+                    .as_ref()
+                    .map(|_| ", superseded".to_string())
+                    .unwrap_or_default(),
+            ));
+        }
+        md.push('\n');
+    }
+
+    if !dump.recent_traces.is_empty() {
+        md.push_str("## Recent traces\n\n");
+        for t in &dump.recent_traces {
+            md.push_str(&format!(
+                "- `{}` {} — {}\n",
+                &t.created_at[..16.min(t.created_at.len())],
+                t.event_type,
+                t.raw_text
+                    .as_ref()
+                    .map(|s| {
+                        let s = s.replace('\n', " ");
+                        if s.len() > 140 {
+                            format!("{}…", &s[..140])
+                        } else {
+                            s
+                        }
+                    })
+                    .unwrap_or_default(),
+            ));
+        }
+        md.push('\n');
+    }
+
+    if !dump.signal_neighbors.is_empty() {
+        md.push_str("## Raw-signal neighbors\n\n");
+        for s in &dump.signal_neighbors {
+            let snippet = if s.raw_text.len() > 200 {
+                format!("{}…", &s.raw_text[..200])
+            } else {
+                s.raw_text.clone()
+            };
+            md.push_str(&format!(
+                "- `{}` _({}, sim {:.0}%)_ — {}\n",
+                s.source,
+                &s.created_at[..16.min(s.created_at.len())],
+                s.similarity * 100.0,
+                snippet,
+            ));
+        }
+        md.push('\n');
+    }
+
+    let bytes = md.len() as u64;
+    std::fs::write(&output_path, &md)
+        .map_err(|e| format!("write {output_path}: {e}"))?;
+
+    Ok(ExportEntityMarkdownResult {
+        output_path,
+        bytes_written: bytes,
+        entity_id: dump.header.entity_id,
+    })
+}
+
+// ---------------------------------------------------------------------------
 // UI-13 — Capture permissions panel (per-source toggles + audit)
 // ---------------------------------------------------------------------------
 
@@ -3881,6 +5447,11 @@ fn main() {
             cmd_outliers_list,
             cmd_outlier_triage,
             cmd_community_overlay,
+            cmd_entity_context_dump,
+            cmd_brain_snapshot,
+            cmd_trace_why,
+            cmd_inspector_layer,
+            cmd_export_entity_markdown,
         ])
         .setup(move |app| {
             let handle = app.handle().clone();

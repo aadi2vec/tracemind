@@ -31,6 +31,29 @@ function relTime(t: string | null): string {
   return `${Math.floor(ms / 86_400_000)}d ago`;
 }
 
+/** Dev-mode toggle exposes the Inspector sidebar entry. localStorage-backed
+ *  so it survives reloads. Default OFF — power users opt in. */
+const DEV_MODE_KEY = "tm:dev_mode";
+
+export function readDevMode(): boolean {
+  try {
+    return localStorage.getItem(DEV_MODE_KEY) === "1";
+  } catch {
+    return false;
+  }
+}
+
+function writeDevMode(next: boolean) {
+  try {
+    if (next) localStorage.setItem(DEV_MODE_KEY, "1");
+    else localStorage.removeItem(DEV_MODE_KEY);
+  } catch {
+    /* ignore — private browsing or storage quota */
+  }
+  // Broadcast so the shell can re-read without a full reload.
+  window.dispatchEvent(new CustomEvent("tm:dev-mode-changed", { detail: next }));
+}
+
 export default function SettingsView() {
   const [perms, setPerms] = useState<CapturePermissionRow[]>([]);
   const [usage, setUsage] = useState<UsageStats | null>(null);
@@ -39,6 +62,7 @@ export default function SettingsView() {
   const [forgetting, setForgetting] = useState<string | null>(null);
   const [forgotMsg, setForgotMsg] = useState<string | null>(null);
   const [sharePayload, setSharePayload] = useState<string | null>(null);
+  const [devMode, setDevMode] = useState<boolean>(() => readDevMode());
 
   async function reload() {
     setLoading(true);
@@ -218,6 +242,28 @@ export default function SettingsView() {
             onFocus={(e) => e.currentTarget.select()}
           />
         )}
+      </section>
+
+      {/* Developer mode */}
+      <section className="bg-tm-surface border border-tm-border rounded-lg p-5">
+        <div className="flex items-start justify-between gap-4">
+          <div>
+            <h3 className="text-lg font-medium text-tm-text">Developer mode</h3>
+            <p className="text-xs text-tm-muted mt-1 max-w-xl">
+              Reveals the <span className="text-tm-text">Inspector</span> sidebar
+              entry — a 4-panel debug surface (brain snapshot, why-this-answer per
+              trace, full entity context dump, raw per-layer browser). Off by
+              default; turn on if you want to see how the system reasons.
+            </p>
+          </div>
+          <ToggleSwitch
+            checked={devMode}
+            onChange={(next) => {
+              setDevMode(next);
+              writeDevMode(next);
+            }}
+          />
+        </div>
       </section>
 
       {/* Privacy invariants */}

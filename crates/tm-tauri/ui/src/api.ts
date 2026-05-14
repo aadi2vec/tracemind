@@ -698,3 +698,259 @@ export interface CommunityRow {
 export async function getCommunityOverlay(): Promise<CommunityRow[]> {
   return invoke("cmd_community_overlay");
 }
+
+// ───────────────────────────────────────────────────────────────────────
+// Context Dashboard — fat one-call payload for "everything we know about X"
+// ───────────────────────────────────────────────────────────────────────
+
+export interface ContextDecay {
+  recency: number;
+  novelty: number;
+  value: number;
+  frequency: number;
+  access_count: number;
+  last_access: string | null;
+}
+
+export interface ContextNeighbor {
+  entity_id: string;
+  name: string;
+  entity_type: string;
+  similarity: number;
+}
+
+export interface ContextHop {
+  entity_id: string;
+  name: string;
+  entity_type: string;
+}
+
+export interface ContextBeliefRow {
+  triple_id: string;
+  subject: string;
+  predicate: string;
+  object: string;
+  /** "In" | "Out" | "Contradicted" | "Unknown" */
+  status: string;
+}
+
+export interface ContextContradiction {
+  id: string;
+  triple_a: string;
+  triple_b: string;
+  detected_at: string;
+  cosine_similarity: number;
+  /** "KeepA" | "KeepB" | "KeepBoth" | null */
+  resolution: string | null;
+}
+
+export interface ContextProvenanceRow {
+  name: string;
+  entity_type: string;
+  confidence: number;
+  valid_from: string;
+  recorded_at: string;
+  superseded_at: string | null;
+}
+
+export interface ContextTraceRow {
+  trace_id: string;
+  event_type: string;
+  raw_text: string | null;
+  retrieval_arm: number | null;
+  created_at: string;
+}
+
+export interface ContextSignal {
+  signal_id: number;
+  raw_text: string;
+  source: string;
+  similarity: number;
+  created_at: string;
+}
+
+export interface ContextCommunity {
+  community_id: number | null;
+  label: string;
+  sibling_count: number;
+  sibling_names: string[];
+}
+
+export interface ContextReasoningStep {
+  entity_id: string;
+  entity_name: string;
+  predicate: string;
+  /** "Out" | "In" */
+  direction: string;
+  confidence: number;
+}
+
+export interface ContextReasoningChain {
+  target_id: string;
+  target_name: string;
+  score: number;
+  steps: ContextReasoningStep[];
+}
+
+export interface ContextAnalogy {
+  target_id: string;
+  target_name: string;
+  similarity: number;
+  shared_patterns: string[];
+  explanation: string;
+}
+
+export interface ContextBanditUse {
+  arm: number;
+  arm_name: string;
+  pulls: number;
+}
+
+export interface ContextIntentRow {
+  id: string;
+  statement: string;
+  state: string;
+  horizon: string | null;
+}
+
+export interface EntityContextDump {
+  header: EntityDrawerHeader;
+  decay: ContextDecay;
+  relations_out: EntityDrawerRelation[];
+  relations_in: EntityDrawerBacklink[];
+  vector_neighbors: ContextNeighbor[];
+  k_hop_neighbors: ContextHop[];
+  community: ContextCommunity;
+  belief_rows: ContextBeliefRow[];
+  contradictions: ContextContradiction[];
+  provenance: ContextProvenanceRow[];
+  recent_traces: ContextTraceRow[];
+  signal_neighbors: ContextSignal[];
+  reasoning_chains: ContextReasoningChain[];
+  analogies: ContextAnalogy[];
+  bandit_arms_used: ContextBanditUse[];
+  related_intents: ContextIntentRow[];
+}
+
+export async function getEntityContext(
+  entityId: string,
+): Promise<EntityContextDump> {
+  return invoke("cmd_entity_context_dump", { entityId });
+}
+
+// ───────────────────────────────────────────────────────────────────────
+// Inspector — Brain snapshot + Why-this-answer + Layer browser + MD export
+// ───────────────────────────────────────────────────────────────────────
+
+export interface BrainArmRow {
+  arm: number;
+  name: string;
+  ucb_pulls: number;
+  ucb_avg_reward: number;
+  linucb_pulls: number;
+  linucb_weight_mag: number;
+}
+
+export interface BrainEventBreakdown {
+  event_type: string;
+  count: number;
+}
+
+export interface BrainSnapshot {
+  generated_at: string;
+  data_dir: string;
+  entity_count: number;
+  triple_count: number;
+  contradiction_count: number;
+  pending_relation_count: number;
+  community_count: number;
+  vector_dim: number;
+  entities_with_vector: number;
+  bandit_arms: BrainArmRow[];
+  linucb_alpha: number;
+  total_traces: number;
+  by_event: BrainEventBreakdown[];
+  recent_buffer_size: number;
+  recent_buffer_capacity: number;
+  governance_blocks_today: number;
+  captures_today: number;
+  open_commitments: number;
+  overdue_commitments: number;
+  pending_candidates: number;
+  pattern_silences_active: number;
+}
+
+export async function getBrainSnapshot(): Promise<BrainSnapshot> {
+  return invoke("cmd_brain_snapshot");
+}
+
+export interface WhyArmRow {
+  arm: number;
+  name: string;
+  top_k: number;
+  hops: number;
+  include_episodic: boolean;
+  include_colbert: boolean;
+  exploit_score: number;
+  explore_score: number;
+  total_score: number;
+  pulls: number;
+}
+
+export interface WhyEntityRow {
+  entity_id: string;
+  name: string;
+  entity_type: string;
+  confidence: number;
+}
+
+export interface WhyTraceView {
+  trace_id: string;
+  event_type: string;
+  created_at: string;
+  raw_text: string | null;
+  plan_action: string | null;
+  plan_complexity: string | null;
+  plan_confidence: number | null;
+  plan_entity_hints: string[];
+  selected_arm: number | null;
+  selected_arm_name: string | null;
+  arm_scores: WhyArmRow[];
+  entities: WhyEntityRow[];
+  latency_ms: number | null;
+  confidence_gate_passed: boolean;
+  linucb_alpha: number;
+}
+
+export async function getTraceWhy(traceId: string): Promise<WhyTraceView> {
+  return invoke("cmd_trace_why", { traceId });
+}
+
+export type InspectorLayerName =
+  | "vector"
+  | "graph"
+  | "episodic"
+  | "bandit"
+  | "governance"
+  | "reason";
+
+export type InspectorLayerPayload = Record<string, unknown>;
+
+export async function getInspectorLayer(
+  layer: InspectorLayerName,
+): Promise<InspectorLayerPayload> {
+  return invoke("cmd_inspector_layer", { layer });
+}
+
+export interface ExportEntityMarkdownResult {
+  output_path: string;
+  bytes_written: number;
+  entity_id: string;
+}
+
+export async function exportEntityMarkdown(
+  entityId: string,
+  outputPath: string,
+): Promise<ExportEntityMarkdownResult> {
+  return invoke("cmd_export_entity_markdown", { entityId, outputPath });
+}
