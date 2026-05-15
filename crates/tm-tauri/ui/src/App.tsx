@@ -300,7 +300,7 @@ export default function App() {
 
         <div className="p-3 border-t border-tm-border space-y-3">
           <div>
-            <p className="text-[10px] uppercase tracking-wider text-tm-muted mb-1.5 px-1">Context</p>
+            <p className="text-[10px] uppercase tracking-wider text-tm-muted mb-1.5 px-1">Active graph</p>
             <ContextSwitcher />
           </div>
           <div className="flex items-center gap-2 px-1">

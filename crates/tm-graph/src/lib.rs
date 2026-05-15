@@ -6,6 +6,7 @@ pub mod entity_resolve;
 pub mod event_graph;
 pub mod graph_sprint;
 pub mod labeler;
+pub mod maintenance;
 pub mod memory_view;
 pub mod moc;
 pub mod ontology;
@@ -33,6 +34,10 @@ pub use entity_resolve::{resolve_in_text, EntityMention};
 pub use labeler::{
     label_clusters, ClusterLabel, LabelTerm, LabelerConfig, BIGRAM_BOOST, DEFAULT_MIN_TOKEN_LEN,
     DEFAULT_TOP_K,
+};
+pub use maintenance::{
+    clean_ephemeral, reset_all, storage_stats, truncate_traces, vacuum_all, CleanupReport,
+    FileStat, StorageStats,
 };
 pub use memory_view::{
     MemberKind, MemberType, MemoryView, ViewFilter, ViewMember, VIEW_SCHEMA_VERSION,

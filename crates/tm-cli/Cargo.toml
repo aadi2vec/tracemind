@@ -31,6 +31,13 @@ tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
 
 [features]
+# Default keeps the Tier-0 extractive backend only so the workspace still
+# builds on machines without cmake installed (llama-cpp-sys-2 requires it).
+# The desktop binary (`tm-tauri`) and most demo paths enable `local-llm`
+# in their own crates so the LLM tier is the *runtime* default whenever
+# the feature is compiled in. To get LLM answers from the CLI/MCP:
+#   cargo build --release -p tm-cli -p tm-mcp --features local-llm
+# (or `local-llm-metal` on Apple Silicon).
 default = []
 # Enable Tier-1 local LLM answers (Qwen 2.5 1.5B Q4 GGUF, ~900 MB first-run download).
 local-llm = ["tm-answer/local-llm"]

@@ -1,5 +1,12 @@
 import { useEffect, useState } from "react";
-import { getBrief, type BriefRow, type BriefView } from "../api";
+import {
+  acceptCandidate,
+  dismissCandidate,
+  getBrief,
+  type BriefRow,
+  type BriefView,
+  type CandidateRow,
+} from "../api";
 
 // UI-10 — vertical commitment timeline, color-coded by state.
 // Pulls from cmd_brief (which already buckets commitments into
@@ -29,12 +36,41 @@ export default function CommitmentTimelineView() {
   const [brief, setBrief] = useState<BriefView | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [expanded, setExpanded] = useState<string | null>(null);
+  const [busy, setBusy] = useState<string | null>(null);
 
-  useEffect(() => {
+  const refresh = () => {
     getBrief()
       .then(setBrief)
       .catch((e) => setError(String(e)));
+  };
+
+  useEffect(() => {
+    refresh();
   }, []);
+
+  const onAccept = async (id: string) => {
+    setBusy(id);
+    try {
+      await acceptCandidate(id);
+      refresh();
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const onDismiss = async (id: string) => {
+    setBusy(id);
+    try {
+      await dismissCandidate(id);
+      refresh();
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusy(null);
+    }
+  };
 
   const rows: Row[] = brief
     ? [
@@ -60,7 +96,55 @@ export default function CommitmentTimelineView() {
         </div>
       )}
 
-      {brief && rows.length === 0 && (
+      {brief && brief.candidates.length > 0 && (
+        <section className="mb-6">
+          <h3 className="text-sm font-semibold text-tm-text mb-2">
+            Pending confirmation
+            <span className="ml-2 text-xs text-tm-muted font-normal">
+              {brief.candidates.length} mined — accept to promote, dismiss to silence
+            </span>
+          </h3>
+          <ul className="space-y-2">
+            {brief.candidates.map((c: CandidateRow) => (
+              <li
+                key={c.id}
+                className="bg-tm-surface border border-tm-border rounded p-3 flex items-start gap-3"
+              >
+                <div className="flex-1 min-w-0">
+                  <p className="text-sm text-tm-text">{c.statement}</p>
+                  <p className="text-xs text-tm-muted mt-1">
+                    <span className="font-mono">{c.matched_phrase}</span>
+                    <span className="mx-2">·</span>
+                    {c.kind}
+                    <span className="mx-2">·</span>
+                    conf {c.confidence.toFixed(2)}
+                    <span className="mx-2">·</span>
+                    {c.created_at}
+                  </p>
+                </div>
+                <div className="flex flex-col gap-1 shrink-0">
+                  <button
+                    onClick={() => onAccept(c.id)}
+                    disabled={busy === c.id}
+                    className="text-xs px-3 py-1 rounded border border-green-600/50 text-green-300 hover:bg-green-500/10 disabled:opacity-40"
+                  >
+                    Accept
+                  </button>
+                  <button
+                    onClick={() => onDismiss(c.id)}
+                    disabled={busy === c.id}
+                    className="text-xs px-3 py-1 rounded border border-tm-border text-tm-muted hover:bg-white/5 disabled:opacity-40"
+                  >
+                    Dismiss
+                  </button>
+                </div>
+              </li>
+            ))}
+          </ul>
+        </section>
+      )}
+
+      {brief && rows.length === 0 && brief.candidates.length === 0 && (
         <div className="bg-tm-surface border border-tm-border rounded-lg p-6 text-center">
           <p className="text-sm text-tm-muted">No commitments tracked yet.</p>
           <p className="text-xs text-tm-muted mt-1">

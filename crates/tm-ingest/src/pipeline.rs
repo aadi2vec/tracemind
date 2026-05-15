@@ -256,11 +256,22 @@ impl IngestPipeline {
             std::collections::HashMap::new();
         for entity in entities.iter_mut() {
             let key = entity.name.to_lowercase();
+            // Fingerprint key collapses plurals/possessives/punctuation
+            // variants within the same batch so "TraceMind" and
+            // "TraceMind's" reuse a single id.
+            let fp_key = entity_fingerprint(&entity.name);
 
             // Check batch-local dedup first
             if let Some(&existing_id) = name_to_id.get(&key) {
                 entity.id = existing_id;
                 continue;
+            }
+            if !fp_key.is_empty() {
+                if let Some(&existing_id) = name_to_id.get(&fp_key) {
+                    entity.id = existing_id;
+                    name_to_id.insert(key, existing_id);
+                    continue;
+                }
             }
 
             // Check graph for existing entity by name (case-insensitive)
@@ -271,6 +282,9 @@ impl IngestPipeline {
                 // Reinforce confidence on re-mention
                 self.graph.reinforce_entity(existing.id, 0.05)?;
                 name_to_id.insert(key, entity.id);
+                if !fp_key.is_empty() {
+                    name_to_id.insert(fp_key.clone(), entity.id);
+                }
                 continue;
             }
 
@@ -287,6 +301,9 @@ impl IngestPipeline {
             }
 
             name_to_id.insert(key, entity.id);
+            if !fp_key.is_empty() {
+                name_to_id.insert(fp_key, entity.id);
+            }
         }
 
         // Remove within-batch duplicates (keep first occurrence of each ID)
@@ -757,6 +774,18 @@ impl IngestPipeline {
             .entities_near_length(name.len(), MAX_DIST)
             .ok()?;
         let lower = name.to_lowercase();
+        let fp = entity_fingerprint(name);
+
+        // Fingerprint pre-pass: matches plurals/possessives/punctuation
+        // variants the Levenshtein band can miss ("TraceMind" vs
+        // "TraceMind's", "open source" vs "open-source", "API"/"APIs").
+        if !fp.is_empty() {
+            for cand in &candidates {
+                if entity_fingerprint(&cand.name) == fp {
+                    return Some(cand.clone());
+                }
+            }
+        }
 
         let mut best: Option<(usize, Entity)> = None;
         for cand in candidates {
@@ -845,6 +874,44 @@ impl IngestPipeline {
 /// Conservative check: treat two names as the same entity only if one is a
 /// prefix/suffix/case-variant of the other. Prevents `decide_memory_op` from
 /// folding unrelated entities that merely share sentence context.
+/// Canonicalize an entity name for duplicate detection. Removes
+/// punctuation, lowercases, normalises whitespace, and strips a single
+/// trailing `s`/`'s` so plurals and possessives collapse to the same
+/// fingerprint. Returns `""` when the canonical form would be too short
+/// (< 3 chars) to be a useful dedup key — callers must treat empty as
+/// "no match" rather than "matches everything".
+///
+/// Examples:
+/// - `"TraceMind"`, `"tracemind"`, `"TraceMind's"`, `"TraceMinds"` → `"tracemind"`
+/// - `"open source"`, `"open-source"`, `"Open Source"` → `"open source"`
+/// - `"API"`, `"APIs"`, `"api."` → `"api"`
+pub fn entity_fingerprint(name: &str) -> String {
+    let mut s: String = name
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c.is_whitespace() {
+                c.to_ascii_lowercase()
+            } else {
+                ' '
+            }
+        })
+        .collect();
+    // Collapse whitespace runs into single spaces, trim.
+    s = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    // Strip a single trailing 's' so plurals/possessives canonicalise
+    // ("rusts" → "rust", "tracemind s" — after the punct-strip of the
+    // possessive — → "tracemind").
+    if let Some(stripped) = s.strip_suffix(" s") {
+        s = stripped.to_string();
+    } else if s.len() > 3 && s.ends_with('s') && !s.ends_with("ss") {
+        s.pop();
+    }
+    if s.chars().count() < 3 {
+        return String::new();
+    }
+    s
+}
+
 fn names_look_like_same_entity(a: &str, b: &str) -> bool {
     let al = a.trim().to_lowercase();
     let bl = b.trim().to_lowercase();
@@ -1254,37 +1321,80 @@ pub(crate) fn extract_triples(text: &str, entities: &[Entity]) -> Vec<Triple> {
     let mut triples: Vec<Triple> = Vec::new();
     let text_lower = text.to_lowercase();
 
-    // Build a lookup from lowercase entity name → entity index
-    let entity_lookup: Vec<(String, usize)> = entities
-        .iter()
-        .enumerate()
-        .map(|(idx, e)| (e.name.to_lowercase(), idx))
-        .collect();
+    // Build a lookup from lowercase entity name → entity index.
+    // Multi-word entities also get a first-word alias so "Aaditya manages X"
+    // matches the entity "Aaditya Srivathsan" even though the surface form
+    // in the sentence is just the first name. Without this, the subject
+    // resolver returns None and the typed triple is dropped.
+    let mut entity_lookup: Vec<(String, usize)> = Vec::new();
+    for (idx, e) in entities.iter().enumerate() {
+        let full = e.name.to_lowercase();
+        entity_lookup.push((full.clone(), idx));
+        if let Some(first) = full.split_whitespace().next() {
+            if first.len() >= 3 && first != full {
+                entity_lookup.push((first.to_string(), idx));
+            }
+        }
+    }
 
-    // Try pattern-based extraction first
+    // Try pattern-based extraction first.
+    //
+    // Richer verb table — covers the common project-work, collaboration,
+    // communication, status, scheduling, and comparison relations the
+    // pattern matcher can confidently identify by surface form alone.
+    // Custom predicate names are the canonical verb in lowercase
+    // (e.g. "manages", "blocks", "scheduled_for").
     let patterns: &[(&[&str], Predicate)] = &[
-        // "X works at Y", "X working at Y", "X worked at Y"
+        // ---- Employment / membership ----
         (&["works at", "working at", "worked at", "work at", "employed at", "employed by", "joined"], Predicate::WorksAt),
-        // "X uses Y", "X using Y", "X built with Y"
-        (&["uses", "using", "built with", "written in", "powered by", "implemented in", "runs on"], Predicate::Custom("uses".into())),
-        // "X is a Y", "X is an Y"
+        // ---- Tooling / stack ----
+        (&["uses", "using", "built with", "written in", "powered by", "implemented in", "runs on", "built on", "based on"], Predicate::Custom("uses".into())),
+        // ---- Type / kind ----
         (&["is a ", "is an ", "are a ", "are an "], Predicate::IsA),
-        // "X depends on Y", "X requires Y"
-        (&["depends on", "requires", "needs", "relies on"], Predicate::DependsOn),
-        // "X produces Y", "X generates Y", "X creates Y", "X building Y"
-        (&["produces", "generates", "creates", "building", "built", "developing", "developed"], Predicate::Produces),
-        // "X owns Y", "X created Y"
-        (&["owns", "created", "founded", "started"], Predicate::Owns),
-        // "X collaborates with Y", "X works with Y"
-        (&["collaborates with", "works with", "partnered with", "teamed with"], Predicate::CollaboratesWith),
-        // "X is part of Y", "X belongs to Y"
-        (&["part of", "belongs to", "member of", "component of", "included in"], Predicate::PartOf),
-        // "X references Y", "X mentions Y", "X links to Y"
-        (&["references", "mentions", "links to", "points to", "refers to"], Predicate::References),
-        // TM-NLP-003c — possession / containment: "X has Y", "X contains Y"
-        // Use spaces around bare verbs to reduce substring false matches
+        // ---- Dependency ----
+        (&["depends on", "requires", "needs", "relies on", "blocked by", "blocked on", "waiting on", "waiting for"], Predicate::DependsOn),
+        // ---- Authoring / production ----
+        (&["produces", "generates", "creates", "building", "built", "developing", "developed", "authored", "wrote", "shipped"], Predicate::Produces),
+        // ---- Ownership / origin ----
+        (&["owns", "created", "founded", "started", "launched", "initiated"], Predicate::Owns),
+        // ---- Collaboration ----
+        (&["collaborates with", "works with", "partnered with", "teamed with", "paired with", "co-authored with"], Predicate::CollaboratesWith),
+        // ---- Composition / inclusion ----
+        (&["part of", "belongs to", "member of", "component of", "included in", "lives in", "lives under"], Predicate::PartOf),
+        // ---- References / links ----
+        (&["references", "mentions", "links to", "points to", "refers to", "cites"], Predicate::References),
+        // ---- Possession / containment ----
+        // Spaces around bare verbs reduce substring false matches
         // ("has" inside "washes", "have" inside "behaves").
         (&[" has ", " have ", " having ", " contains ", " containing ", " includes ", " including "], Predicate::HasProperty),
+
+        // ===== NEW: richer relations =====
+        // ---- Hierarchy / management ----
+        (&["reports to", "reporting to", "reported to"], Predicate::Custom("reports_to".into())),
+        (&["manages", "managing", "managed", "leads", "leading", "led", "heads", "heading", "oversees", "supervises", "mentors", "mentoring"], Predicate::Custom("manages".into())),
+        // ---- Communication ----
+        (&["told", "mentioned to", "asked", "asking", "replied to", "responded to", "emailed", "called", "messaged", "dm'd", "pinged", "notified"], Predicate::Custom("communicated_with".into())),
+        (&["answered", "answers", "responded"], Predicate::Custom("answered".into())),
+        // ---- Status / progress ----
+        (&["completed", "finished", "shipped", "deployed", "released", "merged", "closed"], Predicate::Custom("completed".into())),
+        (&["started", "begun", "began", "kicked off", "initiated"], Predicate::Custom("started".into())),
+        (&["paused", "halted", "stopped", "on hold"], Predicate::Custom("paused".into())),
+        (&["cancelled", "canceled", "abandoned", "dropped"], Predicate::Custom("cancelled".into())),
+        (&["blocks", "blocking", "blocked"], Predicate::Custom("blocks".into())),
+        // ---- Scheduling ----
+        (&["scheduled for", "scheduled on", "scheduled at", "planned for", "postponed to", "moved to", "rescheduled to"], Predicate::Custom("scheduled_for".into())),
+        (&["attending", "attended", "attends", "joining"], Predicate::Custom("attends".into())),
+        // ---- Causation / influence ----
+        (&["caused", "causing", "causes", "triggered", "triggering", "led to", "results in", "resulted in"], Predicate::Custom("caused".into())),
+        (&["fixes", "fixed", "resolves", "resolved", "patches", "patched"], Predicate::Custom("fixes".into())),
+        (&["breaks", "broke", "broken by", "regressed"], Predicate::Custom("breaks".into())),
+        // ---- Measurement / comparison ----
+        (&["faster than", "slower than", "better than", "worse than", "smaller than", "larger than", "cheaper than", "more accurate than"], Predicate::Custom("compared_to".into())),
+        (&["similar to", "like ", "comparable to", "equivalent to", "akin to"], Predicate::Custom("similar_to".into())),
+        // ---- Goal / intent ----
+        (&["aims to", "intends to", "plans to", "wants to", "trying to"], Predicate::Custom("aims_to".into())),
+        // ---- Location / context ----
+        (&["located in", "based in", "lives at", "stored in", "hosted on", "running at", "running on"], Predicate::Custom("located_in".into())),
     ];
 
     for (keywords, predicate) in patterns {

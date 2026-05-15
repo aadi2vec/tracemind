@@ -272,6 +272,16 @@ Partner constraint: no hardcoded `k`. HDBSCAN-first; KMeans is rejected. Outlier
 
 **Exit criteria:** Q3 2026 milestone WME entries (PROJECT_2026.md §7) green; ≥ 3 design partners report at least one "this card appeared when I needed it" moment per week; useful-rate ≥ 30%.
 
+### P4d — Layered-graph substrate enhancements (nice-to-have, post-LGM-2, investor-suggested 2026-05-15)
+
+Source: investor's "Designing a Graph-Based Memory System" framing (2026-05-15). Maps the existing substrate onto five layers — Ontology / Episodic / Semantic / Salience / Knowledge — and flags three concrete gaps. **Not Q3 blockers.** Queue post-LGM-2 (after the Anticipate verb ships); revisit if the WME useful-rate plateaus or a partner explicitly asks for finer-grained anchoring. See `~/.claude/projects/.../memory/tracemind_layered_graph_guidance.md` for the full mapping.
+
+- [ ] **LGS-1 Salience as a first-class layer** — today confidence + freshness live as fields on `kg_relations` / `event_graph` rows. Promote to its own SQLite index: `salience(node_id PRIMARY KEY, score FLOAT, last_touched INTEGER, recency_decay FLOAT, importance FLOAT, updated_at)`. Recomputed nightly by `consolidate`; read by WME L2 to weight candidate retrieval, by Memory Garden to size nodes, by deny-list to expire stale blocks. Decouples "what we know" from "what we care about right now." ~150 LOC, no migration of existing data (additive).
+- [ ] **LGS-2 ColBERT node entry-point selector** — `tm-rerank` currently does document-level MaxSim post-retrieval. Add `tm-rerank::EntityIndex` keyed by entity ID with multi-vector embeddings per entity (concat of name + type + top-3 related triples). Query path: `EntityIndex::nearest(query, k) -> Vec<(EntityId, MaxSimScore)>` runs before graph traversal so KG-R1 anchors on the best entity instead of the first BGE hit. Lets Anticipate (LGM-2) land on the correct subject cheaply. Reuses existing mxbai-colbert weights — no new model download.
+- [ ] **LGS-3 ColBERT subgraph ranker** — after KG-R1 traverses, score the *resulting subgraph* (entity + 1-hop neighborhood + matched triples flattened to text) with MaxSim against the query. Replaces / supplements current RRA+MMR doc-level fusion for graph-anchored answers. New `RetrievalArm::SubgraphColbert` (arm 5) gated behind a feature flag; A/B against arm 4 in `tm-bench-locomo` before promoting. Target: ≥ 1.0 F1 lift on `multi_hop` slice.
+
+**Exit criteria (only if queued):** LGS-1 ships independently of the ColBERT items; LGS-2 + LGS-3 promote together after LoCoMo multi-hop A/B. If the WME useful-rate hits ≥ 45% without these, **kill the section** — graph substrate is already doing its job and added complexity is not warranted.
+
 ---
 
 ## P5 — Legible Memory (visible + granular + steerable, partner-driven 2026-05-12)

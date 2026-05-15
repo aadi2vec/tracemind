@@ -31,13 +31,60 @@
 //! object can't be resolved are dropped.
 
 use serde::Deserialize;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-use tm_types::{Entity, Predicate, Triple};
+use tm_types::{Entity, Predicate, Triple, Result, TraceMindError};
 #[cfg(test)]
 use tm_types::EntityType;
 
 use crate::extractor::{EntityExtractor, HeuristicExtractor};
+
+/// Canonical HuggingFace repo + filename for the Qwen 2.5 1.5B Q4_K_M GGUF.
+/// Used by [`ensure_qwen_weights`] when the user opts into the LLM tier.
+pub const QWEN_HF_REPO: &str = "Qwen/Qwen2.5-1.5B-Instruct-GGUF";
+pub const QWEN_HF_FILE: &str = "qwen2.5-1.5b-instruct-q4_k_m.gguf";
+
+/// Resolve the canonical weights path inside the TraceMind data dir.
+pub fn qwen_weights_path(data_dir: &Path) -> PathBuf {
+    data_dir.join("models").join(QWEN_HF_FILE)
+}
+
+/// Download the Qwen 2.5 1.5B Q4_K_M GGUF into `<data_dir>/models/` if not
+/// already present. Returns the resolved path on success. ~900 MB transfer
+/// on first run; subsequent calls are a fast `Path::exists` check.
+///
+/// Uses `hf-hub`'s sync API (same one GLiNER uses), then copies the cached
+/// blob into the TraceMind data dir so the runtime probe at
+/// `qwen_weights_path` finds it. Copying (instead of symlinking) keeps the
+/// data dir self-contained, which matters for portable installs and for
+/// the per-platform storage scanner that walks `~/.tracemind/`.
+pub fn ensure_qwen_weights(data_dir: &Path) -> Result<PathBuf> {
+    let target = qwen_weights_path(data_dir);
+    if target.exists() {
+        return Ok(target);
+    }
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| {
+            TraceMindError::Embedding(format!("models dir create: {e}"))
+        })?;
+    }
+    tracing::info!("[qwen] resolving weights via hf-hub ({QWEN_HF_REPO})");
+    let api = hf_hub::api::sync::Api::new()
+        .map_err(|e| TraceMindError::Embedding(format!("hf-hub init: {e}")))?;
+    let repo = api.model(QWEN_HF_REPO.to_string());
+    let cached = repo
+        .get(QWEN_HF_FILE)
+        .map_err(|e| TraceMindError::Embedding(format!("hf-hub fetch: {e}")))?;
+    std::fs::copy(&cached, &target).map_err(|e| {
+        TraceMindError::Embedding(format!(
+            "copy {} -> {}: {e}",
+            cached.display(),
+            target.display()
+        ))
+    })?;
+    tracing::info!("[qwen] weights installed at {}", target.display());
+    Ok(target)
+}
 
 /// Configuration for the Qwen-backed extractor. The defaults mirror
 /// [`tm_answer::LocalLlmConfig::primary`] but with smaller token budgets —

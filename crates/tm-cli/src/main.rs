@@ -245,6 +245,13 @@ enum Commands {
         #[command(subcommand)]
         action: ModelsAction,
     },
+    /// Scan local storage and run on-demand cleanups (vacuum, prune
+    /// ephemeral signals, truncate the trace log). All actions are
+    /// local-only and never touch the network.
+    Storage {
+        #[command(subcommand)]
+        action: StorageAction,
+    },
     /// Record a Commitment (intent / decision / hypothesis) — the wedge
     /// primitive of the system of intents (see `docs/INTENT_SYSTEM.md` §1.1).
     Commit {
@@ -768,6 +775,29 @@ enum ModelsAction {
         /// instead of the laptop default.
         #[arg(long)]
         mobile: bool,
+    },
+}
+
+#[derive(clap::Subcommand)]
+enum StorageAction {
+    /// Show on-disk footprint of `$TM_DATA_DIR` (default
+    /// `~/.tracemind/`) plus row counts for the graph + signal tables.
+    Status {
+        /// Emit raw JSON instead of a formatted table.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Run `VACUUM` on every SQLite database in the data dir (graph,
+    /// temporal index, intents). Reclaims pages freed by deletes.
+    Vacuum,
+    /// Delete tier-4 (Ephemeral) captured signals and any consolidated
+    /// signal above tier 1. Entities + triples are untouched.
+    CleanEphemeral,
+    /// Truncate `traces.jsonl` to the most recent N lines.
+    TruncateTraces {
+        /// Keep the last N lines (default 5000).
+        #[arg(long, default_value = "5000")]
+        keep: usize,
     },
 }
 
@@ -1623,6 +1653,9 @@ fn main() {
 
         Commands::Models { action } => {
             cmd_models(action);
+        }
+        Commands::Storage { action } => {
+            cmd_storage(&dir, action);
         }
         Commands::Commit {
             kind,
@@ -3462,6 +3495,107 @@ fn cmd_models(action: ModelsAction) {
                 }
             }
         }
+    }
+}
+
+/// `tracemind storage` — scan footprint + on-demand cleanup.
+///
+/// Surfaces `tm_graph::maintenance` to humans. No network, no model
+/// downloads, no graph rewrites — every action is bounded and listed in
+/// the help text.
+fn cmd_storage(dir: &PathBuf, action: StorageAction) {
+    match action {
+        StorageAction::Status { json } => match tm_graph::storage_stats(dir) {
+            Ok(stats) => {
+                if json {
+                    match serde_json::to_string_pretty(&stats) {
+                        Ok(s) => println!("{}", s),
+                        Err(e) => {
+                            eprintln!("serialize failed: {}", e);
+                            std::process::exit(1);
+                        }
+                    }
+                } else {
+                    println!("Storage @ {}", stats.data_dir);
+                    println!("  Total on disk:       {}", fmt_bytes(stats.total_bytes));
+                    println!("  Entities:            {}", stats.entity_count);
+                    println!("  Triples:             {}", stats.triple_count);
+                    println!(
+                        "  Signals (total/ephem/consol): {}/{}/{}",
+                        stats.signal_count,
+                        stats.ephemeral_signal_count,
+                        stats.consolidated_signal_count,
+                    );
+                    println!("  Trace lines:         {}", stats.trace_line_count);
+                    if !stats.files.is_empty() {
+                        println!("  Files:");
+                        for f in &stats.files {
+                            println!("    {:<32} {}", f.name, fmt_bytes(f.bytes));
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("storage status failed: {}", e);
+                std::process::exit(1);
+            }
+        },
+        StorageAction::Vacuum => match tm_graph::vacuum_all(dir) {
+            Ok(r) => print_cleanup(&r),
+            Err(e) => {
+                eprintln!("vacuum failed: {}", e);
+                std::process::exit(1);
+            }
+        },
+        StorageAction::CleanEphemeral => match tm_graph::clean_ephemeral(dir) {
+            Ok(r) => print_cleanup(&r),
+            Err(e) => {
+                eprintln!("clean-ephemeral failed: {}", e);
+                std::process::exit(1);
+            }
+        },
+        StorageAction::TruncateTraces { keep } => match tm_graph::truncate_traces(dir, keep) {
+            Ok(r) => print_cleanup(&r),
+            Err(e) => {
+                eprintln!("truncate-traces failed: {}", e);
+                std::process::exit(1);
+            }
+        },
+    }
+}
+
+fn print_cleanup(r: &tm_graph::CleanupReport) {
+    let delta = if r.bytes_freed >= 0 {
+        format!("freed {}", fmt_bytes(r.bytes_freed as u64))
+    } else {
+        format!("grew {}", fmt_bytes((-r.bytes_freed) as u64))
+    };
+    println!(
+        "{}: {} → {} ({}){}",
+        r.action,
+        fmt_bytes(r.bytes_before),
+        fmt_bytes(r.bytes_after),
+        delta,
+        if r.rows_deleted > 0 {
+            format!(" · removed {} rows", r.rows_deleted)
+        } else {
+            String::new()
+        },
+    );
+}
+
+fn fmt_bytes(n: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = KB * 1024;
+    const GB: u64 = MB * 1024;
+    if n >= GB {
+        format!("{:.2} GB", n as f64 / GB as f64)
+    } else if n >= MB {
+        format!("{:.2} MB", n as f64 / MB as f64)
+    } else if n >= KB {
+        format!("{:.2} KB", n as f64 / KB as f64)
+    } else {
+        format!("{} B", n)
     }
 }
 

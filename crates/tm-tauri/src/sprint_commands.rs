@@ -621,6 +621,26 @@ pub fn cmd_ontology_accept_proposal(
     ProposalStore::accept(g.connection(), id).map_err(|e| e.to_string())
 }
 
+/// ONT-2 — run the statistical Object Type proposer over the current
+/// captured-signal clusters. Pulls up to 25 samples per cluster, runs
+/// the c-TF-IDF labeler, and persists any new proposals as `pending`.
+/// Returns the number of new proposals written. Safe to call on a tick
+/// (background) or from a UI "Run proposer" button.
+#[tauri::command]
+pub fn cmd_ontology_run_proposer(
+    state: State<'_, AppState>,
+) -> std::result::Result<usize, String> {
+    let g = open_graph(&state)?;
+    let clusters = g.cluster_sample_map(25).map_err(|e| e.to_string())?;
+    let proposals = tm_reflect::propose_object_types(
+        &clusters,
+        &tm_reflect::ontology_proposer::ProposerConfig::default(),
+    );
+    let written = tm_reflect::persist_object_type_proposals(g.connection(), &proposals)
+        .map_err(|e| e.to_string())?;
+    Ok(written)
+}
+
 #[tauri::command]
 pub fn cmd_ontology_reject_proposal(
     state: State<'_, AppState>,
