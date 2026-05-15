@@ -82,7 +82,8 @@ export default function ContextSwitcher() {
     }
   }
 
-  const label = active ? active.name : "all contexts";
+  const label = active ? active.name : "all graphs";
+  const otherCount = contexts.filter((c) => !c.is_active).length;
 
   return (
     <div className="relative">
@@ -90,11 +91,14 @@ export default function ContextSwitcher() {
         onClick={() => setOpen((v) => !v)}
         disabled={busy}
         className="w-full flex items-center justify-between gap-2 px-3 py-1.5 rounded text-xs bg-tm-bg border border-tm-border hover:border-tm-accent transition-colors"
-        title="Switch active context"
+        title="Switch active graph (project / venture / personal). Each graph is a separate context — ingest and queries are scoped to it."
       >
         <span className="flex items-center gap-2 truncate">
           <span className={`w-1.5 h-1.5 rounded-full ${active ? "bg-tm-accent" : "bg-tm-muted"}`} />
           <span className="truncate">{label}</span>
+          {otherCount > 0 && (
+            <span className="text-[10px] text-tm-muted shrink-0">+{otherCount}</span>
+          )}
         </span>
         <svg className="w-3 h-3 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
           <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
@@ -103,6 +107,9 @@ export default function ContextSwitcher() {
 
       {open && (
         <div className="absolute left-0 right-0 bottom-full mb-1 z-10 bg-tm-surface border border-tm-border rounded shadow-lg max-h-80 overflow-y-auto">
+          <div className="px-3 py-1.5 text-[10px] uppercase tracking-wider text-tm-muted border-b border-tm-border">
+            Graphs ({contexts.length})
+          </div>
           <button
             onClick={clearActive}
             disabled={busy}
@@ -110,8 +117,13 @@ export default function ContextSwitcher() {
               active === null ? "text-tm-accent" : "text-tm-muted"
             }`}
           >
-            all contexts (no scope)
+            all graphs (no scope)
           </button>
+          {contexts.length === 0 && (
+            <p className="px-3 py-2 text-[11px] text-tm-muted italic">
+              No separate graphs yet. Create one below to split work, ventures, or personal threads.
+            </p>
+          )}
           {contexts.map((c) => (
             <button
               key={c.id}
@@ -131,7 +143,10 @@ export default function ContextSwitcher() {
               type="text"
               value={newName}
               onChange={(e) => setNewName(e.target.value)}
-              placeholder="new context name"
+              onKeyDown={(e) => {
+                if (e.key === "Enter") handleCreate();
+              }}
+              placeholder="new graph name"
               className="flex-1 min-w-0 px-2 py-1 text-xs bg-tm-bg border border-tm-border rounded"
             />
             <button

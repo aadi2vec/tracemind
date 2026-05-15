@@ -14,12 +14,15 @@
 
 import { useEffect, useMemo, useState } from "react";
 import {
+  acceptCandidate,
   currentContext,
+  dismissCandidate,
   getBrief,
   getTripleDetail,
   resolveContradiction,
   recordOutcome,
   type BriefView as BriefData,
+  type CandidateRow,
   type ContextInfo,
   type ContradictionRow,
   type BriefRow,
@@ -185,6 +188,27 @@ export default function BriefView() {
   const visibleResolved = brief.resolved.filter(
     (r) => !dismissedIds.has(r.id) && !archivedIds.has(r.id),
   );
+  const visibleCandidates = brief.candidates.filter(
+    (r) => !dismissedIds.has(r.id) && !archivedIds.has(r.id),
+  );
+
+  const onAcceptCandidate = async (row: CandidateRow) => {
+    try {
+      await acceptCandidate(row.id);
+      await refresh();
+    } catch (e) {
+      setError(String(e));
+    }
+  };
+  const onDismissCandidate = async (row: CandidateRow) => {
+    try {
+      await dismissCandidate(row.id);
+      dismiss(row.id);
+      await refresh();
+    } catch (e) {
+      setError(String(e));
+    }
+  };
 
   return (
     <div className="max-w-4xl">
@@ -275,6 +299,61 @@ export default function BriefView() {
                   </button>
                 </li>
               ))}
+          </ul>
+        </section>
+      )}
+
+      {visibleCandidates.length > 0 && (
+        <section className="mb-6">
+          <h3 className="text-sm font-semibold text-tm-accent mb-2">
+            mined candidates ({visibleCandidates.length})
+          </h3>
+          <p className="text-xs text-tm-muted mb-2">
+            Phrases the miner flagged as possible commitments. Accept to promote
+            to an open commitment, or dismiss.
+          </p>
+          <ul className="space-y-2">
+            {visibleCandidates.map((row) => (
+              <li
+                key={row.id}
+                className="group border border-tm-accent/30 bg-tm-accent/5 rounded px-4 py-2.5 text-sm flex items-start gap-3"
+              >
+                <div className="flex-1 min-w-0">
+                  <div className="font-mono text-xs text-tm-muted">
+                    {!readIds.has(row.id) && (
+                      <span className="inline-block w-1.5 h-1.5 rounded-full bg-tm-accent mr-1.5 align-middle" />
+                    )}
+                    <span className="uppercase tracking-wide">{row.kind}</span>
+                    {" · "}
+                    <span>matched "{row.matched_phrase}"</span>
+                    {" · "}
+                    <span>confidence {row.confidence.toFixed(2)}</span>
+                  </div>
+                  <div className="text-tm-text mt-1 break-words">
+                    {row.statement}
+                  </div>
+                </div>
+                <div className="flex items-center gap-2 shrink-0">
+                  <button
+                    onClick={() => {
+                      markRead(row.id);
+                      onAcceptCandidate(row);
+                    }}
+                    title="promote to open commitment"
+                    className="px-2 py-1 text-xs bg-tm-accent/20 text-tm-accent border border-tm-accent/40 rounded hover:bg-tm-accent/30"
+                  >
+                    accept
+                  </button>
+                  <button
+                    onClick={() => onDismissCandidate(row)}
+                    title="dismiss candidate"
+                    className="px-2 py-1 text-xs text-tm-muted hover:text-rose-400 border border-transparent hover:border-rose-400/30 rounded"
+                  >
+                    dismiss
+                  </button>
+                </div>
+              </li>
+            ))}
           </ul>
         </section>
       )}

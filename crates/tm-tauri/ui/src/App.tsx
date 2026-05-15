@@ -49,25 +49,35 @@ type View =
 // without a reload.
 type NavItem = { id: View; label: string; icon: string };
 
-const BASE_NAV_ITEMS: NavItem[] = [
+// 2026-05-14 — sidebar trimmed from 15 items to 6 primary surfaces.
+// Power users opt into the rest via Settings → Developer mode. The
+// six items below trace the daily flow: see what's happening (Brief)
+// → splice context for the next AI window (Composer) → search the
+// graph (Query) → visualize (Graph) → write (Ingest) → tune
+// (Settings). Composer is the wedge per `tracemind_composition_layer`.
+const PRIMARY_NAV_ITEMS: NavItem[] = [
   { id: "brief", label: "Brief", icon: "brief" },
-  { id: "dashboard", label: "Dashboard", icon: "grid" },
-  { id: "query", label: "Query", icon: "search" },
-  { id: "ingest", label: "Ingest", icon: "plus" },
-  { id: "graph", label: "Graph", icon: "graph" },
-  { id: "garden", label: "Garden", icon: "garden" },
-  { id: "context", label: "Context", icon: "context" },
-  { id: "views", label: "Views", icon: "views" },
-  { id: "threads", label: "Threads", icon: "timeline" },
   { id: "composer", label: "Composer", icon: "graph" },
+  { id: "query", label: "Query", icon: "search" },
+  { id: "graph", label: "Graph", icon: "graph" },
+  { id: "ingest", label: "Ingest", icon: "plus" },
+  { id: "settings", label: "Settings", icon: "settings" },
+];
+
+// Hidden under dev mode. These are real working surfaces — we just
+// keep them off the default sidebar so newcomers see one obvious
+// path. Inspector stays at the end of the advanced list per its
+// existing convention.
+const ADVANCED_NAV_ITEMS: NavItem[] = [
+  { id: "dashboard", label: "Dashboard", icon: "grid" },
+  { id: "threads", label: "Threads", icon: "timeline" },
+  { id: "views", label: "Views", icon: "views" },
+  { id: "context", label: "Context", icon: "context" },
+  { id: "garden", label: "Garden", icon: "garden" },
   { id: "events", label: "Events", icon: "graph" },
-  // Ontology nav removed 2026-05-13. Ontology is internal infra, not a
-  // primary surface. Schema editor moved behind Settings → Schema for
-  // power users only. Verb cards stay the visible surface.
   { id: "commitments", label: "Commitments", icon: "timeline" },
   { id: "calibration", label: "Calibration", icon: "gauge" },
   { id: "traces", label: "Traces", icon: "list" },
-  { id: "settings", label: "Settings", icon: "settings" },
 ];
 
 const INSPECTOR_NAV_ITEM: NavItem = {
@@ -194,14 +204,25 @@ export default function App() {
     return () => window.removeEventListener("tm:dev-mode-changed", handler);
   }, []);
 
+  // In normal mode: 6 primary items. In dev mode: primary items +
+  // advanced surfaces + Inspector, with Settings always last.
   const navItems = devMode
-    ? [...BASE_NAV_ITEMS.slice(0, -1), INSPECTOR_NAV_ITEM, BASE_NAV_ITEMS[BASE_NAV_ITEMS.length - 1]]
-    : BASE_NAV_ITEMS;
+    ? [
+        ...PRIMARY_NAV_ITEMS.slice(0, -1), // everything except Settings
+        ...ADVANCED_NAV_ITEMS,
+        INSPECTOR_NAV_ITEM,
+        PRIMARY_NAV_ITEMS[PRIMARY_NAV_ITEMS.length - 1], // Settings pinned to bottom
+      ]
+    : PRIMARY_NAV_ITEMS;
 
-  // If dev mode is turned off while the user is in the Inspector, route
-  // them back to Brief — otherwise they'd be stranded.
+  // If dev mode is turned off while the user is on a hidden surface,
+  // route them back to Brief — otherwise the sidebar wouldn't show
+  // their current view and they'd be stranded.
   useEffect(() => {
-    if (!devMode && view === "inspector") setView("brief");
+    if (devMode) return;
+    const visible = new Set<View>(PRIMARY_NAV_ITEMS.map((n) => n.id));
+    visible.add("onboarding");
+    if (!visible.has(view)) setView("brief");
   }, [devMode, view]);
 
   // UI-8 — route first-run users to onboarding. We detect "first run"
@@ -279,7 +300,7 @@ export default function App() {
 
         <div className="p-3 border-t border-tm-border space-y-3">
           <div>
-            <p className="text-[10px] uppercase tracking-wider text-tm-muted mb-1.5 px-1">Context</p>
+            <p className="text-[10px] uppercase tracking-wider text-tm-muted mb-1.5 px-1">Active graph</p>
             <ContextSwitcher />
           </div>
           <div className="flex items-center gap-2 px-1">

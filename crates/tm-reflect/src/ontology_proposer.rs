@@ -116,8 +116,9 @@ fn camelize(term: &str) -> String {
 }
 
 /// Persist `proposals` against the DB, skipping names that already exist
-/// as Object Types. Duplicate pending proposals are merged via
-/// [`ProposalStore::upsert`] (which bumps support_count).
+/// as Object Types *or* were previously rejected (so we don't badger).
+/// Duplicate pending proposals are merged via [`ProposalStore::upsert`]
+/// (which bumps support_count).
 pub fn persist_proposals(
     conn: &Connection,
     proposals: &[ProposedObjectType],
@@ -127,10 +128,17 @@ pub fn persist_proposals(
             .into_iter()
             .map(|o| o.name)
             .collect();
+    // Also skip anything the user already rejected. Accepted proposals
+    // are already covered above (they show up as ObjectTypes).
+    let rejected_names: std::collections::HashSet<String> =
+        ProposalStore::list_with_status(conn, "rejected")?
+            .into_iter()
+            .map(|p| p.name)
+            .collect();
 
     let mut written = 0usize;
     for p in proposals {
-        if existing_names.contains(&p.name) {
+        if existing_names.contains(&p.name) || rejected_names.contains(&p.name) {
             continue;
         }
         let row = OntologyProposal {

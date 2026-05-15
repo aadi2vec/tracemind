@@ -2921,6 +2921,49 @@ impl GraphStore {
     /// computing labels. 25 is a good default — labels stabilise at
     /// ~10 samples and we don't want this query to scan the full
     /// signal log on a huge memory.
+    /// Like [`Self::cluster_labels`] but returns the raw
+    /// `cluster_id → samples` map without running the labeler. Used by
+    /// the ONT-2 proposer runner so callers outside this crate can feed
+    /// the proposer without depending on rusqlite directly.
+    pub fn cluster_sample_map(
+        &self,
+        sample_cap: usize,
+    ) -> Result<std::collections::HashMap<i64, Vec<String>>> {
+        let conn = self.kg.connection();
+        let mut id_stmt = conn
+            .prepare(
+                "SELECT DISTINCT cluster_id FROM captured_signals \
+                 WHERE cluster_id IS NOT NULL AND cluster_id >= 0",
+            )
+            .map_err(|e| TraceMindError::Storage(format!("cluster_sample_map prep ids: {e}")))?;
+        let ids: Vec<i64> = id_stmt
+            .query_map([], |r| r.get::<_, i64>(0))
+            .map_err(|e| TraceMindError::Storage(format!("cluster_sample_map q ids: {e}")))?
+            .filter_map(|r| r.ok())
+            .collect();
+        drop(id_stmt);
+
+        let mut samples: std::collections::HashMap<i64, Vec<String>> =
+            std::collections::HashMap::new();
+        for cid in ids {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT raw_text FROM captured_signals \
+                     WHERE cluster_id = ?1 ORDER BY id DESC LIMIT ?2",
+                )
+                .map_err(|e| TraceMindError::Storage(format!("cluster_sample_map prep: {e}")))?;
+            let texts: Vec<String> = stmt
+                .query_map(params![cid, sample_cap as i64], |r| r.get::<_, String>(0))
+                .map_err(|e| TraceMindError::Storage(format!("cluster_sample_map q: {e}")))?
+                .filter_map(|r| r.ok())
+                .collect();
+            if !texts.is_empty() {
+                samples.insert(cid, texts);
+            }
+        }
+        Ok(samples)
+    }
+
     pub fn cluster_labels(
         &self,
         sample_cap: usize,

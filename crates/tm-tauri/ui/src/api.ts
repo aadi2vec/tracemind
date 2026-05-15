@@ -308,12 +308,22 @@ export interface ContradictionRow {
   cosine_similarity: number;
 }
 
+export interface CandidateRow {
+  id: string;
+  kind: string;
+  statement: string;
+  matched_phrase: string;
+  confidence: number;
+  created_at: string;
+}
+
 export interface BriefView {
   generated_at: string;
   counts: BriefCounts;
   overdue: BriefRow[];
   open: BriefRow[];
   resolved: BriefRow[];
+  candidates: CandidateRow[];
   contradictions: ContradictionRow[];
 }
 
@@ -1098,6 +1108,31 @@ export async function ontologyRejectProposal(id: string): Promise<void> {
   return invoke("cmd_ontology_reject_proposal", { proposalId: id });
 }
 
+/// Run the statistical Object Type proposer over current clusters.
+/// Returns the number of new proposals written.
+export async function ontologyRunProposer(): Promise<number> {
+  return invoke("cmd_ontology_run_proposer");
+}
+
+// ── LLM tier status ─────────────────────────────────────────────────
+
+export interface LlmStatus {
+  feature_compiled: boolean;
+  weights_present: boolean;
+  weights_path: string;
+  active: boolean;
+}
+
+export async function getLlmStatus(): Promise<LlmStatus> {
+  return invoke("cmd_llm_status");
+}
+
+/// Download the Tier-1 LLM weights (~900 MB) on demand. Resolves only
+/// after the download finishes; callers should show a spinner.
+export async function downloadLlm(): Promise<LlmStatus> {
+  return invoke("cmd_llm_download");
+}
+
 // ── LGM-2 — Anticipate ───────────────────────────────────────────────
 
 export interface AnticipateRowDto {
@@ -1253,4 +1288,47 @@ export async function threadAttachView(
 
 export async function threadAttachedView(threadId: string): Promise<string | null> {
   return invoke("cmd_thread_attached_view", { threadId });
+}
+
+// ===== Storage maintenance (2026-05-15) =====
+
+export interface FileStat {
+  name: string;
+  bytes: number;
+}
+
+export interface StorageStats {
+  data_dir: string;
+  total_bytes: number;
+  files: FileStat[];
+  entity_count: number;
+  triple_count: number;
+  signal_count: number;
+  ephemeral_signal_count: number;
+  consolidated_signal_count: number;
+  trace_line_count: number;
+}
+
+export interface CleanupReport {
+  action: string;
+  bytes_before: number;
+  bytes_after: number;
+  bytes_freed: number;
+  rows_deleted: number;
+}
+
+export async function getStorageStats(): Promise<StorageStats> {
+  return invoke("cmd_storage_stats");
+}
+
+export async function vacuumStorage(): Promise<CleanupReport> {
+  return invoke("cmd_storage_vacuum");
+}
+
+export async function cleanEphemeralStorage(): Promise<CleanupReport> {
+  return invoke("cmd_storage_clean_ephemeral");
+}
+
+export async function truncateTraces(keepRecent: number): Promise<CleanupReport> {
+  return invoke("cmd_storage_truncate_traces", { keepRecent });
 }

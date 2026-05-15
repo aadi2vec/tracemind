@@ -293,10 +293,17 @@ pub fn observe(conn: &Connection, obs: &Observation) -> Result<()> {
         let Some(value) = obs.values.get(&v.name) else {
             continue;
         };
-        let parents = PgmStore::parents_of(conn, v.id)?;
-        if parents.is_empty() {
-            // marginal — root prior. Stored as a single-row CPD against
-            // a synthetic root id (Uuid::nil) so reads always work.
+        // The synthetic nil-parent marginal counts as a *root prior*,
+        // not a real parent. Filter it out so the marginal path keeps
+        // running on every observation (otherwise support_count freezes
+        // at 1 after the first observe). We *always* update the marginal
+        // — even when real parents exist — so unconditional anticipate()
+        // stays accurate.
+        let real_parents: Vec<Dependency> = PgmStore::parents_of(conn, v.id)?
+            .into_iter()
+            .filter(|d| d.parent_id != Uuid::nil())
+            .collect();
+        {
             let key = std::iter::empty::<(String, String)>().collect::<BTreeMap<_, _>>();
             let mut existing = PgmStore::parents_of(conn, v.id)?
                 .into_iter()
@@ -322,7 +329,11 @@ pub fn observe(conn: &Connection, obs: &Observation) -> Result<()> {
                     });
                 }
             }
-            normalize(&mut entry, &v.domain);
+            // NB: we store *raw counts* in `probabilities` — not
+            // normalized probabilities. Normalization happens at read
+            // time in `posterior()`. If we normalize here, the prior
+            // gets re-injected on every observation and the most
+            // recent observation dominates (saturation bug).
             PgmStore::upsert_dependency(
                 conn,
                 &Dependency {
@@ -333,10 +344,11 @@ pub fn observe(conn: &Connection, obs: &Observation) -> Result<()> {
                     support_count: existing.as_ref().map(|d| d.support_count).unwrap_or(0) + 1,
                 },
             )?;
-        } else {
+        }
+        if !real_parents.is_empty() {
             // For each parent — store P(child|parent) marginalized as
             // separate per-parent CPDs (naive bayes-ish, keeps it small).
-            for dep in parents {
+            for dep in real_parents {
                 let parent_var = variables.iter().find(|v| v.id == dep.parent_id);
                 let Some(parent_var) = parent_var else { continue };
                 let Some(parent_value) = obs.values.get(&parent_var.name) else {
@@ -361,7 +373,7 @@ pub fn observe(conn: &Connection, obs: &Observation) -> Result<()> {
                         });
                     }
                 }
-                normalize(&mut entry, &v.domain);
+                // Raw counts — normalize on read (see comment above).
                 PgmStore::upsert_dependency(
                     conn,
                     &Dependency {
@@ -448,6 +460,31 @@ pub fn ensure_baseline_variables(conn: &Connection) -> Result<()> {
     PgmStore::upsert_variable(conn, &kind)?;
     PgmStore::upsert_variable(conn, &tw)?;
     PgmStore::upsert_variable(conn, &ctx)?;
+
+    // Declare baseline dependency: event_kind | time_window.
+    // Without this, conditioning the Anticipate API on `time_window`
+    // is a no-op (only the marginal exists). The CPD is left empty;
+    // `observe()` will populate it as observations arrive. Idempotent
+    // via upsert_dependency's ON CONFLICT.
+    let kind_v = PgmStore::get_variable_by_name(conn, "event_kind")?
+        .ok_or_else(|| TraceMindError::Storage("event_kind var missing".into()))?;
+    let tw_v = PgmStore::get_variable_by_name(conn, "time_window")?
+        .ok_or_else(|| TraceMindError::Storage("time_window var missing".into()))?;
+    let existing = PgmStore::parents_of(conn, kind_v.id)?
+        .into_iter()
+        .any(|d| d.parent_id == tw_v.id);
+    if !existing {
+        PgmStore::upsert_dependency(
+            conn,
+            &Dependency {
+                child_id: kind_v.id,
+                parent_id: tw_v.id,
+                cpd: vec![],
+                log_score: 0.0,
+                support_count: 0,
+            },
+        )?;
+    }
     Ok(())
 }
 
@@ -553,7 +590,11 @@ pub fn posterior(
     let variables = PgmStore::list_variables(conn)?;
 
     let mut used_any = false;
-    for dep in deps {
+    for mut dep in deps {
+        // `observe()` stores raw counts in cpd.probabilities. Normalize
+        // here at read time (Dirichlet α=1) so the multiplicative
+        // scoring below works on probabilities, not counts.
+        normalize(&mut dep.cpd, &var.domain);
         if dep.parent_id == Uuid::nil() {
             // marginal prior
             if let Some(row) = dep.cpd.iter().find(|c| c.parent_assignments.is_empty()) {

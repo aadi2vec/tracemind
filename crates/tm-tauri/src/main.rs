@@ -39,6 +39,10 @@ struct AppState {
     /// stays snappy. `Arc` so capture/ingest paths can share one
     /// handle.
     triple_worker: Arc<TripleWorkerHandle>,
+    /// Whether the Qwen LLM triple extractor is loaded for this process.
+    /// Surfaced to the UI via `cmd_llm_status` so the user can tell when
+    /// they're getting heuristic-only relation extraction vs the LLM tier.
+    llm_active: Arc<std::sync::atomic::AtomicBool>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1556,12 +1560,23 @@ struct ContradictionRowView {
 }
 
 #[derive(Serialize)]
+struct CandidateRowView {
+    id: String,
+    kind: String,
+    statement: String,
+    matched_phrase: String,
+    confidence: f32,
+    created_at: String,
+}
+
+#[derive(Serialize)]
 struct BriefView {
     generated_at: String,
     counts: BriefCountsView,
     overdue: Vec<BriefRowView>,
     open: Vec<BriefRowView>,
     resolved: Vec<BriefRowView>,
+    candidates: Vec<CandidateRowView>,
     contradictions: Vec<ContradictionRowView>,
 }
 
@@ -1635,6 +1650,22 @@ fn cmd_brief(state: State<AppState>) -> Result<BriefView, String> {
         overdue: brief.overdue.iter().map(row_view).collect(),
         open: brief.open.iter().map(row_view).collect(),
         resolved: brief.resolved.iter().map(resolved_view).collect(),
+        candidates: brief
+            .candidates
+            .iter()
+            .map(|c| CandidateRowView {
+                id: c.id.to_string(),
+                kind: format!("{:?}", c.kind),
+                statement: c.statement.clone(),
+                matched_phrase: c.matched_phrase.clone(),
+                confidence: c.confidence,
+                created_at: c
+                    .created_at
+                    .with_timezone(&chrono::Local)
+                    .format("%Y-%m-%d %H:%M")
+                    .to_string(),
+            })
+            .collect(),
         contradictions: brief
             .contradictions
             .iter()
@@ -1891,6 +1922,93 @@ fn cmd_accept_candidate(id: String, state: State<AppState>) -> Result<String, St
         .accept_candidate(cid)
         .map_err(|e| format!("accept: {e}"))?;
     Ok(new_id.to_string())
+}
+
+/// LLM backend status — surfaces whether the Qwen tier is active so the
+/// UI can render a "LLM on / heuristic only" badge. `feature_compiled`
+/// reflects build-time `local-llm` gate; `weights_present` reflects
+/// runtime weights at `~/.tracemind/models/qwen2.5-1.5b-instruct-q4_k_m.gguf`;
+/// `active` is true only when both are true (the worker actually loaded).
+#[derive(Serialize)]
+struct LlmStatusView {
+    feature_compiled: bool,
+    weights_present: bool,
+    weights_path: String,
+    active: bool,
+}
+
+#[tauri::command]
+fn cmd_llm_status(state: State<AppState>) -> Result<LlmStatusView, String> {
+    let dir = data_dir(&state);
+    let path = dir
+        .join("models")
+        .join("qwen2.5-1.5b-instruct-q4_k_m.gguf");
+    let feature_compiled = cfg!(feature = "local-llm");
+    let weights_present = path.exists();
+    let active = state.llm_active.load(std::sync::atomic::Ordering::Relaxed);
+    Ok(LlmStatusView {
+        feature_compiled,
+        weights_present,
+        weights_path: path.to_string_lossy().to_string(),
+        active,
+    })
+}
+
+/// Download (or verify) the Qwen 2.5 1.5B Q4_K_M GGUF on demand. Blocking,
+/// ~900 MB first run. Returns the post-download `LlmStatusView` so the UI
+/// can flip the "HEURISTIC ONLY" badge without a follow-up call. The active
+/// bit is updated optimistically — the worker still needs to load weights
+/// on its next consolidation tick before LLM extraction actually fires.
+#[tauri::command]
+async fn cmd_llm_download(state: State<'_, AppState>) -> Result<LlmStatusView, String> {
+    let dir = data_dir(&state);
+    let llm_active = state.llm_active.clone();
+    let path = tokio::task::spawn_blocking(move || tm_ingest::ensure_qwen_weights(&dir))
+        .await
+        .map_err(|e| format!("join: {e}"))?
+        .map_err(|e| e.to_string())?;
+    if cfg!(feature = "local-llm") {
+        llm_active.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    Ok(LlmStatusView {
+        feature_compiled: cfg!(feature = "local-llm"),
+        weights_present: true,
+        weights_path: path.to_string_lossy().to_string(),
+        active: llm_active.load(std::sync::atomic::Ordering::Relaxed),
+    })
+}
+
+// ── Storage maintenance ──────────────────────────────────────────────
+// Settings → Storage panel. Mirrors `tm_graph::maintenance` 1:1 so the
+// CLI and the UI share the same surface area. Every destructive op
+// returns a `CleanupReport` the UI renders verbatim ("freed 1.2 MB,
+// deleted 47 rows").
+
+#[tauri::command]
+fn cmd_storage_stats(state: State<AppState>) -> Result<tm_graph::StorageStats, String> {
+    let dir = data_dir(&state);
+    tm_graph::storage_stats(&dir).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn cmd_storage_vacuum(state: State<AppState>) -> Result<tm_graph::CleanupReport, String> {
+    let dir = data_dir(&state);
+    tm_graph::vacuum_all(&dir).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn cmd_storage_clean_ephemeral(state: State<AppState>) -> Result<tm_graph::CleanupReport, String> {
+    let dir = data_dir(&state);
+    tm_graph::clean_ephemeral(&dir).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn cmd_storage_truncate_traces(
+    state: State<AppState>,
+    keep_recent: usize,
+) -> Result<tm_graph::CleanupReport, String> {
+    let dir = data_dir(&state);
+    tm_graph::truncate_traces(&dir, keep_recent).map_err(|e| e.to_string())
 }
 
 /// Dismiss a pending mined candidate (marks it `dismissed` so it never
@@ -5361,6 +5479,18 @@ fn main() {
     // Falls back to heuristic when the GGUF is missing so the worker
     // always runs. Drop the GGUF at ~/.tracemind/models/qwen2.5-1.5b-instruct-q4_k_m.gguf
     // to enable LLM-quality triples; NER stays deterministic on the hot path.
+    // Track whether the LLM extractor was successfully loaded so the UI
+    // can surface "LLM on" / "heuristic only" without re-probing the
+    // filesystem on every call.
+    let llm_active = std::sync::atomic::AtomicBool::new(false);
+    let model_path = dir
+        .join("models")
+        .join("qwen2.5-1.5b-instruct-q4_k_m.gguf");
+    if cfg!(feature = "local-llm") && model_path.exists() {
+        llm_active.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    let llm_active = Arc::new(llm_active);
+
     let triple_worker = Arc::new(TripleWorker::spawn_qwen_or_default(
         WorkerDb::Path(db_path.clone()),
         64,
@@ -5382,6 +5512,7 @@ fn main() {
         trace_store,
         capture_enabled,
         triple_worker,
+        llm_active,
     };
 
     tauri::Builder::default()
@@ -5413,6 +5544,8 @@ fn main() {
             cmd_next_actions,
             cmd_accept_candidate,
             cmd_dismiss_candidate,
+            cmd_llm_status,
+            cmd_llm_download,
             cmd_triple_detail,
             cmd_resolve_contradiction,
             cmd_record_outcome,
@@ -5479,7 +5612,12 @@ fn main() {
             sprint_commands::cmd_ontology_proposals,
             sprint_commands::cmd_ontology_accept_proposal,
             sprint_commands::cmd_ontology_reject_proposal,
+            sprint_commands::cmd_ontology_run_proposer,
             sprint_commands::cmd_anticipate,
+            cmd_storage_stats,
+            cmd_storage_vacuum,
+            cmd_storage_clean_ephemeral,
+            cmd_storage_truncate_traces,
         ])
         .setup(move |app| {
             let handle = app.handle().clone();

@@ -16,6 +16,7 @@ import {
   ontologyAcceptProposal,
   ontologyProposals,
   ontologyRejectProposal,
+  ontologyRunProposer,
   type OntologyProposalDto,
 } from "../api";
 
@@ -23,6 +24,8 @@ export default function OntologyProposals() {
   const [rows, setRows] = useState<OntologyProposalDto[]>([]);
   const [err, setErr] = useState<string>("");
   const [pendingId, setPendingId] = useState<string | null>(null);
+  const [scanning, setScanning] = useState(false);
+  const [lastScanWrote, setLastScanWrote] = useState<number | null>(null);
 
   const refresh = useCallback(() => {
     ontologyProposals()
@@ -35,7 +38,30 @@ export default function OntologyProposals() {
 
   useEffect(() => {
     refresh();
+    // Auto-scan once on mount so the panel populates without a manual click.
+    ontologyRunProposer()
+      .then((n) => {
+        setLastScanWrote(n);
+        if (n > 0) refresh();
+      })
+      .catch(() => {
+        // Silent — the manual button is always available.
+      });
   }, [refresh]);
+
+  const onScan = async () => {
+    setScanning(true);
+    setErr("");
+    try {
+      const n = await ontologyRunProposer();
+      setLastScanWrote(n);
+      refresh();
+    } catch (e) {
+      setErr(String(e));
+    } finally {
+      setScanning(false);
+    }
+  };
 
   const onAccept = async (id: string) => {
     setPendingId(id);
@@ -64,13 +90,24 @@ export default function OntologyProposals() {
   if (rows.length === 0 && !err) {
     return (
       <section className="bg-tm-surface border border-tm-border rounded-lg p-5 mb-3">
-        <h3 className="text-lg font-medium text-tm-text">
-          Ontology proposals
-        </h3>
+        <div className="flex items-center justify-between">
+          <h3 className="text-lg font-medium text-tm-text">
+            Ontology proposals
+          </h3>
+          <button
+            onClick={onScan}
+            disabled={scanning}
+            className="text-xs px-3 py-1 rounded border border-tm-border text-tm-muted hover:bg-white/5 disabled:opacity-40"
+          >
+            {scanning ? "Scanning…" : "Scan now"}
+          </button>
+        </div>
         <p className="text-xs text-tm-muted mt-1 max-w-xl">
           When recurring clusters in your memory look like a new kind of
-          thing, TraceMind will suggest naming them here. Nothing pending
-          right now.
+          thing, TraceMind will suggest naming them here.
+          {lastScanWrote === 0
+            ? " Last scan didn't surface anything new."
+            : " Nothing pending right now."}
         </p>
       </section>
     );
@@ -82,9 +119,16 @@ export default function OntologyProposals() {
         <h3 className="text-lg font-medium text-tm-text">
           Ontology proposals
         </h3>
-        <span className="text-xs text-tm-muted">
-          {rows.length} pending
-        </span>
+        <div className="flex items-center gap-2">
+          <span className="text-xs text-tm-muted">{rows.length} pending</span>
+          <button
+            onClick={onScan}
+            disabled={scanning}
+            className="text-xs px-2 py-0.5 rounded border border-tm-border text-tm-muted hover:bg-white/5 disabled:opacity-40"
+          >
+            {scanning ? "Scanning…" : "Scan now"}
+          </button>
+        </div>
       </div>
       <p className="text-xs text-tm-muted mb-3 max-w-xl">
         Statistical suggestions from your memory. Accepting one creates a
