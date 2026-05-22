@@ -612,7 +612,11 @@ export default function GraphView() {
         <div className="flex items-center gap-3">
           {data && (
             <span className="text-xs text-tm-muted">
-              {nodesRef.current.length} nodes, {edgesRef.current.length} edges
+              {/* Use data length until refs are populated by the sim effect,
+                  otherwise the header flashes "0 nodes, 0 edges" on first
+                  paint even though the data arrived. */}
+              {(nodesRef.current.length || data.nodes.length)} nodes,{" "}
+              {(edgesRef.current.length || data.edges.length)} edges
               {filter !== "all" && ` (filtered from ${data.nodes.length})`}
             </span>
           )}

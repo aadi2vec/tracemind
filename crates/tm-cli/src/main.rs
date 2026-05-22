@@ -155,6 +155,29 @@ enum Commands {
         #[arg(long, default_value = "0.05")]
         threshold: f64,
     },
+    /// Re-run the current heuristic classifier over every stored
+    /// entity name and update `entity_type` when the verdict differs.
+    /// Fixes legacy rows the old, looser heuristic and GLiNER mislabeled
+    /// (e.g. `UcbBandit`/`Anticipate` stored as Organization).
+    Reclassify {
+        /// Print the changes that *would* be made without writing.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Recompute Louvain communities and c-TF-IDF community labels.
+    /// Equivalent to the Tauri `cmd_consolidate` slow path without the
+    /// LLM relabeler — useful for verifying the labeler pipeline from
+    /// the CLI after changing the labeling code.
+    Relabel,
+    /// Purge single-token entities whose name is a heuristic stopword
+    /// (e.g. `entirely`, `plane`, `during`, `we'll`) — leftover noise
+    /// from earlier ingest runs before the classifier was tightened.
+    /// Deletes the entity, its relations, and its vector.
+    PurgeStopwords {
+        /// Print the entities that *would* be purged without writing.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Manage procedures (learnable action sequences)
     Proc {
         #[command(subcommand)]
@@ -1457,6 +1480,154 @@ fn main() {
             let below = graph.decay_all(factor, threshold)
                 .expect("decay failed");
             println!("Decay applied (factor={factor}). {below} entities below {threshold} threshold.");
+        }
+
+        Commands::Relabel => {
+            let graph = GraphStore::open(&db_path)
+                .expect("failed to open graph store");
+            let cstats = graph.recompute_communities()
+                .expect("recompute_communities failed");
+            println!(
+                "communities: {} entities → {} communities (modularity {:.3})",
+                cstats.n_entities, cstats.n_communities, cstats.modularity
+            );
+            let lstats = graph.recompute_community_labels()
+                .expect("recompute_community_labels failed");
+            println!(
+                "labels: {} populated communities, {} labeled, {} skipped",
+                lstats.n_communities, lstats.n_labeled, lstats.n_skipped
+            );
+        }
+
+        Commands::Reclassify { dry_run } => {
+            use tm_ingest::classify_token;
+            use tm_types::EntityType;
+            let graph = GraphStore::open(&db_path)
+                .expect("failed to open graph store");
+            let rows = graph.list_entity_types()
+                .expect("failed to list entities");
+            let total = rows.len();
+            let mut changed = 0usize;
+            let mut unchanged = 0usize;
+            let mut preserved_custom = 0usize;
+            for (id, name, current) in rows {
+                // Only touch entities currently typed as one of the three
+                // labels the heuristic actually produces. `MapOfContent`,
+                // `Custom(_)`, `Event`, `Url`, `File`, `Technology` are
+                // either graph-system or LLM-assigned and outside the
+                // heuristic's competence — leave them alone.
+                if !matches!(
+                    current,
+                    EntityType::Person | EntityType::Organization | EntityType::Concept
+                ) {
+                    preserved_custom += 1;
+                    continue;
+                }
+                // Restrict to single-token entities — multi-word Person
+                // classifications include real full names ("Aaditya
+                // Srivathsan") that the heuristic can't distinguish from
+                // noun phrases. Only the cheap single-token downgrades
+                // are safe to apply automatically.
+                if name.split_whitespace().count() > 1 {
+                    unchanged += 1;
+                    continue;
+                }
+                let proposed = classify_token(&name);
+                let Some(proposed) = proposed else {
+                    unchanged += 1;
+                    continue;
+                };
+                if proposed == current {
+                    unchanged += 1;
+                    continue;
+                }
+                // Don't *upgrade* a Concept to Person/Org — too risky
+                // ("Anthropic" looks like a Person to the heuristic).
+                // Only the *downgrade* direction (Person/Org → Concept)
+                // is safe enough to apply automatically.
+                let is_safe_downgrade = matches!(
+                    (&current, &proposed),
+                    (EntityType::Person, EntityType::Concept)
+                        | (EntityType::Organization, EntityType::Concept)
+                        | (EntityType::Person, EntityType::Organization)
+                );
+                if !is_safe_downgrade {
+                    unchanged += 1;
+                    continue;
+                }
+                println!(
+                    "  {:<32} {:>14?} → {:?}",
+                    truncate_str(&name, 32),
+                    current,
+                    proposed,
+                );
+                if !dry_run {
+                    if let Err(e) = graph.set_entity_type(id, proposed.clone()) {
+                        eprintln!("    ! update failed: {e}");
+                    } else {
+                        changed += 1;
+                    }
+                } else {
+                    changed += 1;
+                }
+            }
+            println!(
+                "\n{}: {} reviewed | {} reclassified | {} unchanged | {} non-heuristic preserved",
+                if dry_run { "DRY RUN" } else { "Reclassify done" },
+                total, changed, unchanged, preserved_custom
+            );
+        }
+
+        Commands::PurgeStopwords { dry_run } => {
+            use tm_ingest::classify_token;
+            use tm_types::EntityType;
+            let graph = GraphStore::open(&db_path)
+                .expect("failed to open graph store");
+            let rows = graph.list_entity_types()
+                .expect("failed to list entities");
+            let total = rows.len();
+            let mut purged = 0usize;
+            let mut skipped_multiword = 0usize;
+            let mut skipped_non_heuristic = 0usize;
+            let mut skipped_valid = 0usize;
+            for (id, name, current) in rows {
+                // Restrict to the three types the heuristic actually produces.
+                if !matches!(
+                    current,
+                    EntityType::Person | EntityType::Organization | EntityType::Concept
+                ) {
+                    skipped_non_heuristic += 1;
+                    continue;
+                }
+                // Single-token only — multi-word entities ("Aaditya Srivathsan",
+                // "Google Gemini") aren't candidates for stopword purge.
+                if name.split_whitespace().count() > 1 {
+                    skipped_multiword += 1;
+                    continue;
+                }
+                // classify_token returns None for STOPWORDS / SKIP_WORDS /
+                // pure-punctuation / too-short tokens — exactly the noise
+                // we want to delete.
+                if classify_token(&name).is_some() {
+                    skipped_valid += 1;
+                    continue;
+                }
+                println!("  purge {:<32} ({:?})", truncate_str(&name, 32), current);
+                if !dry_run {
+                    if let Err(e) = graph.delete_entity(id) {
+                        eprintln!("    ! delete failed: {e}");
+                    } else {
+                        purged += 1;
+                    }
+                } else {
+                    purged += 1;
+                }
+            }
+            println!(
+                "\n{}: {} reviewed | {} purged | {} valid kept | {} multi-word kept | {} non-heuristic kept",
+                if dry_run { "DRY RUN" } else { "Purge done" },
+                total, purged, skipped_valid, skipped_multiword, skipped_non_heuristic
+            );
         }
 
         Commands::Trace { limit, id } => {

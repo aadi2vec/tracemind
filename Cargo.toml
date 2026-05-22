@@ -28,6 +28,8 @@ members = [
     "crates/tm-tms",
     "crates/tm-engram",
     "crates/tm-pgm",
+    "crates/tm-cluster",
+    "crates/tm-bench-wme",
 ]
 
 [workspace.package]
@@ -93,6 +95,7 @@ tm-modal = { path = "crates/tm-modal" }
 tm-tms = { path = "crates/tm-tms" }
 tm-engram = { path = "crates/tm-engram" }
 tm-pgm = { path = "crates/tm-pgm" }
+tm-cluster = { path = "crates/tm-cluster" }
 
 [profile.release]
 opt-level = 3

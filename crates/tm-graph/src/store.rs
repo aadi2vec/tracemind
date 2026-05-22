@@ -1487,6 +1487,47 @@ impl GraphStore {
     }
 
     /// Reinforce an existing entity's confidence and update its timestamp.
+    /// Iterate every entity as `(uuid, name, entity_type)`. Used by the
+    /// `tracemind reclassify` CLI backfill — small data layer that the
+    /// caller can pair with the current heuristic to repair legacy rows
+    /// the looser GLiNER + heuristic mislabeled.
+    pub fn list_entity_types(&self) -> Result<Vec<(Uuid, String, EntityType)>> {
+        let map = self.entity_map.borrow();
+        let mut out = Vec::with_capacity(map.len());
+        for (uuid, &skg_id) in map.iter() {
+            let skg_ent = self
+                .kg
+                .get_entity(skg_id)
+                .map_err(|e| TraceMindError::Storage(format!("skg get_entity: {e}")))?;
+            let etype: EntityType = serde_json::from_str(&skg_ent.entity_type)
+                .map_err(|e| TraceMindError::Storage(format!("entity_type parse: {e}")))?;
+            out.push((*uuid, skg_ent.name.clone(), etype));
+        }
+        Ok(out)
+    }
+
+    /// Overwrite an entity's `entity_type` in place. Touches nothing else
+    /// (name, properties, confidence, context tag all preserved).
+    pub fn set_entity_type(&self, id: Uuid, etype: EntityType) -> Result<()> {
+        let map = self.entity_map.borrow();
+        let &skg_id = map.get(&id).ok_or_else(|| {
+            TraceMindError::Storage(format!("entity {id} not in id map"))
+        })?;
+        drop(map);
+        let mut skg_ent = self
+            .kg
+            .get_entity(skg_id)
+            .map_err(|e| TraceMindError::Storage(format!("skg get_entity: {e}")))?;
+        let etype_json = serde_json::to_string(&etype)
+            .map_err(|e| TraceMindError::Storage(e.to_string()))?;
+        skg_ent.entity_type = etype_json;
+        skg_ent.set_property("updated_at", json!(Utc::now().to_rfc3339()));
+        self.kg
+            .update_entity(&skg_ent)
+            .map_err(|e| TraceMindError::Storage(format!("skg update_entity: {e}")))?;
+        Ok(())
+    }
+
     pub fn reinforce_entity(&self, id: Uuid, amount: f64) -> Result<()> {
         let map = self.entity_map.borrow();
         let &skg_id = map.get(&id).ok_or_else(|| {
@@ -2334,6 +2375,106 @@ impl GraphStore {
         Ok(signals)
     }
 
+    /// CLU-2 — every captured signal that still carries an embedding,
+    /// regardless of cluster assignment. Used by the periodic full
+    /// HDBSCAN re-cluster so already-assigned events can move between
+    /// clusters when the new partition is computed.
+    ///
+    /// Returned pairs are `(content_hash_hex, embedding)` so callers
+    /// can feed [`tm_cluster::Clusterer::recluster`] directly. The hex
+    /// format (16-char lowercase, zero-padded) matches what
+    /// `IngestPipeline::ingest_fast` uses when it calls
+    /// `Clusterer::assign`, so re-clustering an event updates the
+    /// existing record instead of inserting a duplicate.
+    pub fn all_signals_with_embeddings(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<(String, Vec<f32>)>> {
+        let conn = self.kg.connection();
+        let mut stmt = conn
+            .prepare(
+                "SELECT content_hash, embedding FROM captured_signals \
+                 WHERE embedding IS NOT NULL AND priority_tier < 4 \
+                 ORDER BY id DESC LIMIT ?1",
+            )
+            .map_err(|e| TraceMindError::Storage(format!("prep all_signals: {e}")))?;
+        let rows = stmt
+            .query_map(params![limit as i64], |row| {
+                let hash_i64: i64 = row.get(0)?;
+                let blob: Vec<u8> = row.get(1)?;
+                Ok((hash_i64, blob))
+            })
+            .map_err(|e| TraceMindError::Storage(format!("query all_signals: {e}")))?;
+        let mut out = Vec::new();
+        for r in rows {
+            let (hash_i64, blob) =
+                r.map_err(|e| TraceMindError::Storage(e.to_string()))?;
+            if blob.len() < 4 || blob.len() % 4 != 0 {
+                continue;
+            }
+            let embedding: Vec<f32> = blob
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
+            out.push((format!("{:016x}", hash_i64 as u64), embedding));
+        }
+        Ok(out)
+    }
+
+    /// CLU-5 — Louvain community pass over `kg_entities` + `kg_relations`.
+    /// Thin wrapper around [`crate::community::recompute_communities`] so
+    /// callers (Tauri `cmd_consolidate`, CLI consolidate path) don't need
+    /// a direct `KnowledgeGraph` handle.
+    pub fn recompute_communities(&self) -> Result<crate::community::CommunityStats> {
+        crate::community::recompute_communities(&self.kg)
+    }
+
+    /// CLU-2 / SALIENCE — recompute per-entity salience over the live
+    /// graph. Thin wrapper around [`crate::salience::recompute`] for
+    /// the same reasons as [`Self::recompute_communities`].
+    pub fn recompute_salience(&self) -> Result<crate::salience::SalienceStats> {
+        crate::salience::recompute(&self.kg)
+    }
+
+    /// CLU-5b — Recompute c-TF-IDF labels for every populated community.
+    /// Must run after [`Self::recompute_communities`] in the same pass.
+    pub fn recompute_community_labels(
+        &self,
+    ) -> Result<crate::community::CommunityLabelStats> {
+        crate::community::recompute_community_labels(&self.kg)
+    }
+
+    /// Read-back of the persisted `community_id -> label` map. Empty
+    /// until [`Self::recompute_community_labels`] has run at least once.
+    pub fn community_label_map(
+        &self,
+    ) -> Result<std::collections::HashMap<i64, crate::community::CommunityLabel>> {
+        crate::community::community_label_map(&self.kg)
+    }
+
+    /// CLU-5c — sample inputs for the slow-path LLM community labeler.
+    /// Returns the top-`n` communities (by size) with their member names
+    /// and intra-community relation types so a Tier-1 LLM can name them.
+    pub fn top_community_samples(
+        &self,
+        top_n: usize,
+        max_names: usize,
+        max_rels: usize,
+    ) -> Result<Vec<crate::community::CommunitySample>> {
+        crate::community::top_community_samples(&self.kg, top_n, max_names, max_rels)
+    }
+
+    /// Upsert a single community label. Used by the LLM labeler to
+    /// overwrite the c-TF-IDF fallback for the largest communities.
+    pub fn set_community_label(
+        &self,
+        community_id: i64,
+        label: &str,
+        terms_json: &str,
+    ) -> Result<()> {
+        crate::community::set_community_label(&self.kg, community_id, label, terms_json)
+    }
+
     /// Search unpromoted signals by cosine similarity to a query embedding.
     /// Used by the hybrid retrieval path so fresh captures are findable even
     /// before consolidation has promoted them to entities.
@@ -3087,7 +3228,11 @@ impl GraphStore {
                 .query_row("SELECT COUNT(*) FROM kg_entities", [], |row| row.get(0))
                 .unwrap_or(0);
             let mut names_stmt = conn
-                .prepare("SELECT name FROM kg_entities ORDER BY id DESC LIMIT 3")
+                .prepare(
+                    "SELECT name FROM kg_entities \
+                     WHERE entity_type != '\"map_of_content\"' \
+                     ORDER BY id DESC LIMIT 3",
+                )
                 .map_err(|e| TraceMindError::Storage(format!("community names prep: {e}")))?;
             let samples: Vec<String> = names_stmt
                 .query_map([], |row| row.get::<_, String>(0))
@@ -3115,9 +3260,12 @@ impl GraphStore {
         for (cid, count) in rows {
             let names: Vec<String> = match cid {
                 Some(c) => {
+                    // Exclude MOC entities so the secondary text shows
+                    // real concepts, not "indexes indexes ..." backlinks.
                     let mut s = conn
                         .prepare(
                             "SELECT name FROM kg_entities WHERE community_id = ?1 \
+                             AND entity_type != '\"map_of_content\"' \
                              ORDER BY id DESC LIMIT 3",
                         )
                         .map_err(|e| TraceMindError::Storage(format!("c names prep: {e}")))?;
@@ -3132,6 +3280,7 @@ impl GraphStore {
                     let mut s = conn
                         .prepare(
                             "SELECT name FROM kg_entities WHERE community_id IS NULL \
+                             AND entity_type != '\"map_of_content\"' \
                              ORDER BY id DESC LIMIT 3",
                         )
                         .map_err(|e| TraceMindError::Storage(format!("c names prep: {e}")))?;

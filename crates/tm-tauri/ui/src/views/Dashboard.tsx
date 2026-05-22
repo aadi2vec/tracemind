@@ -1,6 +1,7 @@
 import { useEffect, useState, useRef } from "react";
 import { getDashboard, demoIngest, getNextActions, entityClick, toggleCapture, getCaptureStatus, getSurprising, getEntityTrends, consolidateMemory, acceptCandidate, dismissCandidate, type DashboardStats, type NextActionInfo, type CaptureEvent, type SurprisingEntity, type TrendPoint } from "../api";
 import { listen } from "@tauri-apps/api/event";
+import WmeCardsPanel from "./WmeCardsPanel";
 
 function StatCard({ label, value, sub }: { label: string; value: string | number; sub?: string }) {
   return (
@@ -134,7 +135,16 @@ export default function Dashboard() {
               setConsolidateResult(null);
               try {
                 const r = await consolidateMemory();
-                setConsolidateResult(`+${r.entities_strengthened} -${r.entities_decayed} pruned:${r.entities_pruned} merged:${r.entities_merged}`);
+                const base = `+${r.entities_strengthened} -${r.entities_decayed} pruned:${r.entities_pruned} merged:${r.entities_merged}`;
+                const cluster = r.cluster_skipped_reason
+                  ? `clusters:skip(${r.cluster_skipped_reason})`
+                  : `clusters:${r.cluster_n_clusters} (assigned ${r.cluster_n_assigned}, outliers ${r.cluster_n_outliers})`;
+                const topLabels = (r.community_top_labels ?? []).slice(0, 3).join(" · ");
+                const comm = topLabels
+                  ? `communities:${r.community_n_communities} (Q=${r.community_modularity.toFixed(3)}) → ${topLabels}`
+                  : `communities:${r.community_n_communities} (Q=${r.community_modularity.toFixed(3)})`;
+                const sal = `salience:${r.salience_n_scored}`;
+                setConsolidateResult(`${base} · ${cluster} · ${comm} · ${sal}`);
                 refresh();
               } catch (e) { setConsolidateResult(`Error: ${e}`); }
               finally { setConsolidating(false); }
@@ -295,6 +305,9 @@ export default function Dashboard() {
           </div>
         </div>
       )}
+
+      {/* WME — verb-first working-memory cards (WME-5) */}
+      <WmeCardsPanel limit={8} title="Working Memory" />
 
       {/* Next Actions — verb-first action feed (2026-05-11) */}
       {nextActions.length > 0 && (

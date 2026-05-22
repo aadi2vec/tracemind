@@ -8,7 +8,10 @@ pub mod triple_worker;
 
 pub use extractor::{EntityExtractor, HeuristicExtractor};
 pub use gliner::{GlinerExtractor, SpanHit, DEFAULT_LABELS, DEFAULT_THRESHOLD};
-pub use pipeline::{ConsolidateStats, FastIngestResult, IngestPipeline, IngestResult, SignalPriority};
+pub use pipeline::{
+    classify_multi_word, classify_token, ConsolidateStats, FastIngestResult, IngestPipeline,
+    IngestResult, SignalPriority,
+};
 pub use qwen::{
     build_qwen_prompt, ensure_qwen_weights, parse_qwen_response, qwen_weights_path,
     QwenTripleConfig, QwenTripleExtractor, QWEN_HF_FILE, QWEN_HF_REPO,

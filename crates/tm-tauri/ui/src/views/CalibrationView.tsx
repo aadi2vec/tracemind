@@ -107,7 +107,7 @@ export default function CalibrationView() {
       <section className="bg-tm-surface border border-tm-border rounded-lg p-4">
         <h3 className="text-sm font-medium text-tm-text mb-2">Bandit arms (LinUCB)</h3>
         <p className="text-xs text-tm-muted mb-3">
-          The retrieval engine picks one of five strategies per query. "Avg reward" tracks
+          The retrieval engine picks one of six strategies per query. "Avg reward" tracks
           which arms your feedback has voted up.
         </p>
         {dash && (

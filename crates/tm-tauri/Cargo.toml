@@ -17,8 +17,13 @@ tm-episodic = { workspace = true }
 tm-controller = { workspace = true }
 tm-reason = { workspace = true }
 tm-reflect = { workspace = true }
+tm-cluster = { workspace = true }
 tm-intent = { workspace = true }
 tm-pgm = { workspace = true }
+# Optional: Qwen 2.5 1.5B Q4 via llama-cpp for LLM-generated community
+# labels. Gated by the `local-llm` feature so the heuristic-only build
+# (the one used for fast iteration / CI) doesn't pull in cmake.
+tm-answer = { workspace = true, optional = true }
 chrono = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -50,4 +55,4 @@ custom-protocol = ["tauri/custom-protocol"]
 # back to the heuristic extractor only (no cmake / no LLM weights).
 # Runtime fallback to heuristic also kicks in automatically when the GGUF
 # weights are missing — see `TripleWorker::spawn_qwen_or_default`.
-local-llm = ["tm-ingest/local-llm"]
+local-llm = ["dep:tm-answer", "tm-answer/local-llm"]

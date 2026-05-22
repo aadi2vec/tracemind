@@ -8,6 +8,7 @@ authors.workspace = true
 tm-intent = { workspace = true }
 tm-world-model = { workspace = true }
 tm-graph = { workspace = true }
+tm-cluster = { workspace = true }
 
 serde = { workspace = true }
 serde_json = { workspace = true }

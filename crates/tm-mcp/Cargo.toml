@@ -30,6 +30,7 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
 seahash = { workspace = true }
+rusqlite = { workspace = true }
 
 [features]
 default = []

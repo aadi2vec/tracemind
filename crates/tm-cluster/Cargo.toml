@@ -1,0 +1,28 @@
+[package]
+name = "tm-cluster"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+
+# CLU-1..8 — HDBSCAN-first event clustering substrate. Indexes the same
+# capture stream as tm-graph (relational) and tm-vector (semantic) from
+# the topical/temporal angle. CPU-only, Rust-native, persisted in SQLite.
+
+[dependencies]
+tm-types = { workspace = true }
+# CLU-6 — c-TF-IDF labels. tm-graph::labeler does the math; we just
+# orchestrate (text-resolve member events → label → persist).
+tm-graph = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+rusqlite = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+# HDBSCAN (Rust-native, CPU-only). Pinned to a known-good range.
+hdbscan = "0.10"
+
+[dev-dependencies]
+tempfile = "3"

@@ -2047,6 +2047,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "hdbscan"
+version = "0.10.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d4317842ec54a54ca44aa9bd7f599f5b723c07eaeb4a98875909724500c9cf1a"
+dependencies = [
+ "kdtree",
+ "num-traits",
+]
+
+[[package]]
 name = "heck"
 version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2657,6 +2667,16 @@ checksum = "5dea2b27dd239b2556ed7a25ba842fe47fd602e7fc7433c2a8d6106d4d9edd70"
 dependencies = [
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "kdtree"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0f0a0e9f770b65bac9aad00f97a67ab5c5319effed07f6da385da3c2115e47ba"
+dependencies = [
+ "num-traits",
+ "thiserror 1.0.69",
 ]
 
 [[package]]
@@ -5830,6 +5850,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "tm-bench-wme"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tm-reflect",
+ "tm-types",
+ "uuid",
+]
+
+[[package]]
 name = "tm-capture"
 version = "0.1.0"
 dependencies = [
@@ -5873,6 +5906,23 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
+name = "tm-cluster"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "hdbscan",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tm-graph",
+ "tm-types",
+ "tracing",
  "uuid",
 ]
 
@@ -5959,6 +6009,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror 1.0.69",
+ "tm-cluster",
  "tm-governance",
  "tm-graph",
  "tm-types",
@@ -5988,6 +6039,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "chrono",
+ "rusqlite",
  "seahash",
  "serde",
  "serde_json",
@@ -6059,6 +6111,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror 1.0.69",
+ "tm-cluster",
  "tm-graph",
  "tm-intent",
  "tm-types",
@@ -6112,6 +6165,8 @@ dependencies = [
  "serde_json",
  "tauri",
  "tauri-build",
+ "tm-answer",
+ "tm-cluster",
  "tm-controller",
  "tm-episodic",
  "tm-graph",

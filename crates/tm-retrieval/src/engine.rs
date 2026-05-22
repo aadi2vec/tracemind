@@ -2135,6 +2135,20 @@ fn cosine_sim(a: &[f32], b: &[f32]) -> f32 {
     }
 }
 
+/// Persist any unfinalized bandit reward on engine drop. Without this,
+/// short-lived processes (single CLI query, one-shot Tauri sessions)
+/// always lose the last query's arm pull because the reward is only
+/// finalized by the *next* call to `query()` — which never arrives. The
+/// symptom was an empty `~/.tracemind/bandit.json` even after a dozen
+/// retrievals across sessions.
+impl Drop for RetrievalEngine {
+    fn drop(&mut self) {
+        if self.pending_reward.is_some() {
+            self.finalize_pending_reward();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

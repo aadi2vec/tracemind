@@ -18,6 +18,10 @@ use tm_ingest::{IngestPipeline, TripleJob, TripleWorker, TripleWorkerHandle, Wor
 use tm_retrieval::RetrievalEngine;
 
 mod sprint_commands;
+mod wme_commands;
+
+#[cfg(feature = "local-llm")]
+mod community_label_llm;
 
 // ---------------------------------------------------------------------------
 // App state
@@ -206,10 +210,12 @@ struct RecommendationInfo {
 // Helpers
 // ---------------------------------------------------------------------------
 
-const ARM_NAMES: [&str; 5] = ["vector-only", "graph-heavy", "hybrid", "episodic", "colbert"];
-
+// Delegate to `tm_controller::UcbBandit::arm_name` so the UI label
+// stays in sync with the bandit's real arm count (NUM_ARMS = 6 incl.
+// the subgraph_colbert arm). The old hand-written 5-element table
+// produced "Unknown" for arm 5 in the Calibration view.
 fn arm_name(arm: u8) -> String {
-    ARM_NAMES.get(arm as usize).unwrap_or(&"unknown").to_string()
+    UcbBandit::arm_name(arm).to_string()
 }
 
 /// Build a `Uuid → context_name` lookup map from the graph. Used by
@@ -1256,28 +1262,174 @@ fn cmd_find_analogies(
     }).collect())
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Default)]
 struct ConsolidationResult {
     entities_strengthened: usize,
     entities_decayed: usize,
     entities_pruned: usize,
     entities_merged: usize,
     triples_pruned: usize,
+    // CLU-2 — periodic full HDBSCAN re-cluster results.
+    cluster_n_clusters: usize,
+    cluster_n_outliers: usize,
+    cluster_n_assigned: usize,
+    cluster_skipped_reason: Option<String>,
+    // CLU-5 — Louvain entity communities.
+    community_n_communities: usize,
+    community_modularity: f64,
+    // CLU-5b — c-TF-IDF community labels.
+    community_n_labeled: usize,
+    /// Top-N community names (by member count) for the UI status line.
+    community_top_labels: Vec<String>,
+    // SALIENCE — entity importance scores.
+    salience_n_scored: usize,
 }
 
 #[tauri::command]
-fn cmd_consolidate(state: State<AppState>) -> Result<ConsolidationResult, String> {
-    let graph = tm_graph::GraphStore::open(&state.db_path).map_err(|e| e.to_string())?;
-    let consolidator = tm_reason::Consolidator::with_defaults(&graph);
-    let report = consolidator.consolidate();
+async fn cmd_consolidate(state: State<'_, AppState>) -> Result<ConsolidationResult, String> {
+    // Tauri commands require `Send` futures, but `GraphStore` holds a
+    // `rusqlite::Connection` which is `!Send`. Scope every direct
+    // `GraphStore` use inside synchronous blocks so no non-Send value
+    // straddles the LLM `.await` below.
+    let db_path = state.db_path.clone();
 
-    Ok(ConsolidationResult {
-        entities_strengthened: report.entities_strengthened,
-        entities_decayed: report.entities_decayed,
-        entities_pruned: report.entities_pruned,
-        entities_merged: report.entities_merged,
-        triples_pruned: report.triples_pruned,
-    })
+    let mut result = {
+        let graph = tm_graph::GraphStore::open(&db_path).map_err(|e| e.to_string())?;
+        let consolidator = tm_reason::Consolidator::with_defaults(&graph);
+        let report = consolidator.consolidate();
+
+        let mut result = ConsolidationResult {
+            entities_strengthened: report.entities_strengthened,
+            entities_decayed: report.entities_decayed,
+            entities_pruned: report.entities_pruned,
+            entities_merged: report.entities_merged,
+            triples_pruned: report.triples_pruned,
+            ..Default::default()
+        };
+
+    // CLU-2 — periodic full re-cluster. Pull every captured signal that
+    // still has an embedding and feed it to HDBSCAN. Skipped silently
+    // when the corpus is too small or no embeddings are present (e.g.
+    // hash-embed only); we surface the reason in the result for the UI.
+    const RECLUSTER_LIMIT: usize = 10_000;
+    match graph.all_signals_with_embeddings(RECLUSTER_LIMIT) {
+        Ok(pairs) if pairs.is_empty() => {
+            result.cluster_skipped_reason = Some("no embedded signals".into());
+        }
+        Ok(pairs) => match tm_cluster::Clusterer::open(&state.db_path) {
+            Ok(clusterer) => match clusterer.recluster(pairs) {
+                Ok(cs) => {
+                    result.cluster_n_clusters = cs.n_clusters;
+                    result.cluster_n_outliers = cs.n_outliers;
+                    result.cluster_n_assigned = cs.n_assigned;
+                }
+                Err(tm_cluster::ClusterError::InsufficientSamples { needed, got }) => {
+                    result.cluster_skipped_reason =
+                        Some(format!("insufficient samples: need {needed}, got {got}"));
+                }
+                Err(e) => {
+                    result.cluster_skipped_reason = Some(format!("recluster failed: {e}"));
+                }
+            },
+            Err(e) => {
+                result.cluster_skipped_reason = Some(format!("open clusterer: {e}"));
+            }
+        },
+        Err(e) => {
+            result.cluster_skipped_reason = Some(format!("read signals: {e}"));
+        }
+    }
+
+    // CLU-5 — Louvain entity-community recompute. Cheap (≤ 10k entities)
+    // and idempotent; safe to run on every consolidation cycle.
+    match graph.recompute_communities() {
+        Ok(cs) => {
+            result.community_n_communities = cs.n_communities;
+            result.community_modularity = cs.modularity;
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "recompute_communities failed");
+        }
+    }
+
+    // CLU-5b — c-TF-IDF community labels (fallback / always-on tier).
+    // Replaces "c-0 / c-1 / …" with phrases like "vector search /
+    // embeddings / retrieval". Must run after `recompute_communities`
+    // since it reads the freshly written community_id assignments.
+    match graph.recompute_community_labels() {
+        Ok(ls) => {
+            result.community_n_labeled = ls.n_labeled;
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "recompute_community_labels failed");
+        }
+    }
+
+        // Close the synchronous scope here so the `!Send` GraphStore /
+        // Consolidator are dropped before the LLM `.await` below.
+        result
+    };
+
+    // CLU-5c — Tier-1 LLM relabel pass over the top-N largest
+    // communities. Overwrites the TF-IDF fallback for the few
+    // communities the user actually sees in the status line / Garden.
+    // Cheap (~150 ms per call on Apple Silicon, top-10 by default)
+    // and completely skipped at compile time when local-llm is off.
+    // Runtime-skipped (with a logged reason) when weights are missing.
+    #[cfg(feature = "local-llm")]
+    {
+        const LLM_RELABEL_TOP_N: usize = 10;
+        // The labeler opens its own short-lived `GraphStore` instances in
+        // sync sub-scopes — we just hand it the db path so nothing
+        // `!Send` straddles the await here.
+        let llm_stats = community_label_llm::relabel_top_communities(
+            &db_path,
+            LLM_RELABEL_TOP_N,
+        )
+        .await;
+        if let Some(reason) = &llm_stats.skipped_reason {
+            tracing::info!(reason = %reason, "LLM community labeler: skipped");
+        } else {
+            tracing::info!(
+                attempted = llm_stats.n_attempted,
+                succeeded = llm_stats.n_succeeded,
+                "LLM community labeler"
+            );
+        }
+    }
+
+    // Final read-back + salience pass — reopen the graph in another
+    // synchronous scope; no await touches `result` after this point.
+    {
+        let graph = tm_graph::GraphStore::open(&db_path).map_err(|e| e.to_string())?;
+
+        // Read back the persisted map and pull the top-3 by size so the UI
+        // can show "communities:8 (Q=0.42) → Database internals · Anthropic
+        // relationships · Bug repro" instead of a bare number. This runs
+        // after both the TF-IDF and LLM passes, so it picks up whichever
+        // label is freshest for each community.
+        if let Ok(map) = graph.community_label_map() {
+            let mut entries: Vec<_> = map.values().cloned().collect();
+            entries.sort_by(|a, b| b.size.cmp(&a.size));
+            result.community_top_labels = entries
+                .iter()
+                .take(3)
+                .map(|e| e.label.clone())
+                .collect();
+        }
+
+        // Salience — recompute degree/recency-weighted entity importance.
+        match graph.recompute_salience() {
+            Ok(ss) => {
+                result.salience_n_scored = ss.n_nodes;
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "recompute_salience failed");
+            }
+        }
+    }
+
+    Ok(result)
 }
 
 // ---------------------------------------------------------------------------
@@ -3484,6 +3636,20 @@ struct CommunityRow {
 fn cmd_community_overlay(state: State<AppState>) -> Result<Vec<CommunityRow>, String> {
     let graph = GraphStore::open(&state.db_path).map_err(|e| e.to_string())?;
     let buckets = graph.community_buckets(50).map_err(|e| e.to_string())?;
+    // Prefer the persisted label (c-TF-IDF first pass; LLM relabel for top
+    // communities). Falls back to a member-name composite when the row is
+    // missing — keeps the API stable for fresh DBs without any consolidate.
+    let stored_labels: std::collections::HashMap<i64, String> = graph
+        .community_label_map()
+        .map(|m| m.into_iter().map(|(k, v)| (k as i64, v.label)).collect())
+        .unwrap_or_default();
+    let pick_label = |cid: i64, names: &[String]| -> String {
+        stored_labels
+            .get(&cid)
+            .filter(|s| !s.trim().is_empty())
+            .cloned()
+            .unwrap_or_else(|| label_from_names(names))
+    };
     // LM-22 fix — if the stored column hasn't been populated yet (no CLU-*
     // pass has run), `community_buckets` returns a single `None` bucket.
     // The Graph view computes Louvain on-the-fly via `graph.louvain()` and
@@ -3497,7 +3663,7 @@ fn cmd_community_overlay(state: State<AppState>) -> Result<Vec<CommunityRow>, St
             .into_iter()
             .map(|(community_id, entity_count, sample_names)| {
                 let label = community_id
-                    .map(|_| label_from_names(&sample_names))
+                    .map(|cid| pick_label(cid, &sample_names))
                     .unwrap_or_default();
                 CommunityRow {
                     community_id,
@@ -3545,7 +3711,7 @@ fn cmd_community_overlay(state: State<AppState>) -> Result<Vec<CommunityRow>, St
         .map(|(cid, mut names)| {
             let entity_count = names.len();
             names.truncate(8);
-            let label = label_from_names(&names);
+            let label = pick_label(cid as i64, &names);
             CommunityRow {
                 community_id: Some(cid as i64),
                 entity_count,
@@ -4883,6 +5049,11 @@ fn cmd_export_entity_markdown(
     output_path: String,
     state: State<AppState>,
 ) -> Result<ExportEntityMarkdownResult, String> {
+    // Resolve relative output_path against the TraceMind data dir.
+    // When launched from Finder, CWD is "/" (read-only), so a bare
+    // "markdown/..." path would EROFS. Captured before state moves.
+    let data_root = data_dir(&state);
+    tracing::info!("[export-md] data_root={} output_path={}", data_root.display(), output_path);
     let dump = cmd_entity_context_dump(entity_id.clone(), state)?;
 
     let mut md = String::new();
@@ -5115,11 +5286,25 @@ fn cmd_export_entity_markdown(
     }
 
     let bytes = md.len() as u64;
-    std::fs::write(&output_path, &md)
-        .map_err(|e| format!("write {output_path}: {e}"))?;
+    // Resolve relative paths against the data dir so Finder-launched
+    // app bundles (CWD = "/") don't try to write under root.
+    let path_buf = std::path::Path::new(&output_path);
+    let final_path = if path_buf.is_absolute() {
+        path_buf.to_path_buf()
+    } else {
+        data_root.join(path_buf)
+    };
+    if let Some(parent) = final_path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
+        }
+    }
+    std::fs::write(&final_path, &md)
+        .map_err(|e| format!("write {}: {e}", final_path.display()))?;
 
     Ok(ExportEntityMarkdownResult {
-        output_path,
+        output_path: final_path.to_string_lossy().to_string(),
         bytes_written: bytes,
         entity_id: dump.header.entity_id,
     })
@@ -5618,6 +5803,9 @@ fn main() {
             cmd_storage_vacuum,
             cmd_storage_clean_ephemeral,
             cmd_storage_truncate_traces,
+            // ─── WME-5 — verb-first working-memory cards ──────────
+            wme_commands::cmd_wme_cards,
+            wme_commands::cmd_wme_feedback,
         ])
         .setup(move |app| {
             let handle = app.handle().clone();

@@ -427,7 +427,18 @@ impl GlinerExtractor {
             if !seen.insert(key) {
                 continue;
             }
-            let et = map_label_to_entity_type(&self.labels[h.label_idx]);
+            let mut et = map_label_to_entity_type(&self.labels[h.label_idx]);
+            // Post-process: GLiNER's zero-shot Person/Organization heads
+            // misfire on CamelCase identifiers and sentence-start verbs
+            // ("UcbBandit" → Organization @ 0.42, "Anticipate" →
+            // Organization @ 0.57). When the heuristic *and* model
+            // disagree on these specific shapes, demote to Concept —
+            // never invent a Person from a stray verb.
+            if matches!(et, EntityType::Organization | EntityType::Person)
+                && looks_like_code_identifier_or_verb(&name)
+            {
+                et = EntityType::Concept;
+            }
             out.push(Entity::new(name, et, h.score.min(0.99) as f64));
         }
         Ok(out)
@@ -483,6 +494,85 @@ fn split_words(text: &str) -> Vec<String> {
 /// name is `"TraceMind"` not `"TraceMind,"`.
 fn trim_trailing_punct(s: &str) -> &str {
     s.trim_end_matches(|c: char| c.is_ascii_punctuation())
+}
+
+/// Heuristic guard for GLiNER's Person/Organization heads. Returns
+/// `true` when a span name is shaped like a code identifier or
+/// sentence-start imperative verb — cases where the zero-shot model
+/// most often misfires.
+///
+/// We catch two shapes:
+/// 1. **CamelCase identifiers** — single token, ≥ 2 uppercase letters
+///    in non-leading positions (`UcbBandit`, `LinUcbBandit`).
+/// 2. **Single-token sentence-start verbs** — Title-Case word matching
+///    a short imperative list (`Anticipate`, `Consolidate`, `Promote`,
+///    `Review`, etc.). These leak through GLiNER because at the start
+///    of a sentence they share the morphology of a proper noun.
+fn looks_like_code_identifier_or_verb(name: &str) -> bool {
+    // Multi-word spans are usually genuine — let them through.
+    if name.contains(char::is_whitespace) {
+        return false;
+    }
+    // (1) Internal-cap CamelCase.
+    let internal_upper = name
+        .chars()
+        .skip(1)
+        .filter(|c| c.is_ascii_uppercase())
+        .count();
+    if internal_upper >= 1
+        && name.chars().any(|c| c.is_ascii_lowercase())
+        && name.chars().next().is_some_and(|c| c.is_ascii_uppercase())
+    {
+        return true;
+    }
+    // (2) Sentence-start imperative.
+    const IMPERATIVE_VERBS: &[&str] = &[
+        "anticipate",
+        "consolidate",
+        "promote",
+        "review",
+        "summarize",
+        "describe",
+        "explain",
+        "refactor",
+        "implement",
+        "rebuild",
+        "update",
+        "ensure",
+        "verify",
+        "consider",
+    ];
+    let lower = name.to_ascii_lowercase();
+    IMPERATIVE_VERBS.contains(&lower.as_str())
+}
+
+#[cfg(test)]
+mod identifier_guard_tests {
+    use super::looks_like_code_identifier_or_verb;
+
+    #[test]
+    fn camelcase_identifiers_are_flagged() {
+        assert!(looks_like_code_identifier_or_verb("UcbBandit"));
+        assert!(looks_like_code_identifier_or_verb("LinUcbBandit"));
+        assert!(looks_like_code_identifier_or_verb("TraceMind"));
+    }
+
+    #[test]
+    fn sentence_start_verbs_are_flagged() {
+        assert!(looks_like_code_identifier_or_verb("Anticipate"));
+        assert!(looks_like_code_identifier_or_verb("Consolidate"));
+        assert!(looks_like_code_identifier_or_verb("Promote"));
+    }
+
+    #[test]
+    fn real_proper_nouns_pass_through() {
+        // Single-cap proper nouns — must NOT be flagged.
+        assert!(!looks_like_code_identifier_or_verb("Aaditya"));
+        assert!(!looks_like_code_identifier_or_verb("Anthropic"));
+        assert!(!looks_like_code_identifier_or_verb("Louvain"));
+        // Multi-word org names pass through too.
+        assert!(!looks_like_code_identifier_or_verb("Acme Corp"));
+    }
 }
 
 /// Construct the cached label-prompt id sequence:

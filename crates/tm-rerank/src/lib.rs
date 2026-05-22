@@ -32,6 +32,8 @@
 //! let score = tm_rerank::maxsim(&query_tokens, &doc_tokens);
 //! ```
 
+pub mod entity_index;
 pub mod reranker;
 
+pub use entity_index::{EntityIndex, EntryPoint, IndexedEntity};
 pub use reranker::{maxsim, ColbertReranker, RerankCandidate, RerankResult, COLBERT_DIM};

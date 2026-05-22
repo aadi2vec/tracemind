@@ -1,7 +1,11 @@
 use std::f64;
 use std::path::Path;
 
-pub const NUM_ARMS: usize = 5;
+/// **LGS-3** — 6 arms now. Arm 5 (`subgraph_colbert`) seeds the
+/// graph traversal with the top-k entities chosen by ColBERT MaxSim
+/// over per-entity token grids (see `tm_rerank::EntityIndex`), then
+/// reranks each candidate subgraph by MaxSim against the query.
+pub const NUM_ARMS: usize = 6;
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct BanditState {
@@ -18,6 +22,11 @@ pub struct RetrievalParams {
     pub include_episodic: bool,
     #[serde(default)]
     pub include_colbert: bool,
+    /// **LGS-3** — arm 5 only. When true, the retrieval engine seeds
+    /// graph traversal with entry points from `tm_rerank::EntityIndex`
+    /// and reranks each candidate subgraph by MaxSim against the query.
+    #[serde(default)]
+    pub include_subgraph_colbert: bool,
 }
 
 pub struct UcbBandit {
@@ -107,12 +116,15 @@ impl UcbBandit {
 
     pub fn params_for_arm(arm: u8) -> RetrievalParams {
         match arm {
-            0 => RetrievalParams { arm: 0, top_k: 5, hops: 0, include_episodic: false, include_colbert: false },
-            1 => RetrievalParams { arm: 1, top_k: 10, hops: 1, include_episodic: false, include_colbert: false },
-            2 => RetrievalParams { arm: 2, top_k: 15, hops: 2, include_episodic: false, include_colbert: false },
-            3 => RetrievalParams { arm: 3, top_k: 20, hops: 2, include_episodic: true, include_colbert: false },
-            4 => RetrievalParams { arm: 4, top_k: 10, hops: 1, include_episodic: false, include_colbert: true },
-            _ => RetrievalParams { arm: 0, top_k: 5, hops: 0, include_episodic: false, include_colbert: false },
+            0 => RetrievalParams { arm: 0, top_k: 5,  hops: 0, include_episodic: false, include_colbert: false, include_subgraph_colbert: false },
+            1 => RetrievalParams { arm: 1, top_k: 10, hops: 1, include_episodic: false, include_colbert: false, include_subgraph_colbert: false },
+            2 => RetrievalParams { arm: 2, top_k: 15, hops: 2, include_episodic: false, include_colbert: false, include_subgraph_colbert: false },
+            3 => RetrievalParams { arm: 3, top_k: 20, hops: 2, include_episodic: true,  include_colbert: false, include_subgraph_colbert: false },
+            4 => RetrievalParams { arm: 4, top_k: 10, hops: 1, include_episodic: false, include_colbert: true,  include_subgraph_colbert: false },
+            // LGS-3 — subgraph ColBERT arm: deeper hops, ColBERT-seeded
+            // entry points, MaxSim rerank over candidate subgraphs.
+            5 => RetrievalParams { arm: 5, top_k: 12, hops: 2, include_episodic: false, include_colbert: true,  include_subgraph_colbert: true },
+            _ => RetrievalParams { arm: 0, top_k: 5,  hops: 0, include_episodic: false, include_colbert: false, include_subgraph_colbert: false },
         }
     }
 
@@ -124,6 +136,7 @@ impl UcbBandit {
             2 => "wide",
             3 => "deep",
             4 => "colbert",
+            5 => "subgraph_colbert",
             _ => "unknown",
         }
     }
@@ -173,6 +186,10 @@ const ARM_FEATURES: [[f64; 2]; LINUCB_ARMS] = [
     [0.75, 0.67], // wide
     [1.00, 1.00], // deep
     [0.50, 0.50], // colbert: medium breadth + depth, token-level scoring
+    // subgraph_colbert (arm 5): wide breadth + deep hops + ColBERT seeding.
+    // Slightly above colbert on both axes so the LinUCB policy can prefer
+    // it for queries that benefit from entity-anchored multi-hop traversal.
+    [0.80, 0.80],
 ];
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -724,6 +741,32 @@ mod tests {
             "deep arm bias ({}) should be > narrow arm bias ({}) due to shared strength",
             bandit.arm_bias[3], bandit.arm_bias[0]
         );
+    }
+
+    // ── LGS-3 — arm 5 (subgraph_colbert) ─────────────────────────────────
+    #[test]
+    fn arm5_is_subgraph_colbert() {
+        let p = UcbBandit::params_for_arm(5);
+        assert_eq!(p.arm, 5);
+        assert!(p.include_colbert);
+        assert!(p.include_subgraph_colbert);
+        assert_eq!(UcbBandit::arm_name(5), "subgraph_colbert");
+    }
+
+    #[test]
+    fn arm5_can_be_explored_and_rewarded() {
+        let mut b = UcbBandit::new();
+        // Reward every other arm low, arm 5 high; after a few pulls the
+        // UCB selector should converge on arm 5.
+        for _ in 0..3 {
+            for arm in 0u8..NUM_ARMS as u8 {
+                let r = if arm == 5 { 0.95 } else { 0.10 };
+                b.register_reward(arm, r);
+            }
+        }
+        let chosen = b.select();
+        assert_eq!(chosen.arm, 5, "UCB1 should prefer the high-reward arm 5");
+        assert!(chosen.include_subgraph_colbert);
     }
 
     #[test]
