@@ -131,6 +131,9 @@ export default function QueryView() {
 
   // LM-11e — persist the splice to disk. Fires after every toggle so
   // the state survives reloads + future queries with the same id.
+  // Surface failures to the user — silently logging to console meant a
+  // failed save looked identical to a successful one, and users would
+  // re-toggle entities thinking it didn't register.
   const persistSplice = (
     threadId: string,
     next: { include: Set<string>; exclude: Set<string>; viewName: string | null },
@@ -139,7 +142,7 @@ export default function QueryView() {
       view_name: next.viewName,
       include_ids: [...next.include],
       exclude_ids: [...next.exclude],
-    }).catch((e) => console.error("saveThreadView failed:", e));
+    }).catch((e) => setError(`Splice save failed: ${e}`));
   };
 
   const toggleSplice = (entityId: string, kind: "include" | "exclude") => {
@@ -173,7 +176,7 @@ export default function QueryView() {
     try {
       await clearThreadView(result.query_id);
     } catch (e) {
-      console.error("clearThreadView failed:", e);
+      setError(`Splice clear failed: ${e}`);
     }
     setSplice({ include: new Set(), exclude: new Set(), viewName: null });
   };

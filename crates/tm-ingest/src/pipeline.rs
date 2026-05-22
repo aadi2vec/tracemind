@@ -1089,6 +1089,12 @@ const SKIP_WORDS: &[&str] = &[
     "providing", "select", "selects", "selected", "selecting",
     "binary", "sizes", "plane", "planes", "level", "levels",
     "those", "these", "there", "where", "which", "while",
+    // Weak single-token Concepts surfaced from MOC/community sample
+    // names after the 2026-05-20 quality pass — generic nouns, past
+    // participles, adverbs, conjunctions that the step-5 length>=4
+    // fallback was promoting to entities.
+    "terms", "plus", "matched", "single", "fancy", "sounds", "ideas",
+    "amounts", "total", "natively", "ranked", "ordered",
 ];
 
 /// Classic two-row Levenshtein edit distance (stdlib only).
