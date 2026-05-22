@@ -233,19 +233,25 @@ fn is_stopword(w: &str) -> bool {
     STOPWORDS.binary_search(&w).is_ok()
 }
 
-// Must be sorted for binary_search.
+// Must be sorted for binary_search. In addition to the standard English
+// stopword set, we filter the structural graph plumbing predicates that
+// show up inside MOC-entity *names* ("indexes RelatedTo …") and would
+// otherwise dominate every community label. Both lowercase and the
+// canonical mixed-case form ("relatedto") are listed because the
+// tokenizer downcases input first.
 const STOPWORDS: &[&str] = &[
     "about", "above", "after", "again", "against", "all", "also", "and", "any", "are", "around",
     "because", "been", "before", "being", "below", "between", "both", "but", "can", "could", "did",
     "does", "doing", "done", "down", "during", "each", "etc", "few", "for", "from", "further",
-    "get", "had", "has", "have", "having", "her", "here", "hers", "him", "his", "how", "into",
-    "its", "itself", "just", "made", "make", "makes", "many", "may", "might", "more", "most",
-    "much", "must", "myself", "need", "needs", "not", "now", "off", "once", "one", "only", "other",
-    "our", "ours", "out", "over", "own", "said", "same", "say", "says", "see", "she", "should",
-    "since", "some", "still", "such", "than", "that", "the", "their", "theirs", "them", "then",
-    "there", "these", "they", "this", "those", "through", "thus", "too", "under", "until", "use",
-    "uses", "very", "was", "we", "well", "were", "what", "when", "where", "which", "while", "who",
-    "whom", "why", "will", "with", "without", "would", "yes", "you", "your", "yours",
+    "get", "had", "has", "have", "having", "her", "here", "hers", "him", "his", "how", "indexes",
+    "into", "its", "itself", "just", "made", "make", "makes", "many", "may", "might", "more",
+    "most", "much", "must", "myself", "need", "needs", "not", "now", "off", "once", "one", "only",
+    "other", "our", "ours", "out", "over", "own", "related", "relatedto", "said", "same", "say",
+    "says", "see", "she", "should", "since", "some", "still", "such", "than", "that", "the",
+    "their", "theirs", "them", "then", "there", "these", "they", "this", "those", "through",
+    "thus", "too", "under", "until", "use", "uses", "very", "was", "we", "well", "were", "what",
+    "when", "where", "which", "while", "who", "whom", "why", "will", "with", "without", "would",
+    "yes", "you", "your", "yours",
 ];
 
 // ---------------------------------------------------------------------------

@@ -1,5 +1,6 @@
 pub mod algebra;
 pub mod belief;
+pub mod community;
 pub mod context;
 pub mod deny_list;
 pub mod entity_resolve;
@@ -14,8 +15,20 @@ pub mod ontology_proposals;
 pub mod ontology_types;
 pub mod pending_relations;
 pub mod portable_export;
+pub mod salience;
 pub mod store;
 pub mod thread_graph;
+
+pub use community::{
+    community_label_map, recompute_communities, recompute_community_labels,
+    set_community_label, top_community_samples, CommunityAssignment, CommunityLabel,
+    CommunityLabelStats, CommunitySample, CommunityStats,
+};
+pub use salience::{
+    ensure_schema as ensure_salience_schema, recency_decay_at_age, recompute as recompute_salience,
+    score_for as salience_for, top_k as salience_top_k, SalienceRow, SalienceStats,
+    RECENCY_HALF_LIFE_DAYS, SATURATION_DEGREE,
+};
 
 pub use belief::{effective_confidence, BeliefStore, ContradictionView, ResolveChoice};
 // Re-export so downstream crates (tm-tauri, tm-mcp) can pattern-match

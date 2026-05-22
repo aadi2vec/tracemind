@@ -264,6 +264,15 @@ export interface ConsolidationResult {
   entities_pruned: number;
   entities_merged: number;
   triples_pruned: number;
+  cluster_n_clusters: number;
+  cluster_n_outliers: number;
+  cluster_n_assigned: number;
+  cluster_skipped_reason: string | null;
+  community_n_communities: number;
+  community_modularity: number;
+  community_n_labeled: number;
+  community_top_labels: string[];
+  salience_n_scored: number;
 }
 
 export async function consolidateMemory(): Promise<ConsolidationResult> {
@@ -353,6 +362,54 @@ export interface NextActionInfo {
 
 export async function getNextActions(): Promise<NextActionInfo[]> {
   return invoke("cmd_next_actions");
+}
+
+// WME-5 — Working Memory Engine verb-first card surface
+//
+// Cards are produced by tm-reflect::WorkingMemoryEngine and persisted to
+// the `wme_cards` table. The Brief and Dashboard read them via
+// `cmd_wme_cards`; feedback ("useful / not useful / remind later /
+// dismiss this kind") flows back through `cmd_wme_feedback` so the
+// per-kind outcome aggregator can decay future scores.
+
+export type WmeCardKind =
+  | "resume"
+  | "recall"
+  | "compare"
+  | "caution"
+  | "connect"
+  | "anticipate";
+
+export type WmeFeedback =
+  | "useful_now"
+  | "not_useful_now"
+  | "not_now_remind_later"
+  | "dismiss_this_kind";
+
+export interface WmeCard {
+  id: string;
+  kind: WmeCardKind;
+  target_id: string;
+  statement: string;
+  score: number;
+  relevance: number;
+  surprise: number;
+  recency: number;
+  outcome: number;
+  /// Local-time string formatted "%Y-%m-%d %H:%M:%S".
+  created_at: string;
+}
+
+export async function getWmeCards(limit = 20): Promise<WmeCard[]> {
+  return invoke("cmd_wme_cards", { limit });
+}
+
+export async function wmeFeedback(
+  cardId: string,
+  kind: WmeCardKind,
+  feedback: WmeFeedback,
+): Promise<void> {
+  return invoke("cmd_wme_feedback", { cardId, kind, feedback });
 }
 
 /// Promote a pending mined commitment candidate to an Open Commitment.

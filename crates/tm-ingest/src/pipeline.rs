@@ -23,6 +23,11 @@ pub struct IngestPipeline {
     /// `with_unlimited_rate()` (or `TM_RATE_*` env vars) disables it
     /// for tests + the human-paced `tracemind ingest` subcommand.
     rate_limiter: RateLimiter,
+    /// CLU-4 — HDBSCAN-driven event clusterer. `None` if the clusterer
+    /// failed to open (we treat clustering as a strictly optional
+    /// indexing angle; failure must not break ingest). The fast path
+    /// calls [`tm_cluster::Clusterer::assign`] after embed.
+    clusterer: Option<tm_cluster::Clusterer>,
 }
 
 #[derive(Debug)]
@@ -130,13 +135,32 @@ impl IngestPipeline {
         };
         let governance = GovernanceFilter::default();
 
+        // CLU-4 — open the clusterer against the same SQLite file. We
+        // intentionally swallow open-failure: a missing or corrupt
+        // cluster table must not stall ingest. The fast path checks
+        // `Option<Clusterer>` and skips assignment if absent.
+        let clusterer = match tm_cluster::Clusterer::open(db_path) {
+            Ok(c) => Some(c),
+            Err(e) => {
+                tracing::warn!("[ingest] clusterer open failed (continuing without): {e}");
+                None
+            }
+        };
+
         Ok(Self {
             graph,
             embedder,
             governance,
             extractor: Box::new(HeuristicExtractor),
             rate_limiter: RateLimiter::from_env(),
+            clusterer,
         })
+    }
+
+    /// Borrow the clusterer (if available). Used by the WME L1 topic
+    /// vector and by background re-cluster jobs.
+    pub fn clusterer(&self) -> Option<&tm_cluster::Clusterer> {
+        self.clusterer.as_ref()
     }
 
     /// Replace the entity extractor used during `ingest()` and slow-path
@@ -221,7 +245,13 @@ impl IngestPipeline {
         if !pass {
             let content_hash = hash_text(text);
             let mut trace = Trace::new(session_id, TraceEventType::Ingest, &content_hash);
-            trace.raw_text = Some(format!("[SKIPPED: {}] {}", reason, text));
+            // Audit row preserves the *reason* and the content_hash (the
+            // hash uniquely identifies the rejected text so we don't need
+            // to copy the body into the trace log). The old format
+            // inlined the full text, which made traces.jsonl balloon —
+            // the capture daemon's clipboard re-poll can fire the same
+            // 5KB payload hundreds of times per day.
+            trace.raw_text = Some(format!("[SKIPPED: {reason}]"));
             return Ok(IngestResult {
                 trace,
                 entities: vec![],
@@ -236,6 +266,27 @@ impl IngestPipeline {
 
         // 2. Hash.
         let content_hash = hash_text(text);
+
+        // 2b. CLU-4 — online cluster assignment for the slow path as
+        //     well. The CLI's `tracemind ingest` uses `ingest()` (not
+        //     `ingest_fast`), so without this hook the `event_clusters`
+        //     table stays empty in production. Failures here are
+        //     non-fatal: a missing or corrupt cluster table must never
+        //     stall the slow-path ingest.
+        if let Some(c) = self.clusterer.as_ref() {
+            let event_emb = self.embedder.embed(text);
+            match c.assign(&content_hash, &event_emb) {
+                Ok(a) => tracing::trace!(
+                    target: "tm_cluster",
+                    event = %content_hash,
+                    cluster = a.cluster_id,
+                    prob = a.membership_prob,
+                    outlier = a.is_outlier,
+                    "assigned (slow path)"
+                ),
+                Err(e) => tracing::debug!("[ingest] cluster assign failed: {e}"),
+            }
+        }
 
         // 3. Extract entities via the configured extractor (heuristic by default).
         let mut entities = self.extractor.extract_entities(text);
@@ -515,6 +566,27 @@ impl IngestPipeline {
 
         // 4. Embed.
         let embedding = self.embedder.embed(text);
+
+        // 4b. CLU-4 — online cluster assignment. Hot-path budget ≤ 2 ms.
+        //     We use the seahash content hash (already computed above)
+        //     as the cluster event id so it round-trips deterministically
+        //     with the signal row. Failures here are non-fatal; we just
+        //     log and continue.
+        if let Some(c) = self.clusterer.as_ref() {
+            match c.assign(&content_hash_str, &embedding) {
+                Ok(a) => {
+                    tracing::trace!(
+                        target: "tm_cluster",
+                        event = %content_hash_str,
+                        cluster = a.cluster_id,
+                        prob = a.membership_prob,
+                        outlier = a.is_outlier,
+                        "assigned"
+                    );
+                }
+                Err(e) => tracing::debug!("[ingest] cluster assign failed: {e}"),
+            }
+        }
 
         // 5. Classify into a priority tier.
         let priority = classify_signal(text, &embedding, &self.graph);
@@ -941,6 +1013,14 @@ const STOPWORDS: &[&str] = &[
     "Out", "If", "So", "No", "I", "My", "We", "Our", "He", "She", "They", "You", "Your",
     "Has", "Had", "Have", "Do", "Does", "Did", "Not", "All", "Each", "Every", "Can", "Will",
     "Just", "Now", "Then", "Here", "There", "When", "How", "What", "Who", "Which", "Where",
+    // Contractions / pronouns that sentence-tokenisation can hand us with
+    // a capitalised first letter ("We'll", "I'm").
+    "I'm", "We'll", "We're", "We've", "I've", "You're", "You'll", "It's", "Don't", "Can't",
+    // Generic sentence-start nouns that aren't useful as entities on their
+    // own. Multi-word phrases ("Phase 1", "Session 7") still survive
+    // because they go through `classify_multi_word`.
+    "Session", "Phase", "Step", "Note", "Point", "Item", "Idea", "Plan",
+    "Today", "Yesterday", "Tomorrow",
 ];
 
 /// Known technology/language names that should never be classified as Person.
@@ -984,6 +1064,11 @@ const SKIP_WORDS: &[&str] = &[
     "produces", "needs", "helps", "reads", "holds", "generates", "brings", "mentions",
     "develops", "developing", "developed", "implements", "implementing", "implemented",
     "collaborates", "collaborating",
+    // Imperative / sentence-start verbs the heuristic kept promoting to
+    // Person ("Anticipate the next move…", "Consolidate…", "Review…").
+    "anticipate", "consolidate", "promote", "summarize", "describe",
+    "explain", "review", "fix", "ship", "rebuild", "refactor",
+    "add", "remove", "update", "ensure", "verify", "consider", "note",
     // Past participles / adjectives
     "based", "designed", "focused", "related", "known", "open", "local", "only",
     "also", "even", "just", "very", "most", "more", "much", "many", "some", "such",
@@ -995,6 +1080,21 @@ const SKIP_WORDS: &[&str] = &[
     // Common nouns too generic to be useful
     "data", "time", "information", "system", "systems", "tool", "tools", "type", "types",
     "team", "teams", "device", "devices", "locally", "core", "part", "way", "thing",
+    // Adverbs / generic adjectives that LLM/heuristic extractors keep
+    // surfacing from sentences like "AI agents built entirely in Rust" or
+    // "tiny binary sizes" — single-word noise, not useful as entities.
+    "entirely", "tiny", "small", "large", "huge", "long", "short", "high", "low",
+    "fast", "slow", "easy", "hard", "true", "false", "everything", "nothing",
+    "anyone", "someone", "everyone", "nobody", "somebody",
+    "providing", "select", "selects", "selected", "selecting",
+    "binary", "sizes", "plane", "planes", "level", "levels",
+    "those", "these", "there", "where", "which", "while",
+    // Weak single-token Concepts surfaced from MOC/community sample
+    // names after the 2026-05-20 quality pass — generic nouns, past
+    // participles, adverbs, conjunctions that the step-5 length>=4
+    // fallback was promoting to entities.
+    "terms", "plus", "matched", "single", "fancy", "sounds", "ideas",
+    "amounts", "total", "natively", "ranked", "ordered",
 ];
 
 /// Classic two-row Levenshtein edit distance (stdlib only).
@@ -1252,11 +1352,14 @@ fn is_title_case(token: &str) -> bool {
 }
 
 fn is_stopword(token: &str) -> bool {
-    STOPWORDS.contains(&token)
+    // Case-insensitive — the same English stopword is "We'll" at the
+    // start of a sentence and "we'll" mid-sentence, both of which the
+    // ingest pipeline can hand us.
+    STOPWORDS.iter().any(|w| w.eq_ignore_ascii_case(token))
 }
 
 /// Classify a multi-word entity like "Acme Corp" or "Machine Learning".
-fn classify_multi_word(name: &str) -> EntityType {
+pub fn classify_multi_word(name: &str) -> EntityType {
     let last_word = name.split_whitespace().last().unwrap_or("");
 
     // Check for org suffixes
@@ -1273,12 +1376,14 @@ fn classify_multi_word(name: &str) -> EntityType {
         }
     }
 
-    // Default: if it looks like a proper noun phrase, treat as Person
-    EntityType::Person
+    // Default to Concept rather than Person. Sentence-start title-cased
+    // phrases like "Cutting-edge AI Research Ideas" or "Core Idea" used
+    // to be tagged Person here, polluting the people facets.
+    EntityType::Concept
 }
 
 /// Return the `EntityType` for a single `token`, or `None` if it should be skipped.
-fn classify_token(token: &str) -> Option<EntityType> {
+pub fn classify_token(token: &str) -> Option<EntityType> {
     // 1. URL
     if is_url(token) {
         return Some(EntityType::Url);
@@ -1294,18 +1399,31 @@ fn classify_token(token: &str) -> Option<EntityType> {
         return Some(EntityType::Technology);
     }
 
-    // 4. Capitalized word that isn't a stopword → Person
-    if is_title_case(token) && !is_stopword(token) {
+    // A token that matches *either* the title-case stopword list OR the
+    // SKIP_WORDS verb/adj list is never useful as an entity. Centralising
+    // here prevents sentence-start verbs ("Anticipate", "During") from
+    // slipping past one filter only to pass the other.
+    let is_skip = SKIP_WORDS.iter().any(|w| w.eq_ignore_ascii_case(token));
+    if is_stopword(token) || is_skip {
+        return None;
+    }
+
+    // 4. Capitalized word → Person, but only when the rest is lowercase
+    //    *and* the whole token has at least one lowercase letter. This
+    //    rejects all-caps acronyms ("WME", "L1") and CamelCase identifiers
+    //    ("UcbBandit") which the LLM extractor used to misclassify too.
+    if is_title_case(token) {
         let mut chars = token.chars();
         chars.next(); // skip first
         let rest: String = chars.collect();
-        if rest == rest.to_lowercase() {
+        let has_lower = rest.chars().any(|c| c.is_lowercase());
+        if has_lower && rest == rest.to_lowercase() {
             return Some(EntityType::Person);
         }
     }
 
-    // 5. Concept: any token of length >= 4, but not a common verb/adj/functional word
-    if token.len() >= 4 && !SKIP_WORDS.iter().any(|w| w.eq_ignore_ascii_case(token)) {
+    // 5. Concept: any token of length >= 4 that survived the filters above.
+    if token.len() >= 4 {
         return Some(EntityType::Concept);
     }
 
@@ -1645,7 +1763,64 @@ mod tests {
             // Tests fire many ingest_fast calls in tight loops; the
             // CAP-5 limiter would refuse them. Tests opt out.
             rate_limiter: RateLimiter::unlimited(),
+            // Cluster substrate is optional and skipped in unit tests
+            // (it requires a real on-disk SQLite path).
+            clusterer: None,
         }
+    }
+
+    #[test]
+    fn classify_token_rejects_sentence_start_verbs() {
+        // "Anticipate" / "Consolidate" used to slip through as Person
+        // because they were Title-Case with all-lowercase tail.
+        assert_eq!(classify_token("Anticipate"), None);
+        assert_eq!(classify_token("Consolidate"), None);
+        assert_eq!(classify_token("Review"), None);
+    }
+
+    #[test]
+    fn classify_token_rejects_filler_stopwords() {
+        // STOPWORDS like "During", "Every" must not survive as Concept
+        // either — they were being kept by step 5 of the old heuristic.
+        assert_eq!(classify_token("During"), None);
+        assert_eq!(classify_token("Every"), None);
+        assert_eq!(classify_token("Session"), None);
+        assert_eq!(classify_token("I'm"), None);
+    }
+
+    #[test]
+    fn classify_token_keeps_real_proper_nouns() {
+        assert_eq!(classify_token("Aaditya"), Some(EntityType::Person));
+        assert_eq!(classify_token("Louvain"), Some(EntityType::Person));
+        assert_eq!(classify_token("Rust"), Some(EntityType::Technology));
+    }
+
+    #[test]
+    fn classify_token_camelcase_is_concept_not_person() {
+        // CamelCase identifiers ("UcbBandit") have a mix of upper/lower
+        // in the tail — they should fall through to Concept, never Person.
+        match classify_token("UcbBandit") {
+            Some(EntityType::Concept) | None => (),
+            other => panic!("UcbBandit got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn classify_multi_word_defaults_to_concept() {
+        // "Cutting-edge AI Research Ideas" used to be Person — now Concept.
+        assert_eq!(
+            classify_multi_word("Cutting-edge AI Research Ideas"),
+            EntityType::Concept
+        );
+        assert_eq!(classify_multi_word("Core Idea"), EntityType::Concept);
+        // Org suffix path still works.
+        assert_eq!(classify_multi_word("Acme Corp"), EntityType::Organization);
+        // Tech keyword path still works (Team is an org suffix so we
+        // pick a phrase without one).
+        assert_eq!(
+            classify_multi_word("Rust Compiler Internals"),
+            EntityType::Technology
+        );
     }
 
     #[test]

@@ -259,11 +259,28 @@ impl LocalLlmBackend {
         if let Some(parent) = self.config.model_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        // hf-hub caches under ~/.cache/huggingface; we hard-link or copy into
-        // the configured path so users see the model under ~/.tracemind/models.
+        // hf-hub caches under ~/.cache/huggingface and stores files as
+        // symlinks to a `blobs/<sha>` neighbor. If we naively hard-link
+        // that symlink into ~/.tracemind/models/, the result is either
+        // a hard-link to the symlink (rare) or another symlink that
+        // reuses the original relative `../../blobs/...` target — which
+        // does NOT resolve from the new location. Canonicalize first so
+        // we point at the actual blob, then prefer an absolute-target
+        // symlink (cheap; survives blob updates) and fall back to a
+        // hard link or copy if symlinking fails.
         if cached != self.config.model_path {
-            if std::fs::hard_link(&cached, &self.config.model_path).is_err() {
-                std::fs::copy(&cached, &self.config.model_path)?;
+            let target = std::fs::canonicalize(&cached).unwrap_or(cached.clone());
+            // Remove any stale entry at the destination so the new
+            // link/copy lands cleanly. Ignore-not-found.
+            let _ = std::fs::remove_file(&self.config.model_path);
+            #[cfg(unix)]
+            let linked = std::os::unix::fs::symlink(&target, &self.config.model_path).is_ok();
+            #[cfg(not(unix))]
+            let linked = false;
+            if !linked
+                && std::fs::hard_link(&target, &self.config.model_path).is_err()
+            {
+                std::fs::copy(&target, &self.config.model_path)?;
             }
         }
         info!(
@@ -426,6 +443,10 @@ async fn run_inference(
                 .map_err(|e| AnswerError::Inference(format!("gen decode: {e}")))?;
         }
 
+        // Drop the context (and its borrow on `loaded`/`guard.model`) before
+        // mutating `guard.last_used`. Otherwise rustc sees a live immutable
+        // borrow across the mutable access.
+        drop(ctx);
         guard.last_used = Some(Instant::now());
         Ok(out.trim().to_string())
     })

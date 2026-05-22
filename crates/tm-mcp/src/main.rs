@@ -350,6 +350,29 @@ fn tools_list() -> Value {
                 }
             },
             {
+                "name": "memory_cards",
+                "description": "Read recent Working Memory Engine cards (Resume / Recall / Compare / Caution / Connect / Anticipate) from `wme_cards`. Read-only.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "limit": {"type": "integer", "description": "Cap on returned cards (default 20).", "default": 20},
+                        "kind":  {"type": "string", "description": "Optional filter on card kind."}
+                    }
+                }
+            },
+            {
+                "name": "memory_card_feedback",
+                "description": "Record user feedback on a Working Memory Engine card. Updates the per-kind outcome aggregator (decayed weighted moving avg). Feedback kinds: `useful_now`, `not_useful_now`, `not_now_remind_later`, `dismiss_this_kind`.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "card_id":  {"type": "string", "description": "UUID of the card from `memory_cards`."},
+                        "feedback": {"type": "string", "description": "One of: useful_now | not_useful_now | not_now_remind_later | dismiss_this_kind."}
+                    },
+                    "required": ["card_id", "feedback"]
+                }
+            },
+            {
                 "name": "memory_insight_silence",
                 "description": "Silence the insight-panel surface for one open commitment. Suppresses outlook-divergence highlights for the given commitment_id over a TTL window. Does NOT remove the commitment row itself — only the insight highlight. Idempotent: re-silencing only extends the window.",
                 "inputSchema": {
@@ -2325,7 +2348,128 @@ fn handle_memory_portable_export(params: &Value, db_path: &str) -> Result<Value,
 ///
 /// Read-only: never mutates the intent store. Returns the
 /// [`tm_reflect::DailyBrief`] structure verbatim as JSON.
-fn handle_memory_brief(params: &Value, intents_path: &str) -> Result<Value, String> {
+fn handle_memory_cards(params: &Value, db_path: &str) -> Result<Value, String> {
+    let limit = params
+        .get("limit")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(20) as usize;
+    let kind_filter: Option<String> = params
+        .get("kind")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    let conn = rusqlite::Connection::open(db_path)
+        .map_err(|e| format!("open wme db: {e}"))?;
+    // Ensure the wme_cards table exists; if not, the WME has never
+    // pushed a card. Return an empty list gracefully.
+    tm_reflect::ensure_wme_schema(&conn)
+        .map_err(|e| format!("ensure_wme_schema: {e}"))?;
+
+    let (sql, has_kind) = match kind_filter.as_deref() {
+        Some(_) => (
+            "SELECT id, kind, target_id, statement, score, relevance, surprise, recency, outcome, created_at \
+             FROM wme_cards WHERE kind = ?1 ORDER BY created_at DESC LIMIT ?2",
+            true,
+        ),
+        None => (
+            "SELECT id, kind, target_id, statement, score, relevance, surprise, recency, outcome, created_at \
+             FROM wme_cards ORDER BY created_at DESC LIMIT ?1",
+            false,
+        ),
+    };
+    let mut stmt = conn.prepare(sql).map_err(|e| e.to_string())?;
+    let rows_iter = if has_kind {
+        stmt.query_map(
+            rusqlite::params![kind_filter.as_deref().unwrap_or(""), limit as i64],
+            row_to_card_value,
+        )
+    } else {
+        stmt.query_map(rusqlite::params![limit as i64], row_to_card_value)
+    }
+    .map_err(|e| e.to_string())?;
+
+    let mut cards: Vec<Value> = Vec::new();
+    for r in rows_iter {
+        cards.push(r.map_err(|e| e.to_string())?);
+    }
+    Ok(json!({ "cards": cards }))
+}
+
+fn row_to_card_value(row: &rusqlite::Row<'_>) -> rusqlite::Result<Value> {
+    Ok(json!({
+        "id":         row.get::<_, String>(0)?,
+        "kind":       row.get::<_, String>(1)?,
+        "target_id":  row.get::<_, String>(2)?,
+        "statement":  row.get::<_, String>(3)?,
+        "score":      row.get::<_, f64>(4)?,
+        "relevance":  row.get::<_, f64>(5)?,
+        "surprise":   row.get::<_, f64>(6)?,
+        "recency":    row.get::<_, f64>(7)?,
+        "outcome":    row.get::<_, f64>(8)?,
+        "created_at": row.get::<_, i64>(9)?,
+    }))
+}
+
+fn handle_memory_card_feedback(params: &Value, db_path: &str) -> Result<Value, String> {
+    let card_id_s = params
+        .get("card_id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "missing required parameter: card_id".to_string())?;
+    let card_id = Uuid::parse_str(card_id_s)
+        .map_err(|e| format!("invalid card_id '{card_id_s}': {e}"))?;
+    let feedback_s = params
+        .get("feedback")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "missing required parameter: feedback".to_string())?;
+
+    let feedback = match feedback_s {
+        "useful_now" => tm_reflect::FeedbackKind::UsefulNow,
+        "not_useful_now" => tm_reflect::FeedbackKind::NotUsefulNow,
+        "not_now_remind_later" => tm_reflect::FeedbackKind::NotNowRemindLater,
+        "dismiss_this_kind" => tm_reflect::FeedbackKind::DismissThisKind,
+        other => return Err(format!(
+            "invalid feedback '{other}': must be one of useful_now | not_useful_now | not_now_remind_later | dismiss_this_kind"
+        )),
+    };
+
+    // Look up the card's `kind` so the engine knows which outcome
+    // aggregator to update. If the card row is missing the call still
+    // records the feedback but skips the kind-specific outcome bump.
+    let conn = rusqlite::Connection::open(db_path).map_err(|e| e.to_string())?;
+    tm_reflect::ensure_wme_schema(&conn).map_err(|e| e.to_string())?;
+    let kind_s: Option<String> = conn
+        .query_row(
+            "SELECT kind FROM wme_cards WHERE id = ?1",
+            rusqlite::params![card_id.to_string()],
+            |r| r.get(0),
+        )
+        .ok();
+    let card_kind = kind_s
+        .as_deref()
+        .and_then(|s| match s {
+            "resume" => Some(tm_reflect::CardKind::Resume),
+            "recall" => Some(tm_reflect::CardKind::Recall),
+            "compare" => Some(tm_reflect::CardKind::Compare),
+            "caution" => Some(tm_reflect::CardKind::Caution),
+            "connect" => Some(tm_reflect::CardKind::Connect),
+            "anticipate" => Some(tm_reflect::CardKind::Anticipate),
+            _ => None,
+        })
+        .ok_or_else(|| format!("card {} not found or unknown kind", card_id))?;
+
+    let engine = tm_reflect::WorkingMemoryEngine::open(db_path)
+        .map_err(|e| format!("open wme engine: {e}"))?;
+    engine
+        .record_feedback(card_id, card_kind, feedback)
+        .map_err(|e| format!("record_feedback: {e}"))?;
+    Ok(json!({ "ok": true, "card_id": card_id.to_string(), "feedback": feedback_s }))
+}
+
+fn handle_memory_brief(
+    params: &Value,
+    intents_path: &str,
+    db_path: &str,
+) -> Result<Value, String> {
     use chrono::{Duration, Utc};
     use tm_intent::IntentStore;
     use tm_reflect::{BriefBuilder, BriefConfig};
@@ -2338,6 +2482,12 @@ fn handle_memory_brief(params: &Value, intents_path: &str) -> Result<Value, Stri
         .get("limit_open")
         .and_then(|v| v.as_u64())
         .unwrap_or(20) as usize;
+    // WME-7 — verb-first cards inlined into the brief. Defaults to 12,
+    // matching the desktop panel; set to 0 to opt out.
+    let limit_wme_cards = params
+        .get("limit_wme_cards")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(12) as usize;
 
     let store = IntentStore::open(intents_path)
         .map_err(|e| format!("failed to open intent store: {e}"))?;
@@ -2369,7 +2519,48 @@ fn handle_memory_brief(params: &Value, intents_path: &str) -> Result<Value, Stri
         .build(Utc::now())
         .map_err(|e| format!("brief failed: {e}"))?;
 
-    serde_json::to_value(&brief).map_err(|e| format!("brief serialization: {e}"))
+    let mut value =
+        serde_json::to_value(&brief).map_err(|e| format!("brief serialization: {e}"))?;
+
+    // WME-7 — attach the most recent WME cards as a sibling field so
+    // MCP clients (Claude Code, Goose) can render the verb-first
+    // surface alongside the commitment-centric brief. Best-effort:
+    // missing wme_cards table → empty list, never an error.
+    if limit_wme_cards > 0 {
+        let cards = load_wme_cards_for_brief(db_path, limit_wme_cards).unwrap_or_else(|err| {
+            tracing::debug!("[memory_brief] wme cards skipped: {err}");
+            Vec::new()
+        });
+        if let Some(obj) = value.as_object_mut() {
+            obj.insert("wme_cards".into(), Value::Array(cards));
+        }
+    }
+
+    Ok(value)
+}
+
+/// Read up to `limit` of the most recent WME cards, returning them in
+/// the same JSON shape as the standalone `memory_cards` tool so MCP
+/// clients can share a single deserializer.
+fn load_wme_cards_for_brief(db_path: &str, limit: usize) -> Result<Vec<Value>, String> {
+    let conn =
+        rusqlite::Connection::open(db_path).map_err(|e| format!("open wme db: {e}"))?;
+    tm_reflect::ensure_wme_schema(&conn)
+        .map_err(|e| format!("ensure_wme_schema: {e}"))?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, kind, target_id, statement, score, relevance, surprise, recency, outcome, created_at \
+             FROM wme_cards ORDER BY created_at DESC LIMIT ?1",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map(rusqlite::params![limit as i64], row_to_card_value)
+        .map_err(|e| e.to_string())?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r.map_err(|e| e.to_string())?);
+    }
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------
@@ -3128,7 +3319,15 @@ async fn handle_request(
                         .map_err(|e| anyhow::anyhow!(e))?
                 }
                 "memory_brief" => {
-                    handle_memory_brief(&args, intents_path)
+                    handle_memory_brief(&args, intents_path, db_path)
+                        .map_err(|e| anyhow::anyhow!(e))?
+                }
+                "memory_cards" => {
+                    handle_memory_cards(&args, db_path)
+                        .map_err(|e| anyhow::anyhow!(e))?
+                }
+                "memory_card_feedback" => {
+                    handle_memory_card_feedback(&args, db_path)
                         .map_err(|e| anyhow::anyhow!(e))?
                 }
                 "memory_insight_silence" => {
@@ -3777,7 +3976,7 @@ mod tests {
         .await
         .expect("resolve ok");
 
-        let brief = handle_memory_brief(&json!({}), &intents_path).expect("brief ok");
+        let brief = handle_memory_brief(&json!({}), &intents_path, &intents_path).expect("brief ok");
         let counts = &brief["counts"];
         assert_eq!(counts["open"], 1, "one future-horizon commitment in open");
         assert_eq!(counts["overdue"], 1, "one past-horizon commitment in overdue");
@@ -4002,7 +4201,7 @@ mod tests {
         .await
         .expect("commit ok");
 
-        let brief = handle_memory_brief(&json!({}), &intents_path).expect("brief ok");
+        let brief = handle_memory_brief(&json!({}), &intents_path, &intents_path).expect("brief ok");
         let open = brief["open"].as_array().expect("open array");
         assert_eq!(open.len(), 1);
         let outlook = &open[0]["outlook"];
@@ -4027,7 +4226,7 @@ mod tests {
         .await
         .expect("commit ok");
 
-        let brief = handle_memory_brief(&json!({}), &intents_path).expect("brief ok");
+        let brief = handle_memory_brief(&json!({}), &intents_path, &intents_path).expect("brief ok");
         let open = brief["open"].as_array().expect("open array");
         assert_eq!(open.len(), 1);
         assert!(
@@ -4138,7 +4337,7 @@ mod tests {
         .await
         .expect("commit ok");
 
-        let brief = handle_memory_brief(&json!({}), &intents_path).expect("brief ok");
+        let brief = handle_memory_brief(&json!({}), &intents_path, &intents_path).expect("brief ok");
         let insights = brief["insights"].as_array().expect("insights array present");
         assert!(
             !insights.is_empty(),
@@ -4170,7 +4369,7 @@ mod tests {
         .await
         .expect("commit ok");
 
-        let brief = handle_memory_brief(&json!({}), &intents_path).expect("brief ok");
+        let brief = handle_memory_brief(&json!({}), &intents_path, &intents_path).expect("brief ok");
         let insights = brief["insights"].as_array().expect("insights array present");
         assert!(insights.is_empty(), "no model → no insights, got {brief}");
         assert_eq!(brief["counts"]["insights"], json!(0));
@@ -4231,7 +4430,7 @@ mod tests {
         .await
         .expect("commit ok");
 
-        let brief = handle_memory_brief(&json!({}), &intents_path).expect("brief ok");
+        let brief = handle_memory_brief(&json!({}), &intents_path, &intents_path).expect("brief ok");
         let insights = brief["insights"].as_array().expect("insights array present");
         assert!(
             insights.is_empty(),
@@ -4341,7 +4540,7 @@ mod tests {
         let cid_str = commit["commitment_id"].as_str().unwrap().to_string();
 
         // Sanity: pre-silence brief surfaces the warning.
-        let pre = handle_memory_brief(&json!({}), &intents_path).expect("brief ok");
+        let pre = handle_memory_brief(&json!({}), &intents_path, &intents_path).expect("brief ok");
         assert!(
             !pre["insights"].as_array().unwrap().is_empty(),
             "pre-silence: insight must surface"
@@ -4364,7 +4563,7 @@ mod tests {
         assert_eq!(arr[0]["reason"], json!("I get it"));
 
         // Brief now omits the insight even though the row is still open.
-        let post = handle_memory_brief(&json!({}), &intents_path).expect("brief ok");
+        let post = handle_memory_brief(&json!({}), &intents_path, &intents_path).expect("brief ok");
         assert!(
             post["insights"].as_array().unwrap().is_empty(),
             "post-silence: insight must be filtered, got {post}"
@@ -4385,7 +4584,7 @@ mod tests {
         )
         .expect("unsilence ok");
         assert_eq!(removed["removed"], json!(true));
-        let brief2 = handle_memory_brief(&json!({}), &intents_path).expect("brief ok");
+        let brief2 = handle_memory_brief(&json!({}), &intents_path, &intents_path).expect("brief ok");
         assert!(
             !brief2["insights"].as_array().unwrap().is_empty(),
             "after unsilence: insight must resurface"

@@ -118,6 +118,17 @@ pub fn heuristic_moc_groups(
             Predicate::Custom(s) => s.clone(),
             other => format!("{:?}", other),
         };
+        // Skip MOC-internal predicates so we don't recursively generate
+        // "indexes indexes ..." labels each consolidation pass. The
+        // `indexes` predicate is itself an auto-MOC backlink — picking
+        // it up here means every MOC becomes the seed of a new MOC the
+        // next time the consolidator runs.
+        if pred_label.eq_ignore_ascii_case("indexes")
+            || pred_label.eq_ignore_ascii_case("related_to")
+            || pred_label.eq_ignore_ascii_case("relatedto")
+        {
+            continue;
+        }
         let key = (pred_label.clone(), target_name.clone());
         let entry = groups.entry(key).or_default();
         if !entry.contains(&t.subject_id) {

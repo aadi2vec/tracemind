@@ -63,6 +63,11 @@ export default function GraphView() {
   // null = show every community.
   const [focusCommunity, setFocusCommunity] = useState<number | null>(null);
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number; node: SimNode } | null>(null);
+  // Destructive delete confirmation — Tauri's WKWebView doesn't render
+  // window.confirm(), and the prior implementation deleted on first
+  // click with no error feedback if the API call failed.
+  const [pendingDelete, setPendingDelete] = useState<{ id: string; name: string } | null>(null);
+  const [deleting, setDeleting] = useState(false);
   const nodesRef = useRef<SimNode[]>([]);
   const edgesRef = useRef<GraphEdge[]>([]);
   const animRef = useRef<number>(0);
@@ -612,7 +617,11 @@ export default function GraphView() {
         <div className="flex items-center gap-3">
           {data && (
             <span className="text-xs text-tm-muted">
-              {nodesRef.current.length} nodes, {edgesRef.current.length} edges
+              {/* Use data length until refs are populated by the sim effect,
+                  otherwise the header flashes "0 nodes, 0 edges" on first
+                  paint even though the data arrived. */}
+              {(nodesRef.current.length || data.nodes.length)} nodes,{" "}
+              {(edgesRef.current.length || data.edges.length)} edges
               {filter !== "all" && ` (filtered from ${data.nodes.length})`}
             </span>
           )}
@@ -803,13 +812,64 @@ export default function GraphView() {
           <button
             className="w-full text-left px-3 py-1.5 text-xs text-red-400 hover:bg-red-500/10 transition-colors"
             onClick={async () => {
-              await deleteEntity(contextMenu.node.id);
+              const target = contextMenu.node;
               setContextMenu(null);
-              getGraph().then(setData).catch((e) => setError(String(e)));
+              // Confirm in-app — Tauri's WKWebView swallows window.confirm.
+              setPendingDelete({ id: target.id, name: target.name });
             }}
           >
             Delete Entity
           </button>
+        </div>
+      )}
+
+      {pendingDelete && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm"
+          onClick={() => !deleting && setPendingDelete(null)}
+        >
+          <div
+            className="bg-tm-surface border border-tm-border rounded-lg p-5 max-w-md w-[420px] shadow-xl"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <h3 className="text-base font-semibold text-tm-text mb-2">
+              Delete entity?
+            </h3>
+            <p className="text-sm text-tm-muted">
+              <span className="text-tm-text font-medium">{pendingDelete.name}</span>{" "}
+              and its outgoing + incoming triples will be removed. This cannot
+              be undone.
+            </p>
+            <div className="flex justify-end gap-2 mt-5">
+              <button
+                onClick={() => setPendingDelete(null)}
+                disabled={deleting}
+                className="px-3 py-1.5 text-sm border border-tm-border rounded text-tm-text hover:bg-white/5 disabled:opacity-50"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={async () => {
+                  setDeleting(true);
+                  try {
+                    await deleteEntity(pendingDelete.id);
+                    setPendingDelete(null);
+                    const next = await getGraph();
+                    setData(next);
+                    setError("");
+                  } catch (e) {
+                    setError(`Delete failed: ${e}`);
+                  } finally {
+                    setDeleting(false);
+                  }
+                }}
+                disabled={deleting}
+                className="px-3 py-1.5 text-sm bg-rose-500/20 text-rose-300 border border-rose-500/40 rounded hover:bg-rose-500/30 disabled:opacity-50"
+              >
+                {deleting ? "Deleting…" : "Delete"}
+              </button>
+            </div>
+          </div>
         </div>
       )}
     </div>

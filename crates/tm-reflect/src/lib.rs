@@ -31,6 +31,7 @@ pub mod matcher;
 pub mod ontology_proposer;
 pub mod outcome_prompt;
 pub mod pattern;
+pub mod working_memory;
 
 pub use brief::{
     BriefBuilder, BriefConfig, BriefError, CandidateBriefRow, CommitmentBriefRow,
@@ -49,4 +50,11 @@ pub use outcome_prompt::{
 pub use pattern::{
     default_window_start, detect_patterns, wilson_lower_bound, CellKey, DetectedPattern,
     PatternConfig, PolarityDist, TimeBand,
+};
+pub use working_memory::{
+    ensure_schema as ensure_wme_schema, proposals_from_sources, ActivityContext, BridgeInput,
+    CandidateSources, Card, CardKind, CardProposal, CardSignals, CommitmentInput,
+    ContradictionInput, FeedbackKind, OutlierInput, SimilarMemoryInput, WmeConfig, WmeError,
+    WmeResult, WorkingMemoryEngine, DEFAULT_SCORE_FLOOR, MAX_CARDS_PER_HOUR,
+    PER_TARGET_COOLDOWN_SECS,
 };

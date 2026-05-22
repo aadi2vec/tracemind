@@ -114,8 +114,12 @@ export default function EventGraphView() {
         <div className="text-sm text-tm-muted">Loading…</div>
       ) : graph.nodes.length === 0 ? (
         <div className="text-sm text-tm-muted px-4 py-8 rounded border border-dashed border-tm-border text-center">
-          No events yet. They populate automatically as you ingest captures,
-          run queries, and commit to next actions.
+          No events yet. The ingest → event-graph wiring is part of the EVG
+          sprint and not live in this build — captures and queries are not
+          producing event nodes yet. Use the <code>cmd_event_record</code> /
+          <code>cmd_event_edge</code> Tauri commands (or the MCP equivalents)
+          to seed nodes manually, then <em>Promote sequences</em> to derive
+          edges.
         </div>
       ) : (
         <>

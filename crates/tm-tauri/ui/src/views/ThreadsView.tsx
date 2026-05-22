@@ -224,16 +224,29 @@ function ThreadGraphPanel({ graph }: { graph: ThreadGraphDto }) {
     ["Commitments", graph.commitment_ids.length],
     ["Capture signals", graph.capture_signal_ids.length],
   ];
+  const allZero = rows.every(([, n]) => n === 0);
   return (
-    <div className="grid grid-cols-5 gap-3 text-xs">
-      {rows.map(([label, n]) => (
-        <div key={label} className="px-3 py-2 rounded bg-tm-surface border border-tm-border">
-          <div className="text-tm-muted uppercase tracking-wider text-[10px]">
-            {label}
+    <div className="space-y-2">
+      <div className="grid grid-cols-5 gap-3 text-xs">
+        {rows.map(([label, n]) => (
+          <div
+            key={label}
+            className="px-3 py-2 rounded bg-tm-surface border border-tm-border"
+          >
+            <div className="text-tm-muted uppercase tracking-wider text-[10px]">
+              {label}
+            </div>
+            <div className="text-tm-text text-lg font-semibold mt-0.5">{n}</div>
           </div>
-          <div className="text-tm-text text-lg font-semibold mt-0.5">{n}</div>
+        ))}
+      </div>
+      {allZero && (
+        <div className="text-[11px] text-tm-muted leading-snug">
+          Thread is empty because the ingest → event-graph wiring is part
+          of the EVG sprint and not live in this build. Captures and
+          queries are not yet associated with threads.
         </div>
-      ))}
+      )}
     </div>
   );
 }

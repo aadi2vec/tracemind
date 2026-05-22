@@ -8,6 +8,10 @@ tm-types = { workspace = true }
 tm-graph = { workspace = true }
 tm-vector = { workspace = true }  # for Embedder only
 tm-governance = { workspace = true }
+# CLU-4 — hot-path hook into the HDBSCAN substrate. Failure to open the
+# clusterer is non-fatal (Option<Clusterer> at runtime), but the dep is
+# always linked so the assign call stays a single inline branch.
+tm-cluster = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 uuid = { workspace = true }
