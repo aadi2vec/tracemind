@@ -1,0 +1,37 @@
+[package]
+name = "tm-bench-memory"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "tm-bench-memory"
+path = "src/main.rs"
+
+[lib]
+name = "tm_bench_memory"
+path = "src/lib.rs"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+chrono = { workspace = true }
+async-trait = "0.1"
+tokio = { workspace = true }
+uuid = { workspace = true }
+tempfile = "3"
+
+# The TraceMind runner is the *primary* runner for this crate (unlike LoCoMo
+# which had a no-deps default). Persistence is a TraceMind-specific claim;
+# the harness's job is to prove it under the real stack. We still keep the
+# feature gate so CI can compile the bare harness for unit tests fast.
+tm-ingest = { workspace = true, optional = true }
+tm-retrieval = { workspace = true, optional = true }
+
+[features]
+default = ["tracemind"]
+tracemind = ["dep:tm-ingest", "dep:tm-retrieval"]

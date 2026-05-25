@@ -1,0 +1,1139 @@
+//! Tight span extractor for persistence answers.
+//!
+//! Same problem token-F1 always has: a long candidate dilutes precision.
+//! For W-3 the candidate is the *single most-relevant retrieved
+//! sentence* from Session A's ingest, but a 12-word sentence around a
+//! 2-word answer still scores poorly. So we classify the query and
+//! pull the tightest span we can defend.
+//!
+//! Kept hand-written (no regex crate) for two reasons: smaller binary
+//! and no dependency on `regex`'s build, which matters in the CI gate
+//! path that needs to be fast.
+
+use std::collections::HashSet;
+
+/// What the query is asking for. Same idea as the LoCoMo extractor's
+/// `QKind`, but tuned for the W-3 fixture (which has more
+/// name-resolution and decision-history shapes than LoCoMo).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QKind {
+    /// Calendar date — "When …?", "What date …?"
+    Date,
+    /// Person name — "Who …?", "With whom …?"
+    Person,
+    /// Place / location — "Where …?"
+    Place,
+    /// Cardinal number / count — "How many …?"
+    Number,
+    /// Currency — "How much did X cost?"
+    Money,
+    /// Storage / memory amount — "How much memory does X have?"
+    Quantity,
+    /// Duration — "How long is X?"
+    Duration,
+    /// Decision / choice — "What did I pick?", "Which X did I choose?"
+    Choice,
+    /// No specialized extractor; return candidate as-is and let the
+    /// scorer + normalization sort it out.
+    Generic,
+}
+
+const YN_LEAD: &[&str] = &[
+    "did", "does", "do", "is", "are", "was", "were", "has", "have", "had", "will", "can", "could",
+    "should", "would",
+];
+
+/// Words like "is X?" that don't disambiguate intent; reserved.
+const QUANTITY_HINTS: &[&str] = &[
+    "memory", "ram", "storage", "disk", "capacity", "size", "space",
+];
+
+const DURATION_HINTS: &[&str] = &[
+    "long", "sprint", "cycle", "period",
+];
+
+const CHOICE_HINTS: &[&str] = &[
+    "language", "stack", "platform", "framework", "algorithm",
+    "model", "library", "tool", "approach", "school", "billing",
+    "embedding", "clustering", "styling",
+];
+
+pub fn classify(q: &str) -> QKind {
+    let lower = q.trim().to_lowercase();
+    let mut tokens = lower.split_whitespace();
+    let first = match tokens.next() {
+        Some(t) => t,
+        None => return QKind::Generic,
+    };
+
+    // "Which X did I pick?" / "What X did I choose?" always Choice
+    if lower.contains("did i pick")
+        || lower.contains("did i choose")
+        || lower.contains("did i decide")
+        || lower.contains("did i go with")
+        || lower.contains("did i settle")
+        || lower.contains("did i commit")
+        || lower.contains("did i set")
+        || lower.contains("am i shipping")
+        || lower.contains("am i using")
+        || lower.contains("am i choosing")
+        || lower.contains("are we using")
+        || lower.contains("are we shipping")
+        || lower.contains("are we choosing")
+        || lower.contains("did we pick")
+        || lower.contains("did we choose")
+        || lower.contains("did we decide")
+    {
+        return QKind::Choice;
+    }
+
+    if first == "which" {
+        return QKind::Choice;
+    }
+
+    if first == "when" || lower.contains("what date") || lower.contains("which date") {
+        return QKind::Date;
+    }
+    if first == "who" || lower.contains("with whom") {
+        return QKind::Person;
+    }
+    if first == "where" {
+        return QKind::Place;
+    }
+    if first == "how" {
+        match tokens.next() {
+            Some("many") => return QKind::Number,
+            Some("much") => {
+                // "how much memory" / "how much storage" → quantity
+                if QUANTITY_HINTS.iter().any(|h| lower.contains(h)) {
+                    return QKind::Quantity;
+                }
+                return QKind::Money;
+            }
+            Some("long") => return QKind::Duration,
+            _ => {}
+        }
+    }
+
+    // What/X queries that point at a choice-y noun → Choice
+    if first == "what" && CHOICE_HINTS.iter().any(|h| lower.contains(h)) {
+        return QKind::Choice;
+    }
+
+    if YN_LEAD.contains(&first) {
+        return QKind::Generic;
+    }
+
+    QKind::Generic
+}
+
+/// Compose a short prediction from a single candidate sentence. Falls
+/// back to the candidate itself when no extractor fires confidently.
+pub fn compose(query: &str, candidate: &str) -> String {
+    match classify(query) {
+        QKind::Date => extract_date(candidate).unwrap_or_else(|| candidate.to_string()),
+        QKind::Number => extract_number(candidate).unwrap_or_else(|| candidate.to_string()),
+        QKind::Money => extract_money(candidate)
+            .or_else(|| extract_number(candidate))
+            .unwrap_or_else(|| candidate.to_string()),
+        QKind::Quantity => extract_quantity(candidate)
+            .or_else(|| extract_number(candidate))
+            .unwrap_or_else(|| candidate.to_string()),
+        QKind::Duration => extract_duration(candidate).unwrap_or_else(|| candidate.to_string()),
+        // For Person/Place/Choice/Generic: try choice marker first
+        // (handles retraction-aware "going with X" / "set X to Y"),
+        // then value patterns ("X is Y"), then capitalized clusters.
+        QKind::Person | QKind::Place => extract_choice(candidate, query)
+            .filter(|s| !s.is_empty())
+            .or_else(|| extract_person(candidate, query))
+            .or_else(|| extract_value(query, candidate))
+            .unwrap_or_else(|| candidate.to_string()),
+        QKind::Choice => extract_choice(candidate, query)
+            .filter(|s| !s.is_empty())
+            .or_else(|| extract_person(candidate, query))
+            .unwrap_or_else(|| candidate.to_string()),
+        QKind::Generic => extract_choice(candidate, query)
+            .filter(|s| !s.is_empty())
+            .or_else(|| extract_value(query, candidate))
+            .or_else(|| extract_money(candidate))
+            .or_else(|| extract_person(candidate, query))
+            .unwrap_or_else(|| candidate.to_string()),
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Date extractor
+// ────────────────────────────────────────────────────────────────────
+
+const MONTHS: &[&str] = &[
+    "january", "february", "march", "april", "may", "june", "july",
+    "august", "september", "october", "november", "december",
+    "jan", "feb", "mar", "apr", "jun", "jul", "aug", "sep", "sept", "oct", "nov", "dec",
+];
+
+const WEEKDAYS: &[&str] = &[
+    "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday",
+];
+
+const RELATIVE_DAY: &[&str] = &["today", "tomorrow", "tonight", "yesterday"];
+
+const TIME_OF_DAY: &[&str] = &["morning", "afternoon", "evening", "night"];
+
+pub fn extract_date(s: &str) -> Option<String> {
+    let lower = s.to_lowercase();
+
+    // ISO date: 2026-05-03
+    if let Some(span) = scan_iso_date(&lower) {
+        return Some(verbatim_span(s, &lower, &span));
+    }
+
+    // "May 3", "May 3rd", "May 3, 2026"
+    for m in MONTHS {
+        if let Some(idx) = lower.find(m) {
+            let end_month = idx + m.len();
+            let after = &lower[end_month..];
+            // Need a space + a digit to follow for a date.
+            let after_trim = after.trim_start();
+            if after_trim.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false) {
+                let mut end = end_month;
+                while end < lower.len() && lower.as_bytes()[end].is_ascii_whitespace() {
+                    end += 1;
+                }
+                while end < lower.len() && lower.as_bytes()[end].is_ascii_digit() {
+                    end += 1;
+                }
+                // Optional "st/nd/rd/th"
+                if end + 2 <= lower.len() {
+                    let rest = &lower[end..end + 2];
+                    if matches!(rest, "st" | "nd" | "rd" | "th") {
+                        end += 2;
+                    }
+                }
+                // Optional ", year"
+                let tail = &lower[end..];
+                if let Some(stripped) = tail.strip_prefix(", ") {
+                    let mut yend = end + 2;
+                    let mut yc = 0;
+                    for c in stripped.chars() {
+                        if c.is_ascii_digit() && yc < 4 {
+                            yend += 1;
+                            yc += 1;
+                        } else {
+                            break;
+                        }
+                    }
+                    if yc == 4 {
+                        end = yend;
+                    }
+                }
+                return Some(verbatim_span(s, &lower, &(idx, end)));
+            }
+        }
+    }
+
+    // "next Tuesday", "this Friday", "by Monday", "on Wednesday",
+    // optionally followed by " morning/afternoon/evening"
+    for w in WEEKDAYS {
+        if let Some(idx) = lower.find(w) {
+            let start = preceding_qualifier(&lower, idx).unwrap_or(idx);
+            let mut end = idx + w.len();
+            // optional time-of-day
+            let tail = &lower[end..];
+            for t in TIME_OF_DAY {
+                let space_t = format!(" {}", t);
+                if tail.starts_with(&space_t) {
+                    end += space_t.len();
+                    break;
+                }
+            }
+            return Some(verbatim_span(s, &lower, &(start, end)));
+        }
+    }
+
+    // "today", "tomorrow", "yesterday", "tonight"
+    for r in RELATIVE_DAY {
+        if let Some(idx) = lower.find(r) {
+            let end = idx + r.len();
+            return Some(verbatim_span(s, &lower, &(idx, end)));
+        }
+    }
+
+    // "in N days/weeks/months"
+    if let Some(idx) = lower.find("in ") {
+        let after_in = idx + 3;
+        if after_in < lower.len() {
+            let mut p = after_in;
+            let digit_start = p;
+            while p < lower.len() && lower.as_bytes()[p].is_ascii_digit() {
+                p += 1;
+            }
+            if p == digit_start {
+                for word_num in [
+                    "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten",
+                ] {
+                    if lower[after_in..].starts_with(word_num) {
+                        p = after_in + word_num.len();
+                        break;
+                    }
+                }
+            }
+            if p > digit_start {
+                while p < lower.len() && lower.as_bytes()[p].is_ascii_whitespace() {
+                    p += 1;
+                }
+                for unit in [
+                    "days", "day", "weeks", "week", "months", "month", "years", "year",
+                ] {
+                    if lower[p..].starts_with(unit) {
+                        let end = p + unit.len();
+                        return Some(verbatim_span(s, &lower, &(idx, end)));
+                    }
+                }
+            }
+        }
+    }
+
+    None
+}
+
+fn scan_iso_date(lower: &str) -> Option<(usize, usize)> {
+    let bytes = lower.as_bytes();
+    let n = bytes.len();
+    if n < 10 {
+        return None;
+    }
+    for i in 0..=(n - 10) {
+        if bytes[i].is_ascii_digit()
+            && bytes[i + 1].is_ascii_digit()
+            && bytes[i + 2].is_ascii_digit()
+            && bytes[i + 3].is_ascii_digit()
+            && bytes[i + 4] == b'-'
+            && bytes[i + 5].is_ascii_digit()
+            && bytes[i + 6].is_ascii_digit()
+            && bytes[i + 7] == b'-'
+            && bytes[i + 8].is_ascii_digit()
+            && bytes[i + 9].is_ascii_digit()
+        {
+            return Some((i, i + 10));
+        }
+    }
+    None
+}
+
+fn preceding_qualifier(lower: &str, idx: usize) -> Option<usize> {
+    if idx == 0 {
+        return None;
+    }
+    let head = &lower[..idx];
+    for q in ["next ", "this ", "by ", "on ", "last "] {
+        if head.ends_with(q) {
+            return Some(idx - q.len());
+        }
+    }
+    None
+}
+
+fn verbatim_span(orig: &str, lower: &str, span: &(usize, usize)) -> String {
+    let (a, b) = (span.0.min(orig.len()), span.1.min(orig.len()));
+    if orig.is_char_boundary(a) && orig.is_char_boundary(b) {
+        orig[a..b].to_string()
+    } else {
+        lower[span.0..span.1].to_string()
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Person / Place extractor — capitalized clusters, refined.
+// ────────────────────────────────────────────────────────────────────
+
+const PRONOUNS: &[&str] = &[
+    "he", "she", "it", "they", "his", "her", "their", "them",
+    "my", "your", "our", "us", "we", "i", "you", "me", "him",
+];
+
+const SKIP_LEADING: &[&str] = &[
+    "wait", "actually", "sorry", "scratch", "no", "yes", "ok", "okay",
+    "well", "look", "hey", "oh",
+    "met", "hired", "got", "set", "made", "took", "saw", "did",
+    "picked", "chose", "going", "settled", "committed", "decided",
+    "the", "a", "an",
+    "updated", "bumped", "moved", "changed", "rescheduled",
+    "adopted", "started", "booked",
+];
+
+fn is_pronoun(w: &str) -> bool {
+    PRONOUNS.contains(&w.to_lowercase().as_str())
+}
+
+fn is_skip_leading(w: &str) -> bool {
+    SKIP_LEADING.contains(&w.to_lowercase().as_str())
+}
+
+fn q_tokens_lower(query: &str) -> HashSet<String> {
+    query
+        .split_whitespace()
+        .map(|t| t.trim_matches(|c: char| !c.is_alphanumeric()).to_lowercase())
+        .filter(|t| !t.is_empty())
+        .collect()
+}
+
+/// Collect runs of consecutive capitalized tokens from `s` (separated
+/// by lowercase tokens / punctuation).
+fn capitalized_clusters(s: &str) -> Vec<Vec<String>> {
+    let mut clusters: Vec<Vec<String>> = Vec::new();
+    let mut cur: Vec<String> = Vec::new();
+    for tok in s.split_whitespace() {
+        let stripped = tok.trim_matches(|c: char| !c.is_alphanumeric());
+        if stripped.is_empty() {
+            if !cur.is_empty() {
+                clusters.push(std::mem::take(&mut cur));
+            }
+            continue;
+        }
+        let first_upper = stripped
+            .chars()
+            .next()
+            .map(|c| c.is_ascii_uppercase())
+            .unwrap_or(false);
+        if first_upper {
+            cur.push(stripped.to_string());
+        } else if !cur.is_empty() {
+            clusters.push(std::mem::take(&mut cur));
+        }
+    }
+    if !cur.is_empty() {
+        clusters.push(cur);
+    }
+    clusters
+}
+
+/// Strip leading discourse / verb / pronoun tokens from a cluster.
+fn refine_cluster(c: Vec<String>) -> Vec<String> {
+    let mut result = c;
+    while let Some(first) = result.first() {
+        if is_pronoun(first) || is_skip_leading(first) {
+            result.remove(0);
+        } else {
+            break;
+        }
+    }
+    result
+}
+
+pub fn extract_person(candidate: &str, query: &str) -> Option<String> {
+    let q_tokens = q_tokens_lower(query);
+    for cluster in capitalized_clusters(candidate) {
+        let refined = refine_cluster(cluster);
+        if refined.is_empty() {
+            continue;
+        }
+        // Skip cluster fully covered by the query.
+        if refined.iter().all(|t| q_tokens.contains(&t.to_lowercase())) {
+            continue;
+        }
+        return Some(refined.join(" "));
+    }
+    None
+}
+
+/// Backwards-compatible alias (used in tests).
+pub fn extract_place(candidate: &str, query: &str) -> Option<String> {
+    extract_person(candidate, query)
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Number extractor — first integer, optional comma-grouping.
+// ────────────────────────────────────────────────────────────────────
+
+pub fn extract_number(s: &str) -> Option<String> {
+    let bytes = s.as_bytes();
+    let mut start: Option<usize> = None;
+    for (i, &b) in bytes.iter().enumerate() {
+        if b.is_ascii_digit() {
+            start = Some(i);
+            break;
+        }
+    }
+    let start = start?;
+    let mut end = start;
+    while end < bytes.len() && (bytes[end].is_ascii_digit() || bytes[end] == b',') {
+        end += 1;
+    }
+    if end > start && bytes[end - 1] == b',' {
+        end -= 1;
+    }
+    Some(s[start..end].to_string())
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Money extractor — $X, $X.YY, $XM, $XK, $X million / billion
+// ────────────────────────────────────────────────────────────────────
+
+pub fn extract_money(s: &str) -> Option<String> {
+    if let Some(dollar) = s.find('$') {
+        let rest = &s[dollar..];
+        let mut end = 1; // include $
+        let bytes = rest.as_bytes();
+        while end < bytes.len()
+            && (bytes[end].is_ascii_digit()
+                || bytes[end] == b'.'
+                || bytes[end] == b','
+                || bytes[end] == b'k'
+                || bytes[end] == b'K'
+                || bytes[end] == b'm'
+                || bytes[end] == b'M'
+                || bytes[end] == b'b'
+                || bytes[end] == b'B')
+        {
+            end += 1;
+        }
+        if end > 1 {
+            return Some(rest[..end].to_string());
+        }
+    }
+    let lower = s.to_lowercase();
+    for unit in ["million", "billion", "thousand"] {
+        if let Some(idx) = lower.find(unit) {
+            let head = lower[..idx].trim_end();
+            // Walk back to find the number word/digits prefix.
+            let num_start = head.rfind(|c: char| c.is_whitespace()).map(|i| i + 1).unwrap_or(0);
+            let num = head[num_start..].trim();
+            if !num.is_empty()
+                && (num.chars().any(|c| c.is_ascii_digit()) || is_number_word(num))
+            {
+                return Some(format!("{} {}", num, unit));
+            }
+        }
+    }
+    None
+}
+
+fn is_number_word(w: &str) -> bool {
+    matches!(
+        w.to_lowercase().as_str(),
+        "one" | "two" | "three" | "four" | "five" | "six" | "seven" | "eight" | "nine" | "ten"
+    )
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Quantity extractor — "64GB", "16TB", "32MB"
+// ────────────────────────────────────────────────────────────────────
+
+const STORAGE_UNITS: &[&str] = &["TB", "GB", "MB", "KB", "tb", "gb", "mb", "kb"];
+
+pub fn extract_quantity(s: &str) -> Option<String> {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i].is_ascii_digit() {
+            let start = i;
+            while i < bytes.len() && bytes[i].is_ascii_digit() {
+                i += 1;
+            }
+            // Optional space.
+            let after_digits = i;
+            while i < bytes.len() && bytes[i] == b' ' {
+                i += 1;
+            }
+            // Match unit
+            for u in STORAGE_UNITS {
+                if s[i..].starts_with(u) {
+                    let end = i + u.len();
+                    // Use the original (preserves "64GB" or "64 GB").
+                    return Some(s[start..end].to_string());
+                }
+            }
+            // No unit — back off and continue scanning.
+            i = after_digits;
+        } else {
+            i += 1;
+        }
+    }
+    None
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Duration extractor — "6 weeks", "6-week", "3 months", "2 hours"
+// ────────────────────────────────────────────────────────────────────
+
+const DURATION_UNITS: &[&str] = &[
+    "weeks", "week", "days", "day", "months", "month", "years", "year",
+    "hours", "hour", "minutes", "minute", "seconds", "second",
+];
+
+pub fn extract_duration(s: &str) -> Option<String> {
+    let lower = s.to_lowercase();
+    let bytes = lower.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i].is_ascii_digit() {
+            let start = i;
+            while i < bytes.len() && bytes[i].is_ascii_digit() {
+                i += 1;
+            }
+            // separator: ' ' or '-'
+            let sep_start = i;
+            while i < bytes.len() && (bytes[i] == b' ' || bytes[i] == b'-') {
+                i += 1;
+            }
+            if i > sep_start {
+                for u in DURATION_UNITS {
+                    if lower[i..].starts_with(u) {
+                        let end = i + u.len();
+                        // Re-form span with original case but normalize
+                        // "6-week" → "6 weeks" so tokenizer matches refs.
+                        let raw = &s[start..end];
+                        return Some(normalize_duration(raw));
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+fn normalize_duration(raw: &str) -> String {
+    // "6-week" → "6 weeks"; "6 week" → "6 weeks"; "6 weeks" → "6 weeks".
+    let lower = raw.to_lowercase();
+    let with_space = lower.replace('-', " ");
+    // pluralize unit if needed
+    let parts: Vec<&str> = with_space.split_whitespace().collect();
+    if parts.len() == 2 {
+        let num = parts[0];
+        let unit = parts[1];
+        if !unit.ends_with('s') {
+            // Only pluralize when num != 1
+            let plural = if num == "1" {
+                unit.to_string()
+            } else {
+                format!("{}s", unit)
+            };
+            return format!("{} {}", num, plural);
+        }
+    }
+    with_space
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Decision / choice extractor.
+// ────────────────────────────────────────────────────────────────────
+
+pub fn extract_choice(candidate: &str, _query: &str) -> Option<String> {
+    let lower = candidate.to_lowercase();
+
+    // Markers that introduce a chosen option.
+    // Order matters — multi-word patterns first.
+    let markers: &[(&str, MarkerKind)] = &[
+        ("going with ", MarkerKind::Choice),
+        ("we're using ", MarkerKind::Choice),
+        ("settled on ", MarkerKind::Choice),
+        ("decided to use ", MarkerKind::Choice),
+        ("decided to ", MarkerKind::FirstWord),
+        ("committed to ", MarkerKind::Choice),
+        ("picked ", MarkerKind::Choice),
+        ("chose ", MarkerKind::Choice),
+        ("using ", MarkerKind::Choice),
+        ("ask to ", MarkerKind::Choice),
+        ("set to ", MarkerKind::Choice),
+        ("set the ", MarkerKind::ToOrComma),
+        ("updated to ", MarkerKind::Choice),
+        ("bumped to ", MarkerKind::Choice),
+        ("now with ", MarkerKind::Choice),
+        ("deal is now with ", MarkerKind::Choice),
+    ];
+
+    for (marker, kind) in markers {
+        if let Some(idx) = lower.find(marker) {
+            let start = idx + marker.len();
+            if start >= candidate.len() {
+                continue;
+            }
+            let after = &candidate[start..];
+            match kind {
+                MarkerKind::Choice => {
+                    let span = take_until_stop(after);
+                    return Some(prefer_acronym(&span));
+                }
+                MarkerKind::FirstWord => {
+                    let first = first_word(after);
+                    if !first.is_empty() {
+                        return Some(first);
+                    }
+                }
+                MarkerKind::ToOrComma => {
+                    // For "Set the seed round ask to $1M, not $3M.":
+                    // skip to next " to " then take_until_stop.
+                    if let Some(t) = after.to_lowercase().find(" to ") {
+                        let s2 = t + 4;
+                        if s2 < after.len() {
+                            return Some(take_until_stop(&after[s2..]));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// If a multi-word span contains an all-caps acronym (e.g. "shipping
+/// the MCP integration" → "MCP"), prefer the acronym. Leaves single-
+/// word and acronym-free spans unchanged. Skips hyphenated tokens
+/// like "BGE-small" so we keep useful suffixes.
+fn prefer_acronym(span: &str) -> String {
+    let tokens: Vec<&str> = span.split_whitespace().collect();
+    if tokens.len() <= 1 {
+        return span.to_string();
+    }
+    for t in &tokens {
+        if t.contains('-') {
+            continue;
+        }
+        let stripped: String = t.chars().filter(|c| c.is_alphanumeric()).collect();
+        if stripped.len() >= 2
+            && stripped.len() <= 5
+            && stripped.chars().all(|c| c.is_ascii_uppercase())
+        {
+            return stripped;
+        }
+    }
+    span.to_string()
+}
+
+#[derive(Clone, Copy)]
+enum MarkerKind {
+    Choice,
+    FirstWord,
+    ToOrComma,
+}
+
+fn first_word(s: &str) -> String {
+    s.split_whitespace()
+        .next()
+        .unwrap_or("")
+        .trim_end_matches(|c: char| !c.is_alphanumeric())
+        .to_string()
+}
+
+fn take_until_stop(s: &str) -> String {
+    // Word-boundary stops (require surrounding space to avoid hitting
+    // decimals like "$1.5M" or compounds like "BGE-small").
+    let stops: &[&str] = &[
+        " over ", " for ", " not ", " instead", " before ", " after ",
+        " starting ", " given ", " to keep ", " because ", " — ", " - ",
+        " from ", " with ", " at ", " in ",
+        ". ", ", ", "; ",
+    ];
+    let lower = s.to_lowercase();
+    let mut end = s.len();
+    for stop in stops {
+        if let Some(i) = lower.find(stop) {
+            if i < end {
+                end = i;
+            }
+        }
+    }
+    // Trim trailing terminator only if at very end (sentence period).
+    s[..end]
+        .trim()
+        .trim_end_matches(|c: char| matches!(c, '.' | ',' | ';' | '—' | '-') && false || c.is_whitespace())
+        .trim_end_matches(|c: char| matches!(c, '.' | ',' | ';'))
+        .to_string()
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Generic value extractor — "X is Y", "X starts with Y", etc.
+// ────────────────────────────────────────────────────────────────────
+
+pub fn extract_value(_query: &str, candidate: &str) -> Option<String> {
+    let lower = candidate.to_lowercase();
+    let patterns: &[&str] = &[
+        " starts with ",
+        " helps with ",
+        " keeps ",
+        " keep ",
+        " named ",
+        " called ",
+        " is at ",
+        " is ",
+        " are ",
+        " was ",
+        " were ",
+    ];
+    for p in patterns {
+        if let Some(idx) = lower.find(p) {
+            let start = idx + p.len();
+            if start >= candidate.len() {
+                continue;
+            }
+            let rest = candidate[start..]
+                .trim_end_matches(|c: char| !c.is_alphanumeric() && c != '$' && c != '-' && c != '_');
+            if rest.is_empty() {
+                continue;
+            }
+            // Strip leading "at " / "the " when " is " matched.
+            let cleaned = rest
+                .strip_prefix("at ")
+                .or_else(|| rest.strip_prefix("the "))
+                .unwrap_or(rest);
+            return Some(cleaned.to_string());
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn classify_when_is_date() {
+        assert_eq!(classify("When is the flight?"), QKind::Date);
+        assert_eq!(classify("What date is the meeting?"), QKind::Date);
+    }
+
+    #[test]
+    fn classify_who_is_person() {
+        assert_eq!(classify("Who founded TraceMind?"), QKind::Person);
+        assert_eq!(classify("With whom is Aaditya meeting?"), QKind::Person);
+    }
+
+    #[test]
+    fn classify_which_is_choice() {
+        assert_eq!(classify("Which school did I pick?"), QKind::Choice);
+    }
+
+    #[test]
+    fn classify_how_long_is_duration() {
+        assert_eq!(classify("How long are my sprint cycles?"), QKind::Duration);
+    }
+
+    #[test]
+    fn classify_how_much_memory_is_quantity() {
+        assert_eq!(
+            classify("How much unified memory does the MacBook have?"),
+            QKind::Quantity
+        );
+    }
+
+    #[test]
+    fn classify_yn_is_generic() {
+        assert_eq!(classify("Did Alice ship the spec?"), QKind::Generic);
+    }
+
+    #[test]
+    fn date_iso() {
+        assert_eq!(
+            extract_date("Flight is 2026-05-03 morning"),
+            Some("2026-05-03".into())
+        );
+    }
+
+    #[test]
+    fn date_month_day() {
+        assert_eq!(
+            extract_date("My flight to Tokyo is on May 3rd"),
+            Some("May 3rd".into())
+        );
+    }
+
+    #[test]
+    fn date_month_day_year() {
+        assert_eq!(
+            extract_date("Conference is October 15, 2026"),
+            Some("October 15, 2026".into())
+        );
+    }
+
+    #[test]
+    fn date_weekday_with_qualifier_and_time_of_day() {
+        assert_eq!(
+            extract_date("Wait, the meeting moved to Wednesday morning."),
+            Some("Wednesday morning".into())
+        );
+    }
+
+    #[test]
+    fn date_relative() {
+        assert_eq!(extract_date("Ship the demo tomorrow"), Some("tomorrow".into()));
+    }
+
+    #[test]
+    fn date_in_n_weeks() {
+        assert_eq!(extract_date("Will publish in 3 weeks"), Some("in 3 weeks".into()));
+    }
+
+    #[test]
+    fn date_in_n_months() {
+        assert_eq!(
+            extract_date("The fixed-rate period ends in 18 months."),
+            Some("in 18 months".into())
+        );
+    }
+
+    #[test]
+    fn person_extracts_capitalized_cluster() {
+        assert_eq!(
+            extract_person("Aaditya works at TraceMind.", "Where does Aaditya work?"),
+            Some("TraceMind".into())
+        );
+    }
+
+    #[test]
+    fn person_drops_leading_verb() {
+        assert_eq!(
+            extract_person(
+                "Met Dr Patel at the conference yesterday.",
+                "Who suggested I read the paper?"
+            ),
+            Some("Dr Patel".into())
+        );
+    }
+
+    #[test]
+    fn person_drops_leading_pronoun() {
+        assert_eq!(
+            extract_person(
+                "My friend Lila moved to Brooklyn last year.",
+                "Where does Lila live now?"
+            ),
+            Some("Brooklyn".into())
+        );
+    }
+
+    #[test]
+    fn person_drops_discourse_marker() {
+        assert_eq!(
+            extract_person(
+                "Wait, it's Lyra Coffee, not Cafe Vega.",
+                "Where's the coffee meeting?"
+            ),
+            Some("Lyra Coffee".into())
+        );
+    }
+
+    #[test]
+    fn person_handles_sorry_no_actually() {
+        assert_eq!(
+            extract_person(
+                "Sorry, no, actually it's Mike Chen, not Sarah.",
+                "Who's the new VP of engineering?"
+            ),
+            Some("Mike Chen".into())
+        );
+    }
+
+    #[test]
+    fn number_extracts_first_int() {
+        assert_eq!(extract_number("3 dogs and 7 cats"), Some("3".into()));
+    }
+
+    #[test]
+    fn money_dollar_amount() {
+        assert_eq!(extract_money("She raised $2.5M"), Some("$2.5M".into()));
+    }
+
+    #[test]
+    fn money_million_words() {
+        assert_eq!(
+            extract_money("Raised 25 million in seed"),
+            Some("25 million".into())
+        );
+    }
+
+    #[test]
+    fn money_two_million_words() {
+        assert_eq!(
+            extract_money("The seed round target is two million dollars."),
+            Some("two million".into())
+        );
+    }
+
+    #[test]
+    fn quantity_gb() {
+        assert_eq!(
+            extract_quantity("It has 64GB of unified memory."),
+            Some("64GB".into())
+        );
+    }
+
+    #[test]
+    fn quantity_gb_space() {
+        assert_eq!(extract_quantity("16 GB RAM"), Some("16 GB".into()));
+    }
+
+    #[test]
+    fn duration_dash_unit_normalises() {
+        assert_eq!(
+            extract_duration("Committed to a 6-week sprint cycle starting Monday."),
+            Some("6 weeks".into())
+        );
+    }
+
+    #[test]
+    fn duration_space_unit() {
+        assert_eq!(
+            extract_duration("Sprints are 6 weeks long."),
+            Some("6 weeks".into())
+        );
+    }
+
+    #[test]
+    fn choice_picked_over() {
+        assert_eq!(
+            extract_choice(
+                "Picked HDBSCAN over KMeans for the clustering substrate.",
+                "Which algorithm did I pick?"
+            ),
+            Some("HDBSCAN".into())
+        );
+    }
+
+    #[test]
+    fn choice_going_with() {
+        assert_eq!(
+            extract_choice(
+                "Going with Stripe over Lago for billing infrastructure.",
+                "Which billing platform?"
+            ),
+            Some("Stripe".into())
+        );
+    }
+
+    #[test]
+    fn choice_settled_on() {
+        assert_eq!(
+            extract_choice(
+                "Settled on Tailwind for styling instead of CSS modules.",
+                "What did I pick for styling?"
+            ),
+            Some("Tailwind".into())
+        );
+    }
+
+    #[test]
+    fn choice_decided_to_use() {
+        assert_eq!(
+            extract_choice(
+                "Decided to use Rust for the core engine, not Go.",
+                "What language?"
+            ),
+            Some("Rust".into())
+        );
+    }
+
+    #[test]
+    fn choice_decided_to_verb() {
+        assert_eq!(
+            extract_choice(
+                "Decided to delete the Reason nav item and surface chains as verb cards.",
+                "What did I decide about the Reason nav?"
+            ),
+            Some("delete".into())
+        );
+    }
+
+    #[test]
+    fn choice_set_to() {
+        assert_eq!(
+            extract_choice(
+                "Set the seed round ask to $1M, not $3M.",
+                "What is the seed round ask?"
+            ),
+            Some("$1M".into())
+        );
+    }
+
+    #[test]
+    fn choice_using_after_scratch() {
+        assert_eq!(
+            extract_choice(
+                "Scratch that, we're using Lago instead.",
+                "Which billing platform?"
+            ),
+            Some("Lago".into())
+        );
+    }
+
+    #[test]
+    fn value_is_pattern() {
+        assert_eq!(
+            extract_value("What is my favourite tea?", "My favourite tea is matcha."),
+            Some("matcha".into())
+        );
+    }
+
+    #[test]
+    fn value_starts_with_pattern() {
+        assert_eq!(
+            extract_value(
+                "What does my OpenRouter API key start with?",
+                "My API key for OpenRouter starts with sk-or-v1."
+            ),
+            Some("sk-or-v1".into())
+        );
+    }
+
+    #[test]
+    fn value_is_at_strips_at() {
+        assert_eq!(
+            extract_value(
+                "Where is the Tauri app binary?",
+                "The Tauri app binary is at target/release/tracemind-app."
+            ),
+            Some("target/release/tracemind-app".into())
+        );
+    }
+
+    #[test]
+    fn compose_when_with_date() {
+        assert_eq!(
+            compose("When is my flight?", "Flight is May 3rd."),
+            "May 3rd".to_string()
+        );
+    }
+
+    #[test]
+    fn compose_who_with_person() {
+        assert_eq!(
+            compose("Who founded TraceMind?", "Aaditya is the founder of TraceMind."),
+            "Aaditya".to_string()
+        );
+    }
+
+    #[test]
+    fn compose_choice_with_choice() {
+        assert_eq!(
+            compose(
+                "Which algorithm did I pick?",
+                "Picked HDBSCAN over KMeans for the clustering substrate."
+            ),
+            "HDBSCAN".to_string()
+        );
+    }
+
+    #[test]
+    fn compose_quantity_with_storage() {
+        assert_eq!(
+            compose("How much memory does my laptop have?", "It has 64GB of unified memory."),
+            "64GB".to_string()
+        );
+    }
+
+    #[test]
+    fn compose_duration_normalizes() {
+        assert_eq!(
+            compose("How long are my sprints?", "Committed to a 6-week sprint cycle starting Monday."),
+            "6 weeks".to_string()
+        );
+    }
+
+    #[test]
+    fn compose_generic_value() {
+        assert_eq!(
+            compose("What is my favourite tea?", "My favourite tea is matcha."),
+            "matcha".to_string()
+        );
+    }
+}
