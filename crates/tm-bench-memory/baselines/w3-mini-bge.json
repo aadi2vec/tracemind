@@ -1,6 +1,6 @@
 {
-  "runner": "tracemind-w3-hash",
-  "timestamp": "2026-05-26T00:59:19.529912+00:00",
+  "runner": "tracemind-w3-bge",
+  "timestamp": "2026-05-26T01:00:00.968677+00:00",
   "total_pairs": 50,
   "persistence_score": 97.0,
   "overall_exact_match": 96.0,
@@ -31,7 +31,7 @@
       "exact_match": 100.0
     }
   },
-  "wall_seconds": 1.041719125,
+  "wall_seconds": 4.5030345,
   "outcomes": [
     {
       "pair_id": "fr-01",
@@ -43,7 +43,7 @@
       ],
       "f1": 1.0,
       "exact_match": 1.0,
-      "latency_ms": 9
+      "latency_ms": 122
     },
     {
       "pair_id": "fr-02",
@@ -55,7 +55,7 @@
       ],
       "f1": 1.0,
       "exact_match": 1.0,
-      "latency_ms": 3
+      "latency_ms": 7
     },
     {
       "pair_id": "fr-03",
@@ -67,7 +67,7 @@
       ],
       "f1": 1.0,
       "exact_match": 1.0,
-      "latency_ms": 6
+      "latency_ms": 8
     },
     {
       "pair_id": "fr-04",
@@ -80,7 +80,7 @@
       ],
       "f1": 1.0,
       "exact_match": 1.0,
-      "latency_ms": 5
+      "latency_ms": 9
     },
     {
       "pair_id": "fr-05",
@@ -92,7 +92,7 @@
       ],
       "f1": 1.0,
       "exact_match": 1.0,
-      "latency_ms": 8
+      "latency_ms": 13
     },
     {
       "pair_id": "fr-06",
@@ -107,7 +107,7 @@
       ],
       "f1": 1.0,
       "exact_match": 1.0,
-      "latency_ms": 8
+      "latency_ms": 15
     },
     {
       "pair_id": "fr-07",
@@ -119,7 +119,7 @@
       ],
       "f1": 1.0,
       "exact_match": 1.0,
-      "latency_ms": 12
+      "latency_ms": 14
     },
     {
       "pair_id": "fr-08",
@@ -133,7 +133,7 @@
       ],
       "f1": 1.0,
       "exact_match": 1.0,
-      "latency_ms": 13
+      "latency_ms": 14
     },
     {
       "pair_id": "fr-09",
@@ -146,7 +146,7 @@
       ],
       "f1": 1.0,
       "exact_match": 1.0,
-      "latency_ms": 6
+      "latency_ms": 11
     },
     {
       "pair_id": "fr-10",
@@ -158,7 +158,7 @@
       ],
       "f1": 1.0,
       "exact_match": 1.0,
-      "latency_ms": 7
+      "latency_ms": 9
     },
     {
       "pair_id": "nr-01",
@@ -171,7 +171,7 @@
       ],
       "f1": 1.0,
       "exact_match": 1.0,
-      "latency_ms": 7
+      "latency_ms": 10
     },
     {
       "pair_id": "nr-02",
@@ -186,7 +186,7 @@
       ],
       "f1": 1.0,
       "exact_match": 1.0,
-      "latency_ms": 6
+      "latency_ms": 14
     },
     {
       "pair_id": "nr-03",
@@ -198,7 +198,7 @@
       ],
       "f1": 1.0,
       "exact_match": 1.0,
-      "latency_ms": 6
+      "latency_ms": 12
     },
     {
       "pair_id": "nr-04",
@@ -212,7 +212,7 @@
       ],
       "f1": 1.0,
       "exact_match": 1.0,
-      "latency_ms": 8
+      "latency_ms": 10
     },
     {
       "pair_id": "nr-05",
@@ -225,7 +225,7 @@
       ],
       "f1": 1.0,
       "exact_match": 1.0,
-      "latency_ms": 5
+      "latency_ms": 13
     },
     {
       "pair_id": "nr-06",
@@ -237,7 +237,7 @@
       ],
       "f1": 0.5,
       "exact_match": 0.0,
-      "latency_ms": 8
+      "latency_ms": 13
     },
     {
       "pair_id": "nr-07",
@@ -249,7 +249,7 @@
       ],
       "f1": 1.0,
       "exact_match": 1.0,
-      "latency_ms": 9
+      "latency_ms": 10
     },
     {
       "pair_id": "nr-08",
@@ -261,7 +261,7 @@
       ],
       "f1": 1.0,
       "exact_match": 1.0,
-      "latency_ms": 9
+      "latency_ms": 10
     },
     {
       "pair_id": "nr-09",
@@ -275,7 +275,7 @@
       ],
       "f1": 1.0,
       "exact_match": 1.0,
-      "latency_ms": 8
+      "latency_ms": 11
     },
     {
       "pair_id": "nr-10",
@@ -287,7 +287,7 @@
       ],
       "f1": 1.0,
       "exact_match": 1.0,
-      "latency_ms": 7
+      "latency_ms": 14
     },
     {
       "pair_id": "dh-01",
@@ -299,7 +299,7 @@
       ],
       "f1": 1.0,
       "exact_match": 1.0,
-      "latency_ms": 8
+      "latency_ms": 10
     },
     {
       "pair_id": "dh-02",
@@ -312,7 +312,7 @@
       ],
       "f1": 0.0,
       "exact_match": 0.0,
-      "latency_ms": 8
+      "latency_ms": 9
     },
     {
       "pair_id": "dh-03",
@@ -324,7 +324,7 @@
       ],
       "f1": 1.0,
       "exact_match": 1.0,
-      "latency_ms": 9
+      "latency_ms": 12
     },
     {
       "pair_id": "dh-04",
@@ -338,7 +338,7 @@
       ],
       "f1": 1.0,
       "exact_match": 1.0,
-      "latency_ms": 8
+      "latency_ms": 10
     },
     {
       "pair_id": "dh-05",
@@ -351,7 +351,7 @@
       ],
       "f1": 1.0,
       "exact_match": 1.0,
-      "latency_ms": 8
+      "latency_ms": 12
     },
     {
       "pair_id": "dh-06",
@@ -365,7 +365,7 @@
       ],
       "f1": 1.0,
       "exact_match": 1.0,
-      "latency_ms": 8
+      "latency_ms": 12
     },
     {
       "pair_id": "dh-07",
@@ -378,7 +378,7 @@
       ],
       "f1": 1.0,
       "exact_match": 1.0,
-      "latency_ms": 8
+      "latency_ms": 9
     },
     {
       "pair_id": "dh-08",
@@ -390,7 +390,7 @@
       ],
       "f1": 1.0,
       "exact_match": 1.0,
-      "latency_ms": 7
+      "latency_ms": 10
     },
     {
       "pair_id": "dh-09",
@@ -404,7 +404,7 @@
       ],
       "f1": 1.0,
       "exact_match": 1.0,
-      "latency_ms": 7
+      "latency_ms": 10
     },
     {
       "pair_id": "dh-10",
@@ -416,7 +416,7 @@
       ],
       "f1": 1.0,
       "exact_match": 1.0,
-      "latency_ms": 8
+      "latency_ms": 9
     },
     {
       "pair_id": "cr-01",
@@ -428,7 +428,7 @@
       ],
       "f1": 1.0,
       "exact_match": 1.0,
-      "latency_ms": 8
+      "latency_ms": 10
     },
     {
       "pair_id": "cr-02",
@@ -441,7 +441,7 @@
       ],
       "f1": 1.0,
       "exact_match": 1.0,
-      "latency_ms": 7
+      "latency_ms": 11
     },
     {
       "pair_id": "cr-03",
@@ -454,7 +454,7 @@
       ],
       "f1": 1.0,
       "exact_match": 1.0,
-      "latency_ms": 7
+      "latency_ms": 10
     },
     {
       "pair_id": "cr-04",
@@ -466,7 +466,7 @@
       ],
       "f1": 1.0,
       "exact_match": 1.0,
-      "latency_ms": 8
+      "latency_ms": 11
     },
     {
       "pair_id": "cr-05",
@@ -504,7 +504,7 @@
       ],
       "f1": 1.0,
       "exact_match": 1.0,
-      "latency_ms": 2
+      "latency_ms": 6
     },
     {
       "pair_id": "cr-08",
@@ -518,7 +518,7 @@
       ],
       "f1": 1.0,
       "exact_match": 1.0,
-      "latency_ms": 7
+      "latency_ms": 10
     },
     {
       "pair_id": "cr-09",
@@ -531,7 +531,7 @@
       ],
       "f1": 1.0,
       "exact_match": 1.0,
-      "latency_ms": 7
+      "latency_ms": 9
     },
     {
       "pair_id": "cr-10",
@@ -543,7 +543,7 @@
       ],
       "f1": 1.0,
       "exact_match": 1.0,
-      "latency_ms": 7
+      "latency_ms": 8
     },
     {
       "pair_id": "tp-01",
@@ -557,7 +557,7 @@
       ],
       "f1": 1.0,
       "exact_match": 1.0,
-      "latency_ms": 7
+      "latency_ms": 12
     },
     {
       "pair_id": "tp-02",
@@ -571,7 +571,7 @@
       ],
       "f1": 1.0,
       "exact_match": 1.0,
-      "latency_ms": 2
+      "latency_ms": 5
     },
     {
       "pair_id": "tp-03",
@@ -584,7 +584,7 @@
       ],
       "f1": 1.0,
       "exact_match": 1.0,
-      "latency_ms": 7
+      "latency_ms": 11
     },
     {
       "pair_id": "tp-04",
@@ -597,7 +597,7 @@
       ],
       "f1": 1.0,
       "exact_match": 1.0,
-      "latency_ms": 7
+      "latency_ms": 8
     },
     {
       "pair_id": "tp-05",
@@ -609,7 +609,7 @@
       ],
       "f1": 1.0,
       "exact_match": 1.0,
-      "latency_ms": 7
+      "latency_ms": 9
     },
     {
       "pair_id": "tp-06",
@@ -623,7 +623,7 @@
       ],
       "f1": 1.0,
       "exact_match": 1.0,
-      "latency_ms": 7
+      "latency_ms": 10
     },
     {
       "pair_id": "tp-07",
@@ -635,7 +635,7 @@
       ],
       "f1": 1.0,
       "exact_match": 1.0,
-      "latency_ms": 7
+      "latency_ms": 9
     },
     {
       "pair_id": "tp-08",
@@ -647,7 +647,7 @@
       ],
       "f1": 1.0,
       "exact_match": 1.0,
-      "latency_ms": 7
+      "latency_ms": 12
     },
     {
       "pair_id": "tp-09",
@@ -660,7 +660,7 @@
       ],
       "f1": 1.0,
       "exact_match": 1.0,
-      "latency_ms": 7
+      "latency_ms": 9
     },
     {
       "pair_id": "tp-10",
@@ -673,7 +673,7 @@
       ],
       "f1": 1.0,
       "exact_match": 1.0,
-      "latency_ms": 8
+      "latency_ms": 11
     }
   ]
 }

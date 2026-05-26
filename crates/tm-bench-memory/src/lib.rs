@@ -50,7 +50,7 @@ pub mod tracemind_runner;
 #[cfg(feature = "tracemind")]
 pub use tracemind_runner::{TraceMindConfig, TraceMindPersistenceRunner};
 
-pub use dataset::{Category, PersistenceDataset, PersistenceError, PersistencePair};
+pub use dataset::{Category, PersistenceDataset, PersistenceError, PersistencePair, Split};
 pub use report::{BenchmarkReport, CategoryBreakdown, PairOutcome};
 pub use runner::{EchoRunner, NullRunner, PersistenceRunner, RunnerContext};
 pub use scoring::{best_exact_match, best_f1, exact_match, token_f1, Score};

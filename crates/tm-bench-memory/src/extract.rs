@@ -55,7 +55,10 @@ const DURATION_HINTS: &[&str] = &[
 const CHOICE_HINTS: &[&str] = &[
     "language", "stack", "platform", "framework", "algorithm",
     "model", "library", "tool", "approach", "school", "billing",
-    "embedding", "clustering", "styling",
+    "embedding", "clustering", "styling", "style",
+    // Decision-history shapes that aren't quite Choice but
+    // benefit from the same marker-driven extraction.
+    "host", "cadence", "method", "system", "scheme", "process",
 ];
 
 pub fn classify(q: &str) -> QKind {
@@ -91,7 +94,14 @@ pub fn classify(q: &str) -> QKind {
         return QKind::Choice;
     }
 
-    if first == "when" || lower.contains("what date") || lower.contains("which date") {
+    if first == "when"
+        || lower.contains("what date")
+        || lower.contains("which date")
+        || lower.contains("what time")
+        || lower.contains("at what time")
+        || lower.contains("which day")
+        || lower.contains("what day")
+    {
         return QKind::Date;
     }
     if first == "who" || lower.contains("with whom") {
@@ -127,9 +137,45 @@ pub fn classify(q: &str) -> QKind {
     QKind::Generic
 }
 
+/// If the candidate is a retraction sentence containing a
+/// "no — actually" / "actually" / "scratch that" marker, slice it down
+/// to the tail after the LAST such marker. So
+/// `"We changed it to Lisbon, no — actually to Porto."` becomes
+/// `"to Porto."` — the post-retraction content. Idempotent.
+fn slice_after_retraction(candidate: &str) -> String {
+    let lower = candidate.to_lowercase();
+    let markers: &[&str] = &[
+        "no — actually ",
+        "no, actually ",
+        "no - actually ",
+        "scratch that — ",
+        "scratch that, ",
+        "scratch that ",
+        "actually, ",
+        "actually ",
+    ];
+    let mut latest: Option<usize> = None;
+    for m in markers {
+        let mut from = 0;
+        while let Some(rel) = lower[from..].find(m) {
+            let abs = from + rel + m.len();
+            latest = Some(latest.map_or(abs, |l| l.max(abs)));
+            from = abs;
+        }
+    }
+    if let Some(start) = latest {
+        if start < candidate.len() {
+            return candidate[start..].to_string();
+        }
+    }
+    candidate.to_string()
+}
+
 /// Compose a short prediction from a single candidate sentence. Falls
 /// back to the candidate itself when no extractor fires confidently.
-pub fn compose(query: &str, candidate: &str) -> String {
+pub fn compose(query: &str, raw_candidate: &str) -> String {
+    let sliced = slice_after_retraction(raw_candidate);
+    let candidate = sliced.as_str();
     match classify(query) {
         QKind::Date => extract_date(candidate).unwrap_or_else(|| candidate.to_string()),
         QKind::Number => extract_number(candidate).unwrap_or_else(|| candidate.to_string()),
@@ -143,22 +189,188 @@ pub fn compose(query: &str, candidate: &str) -> String {
         // For Person/Place/Choice/Generic: try choice marker first
         // (handles retraction-aware "going with X" / "set X to Y"),
         // then value patterns ("X is Y"), then capitalized clusters.
-        QKind::Person | QKind::Place => extract_choice(candidate, query)
+        QKind::Person => extract_choice(candidate, query)
             .filter(|s| !s.is_empty())
             .or_else(|| extract_person(candidate, query))
             .or_else(|| extract_value(query, candidate))
             .unwrap_or_else(|| candidate.to_string()),
-        QKind::Choice => extract_choice(candidate, query)
-            .filter(|s| !s.is_empty())
+        QKind::Place => extract_place_pattern(candidate)
+            .or_else(|| extract_choice(candidate, query).filter(|s| !s.is_empty()))
             .or_else(|| extract_person(candidate, query))
+            .or_else(|| extract_value(query, candidate))
+            .unwrap_or_else(|| candidate.to_string()),
+        QKind::Choice => extract_topic_is(query, candidate)
+            .or_else(|| extract_choice(candidate, query).filter(|s| !s.is_empty()))
+            .or_else(|| extract_place_pattern(candidate))
+            .or_else(|| extract_person(candidate, query))
+            .or_else(|| extract_value(query, candidate))
             .unwrap_or_else(|| candidate.to_string()),
         QKind::Generic => extract_choice(candidate, query)
             .filter(|s| !s.is_empty())
             .or_else(|| extract_value(query, candidate))
             .or_else(|| extract_money(candidate))
+            .or_else(|| extract_topic_suffix(query, candidate))
             .or_else(|| extract_person(candidate, query))
             .unwrap_or_else(|| candidate.to_string()),
     }
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Topic-suffix extractor — for Generic queries.
+//
+// When the query has a clear topic noun (e.g., "coffee" in
+// "How do I prefer my coffee?") and that noun appears in the candidate,
+// the answer often follows: "I take my coffee black with no sugar." →
+// the part after "coffee " is the answer.
+//
+// We only fire when (a) the candidate contains the topic, (b) there's
+// text after it, and (c) that text isn't just a sentence terminator.
+// ────────────────────────────────────────────────────────────────────
+
+const TOPIC_STOPWORDS: &[&str] = &[
+    "what", "when", "where", "which", "who", "whom", "whose", "why", "how",
+    "did", "does", "do", "was", "were", "are", "is", "be", "been",
+    "the", "a", "an", "my", "your", "our", "his", "her", "their",
+    "and", "or", "but", "of", "to", "for", "from", "with", "in", "on", "at",
+    "i", "you", "we", "they", "he", "she", "it", "me", "him", "us", "them",
+    "this", "that", "these", "those",
+    "have", "has", "had", "will", "would", "should", "could", "can",
+    "prefer", "like", "want", "need", "take", "use", "make", "find",
+    "ship", "start", "ship",
+];
+
+fn topic_word(query: &str) -> Option<String> {
+    // Pick the LAST content word in the query (often the topic).
+    topic_words(query).into_iter().last()
+}
+
+/// All content words from the query in order. Used by callers that want
+/// to try multiple topic candidates (e.g., extract_topic_is iterates so
+/// "What style does my yoga teacher Anna practice?" can match on
+/// "style" even though "practice" is the last word).
+fn topic_words(query: &str) -> Vec<String> {
+    query
+        .split_whitespace()
+        .map(|w| w.trim_matches(|c: char| !c.is_alphanumeric()).to_lowercase())
+        .filter(|w| !w.is_empty() && w.len() >= 3 && !TOPIC_STOPWORDS.contains(&w.as_str()))
+        .collect()
+}
+
+/// Find the wh-focus noun in a query: the noun immediately following
+/// "which" or "what". Returns None for other shapes.
+///
+/// "Which city does my friend live in?" → Some("city")
+/// "What style does Anna practice?"      → Some("style")
+/// "How do I prefer my coffee?"          → None (Generic; no wh-focus)
+fn wh_focus_noun(query: &str) -> Option<String> {
+    let lower = query.to_lowercase();
+    let words: Vec<String> = lower
+        .split_whitespace()
+        .map(|w| w.trim_matches(|c: char| !c.is_alphanumeric()).to_string())
+        .collect();
+    for i in 0..words.len().saturating_sub(1) {
+        if words[i] == "which" || words[i] == "what" {
+            let next = &words[i + 1];
+            // Skip "kind of X" / "type of X" → use X.
+            if (next == "kind" || next == "type" || next == "sort")
+                && i + 3 < words.len()
+                && words[i + 2] == "of"
+            {
+                let cand = &words[i + 3];
+                if cand.len() >= 3 && !TOPIC_STOPWORDS.contains(&cand.as_str()) {
+                    return Some(cand.clone());
+                }
+            }
+            if next.len() >= 3 && !TOPIC_STOPWORDS.contains(&next.as_str()) {
+                return Some(next.clone());
+            }
+        }
+    }
+    None
+}
+
+/// Find a " <focus> is X" / "<Focus> is X" pattern in `candidate` where
+/// `focus` is the wh-target noun from the query. Returns X.
+///
+/// Only fires for wh-shaped queries — "Which style is X?" /
+/// "What language are we using?". Skips Generic queries entirely so it
+/// can't grab unrelated " X is Y" matches.
+pub fn extract_topic_is(query: &str, candidate: &str) -> Option<String> {
+    let focus = wh_focus_noun(query)?;
+    let lower = candidate.to_lowercase();
+    for sep in [" is ", " was ", " are ", " were "] {
+        let pat = format!(" {}{}", focus, sep);
+        if let Some(idx) = lower.find(&pat) {
+            let start = idx + pat.len();
+            if start < candidate.len() {
+                let tail = &candidate[start..];
+                let span = take_until_stop(tail);
+                if !span.is_empty() {
+                    return Some(span);
+                }
+            }
+        }
+        // Start-of-sentence variant: "Style is X."
+        let pat2 = format!("{}{}", focus, sep);
+        if lower.starts_with(&pat2) {
+            let start = pat2.len();
+            let tail = &candidate[start..];
+            let span = take_until_stop(tail);
+            if !span.is_empty() {
+                return Some(span);
+            }
+        }
+        // Possessive variant: "Her style is X" / "His tool is X" — find
+        // " <pronoun> <focus> is X" after the wh-noun anchor.
+        for poss in [" her ", " his ", " their ", " our ", " my ", " your "] {
+            let pat3 = format!("{}{}{}", poss, focus, sep);
+            if let Some(idx) = lower.find(&pat3) {
+                let start = idx + pat3.len();
+                if start < candidate.len() {
+                    let tail = &candidate[start..];
+                    let span = take_until_stop(tail);
+                    if !span.is_empty() {
+                        return Some(span);
+                    }
+                }
+            }
+            // sentence-start: "Her style is X."
+            let pat4 = format!("{}{}{}", poss.trim_start(), focus, sep);
+            if lower.starts_with(&pat4) {
+                let start = pat4.len();
+                let tail = &candidate[start..];
+                let span = take_until_stop(tail);
+                if !span.is_empty() {
+                    return Some(span);
+                }
+            }
+        }
+    }
+    None
+}
+
+pub fn extract_topic_suffix(query: &str, candidate: &str) -> Option<String> {
+    let topic = topic_word(query)?;
+    if topic.len() < 3 {
+        return None;
+    }
+    let lower = candidate.to_lowercase();
+    let idx = find_word(&lower, &topic)?;
+    let start = idx + topic.len();
+    if start >= candidate.len() {
+        return None;
+    }
+    let tail = &candidate[start..];
+    let tail = tail.trim_start();
+    if tail.is_empty() {
+        return None;
+    }
+    // Stop at next sentence terminator.
+    let span = take_until_stop(tail);
+    if span.is_empty() || span.len() < 2 {
+        return None;
+    }
+    Some(span)
 }
 
 // ────────────────────────────────────────────────────────────────────
@@ -258,6 +470,26 @@ pub fn extract_date(s: &str) -> Option<String> {
         }
     }
 
+    // Clock times: "2pm", "11am", "10:30am", "2:00 pm". Run BEFORE the
+    // "in N weeks" branch — "2pm" is a more useful answer than "in 2pm".
+    if let Some(span) = scan_clock_time(&lower) {
+        return Some(verbatim_span(s, &lower, &span));
+    }
+
+    // Bare month name with no day after it: "moved to June.".
+    // Has to run AFTER the "May 3" branch above and AFTER the weekday
+    // branch (which catches "Friday at 11am"). Skip "may" as a bare
+    // month because "may" is also a modal verb — too many false hits.
+    for m in MONTHS {
+        if *m == "may" {
+            continue;
+        }
+        if let Some(idx) = find_word(&lower, m) {
+            let end = idx + m.len();
+            return Some(verbatim_span(s, &lower, &(idx, end)));
+        }
+    }
+
     // "in N days/weeks/months"
     if let Some(idx) = lower.find("in ") {
         let after_in = idx + 3;
@@ -320,12 +552,73 @@ fn scan_iso_date(lower: &str) -> Option<(usize, usize)> {
     None
 }
 
+/// Match clock times: `2pm`, `11am`, `10:30am`, `2:00 pm`.
+fn scan_clock_time(lower: &str) -> Option<(usize, usize)> {
+    let bytes = lower.as_bytes();
+    let n = bytes.len();
+    let mut i = 0;
+    while i < n {
+        if bytes[i].is_ascii_digit() {
+            let start = i;
+            while i < n && bytes[i].is_ascii_digit() {
+                i += 1;
+            }
+            // optional :MM
+            if i + 2 < n && bytes[i] == b':' && bytes[i + 1].is_ascii_digit() && bytes[i + 2].is_ascii_digit() {
+                i += 3;
+            }
+            // optional space
+            let mut after = i;
+            while after < n && bytes[after] == b' ' {
+                after += 1;
+            }
+            if after + 1 < n + 1 {
+                let tail = &lower[after..];
+                if tail.starts_with("am") || tail.starts_with("pm") {
+                    return Some((start, after + 2));
+                }
+            }
+        } else {
+            i += 1;
+        }
+    }
+    None
+}
+
+/// Find a whole word — must be preceded and followed by non-alpha.
+fn find_word(haystack: &str, needle: &str) -> Option<usize> {
+    let mut from = 0;
+    while let Some(rel) = haystack[from..].find(needle) {
+        let abs = from + rel;
+        let before_ok = abs == 0
+            || !haystack[..abs]
+                .chars()
+                .last()
+                .map(|c| c.is_alphabetic())
+                .unwrap_or(false);
+        let end = abs + needle.len();
+        let after_ok = end == haystack.len()
+            || !haystack[end..]
+                .chars()
+                .next()
+                .map(|c| c.is_alphabetic())
+                .unwrap_or(false);
+        if before_ok && after_ok {
+            return Some(abs);
+        }
+        from = abs + 1;
+    }
+    None
+}
+
 fn preceding_qualifier(lower: &str, idx: usize) -> Option<usize> {
     if idx == 0 {
         return None;
     }
     let head = &lower[..idx];
-    for q in ["next ", "this ", "by ", "on ", "last "] {
+    // "on " is intentionally excluded — "on Friday" should normalize to
+    // "Friday" since references almost always list the bare weekday.
+    for q in ["next ", "this ", "by ", "last "] {
         if head.ends_with(q) {
             return Some(idx - q.len());
         }
@@ -349,6 +642,15 @@ fn verbatim_span(orig: &str, lower: &str, span: &(usize, usize)) -> String {
 const PRONOUNS: &[&str] = &[
     "he", "she", "it", "they", "his", "her", "their", "them",
     "my", "your", "our", "us", "we", "i", "you", "me", "him",
+    // Contraction forms — non-alnum stripping turns "I'm" → "Im",
+    // "you're" → "youre", "she's" → "shes", etc. Without these the
+    // capitalized-cluster pass returns the contraction itself
+    // ("I'm pitching X" → "I'm") instead of walking past to the
+    // proper noun.
+    "im", "youre", "were", "theyre", "hes", "shes", "its",
+    "id", "youd", "wed", "theyd", "hed", "shed",
+    "ive", "youve", "weve", "theyve",
+    "ill", "youll", "well", "theyll", "hell", "shell",
 ];
 
 const SKIP_LEADING: &[&str] = &[
@@ -361,12 +663,18 @@ const SKIP_LEADING: &[&str] = &[
     "adopted", "started", "booked",
 ];
 
+fn alnum_lower(w: &str) -> String {
+    w.chars().filter(|c| c.is_alphanumeric()).flat_map(|c| c.to_lowercase()).collect()
+}
+
 fn is_pronoun(w: &str) -> bool {
-    PRONOUNS.contains(&w.to_lowercase().as_str())
+    let key = alnum_lower(w);
+    PRONOUNS.contains(&key.as_str())
 }
 
 fn is_skip_leading(w: &str) -> bool {
-    SKIP_LEADING.contains(&w.to_lowercase().as_str())
+    let key = alnum_lower(w);
+    SKIP_LEADING.contains(&key.as_str())
 }
 
 fn q_tokens_lower(query: &str) -> HashSet<String> {
@@ -512,6 +820,10 @@ fn is_number_word(w: &str) -> bool {
     matches!(
         w.to_lowercase().as_str(),
         "one" | "two" | "three" | "four" | "five" | "six" | "seven" | "eight" | "nine" | "ten"
+            | "eleven" | "twelve" | "thirteen" | "fourteen" | "fifteen" | "sixteen"
+            | "seventeen" | "eighteen" | "nineteen"
+            | "twenty" | "thirty" | "forty" | "fifty" | "sixty" | "seventy" | "eighty" | "ninety"
+            | "hundred"
     )
 }
 
@@ -623,13 +935,20 @@ pub fn extract_choice(candidate: &str, _query: &str) -> Option<String> {
     let lower = candidate.to_lowercase();
 
     // Markers that introduce a chosen option.
-    // Order matters — multi-word patterns first.
+    // Order matters — most-specific multi-word patterns first.
     let markers: &[(&str, MarkerKind)] = &[
         ("going with ", MarkerKind::Choice),
         ("we're using ", MarkerKind::Choice),
         ("settled on ", MarkerKind::Choice),
+        // More-specific "decided to <verb> on/at" patterns BEFORE the
+        // generic "decided to <verb>" FirstWord fallback.
+        ("decided to launch on ", MarkerKind::Choice),
+        ("decided to ship on ", MarkerKind::Choice),
+        ("decided to ship it ", MarkerKind::Choice),
         ("decided to use ", MarkerKind::Choice),
         ("decided to ", MarkerKind::FirstWord),
+        ("ship it ", MarkerKind::Choice),
+        ("launch on ", MarkerKind::Choice),
         ("committed to ", MarkerKind::Choice),
         ("picked ", MarkerKind::Choice),
         ("chose ", MarkerKind::Choice),
@@ -637,10 +956,20 @@ pub fn extract_choice(candidate: &str, _query: &str) -> Option<String> {
         ("ask to ", MarkerKind::Choice),
         ("set to ", MarkerKind::Choice),
         ("set the ", MarkerKind::ToOrComma),
+        ("updated it to ", MarkerKind::Choice),
         ("updated to ", MarkerKind::Choice),
         ("bumped to ", MarkerKind::Choice),
+        ("moved everything to ", MarkerKind::Choice),
+        ("moved it to ", MarkerKind::Choice),
+        ("moved to ", MarkerKind::Choice),
         ("now with ", MarkerKind::Choice),
         ("deal is now with ", MarkerKind::Choice),
+        // Employment / location-of-work markers — useful for Choice
+        // queries like "which company did X work at?".
+        ("used to work at ", MarkerKind::Choice),
+        ("worked at ", MarkerKind::Choice),
+        ("works at ", MarkerKind::Choice),
+        ("work at ", MarkerKind::Choice),
     ];
 
     for (marker, kind) in markers {
@@ -677,25 +1006,76 @@ pub fn extract_choice(candidate: &str, _query: &str) -> Option<String> {
     None
 }
 
-/// If a multi-word span contains an all-caps acronym (e.g. "shipping
-/// the MCP integration" → "MCP"), prefer the acronym. Leaves single-
-/// word and acronym-free spans unchanged. Skips hyphenated tokens
-/// like "BGE-small" so we keep useful suffixes.
+/// Pick the head of a choice span.
+///
+/// Strategy:
+///   1. Strip leading determiners ("the freemium GTM" → "freemium GTM",
+///      "the MCP integration" → "MCP integration").
+///   2. If the remaining tokens are ALL Title Case (likely a proper-noun
+///      phrase like "Claude Code"), return the whole span unchanged —
+///      these are usually single-entity answers.
+///   3. Otherwise (mixed case or all-lowercase + acronym), return just
+///      the first content token. So "freemium GTM" → "freemium",
+///      "MCP integration" → "MCP", "annual billing only" → "annual".
 fn prefer_acronym(span: &str) -> String {
-    let tokens: Vec<&str> = span.split_whitespace().collect();
+    let stripped = strip_leading_determiners(span);
+    let tokens: Vec<&str> = stripped.split_whitespace().collect();
     if tokens.len() <= 1 {
-        return span.to_string();
+        return stripped;
     }
-    for t in &tokens {
-        if t.contains('-') {
-            continue;
+    let alnum = |t: &str| -> String { t.chars().filter(|c| c.is_alphanumeric()).collect() };
+    let alnum_low = |t: &str| -> String {
+        t.chars().filter(|c| c.is_alphanumeric()).flat_map(|c| c.to_lowercase()).collect()
+    };
+    // Magnitude-pair carve-out: "twenty million", "fifteen million",
+    // "10 million", "$1.5B" — keep number + magnitude together.
+    if tokens.len() >= 2 {
+        let first_key = alnum_low(tokens[0]);
+        let second_key = alnum_low(tokens[1]);
+        let first_is_num = is_number_word(&first_key) || first_key.chars().all(|c| c.is_ascii_digit());
+        let is_magnitude = matches!(
+            second_key.as_str(),
+            "million" | "millions" | "billion" | "billions" | "thousand" | "thousands" | "hundred"
+        );
+        if first_is_num && is_magnitude {
+            return format!("{} {}", alnum(tokens[0]), alnum(tokens[1]));
         }
-        let stripped: String = t.chars().filter(|c| c.is_alphanumeric()).collect();
-        if stripped.len() >= 2
-            && stripped.len() <= 5
-            && stripped.chars().all(|c| c.is_ascii_uppercase())
-        {
-            return stripped;
+    }
+    // Prepositional / adverbial phrase carve-out: spans like
+    // "on by default", "in production", "at scale" — return the whole
+    // stripped span, not just the leading preposition.
+    let first_key = alnum_low(tokens[0]);
+    const LEADING_PREPS: &[&str] = &["on", "in", "at", "by", "off", "out", "into", "with"];
+    if LEADING_PREPS.contains(&first_key.as_str()) {
+        return stripped;
+    }
+    let all_title_case = tokens.iter().all(|t| {
+        let s = alnum(t);
+        !s.is_empty() && s.chars().next().map(|c| c.is_ascii_uppercase()).unwrap_or(false)
+    });
+    if all_title_case {
+        return stripped;
+    }
+    // Mixed-case: return the first non-filler token.
+    for t in &tokens {
+        let key = alnum_low(t);
+        if !key.is_empty() && !FILLER_WORDS.contains(&key.as_str()) {
+            return alnum(t);
+        }
+    }
+    stripped
+}
+
+const FILLER_WORDS: &[&str] = &[
+    "the", "a", "an", "my", "our", "your", "his", "her", "their",
+    "this", "that", "these", "those",
+];
+
+fn strip_leading_determiners(span: &str) -> String {
+    let lower = span.to_lowercase();
+    for det in ["the ", "a ", "an ", "my ", "our ", "your ", "his ", "her ", "their "] {
+        if lower.starts_with(det) {
+            return span[det.len()..].to_string();
         }
     }
     span.to_string()
@@ -723,6 +1103,10 @@ fn take_until_stop(s: &str) -> String {
         " over ", " for ", " not ", " instead", " before ", " after ",
         " starting ", " given ", " to keep ", " because ", " — ", " - ",
         " from ", " with ", " at ", " in ",
+        " as the ", " as our ", " as my ", " as primary ", " as a ",
+        " only ", " only.", " only,",
+        " now ", " now.", " now,",
+        " first ", " first.", " first,",
         ". ", ", ", "; ",
     ];
     let lower = s.to_lowercase();
@@ -740,6 +1124,62 @@ fn take_until_stop(s: &str) -> String {
         .trim_end_matches(|c: char| matches!(c, '.' | ',' | ';' | '—' | '-') && false || c.is_whitespace())
         .trim_end_matches(|c: char| matches!(c, '.' | ',' | ';'))
         .to_string()
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Place-pattern extractor — " from X", " on the X of the Y", " in X".
+// ────────────────────────────────────────────────────────────────────
+
+pub fn extract_place_pattern(candidate: &str) -> Option<String> {
+    let lower = candidate.to_lowercase();
+    // " came from X" / " from X" — prefer the longer prefix.
+    let markers: &[&str] = &[
+        " came from ",
+        " from ",
+        " on the ",
+        " in the ",
+        " at the ",
+        " lives in ",
+        " moved to ",
+        " used to work at ",
+        " works at ",
+        " worked at ",
+        " work at ",
+        " based in ",
+    ];
+    for m in markers {
+        if let Some(idx) = lower.find(m) {
+            let start = idx + m.len();
+            if start >= candidate.len() {
+                continue;
+            }
+            let after = &candidate[start..];
+            let span = take_until_stop(after);
+            if span.is_empty() {
+                continue;
+            }
+            // " in X" / " at X" must be a proper noun for Place. The
+            // span must start with an uppercase letter to count.
+            let needs_upper = matches!(
+                *m,
+                " from "
+                    | " in "
+                    | " at "
+                    | " works at "
+                    | " worked at "
+                    | " work at "
+                    | " used to work at "
+                    | " based in "
+            );
+            if needs_upper
+                && !span.chars().next().map(|c| c.is_ascii_uppercase()).unwrap_or(false)
+            {
+                continue;
+            }
+            return Some(span);
+        }
+    }
+    None
 }
 
 // ────────────────────────────────────────────────────────────────────
@@ -910,6 +1350,48 @@ mod tests {
                 "Where's the coffee meeting?"
             ),
             Some("Lyra Coffee".into())
+        );
+    }
+
+    #[test]
+    fn topic_is_extracts_value_for_wh_focus() {
+        // Regression: wh-focus topic_is must beat place_pattern when
+        // both fire, so "What style ... practice?" returns "Ashtanga"
+        // from "Her style is traditional Ashtanga." instead of "Mysore"
+        // from "trained in Mysore." in the sibling sentence.
+        assert_eq!(
+            super::extract_topic_is(
+                "What style does my yoga teacher Anna practice?",
+                "Her style is traditional Ashtanga."
+            ),
+            Some("traditional Ashtanga".into())
+        );
+    }
+
+    #[test]
+    fn topic_is_skips_unrelated_is_patterns() {
+        // "Which city does my friend live in?" — focus="city" — must
+        // NOT match " friend is Karan" in the sibling sentence.
+        assert_eq!(
+            super::extract_topic_is(
+                "Which city does my oldest friend live in?",
+                "My oldest friend is Karan."
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn person_drops_contraction_im() {
+        // Regression: mid-token apostrophe was leaving "I'm" stripped to
+        // "I'm" (not "im"), so the PRONOUNS lookup missed it and the
+        // extractor returned "I'm" as the answer.
+        assert_eq!(
+            extract_person(
+                "The investor I'm pitching tomorrow is Maya Reyes.",
+                "Who am I meeting for the pitch tomorrow?"
+            ),
+            Some("Maya Reyes".into())
         );
     }
 
@@ -1137,3 +1619,4 @@ mod tests {
         );
     }
 }
+

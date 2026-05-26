@@ -1,0 +1,349 @@
+{
+  "runner": "tracemind-w3-hash",
+  "timestamp": "2026-05-26T00:59:18.481879+00:00",
+  "total_pairs": 25,
+  "persistence_score": 100.0,
+  "overall_exact_match": 100.0,
+  "by_category": {
+    "contradiction_recovery": {
+      "count": 5,
+      "f1": 100.0,
+      "exact_match": 100.0
+    },
+    "decision_history": {
+      "count": 5,
+      "f1": 100.0,
+      "exact_match": 100.0
+    },
+    "factual_recall": {
+      "count": 5,
+      "f1": 100.0,
+      "exact_match": 100.0
+    },
+    "name_resolution": {
+      "count": 5,
+      "f1": 100.0,
+      "exact_match": 100.0
+    },
+    "temporal_pinning": {
+      "count": 5,
+      "f1": 100.0,
+      "exact_match": 100.0
+    }
+  },
+  "wall_seconds": 6.765825667,
+  "outcomes": [
+    {
+      "pair_id": "fr-tune-01",
+      "category": "factual_recall",
+      "query": "Which tea do I prefer?",
+      "prediction": "matcha",
+      "references": [
+        "matcha"
+      ],
+      "f1": 1.0,
+      "exact_match": 1.0,
+      "latency_ms": 143
+    },
+    {
+      "pair_id": "fr-tune-02",
+      "category": "factual_recall",
+      "query": "Who started the TraceMind company?",
+      "prediction": "Aaditya",
+      "references": [
+        "Aaditya"
+      ],
+      "f1": 1.0,
+      "exact_match": 1.0,
+      "latency_ms": 3
+    },
+    {
+      "pair_id": "fr-tune-03",
+      "category": "factual_recall",
+      "query": "What's the passphrase for the office network?",
+      "prediction": "acorn-mountain-42",
+      "references": [
+        "acorn-mountain-42"
+      ],
+      "f1": 1.0,
+      "exact_match": 1.0,
+      "latency_ms": 6
+    },
+    {
+      "pair_id": "fr-tune-04",
+      "category": "factual_recall",
+      "query": "What car do I own?",
+      "prediction": "Honda Civic",
+      "references": [
+        "2019 Honda Civic",
+        "Honda Civic"
+      ],
+      "f1": 1.0,
+      "exact_match": 1.0,
+      "latency_ms": 6
+    },
+    {
+      "pair_id": "fr-tune-05",
+      "category": "factual_recall",
+      "query": "Which city does my sister Priya call home?",
+      "prediction": "Bangalore",
+      "references": [
+        "Bangalore"
+      ],
+      "f1": 1.0,
+      "exact_match": 1.0,
+      "latency_ms": 8
+    },
+    {
+      "pair_id": "nr-tune-01",
+      "category": "name_resolution",
+      "query": "Who runs the backend on my team?",
+      "prediction": "Jordan",
+      "references": [
+        "Jordan Lee",
+        "Jordan"
+      ],
+      "f1": 1.0,
+      "exact_match": 1.0,
+      "latency_ms": 8
+    },
+    {
+      "pair_id": "nr-tune-02",
+      "category": "name_resolution",
+      "query": "Who recommended I read the Hinton 2022 paper?",
+      "prediction": "Dr Patel",
+      "references": [
+        "Dr Patel",
+        "Patel"
+      ],
+      "f1": 1.0,
+      "exact_match": 1.0,
+      "latency_ms": 11
+    },
+    {
+      "pair_id": "nr-tune-03",
+      "category": "name_resolution",
+      "query": "Where did our first design hire come from?",
+      "prediction": "Figma's growth team",
+      "references": [
+        "Figma",
+        "Figma's growth team",
+        "Figma growth team"
+      ],
+      "f1": 1.0,
+      "exact_match": 1.0,
+      "latency_ms": 11
+    },
+    {
+      "pair_id": "nr-tune-04",
+      "category": "name_resolution",
+      "query": "Where is my therapist's office located?",
+      "prediction": "third floor of the Mission building",
+      "references": [
+        "third floor of the Mission building",
+        "third floor",
+        "Mission building"
+      ],
+      "f1": 1.0,
+      "exact_match": 1.0,
+      "latency_ms": 6
+    },
+    {
+      "pair_id": "nr-tune-05",
+      "category": "name_resolution",
+      "query": "Who led my pre-seed round?",
+      "prediction": "Sam Klein",
+      "references": [
+        "Sam Klein",
+        "Sam"
+      ],
+      "f1": 1.0,
+      "exact_match": 1.0,
+      "latency_ms": 6
+    },
+    {
+      "pair_id": "dh-tune-01",
+      "category": "decision_history",
+      "query": "Which language did we pick for the core?",
+      "prediction": "Rust",
+      "references": [
+        "Rust"
+      ],
+      "f1": 1.0,
+      "exact_match": 1.0,
+      "latency_ms": 7
+    },
+    {
+      "pair_id": "dh-tune-02",
+      "category": "decision_history",
+      "query": "Which embedded database did we settle on?",
+      "prediction": "SQLite",
+      "references": [
+        "SQLite"
+      ],
+      "f1": 1.0,
+      "exact_match": 1.0,
+      "latency_ms": 7
+    },
+    {
+      "pair_id": "dh-tune-03",
+      "category": "decision_history",
+      "query": "Which embedding model are we shipping?",
+      "prediction": "BGE-small",
+      "references": [
+        "BGE-small",
+        "BGE"
+      ],
+      "f1": 1.0,
+      "exact_match": 1.0,
+      "latency_ms": 6
+    },
+    {
+      "pair_id": "dh-tune-04",
+      "category": "decision_history",
+      "query": "Which desktop framework are we building on?",
+      "prediction": "Tauri",
+      "references": [
+        "Tauri 2",
+        "Tauri"
+      ],
+      "f1": 1.0,
+      "exact_match": 1.0,
+      "latency_ms": 9
+    },
+    {
+      "pair_id": "dh-tune-05",
+      "category": "decision_history",
+      "query": "Which protocol did we adopt for AI host integration?",
+      "prediction": "MCP",
+      "references": [
+        "MCP"
+      ],
+      "f1": 1.0,
+      "exact_match": 1.0,
+      "latency_ms": 6
+    },
+    {
+      "pair_id": "cr-tune-01",
+      "category": "contradiction_recovery",
+      "query": "When am I now meeting Sam?",
+      "prediction": "Saturday",
+      "references": [
+        "Saturday"
+      ],
+      "f1": 1.0,
+      "exact_match": 1.0,
+      "latency_ms": 8
+    },
+    {
+      "pair_id": "cr-tune-02",
+      "category": "contradiction_recovery",
+      "query": "When does the Tauri release ship now?",
+      "prediction": "June 17",
+      "references": [
+        "June 17"
+      ],
+      "f1": 1.0,
+      "exact_match": 1.0,
+      "latency_ms": 6
+    },
+    {
+      "pair_id": "cr-tune-03",
+      "category": "contradiction_recovery",
+      "query": "What time is the pitch now?",
+      "prediction": "2pm",
+      "references": [
+        "2pm"
+      ],
+      "f1": 1.0,
+      "exact_match": 1.0,
+      "latency_ms": 8
+    },
+    {
+      "pair_id": "cr-tune-04",
+      "category": "contradiction_recovery",
+      "query": "When is Jordan now starting?",
+      "prediction": "June",
+      "references": [
+        "June"
+      ],
+      "f1": 1.0,
+      "exact_match": 1.0,
+      "latency_ms": 8
+    },
+    {
+      "pair_id": "cr-tune-05",
+      "category": "contradiction_recovery",
+      "query": "Where is the retreat now happening?",
+      "prediction": "Porto",
+      "references": [
+        "Porto"
+      ],
+      "f1": 1.0,
+      "exact_match": 1.0,
+      "latency_ms": 9
+    },
+    {
+      "pair_id": "tp-tune-01",
+      "category": "temporal_pinning",
+      "query": "When am I flying to New York?",
+      "prediction": "May 3",
+      "references": [
+        "May 3"
+      ],
+      "f1": 1.0,
+      "exact_match": 1.0,
+      "latency_ms": 9
+    },
+    {
+      "pair_id": "tp-tune-02",
+      "category": "temporal_pinning",
+      "query": "When do we plan to close the Series A?",
+      "prediction": "November 15",
+      "references": [
+        "November 15"
+      ],
+      "f1": 1.0,
+      "exact_match": 1.0,
+      "latency_ms": 9
+    },
+    {
+      "pair_id": "tp-tune-03",
+      "category": "temporal_pinning",
+      "query": "When is my anniversary?",
+      "prediction": "July 22",
+      "references": [
+        "July 22"
+      ],
+      "f1": 1.0,
+      "exact_match": 1.0,
+      "latency_ms": 3
+    },
+    {
+      "pair_id": "tp-tune-04",
+      "category": "temporal_pinning",
+      "query": "When does Tauri 2.5 land?",
+      "prediction": "August 9",
+      "references": [
+        "August 9"
+      ],
+      "f1": 1.0,
+      "exact_match": 1.0,
+      "latency_ms": 8
+    },
+    {
+      "pair_id": "tp-tune-05",
+      "category": "temporal_pinning",
+      "query": "When is my therapy session?",
+      "prediction": "Friday",
+      "references": [
+        "Friday at 11am",
+        "Friday",
+        "11am"
+      ],
+      "f1": 1.0,
+      "exact_match": 1.0,
+      "latency_ms": 8
+    }
+  ]
+}

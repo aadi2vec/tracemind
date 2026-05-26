@@ -39,18 +39,52 @@ impl Category {
     }
 }
 
+/// Which split a pair belongs to. `Tune` pairs are used for extractor
+/// pattern engineering; `Test` pairs are held out — the headline number
+/// is reported on Test only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Split {
+    Tune,
+    Test,
+}
+
+impl Default for Split {
+    fn default() -> Self {
+        Split::Test
+    }
+}
+
+impl Split {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Split::Tune => "tune",
+            Split::Test => "test",
+        }
+    }
+}
+
 /// One persistence pair.
 ///
-/// `store` is the list of sentences ingested in Session A (closing the
-/// store between sentences is not required — within-session ordering is
-/// part of what we ingest). `query` is what we ask in Session B.
+/// `store` is the list of answer-bearing sentences ingested in
+/// Session A. `distractors` are near-miss sentences ingested alongside
+/// (same session) to test that retrieval picks the *right* one — for
+/// example, when the store says "I drink matcha" a distractor might be
+/// "my friend drinks oolong" to make sure we don't conflate referents.
+/// `query` is what we ask in Session B (post-close-and-reopen).
 /// `answers` is the list of acceptable reference answers; the scorer
 /// takes the best F1 / EM across the list.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PersistencePair {
     pub id: String,
     pub category: Category,
+    #[serde(default)]
+    pub split: Split,
     pub store: Vec<String>,
+    /// Same-pair distractor sentences. Ingested into the shared DB
+    /// alongside `store` so retrieval has to discriminate.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub distractors: Vec<String>,
     pub query: String,
     pub answers: Vec<String>,
     /// Optional free-form note for fixture authors (e.g. why the pair
@@ -63,6 +97,37 @@ pub struct PersistencePair {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PersistenceDataset {
     pub pairs: Vec<PersistencePair>,
+    /// Shared noise corpus ingested once into the bulk DB to grow it
+    /// past the trivial-size regime. Belongs to neither tune nor test;
+    /// purely there so retrieval has to work to find the right sentence.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub noise_corpus: Vec<String>,
+}
+
+impl PersistenceDataset {
+    /// Filter to a single split. Used by the CLI to score Test alone.
+    pub fn filter_split(&self, split: Split) -> Self {
+        Self {
+            pairs: self
+                .pairs
+                .iter()
+                .filter(|p| p.split == split)
+                .cloned()
+                .collect(),
+            noise_corpus: self.noise_corpus.clone(),
+        }
+    }
+
+    /// Total sentences that would land in the shared DB during a bulk
+    /// run (store + distractors per pair + noise corpus).
+    pub fn shared_db_size(&self) -> usize {
+        self.noise_corpus.len()
+            + self
+                .pairs
+                .iter()
+                .map(|p| p.store.len() + p.distractors.len())
+                .sum::<usize>()
+    }
 }
 
 impl PersistenceDataset {
@@ -72,13 +137,16 @@ impl PersistenceDataset {
     }
 
     pub fn load_from_str(raw: &str) -> Result<Self, PersistenceError> {
-        // Accept either `{"pairs": [...]}` or a bare array.
+        // Accept either `{"pairs": [...], "noise_corpus": [...]}` or a bare array.
         if let Ok(ds) = serde_json::from_str::<PersistenceDataset>(raw) {
             return Ok(ds);
         }
         let pairs: Vec<PersistencePair> =
             serde_json::from_str(raw).map_err(PersistenceError::Parse)?;
-        Ok(Self { pairs })
+        Ok(Self {
+            pairs,
+            noise_corpus: Vec::new(),
+        })
     }
 }
 
