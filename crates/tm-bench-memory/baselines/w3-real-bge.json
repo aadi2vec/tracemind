@@ -1,0 +1,357 @@
+{
+  "runner": "tracemind-w3-bge",
+  "timestamp": "2026-05-26T00:59:56.442167+00:00",
+  "total_pairs": 25,
+  "persistence_score": 100.0,
+  "overall_exact_match": 100.0,
+  "by_category": {
+    "contradiction_recovery": {
+      "count": 5,
+      "f1": 100.0,
+      "exact_match": 100.0
+    },
+    "decision_history": {
+      "count": 5,
+      "f1": 100.0,
+      "exact_match": 100.0
+    },
+    "factual_recall": {
+      "count": 5,
+      "f1": 100.0,
+      "exact_match": 100.0
+    },
+    "name_resolution": {
+      "count": 5,
+      "f1": 100.0,
+      "exact_match": 100.0
+    },
+    "temporal_pinning": {
+      "count": 5,
+      "f1": 100.0,
+      "exact_match": 100.0
+    }
+  },
+  "wall_seconds": 27.480605708,
+  "outcomes": [
+    {
+      "pair_id": "fr-test-01",
+      "category": "factual_recall",
+      "query": "How much are we trying to raise in the seed?",
+      "prediction": "two million",
+      "references": [
+        "two million",
+        "two million dollars",
+        "2 million",
+        "$2M"
+      ],
+      "f1": 1.0,
+      "exact_match": 1.0,
+      "latency_ms": 197
+    },
+    {
+      "pair_id": "fr-test-02",
+      "category": "factual_recall",
+      "query": "What's the prefix on my OpenRouter API key?",
+      "prediction": "sk-or-v1",
+      "references": [
+        "sk-or-v1"
+      ],
+      "f1": 1.0,
+      "exact_match": 1.0,
+      "latency_ms": 10
+    },
+    {
+      "pair_id": "fr-test-03",
+      "category": "factual_recall",
+      "query": "How do I prefer my coffee?",
+      "prediction": "black",
+      "references": [
+        "black with no sugar",
+        "black",
+        "no sugar"
+      ],
+      "f1": 1.0,
+      "exact_match": 1.0,
+      "latency_ms": 11
+    },
+    {
+      "pair_id": "fr-test-04",
+      "category": "factual_recall",
+      "query": "Who am I meeting for the pitch tomorrow?",
+      "prediction": "Maya Reyes",
+      "references": [
+        "Maya Reyes",
+        "Maya"
+      ],
+      "f1": 1.0,
+      "exact_match": 1.0,
+      "latency_ms": 11
+    },
+    {
+      "pair_id": "fr-test-05",
+      "category": "factual_recall",
+      "query": "Where does the Tauri build land on disk?",
+      "prediction": "target/release/tracemind-app",
+      "references": [
+        "target/release/tracemind-app"
+      ],
+      "f1": 1.0,
+      "exact_match": 1.0,
+      "latency_ms": 15
+    },
+    {
+      "pair_id": "nr-test-01",
+      "category": "name_resolution",
+      "query": "Which company did our iOS contractor previously work at?",
+      "prediction": "Square",
+      "references": [
+        "Square",
+        "Square on Cash App",
+        "Cash App"
+      ],
+      "f1": 1.0,
+      "exact_match": 1.0,
+      "latency_ms": 12
+    },
+    {
+      "pair_id": "nr-test-02",
+      "category": "name_resolution",
+      "query": "Where does my mentor Ilya work?",
+      "prediction": "OpenAI",
+      "references": [
+        "OpenAI"
+      ],
+      "f1": 1.0,
+      "exact_match": 1.0,
+      "latency_ms": 15
+    },
+    {
+      "pair_id": "nr-test-03",
+      "category": "name_resolution",
+      "query": "What style does my yoga teacher Anna practice?",
+      "prediction": "traditional Ashtanga",
+      "references": [
+        "Ashtanga",
+        "traditional Ashtanga"
+      ],
+      "f1": 1.0,
+      "exact_match": 1.0,
+      "latency_ms": 16
+    },
+    {
+      "pair_id": "nr-test-04",
+      "category": "name_resolution",
+      "query": "Which city does my oldest friend live in?",
+      "prediction": "Toronto",
+      "references": [
+        "Toronto"
+      ],
+      "f1": 1.0,
+      "exact_match": 1.0,
+      "latency_ms": 12
+    },
+    {
+      "pair_id": "nr-test-05",
+      "category": "name_resolution",
+      "query": "Who is our patent attorney?",
+      "prediction": "Rachel Goldberg",
+      "references": [
+        "Rachel Goldberg",
+        "Rachel"
+      ],
+      "f1": 1.0,
+      "exact_match": 1.0,
+      "latency_ms": 10
+    },
+    {
+      "pair_id": "dh-test-01",
+      "category": "decision_history",
+      "query": "Which monetization approach are we taking?",
+      "prediction": "freemium",
+      "references": [
+        "freemium"
+      ],
+      "f1": 1.0,
+      "exact_match": 1.0,
+      "latency_ms": 11
+    },
+    {
+      "pair_id": "dh-test-02",
+      "category": "decision_history",
+      "query": "Which local model are we shipping at Tier 1?",
+      "prediction": "Qwen",
+      "references": [
+        "Qwen 2.5 1.5B",
+        "Qwen"
+      ],
+      "f1": 1.0,
+      "exact_match": 1.0,
+      "latency_ms": 10
+    },
+    {
+      "pair_id": "dh-test-03",
+      "category": "decision_history",
+      "query": "Which operating system are we launching on first?",
+      "prediction": "macOS",
+      "references": [
+        "macOS"
+      ],
+      "f1": 1.0,
+      "exact_match": 1.0,
+      "latency_ms": 13
+    },
+    {
+      "pair_id": "dh-test-04",
+      "category": "decision_history",
+      "query": "What billing cadence are we starting with?",
+      "prediction": "annual",
+      "references": [
+        "annual",
+        "annual billing"
+      ],
+      "f1": 1.0,
+      "exact_match": 1.0,
+      "latency_ms": 10
+    },
+    {
+      "pair_id": "dh-test-05",
+      "category": "decision_history",
+      "query": "Which AI host is our primary integration?",
+      "prediction": "Claude Code",
+      "references": [
+        "Claude Code"
+      ],
+      "f1": 1.0,
+      "exact_match": 1.0,
+      "latency_ms": 11
+    },
+    {
+      "pair_id": "cr-test-01",
+      "category": "contradiction_recovery",
+      "query": "What is the Series A target now?",
+      "prediction": "twenty million",
+      "references": [
+        "twenty million",
+        "20 million",
+        "$20M"
+      ],
+      "f1": 1.0,
+      "exact_match": 1.0,
+      "latency_ms": 11
+    },
+    {
+      "pair_id": "cr-test-02",
+      "category": "contradiction_recovery",
+      "query": "Which tool am I now using for the spec?",
+      "prediction": "Linear",
+      "references": [
+        "Linear"
+      ],
+      "f1": 1.0,
+      "exact_match": 1.0,
+      "latency_ms": 9
+    },
+    {
+      "pair_id": "cr-test-03",
+      "category": "contradiction_recovery",
+      "query": "When and where is the investor dinner now?",
+      "prediction": "Thursday",
+      "references": [
+        "Thursday at Lazy Bear",
+        "Lazy Bear",
+        "Thursday"
+      ],
+      "f1": 1.0,
+      "exact_match": 1.0,
+      "latency_ms": 16
+    },
+    {
+      "pair_id": "cr-test-04",
+      "category": "contradiction_recovery",
+      "query": "How does the local LLM ship now?",
+      "prediction": "on by default",
+      "references": [
+        "on by default",
+        "default on",
+        "by default"
+      ],
+      "f1": 1.0,
+      "exact_match": 1.0,
+      "latency_ms": 12
+    },
+    {
+      "pair_id": "cr-test-05",
+      "category": "contradiction_recovery",
+      "query": "Which day is yoga held on now?",
+      "prediction": "Wednesdays",
+      "references": [
+        "Wednesdays",
+        "Wednesday"
+      ],
+      "f1": 1.0,
+      "exact_match": 1.0,
+      "latency_ms": 12
+    },
+    {
+      "pair_id": "tp-test-01",
+      "category": "temporal_pinning",
+      "query": "When is the pitch with the investor?",
+      "prediction": "Tuesday morning",
+      "references": [
+        "Tuesday morning",
+        "Tuesday"
+      ],
+      "f1": 1.0,
+      "exact_match": 1.0,
+      "latency_ms": 10
+    },
+    {
+      "pair_id": "tp-test-02",
+      "category": "temporal_pinning",
+      "query": "When is my visa appointment?",
+      "prediction": "October 4",
+      "references": [
+        "October 4"
+      ],
+      "f1": 1.0,
+      "exact_match": 1.0,
+      "latency_ms": 11
+    },
+    {
+      "pair_id": "tp-test-03",
+      "category": "temporal_pinning",
+      "query": "When are we publicly launching the product?",
+      "prediction": "September 20",
+      "references": [
+        "September 20"
+      ],
+      "f1": 1.0,
+      "exact_match": 1.0,
+      "latency_ms": 12
+    },
+    {
+      "pair_id": "tp-test-04",
+      "category": "temporal_pinning",
+      "query": "When do my parents land?",
+      "prediction": "June 12",
+      "references": [
+        "June 12"
+      ],
+      "f1": 1.0,
+      "exact_match": 1.0,
+      "latency_ms": 12
+    },
+    {
+      "pair_id": "tp-test-05",
+      "category": "temporal_pinning",
+      "query": "When does the Q3 board meet?",
+      "prediction": "August 14",
+      "references": [
+        "August 14"
+      ],
+      "f1": 1.0,
+      "exact_match": 1.0,
+      "latency_ms": 13
+    }
+  ]
+}

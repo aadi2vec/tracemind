@@ -47,6 +47,12 @@ struct AppState {
     /// Surfaced to the UI via `cmd_llm_status` so the user can tell when
     /// they're getting heuristic-only relation extraction vs the LLM tier.
     llm_active: Arc<std::sync::atomic::AtomicBool>,
+    /// CTX-EVG Slice A — the currently "active" thread. Mutated by
+    /// `cmd_thread_start` / `cmd_thread_end`; read by `cmd_ingest` and
+    /// `cmd_query` so that every capture/query event written to
+    /// `event_nodes` carries the right `thread_id`. `None` means
+    /// captures/queries are unthreaded (the legacy behavior).
+    active_thread_id: Arc<Mutex<Option<Uuid>>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -262,6 +268,60 @@ fn cmd_ingest(text: String, state: State<AppState>) -> Result<IngestResponse, St
     let trace_store = state.trace_store.lock().map_err(|e| e.to_string())?;
     let _ = trace_store.append(&result.trace);
 
+    // CTX-EVG Slice A — write a `Capture` event node tied to the
+    // currently-active thread (if any). `payload_ref = trace_id` so
+    // downstream consumers can deref to the full ingest payload via
+    // the trace store. `salience` = mean entity confidence as a coarse
+    // proxy until WME-2 ships a real salience scorer. Best-effort: a
+    // failure here must NOT break the ingest IPC contract.
+    {
+        let active = state.active_thread_id.lock().ok().and_then(|g| *g);
+        let mean_conf = if result.entities.is_empty() {
+            0.0
+        } else {
+            result.entities.iter().map(|e| e.confidence).sum::<f64>()
+                / result.entities.len() as f64
+        };
+        if let Ok(g) = GraphStore::open(&state.db_path) {
+            let mut node = tm_graph::event_graph::EventNode::new(
+                tm_graph::event_graph::EventNodeKind::Capture,
+                result.trace.id.to_string(),
+            );
+            node.thread_id = active;
+            node.salience = mean_conf;
+            let _ = tm_graph::event_graph::EventGraphStore::insert_node(g.connection(), &node);
+
+            // CTX-EVG-C — if the captured text reads like a commitment,
+            // also write a `Commitment` event node so the Ledger surface
+            // has something to count. Auto-create only at ≥0.85 confidence
+            // (the "no-friction" path from the spec); below that the UI
+            // can later propose. Best-effort — never breaks ingest.
+            if let Some(cand) = tm_ingest::detect_commitment(&text) {
+                if cand.confidence >= 0.85 {
+                    let mut commit_node =
+                        tm_graph::event_graph::EventNode::commitment(
+                            result.trace.id.to_string(),
+                            cand.due_at,
+                        );
+                    commit_node.thread_id = active;
+                    commit_node.salience = cand.confidence as f64;
+                    let _ = tm_graph::event_graph::EventGraphStore::insert_node(
+                        g.connection(),
+                        &commit_node,
+                    );
+                }
+            }
+
+            // Opportunistic sweep so an overdue commitment surfaces as
+            // `broken` without a separate cron. Cheap (single indexed
+            // UPDATE) — runs on every ingest.
+            let _ = tm_graph::event_graph::EventGraphStore::sweep_broken(
+                g.connection(),
+                chrono::Utc::now().timestamp_millis(),
+            );
+        }
+    }
+
     // LM-8 — kick the async triple worker. Best-effort: if the
     // channel is full we drop the job (counter tracks the backpressure
     // event). The synchronous pipeline above already produced the
@@ -364,6 +424,24 @@ fn cmd_query(text: String, state: State<AppState>) -> Result<QueryResponse, Stri
     // See tm-graph::store::reload_maps doc comment.
     let _ = engine.refresh_graph();
     let result = engine.query(&text).map_err(|e| e.to_string())?;
+
+    // CTX-EVG Slice A — write a `Query` event node tied to the
+    // currently-active thread. `payload_ref = query_id` so consumers
+    // can join back to the recorded trace + arm choice. Salience is
+    // the bandit arm number (normalized) — close enough as a coarse
+    // proxy until WME-2 ships a real query-salience scorer.
+    {
+        let active = state.active_thread_id.lock().ok().and_then(|g| *g);
+        if let Ok(g) = GraphStore::open(&state.db_path) {
+            let mut node = tm_graph::event_graph::EventNode::new(
+                tm_graph::event_graph::EventNodeKind::Query,
+                result.query_id.to_string(),
+            );
+            node.thread_id = active;
+            node.salience = (result.arm as f64) / 4.0; // 5 arms (0..=4) → [0,1]
+            let _ = tm_graph::event_graph::EventGraphStore::insert_node(g.connection(), &node);
+        }
+    }
 
     let name_of: HashMap<Uuid, &str> = result.entities.iter()
         .map(|e| (e.id, e.name.as_str())).collect();
@@ -5688,6 +5766,13 @@ fn main() {
     let cap_trace_store = Arc::clone(&trace_store);
     let cap_enabled = Arc::clone(&capture_enabled);
 
+    // CTX-EVG Slice A — shared active-thread cell. The capture daemon
+    // needs a clone so background clipboard/window captures land in
+    // the same thread the user explicitly opened.
+    let active_thread_id: Arc<Mutex<Option<Uuid>>> = Arc::new(Mutex::new(None));
+    let cap_active_thread = Arc::clone(&active_thread_id);
+    let cap_db_path = db_path.clone();
+
     let state = AppState {
         db_path: db_path.clone(),
         trace_path: trace_path.clone(),
@@ -5698,6 +5783,7 @@ fn main() {
         capture_enabled,
         triple_worker,
         llm_active,
+        active_thread_id,
     };
 
     tauri::Builder::default()
@@ -5775,6 +5861,7 @@ fn main() {
             // ─── Sprint GRAPH ─────────────────────────────────────
             sprint_commands::cmd_thread_start,
             sprint_commands::cmd_thread_end,
+            sprint_commands::cmd_thread_active,
             sprint_commands::cmd_threads_list,
             sprint_commands::cmd_thread_materialize,
             sprint_commands::cmd_graph_compose,
@@ -5799,6 +5886,12 @@ fn main() {
             sprint_commands::cmd_ontology_reject_proposal,
             sprint_commands::cmd_ontology_run_proposer,
             sprint_commands::cmd_anticipate,
+            // ─── CTX-EVG-C — Commitment Ledger ────────────────────
+            sprint_commands::cmd_commitment_ledger,
+            sprint_commands::cmd_commitment_resolve,
+            sprint_commands::cmd_commitment_set_state,
+            sprint_commands::cmd_commitment_propose_resolution,
+            sprint_commands::cmd_commitment_create,
             cmd_storage_stats,
             cmd_storage_vacuum,
             cmd_storage_clean_ephemeral,
@@ -5820,6 +5913,31 @@ fn main() {
                 // clipboard/window/editor text too, not just user-typed
                 // IPC ingests.
                 let triple_worker = cap_triple_worker;
+                // CTX-EVG Slice A — background captures should land in
+                // the same `active_thread` the IPC ingest path uses, so
+                // a user-opened thread accumulates *everything* it sees
+                // (typed ingests + clipboard + window + editor) until
+                // explicitly ended.
+                let active_thread = cap_active_thread;
+                let db_path_for_events = cap_db_path;
+                // Helper: write a `Capture` event node bound to the
+                // currently-active thread. Best-effort — never breaks
+                // the capture loop if the DB is locked.
+                let write_capture_event = |trace_id: uuid::Uuid, mean_conf: f64| {
+                    let thread = active_thread.lock().ok().and_then(|g| *g);
+                    if let Ok(g) = GraphStore::open(&db_path_for_events) {
+                        let mut node = tm_graph::event_graph::EventNode::new(
+                            tm_graph::event_graph::EventNodeKind::Capture,
+                            trace_id.to_string(),
+                        );
+                        node.thread_id = thread;
+                        node.salience = mean_conf;
+                        let _ = tm_graph::event_graph::EventGraphStore::insert_node(
+                            g.connection(),
+                            &node,
+                        );
+                    }
+                };
 
                 let mut seen_hashes: HashSet<u64> = HashSet::new();
                 let mut last_clip_hash: u64 = 0;
@@ -5859,6 +5977,14 @@ fn main() {
                                     if let Ok(ts) = trace_store.lock() {
                                         let _ = ts.append(&result.trace);
                                     }
+                                    // CTX-EVG Slice A — record Capture event
+                                    let mean_conf = if result.entities.is_empty() {
+                                        0.0
+                                    } else {
+                                        result.entities.iter().map(|e| e.confidence).sum::<f64>()
+                                            / result.entities.len() as f64
+                                    };
+                                    write_capture_event(result.trace.id, mean_conf);
                                     // LM-8 — enqueue background triple extraction
                                     let _ = triple_worker.try_enqueue(TripleJob {
                                         text: text.clone(),
@@ -5904,6 +6030,14 @@ fn main() {
                                             if let Ok(ts) = trace_store.lock() {
                                                 let _ = ts.append(&result.trace);
                                             }
+                                            // CTX-EVG Slice A — record Capture event
+                                            let mean_conf = if result.entities.is_empty() {
+                                                0.0
+                                            } else {
+                                                result.entities.iter().map(|e| e.confidence).sum::<f64>()
+                                                    / result.entities.len() as f64
+                                            };
+                                            write_capture_event(result.trace.id, mean_conf);
                                             // LM-8 — slow-path triple extraction off the capture loop.
                                             let _ = triple_worker.try_enqueue(TripleJob {
                                                 text: context.clone(),
@@ -5934,6 +6068,14 @@ fn main() {
                                         if let Ok(ts) = trace_store.lock() {
                                             let _ = ts.append(&result.trace);
                                         }
+                                        // CTX-EVG Slice A — record Capture event
+                                        let mean_conf = if result.entities.is_empty() {
+                                            0.0
+                                        } else {
+                                            result.entities.iter().map(|e| e.confidence).sum::<f64>()
+                                                / result.entities.len() as f64
+                                        };
+                                        write_capture_event(result.trace.id, mean_conf);
                                         // LM-8 — enqueue slow-path triple extraction.
                                         let _ = triple_worker.try_enqueue(TripleJob {
                                             text: context.clone(),

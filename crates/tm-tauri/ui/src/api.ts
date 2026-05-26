@@ -1058,6 +1058,13 @@ export async function threadEnd(threadId: string): Promise<void> {
   return invoke("cmd_thread_end", { threadId });
 }
 
+// CTX-EVG Slice A — currently-active thread id, or null if none.
+// The active thread is set by `threadStart` and cleared by `threadEnd`;
+// every ingest/query writes a Capture/Query event node bound to it.
+export async function threadActive(): Promise<string | null> {
+  return invoke("cmd_thread_active");
+}
+
 export async function threadsList(limit = 50): Promise<ThreadDto[]> {
   return invoke("cmd_threads_list", { limit });
 }
@@ -1388,4 +1395,79 @@ export async function cleanEphemeralStorage(): Promise<CleanupReport> {
 
 export async function truncateTraces(keepRecent: number): Promise<CleanupReport> {
   return invoke("cmd_storage_truncate_traces", { keepRecent });
+}
+
+// ─── CTX-EVG-C — Commitment Ledger ───────────────────────────────────
+
+export type CommitmentStateStr =
+  | ""
+  | "pending"
+  | "kept"
+  | "broken"
+  | "abandoned";
+
+export interface CommitmentDto {
+  id: string;
+  payload_ref: string;
+  ts: number;
+  due_at: number | null;
+  state: CommitmentStateStr;
+  thread_id: string | null;
+  salience: number;
+}
+
+export interface LedgerDto {
+  kept: number;
+  broken: number;
+  pending: number;
+  abandoned: number;
+  commitments: CommitmentDto[];
+  since_ms: number;
+  until_ms: number;
+}
+
+export async function commitmentLedger(windowDays: number): Promise<LedgerDto> {
+  return invoke("cmd_commitment_ledger", { windowDays });
+}
+
+export async function commitmentResolve(
+  commitmentId: string,
+  polarity: number,
+  outcomeText?: string,
+  outcomeId?: string,
+): Promise<{ state: CommitmentStateStr; outcome_id: string }> {
+  return invoke("cmd_commitment_resolve", {
+    req: {
+      commitment_id: commitmentId,
+      polarity,
+      outcome_text: outcomeText ?? null,
+      outcome_id: outcomeId ?? null,
+    },
+  });
+}
+
+export async function commitmentSetState(
+  commitmentId: string,
+  state: Exclude<CommitmentStateStr, "">,
+): Promise<void> {
+  return invoke("cmd_commitment_set_state", {
+    req: { commitment_id: commitmentId, state },
+  });
+}
+
+export async function commitmentProposeResolution(
+  outcomeId?: string,
+): Promise<CommitmentDto[]> {
+  return invoke("cmd_commitment_propose_resolution", {
+    outcomeId: outcomeId ?? null,
+  });
+}
+
+export async function commitmentCreate(
+  text: string,
+  dueAt?: number,
+): Promise<CommitmentDto> {
+  return invoke("cmd_commitment_create", {
+    req: { text, due_at: dueAt ?? null },
+  });
 }

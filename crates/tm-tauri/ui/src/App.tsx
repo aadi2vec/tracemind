@@ -17,6 +17,7 @@ import InspectorView from "./views/InspectorView";
 import ThreadsView from "./views/ThreadsView";
 import ComposerView from "./views/ComposerView";
 import EventGraphView from "./views/EventGraphView";
+import LedgerView from "./views/LedgerView";
 // OntologyView demoted 2026-05-13 — now imported only from SettingsView
 // behind the Schema sub-panel (power users). Not in primary nav.
 import { getUsageStats } from "./api";
@@ -32,6 +33,7 @@ type View =
   | "context"
   | "views"
   | "commitments"
+  | "ledger"
   | "calibration"
   | "threads"
   | "composer"
@@ -75,6 +77,7 @@ const ADVANCED_NAV_ITEMS: NavItem[] = [
   { id: "context", label: "Context", icon: "context" },
   { id: "garden", label: "Garden", icon: "garden" },
   { id: "events", label: "Events", icon: "graph" },
+  { id: "ledger", label: "Ledger", icon: "timeline" },
   { id: "commitments", label: "Commitments", icon: "timeline" },
   { id: "calibration", label: "Calibration", icon: "gauge" },
   { id: "traces", label: "Traces", icon: "list" },
@@ -312,7 +315,7 @@ export default function App() {
 
       {/* Main content */}
       <main className="flex-1 overflow-y-auto bg-tm-bg p-6">
-        {view === "brief" && <BriefView />}
+        {view === "brief" && <BriefView onOpenLedger={() => setView("ledger")} />}
         {view === "dashboard" && <Dashboard />}
         {view === "query" && <QueryView />}
         {view === "ingest" && <IngestView />}
@@ -323,6 +326,7 @@ export default function App() {
         {view === "threads" && <ThreadsView />}
         {view === "composer" && <ComposerView />}
         {view === "events" && <EventGraphView />}
+        {view === "ledger" && <LedgerView />}
         {view === "commitments" && <CommitmentTimelineView />}
         {view === "calibration" && <CalibrationView />}
         {view === "traces" && <TracesView />}

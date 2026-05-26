@@ -427,6 +427,19 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// CTX-EVG-C — Commitment Ledger reader. Prints the score
+    /// (kept / broken / pending) over a sliding window and lists the
+    /// commitments themselves. Reads the EVG event-graph directly; does
+    /// not conflict with the higher-level Intent-System `commit` /
+    /// `resolve` / `commitments` subcommands.
+    Ledger {
+        /// Window length in days. `0` = all time.
+        #[arg(long, default_value = "7")]
+        window: u32,
+        /// Emit JSON instead of formatted text.
+        #[arg(long)]
+        json: bool,
+    },
     /// Demo helpers — restore a deterministic `~/.tracemind/` snapshot
     /// for recording the 3-minute walkthrough.
     Demo {
@@ -583,6 +596,29 @@ enum DemoAction {
         /// staying fully silent. Off by default for the recording.
         #[arg(long)]
         verbose: bool,
+    },
+    /// CTX-EVG Slice A — seed a deterministic thread with a handful of
+    /// captures and queries so the EVG view in the desktop app has
+    /// non-zero data on a clean install. Starts a thread, writes ~5
+    /// `Capture` event nodes + ~2 `Query` event nodes bound to it,
+    /// ends the thread, then prints the thread id.
+    EvgThread {
+        /// Thread title. Defaults to "EVG demo thread".
+        #[arg(long, default_value = "EVG demo thread")]
+        title: String,
+        /// Leave the thread open instead of ending it. Useful when
+        /// you want to keep capturing into it from the desktop app.
+        #[arg(long)]
+        keep_open: bool,
+    },
+    /// CTX-EVG-C — seed a deterministic Commitment Ledger fixture so
+    /// the homepage card has non-empty score on a clean install. Writes
+    /// 6 commitments (3 kept, 2 broken, 1 pending) with Resolves edges
+    /// for the resolved ones, all in a single demo thread.
+    EvgLedger {
+        /// Thread title for the fixture.
+        #[arg(long, default_value = "Ledger demo thread")]
+        title: String,
     },
 }
 
@@ -1947,6 +1983,9 @@ fn main() {
         }
         Commands::Demo { action } => {
             cmd_demo(&dir, action);
+        }
+        Commands::Ledger { window, json } => {
+            cmd_evg_ledger(&dir, window, json);
         }
         Commands::Contradictions { action } => {
             let db_path = dir.join("memory.db").to_str().unwrap().to_string();
@@ -7333,7 +7372,287 @@ fn cmd_demo(dir: &PathBuf, action: DemoAction) {
     match action {
         DemoAction::Restore { force } => cmd_demo_restore(dir, force),
         DemoAction::Preroll { seconds, verbose } => cmd_demo_preroll(dir, seconds, verbose),
+        DemoAction::EvgThread { title, keep_open } => cmd_demo_evg_thread(dir, &title, keep_open),
+        DemoAction::EvgLedger { title } => cmd_demo_evg_ledger(dir, &title),
     }
+}
+
+/// CTX-EVG-C — seed a deterministic Commitment Ledger fixture.
+/// Writes 6 commitments (3 kept, 2 broken, 1 pending) attached to a
+/// single demo thread, plus Resolves edges for the resolved ones, so
+/// the homepage Ledger card has non-empty data on a clean install.
+fn cmd_demo_evg_ledger(dir: &PathBuf, title: &str) {
+    use tm_graph::event_graph::{
+        CommitmentState, EventGraphStore, EventNode, EventNodeKind,
+    };
+    use tm_graph::thread_graph::{Thread, ThreadGraphStore, ThreadSource};
+    use tm_graph::GraphStore;
+
+    let db_path = dir.join("memory.db");
+    let db_path_str = db_path.to_string_lossy().to_string();
+
+    let graph = match GraphStore::open(&db_path_str) {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("failed to open graph at {db_path_str}: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    let thread = Thread::new(title.to_string(), ThreadSource::Tracemind);
+    if let Err(e) = ThreadGraphStore::upsert(graph.connection(), &thread) {
+        eprintln!("upsert thread: {e}");
+        std::process::exit(1);
+    }
+
+    let now = chrono::Utc::now().timestamp_millis();
+    let day = 86_400_000i64;
+    // Six commitments distributed across the week: 3 kept, 2 broken,
+    // 1 pending. `ts` is when the commitment was created; `due_at` is
+    // when it was promised. Salience is the heuristic confidence.
+    let fixture = [
+        // text, due_offset_days, state
+        ("I'll ship the EVG ledger by Friday", -1, CommitmentState::Kept),
+        ("I'll write the spec doc by tomorrow", -2, CommitmentState::Kept),
+        ("Todo: review the Foundry parity notes", 0, CommitmentState::Kept),
+        ("I will email the investor update by Monday", -3, CommitmentState::Broken),
+        ("I'm going to draft the demo script by Thursday", -2, CommitmentState::Broken),
+        ("I'll record the 3-min walkthrough by Sunday", 2, CommitmentState::Pending),
+    ];
+
+    let mut commitment_ids = Vec::new();
+    for (i, (text, due_delta, state)) in fixture.iter().enumerate() {
+        let due_at = Some(now + (*due_delta as i64) * day);
+        let mut node = EventNode::commitment((*text).to_string(), due_at);
+        node.ts = now - ((6 - i) as i64) * (day / 4); // staggered creation
+        node.thread_id = Some(thread.id);
+        node.state = *state;
+        node.salience = 0.9;
+        if let Err(e) = EventGraphStore::insert_node(graph.connection(), &node) {
+            eprintln!("insert commitment {i}: {e}");
+            std::process::exit(1);
+        }
+        commitment_ids.push((node.id, *state));
+    }
+
+    // For the kept + broken commitments, write a paired Outcome node
+    // and Resolves edge so the EVG view shows a complete loop.
+    for (cid, state) in &commitment_ids {
+        let polarity = match state {
+            CommitmentState::Kept => 1.0,
+            CommitmentState::Broken => -1.0,
+            _ => continue,
+        };
+        let payload = format!("outcome-for:{cid}");
+        let mut o = EventNode::new(EventNodeKind::Outcome, payload);
+        o.thread_id = Some(thread.id);
+        o.ts = now;
+        if let Err(e) = EventGraphStore::insert_node(graph.connection(), &o) {
+            eprintln!("insert outcome: {e}");
+            std::process::exit(1);
+        }
+        if let Err(e) =
+            EventGraphStore::resolve_commitment(graph.connection(), o.id, *cid, polarity)
+        {
+            eprintln!("resolve commitment: {e}");
+            std::process::exit(1);
+        }
+        // Re-upsert with the same polarity so the Resolves edge clears
+        // the MIN_SUPPORT floor (>=2) and renders in the EVG view.
+        let _ = EventGraphStore::resolve_commitment(
+            graph.connection(),
+            o.id,
+            *cid,
+            polarity,
+        );
+    }
+
+    println!(
+        "Seeded Commitment Ledger fixture: thread={} commitments={} (kept=3, broken=2, pending=1)",
+        thread.id,
+        commitment_ids.len()
+    );
+}
+
+/// CTX-EVG-C — read the Commitment Ledger.
+fn cmd_evg_ledger(dir: &PathBuf, window_days: u32, json: bool) {
+    use tm_graph::event_graph::EventGraphStore;
+    use tm_graph::GraphStore;
+
+    let db_path = dir.join("memory.db");
+    let db_path_str = db_path.to_string_lossy().to_string();
+    let graph = match GraphStore::open(&db_path_str) {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("failed to open graph at {db_path_str}: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    // Opportunistic sweep so output reflects current broken state.
+    let _ = EventGraphStore::sweep_broken(graph.connection(), now_ms);
+
+    let (since_ms, until_ms) = if window_days == 0 {
+        (0, i64::MAX / 2)
+    } else {
+        let dur = (window_days as i64) * 86_400_000;
+        (now_ms - dur, now_ms + 86_400_000)
+    };
+
+    let summary = match EventGraphStore::commitment_ledger(
+        graph.connection(),
+        since_ms,
+        until_ms,
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("ledger: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    if json {
+        let obj = serde_json::json!({
+            "window_days": window_days,
+            "kept": summary.kept,
+            "broken": summary.broken,
+            "pending": summary.pending,
+            "abandoned": summary.abandoned,
+            "commitment_ids": summary.commitment_ids
+                .iter().map(|u| u.to_string()).collect::<Vec<_>>(),
+        });
+        println!("{}", serde_json::to_string_pretty(&obj).unwrap());
+        return;
+    }
+
+    println!("─── Commitment Ledger (last {} days) ───", window_days);
+    println!("  kept      {}", summary.kept);
+    println!("  broken    {}", summary.broken);
+    println!("  pending   {}", summary.pending);
+    println!("  abandoned {}", summary.abandoned);
+    println!();
+    for cid in &summary.commitment_ids {
+        if let Ok(Some(n)) = EventGraphStore::get_node(graph.connection(), *cid) {
+            let due = n
+                .due_at
+                .map(|d| {
+                    chrono::DateTime::<chrono::Utc>::from_timestamp_millis(d)
+                        .map(|dt| dt.format("%Y-%m-%d").to_string())
+                        .unwrap_or_else(|| "?".into())
+                })
+                .unwrap_or_else(|| "—".into());
+            println!(
+                "  [{:>9}] due={} {} {}",
+                n.state.as_str(),
+                due,
+                &n.id.to_string()[..8],
+                n.payload_ref,
+            );
+        }
+    }
+}
+
+/// CTX-EVG Slice A — seed a deterministic thread + a handful of
+/// capture/query event nodes so the desktop EventGraphView and the
+/// ThreadsView panel both have non-zero data on a clean install. We
+/// reuse the live ingest pipeline + retrieval engine so this fixture
+/// also exercises the same writers the IPC handlers use — proving
+/// the wiring end-to-end, not just the schema.
+fn cmd_demo_evg_thread(dir: &PathBuf, title: &str, keep_open: bool) {
+    use tm_graph::event_graph::{EventGraphStore, EventNode, EventNodeKind};
+    use tm_graph::thread_graph::{Thread, ThreadGraphStore, ThreadSource};
+    use tm_graph::GraphStore;
+    use uuid::Uuid;
+
+    let db_path = dir.join("memory.db");
+    let db_path_str = db_path.to_string_lossy().to_string();
+
+    let graph = match GraphStore::open(&db_path_str) {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("failed to open graph at {db_path_str}: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    // 1. Open a thread.
+    let mut thread = Thread::new(title.to_string(), ThreadSource::Tracemind);
+    if let Err(e) = ThreadGraphStore::upsert(graph.connection(), &thread) {
+        eprintln!("thread upsert failed: {e}");
+        std::process::exit(1);
+    }
+    let thread_id = thread.id;
+
+    // 2. Seed 5 Capture events + 2 Query events. We use synthetic
+    //    payload_refs (uuid strings) so the fixture works without
+    //    having to also touch the trace store — the EVG view only
+    //    cares about the event-node row.
+    let captures = [
+        ("Aaditya kicked off the EVG sprint", 0.82),
+        ("Decided Slice A = hot-path wiring", 0.78),
+        ("Threaded ingest writes Capture nodes", 0.71),
+        ("Threaded query writes Query nodes", 0.69),
+        ("Demo fixture seeds a thread", 0.74),
+    ];
+    let mut node_ids: Vec<Uuid> = Vec::with_capacity(captures.len() + 2);
+    for (_label, salience) in captures.iter() {
+        let mut n = EventNode::new(EventNodeKind::Capture, Uuid::new_v4().to_string());
+        n.thread_id = Some(thread_id);
+        n.salience = *salience;
+        if let Err(e) = EventGraphStore::insert_node(graph.connection(), &n) {
+            eprintln!("insert capture node failed: {e}");
+            std::process::exit(1);
+        }
+        node_ids.push(n.id);
+    }
+    for salience in [0.20, 0.40] {
+        let mut n = EventNode::new(EventNodeKind::Query, Uuid::new_v4().to_string());
+        n.thread_id = Some(thread_id);
+        n.salience = salience;
+        if let Err(e) = EventGraphStore::insert_node(graph.connection(), &n) {
+            eprintln!("insert query node failed: {e}");
+            std::process::exit(1);
+        }
+        node_ids.push(n.id);
+    }
+
+    // 3. Optionally end the thread so it shows up in the "ended"
+    //    section. The materialize view still works on closed threads.
+    //    Also promote `Precedes` edges between consecutive nodes so
+    //    the EventGraphView has real visible edges. Two passes lift
+    //    them above MIN_SUPPORT = 2 so they render via
+    //    `visible_edges()` instead of staying invisible-below-floor.
+    let mut promoted = 0usize;
+    if !keep_open {
+        if let Err(e) = ThreadGraphStore::end_thread(graph.connection(), thread_id) {
+            eprintln!("end thread failed: {e}");
+            std::process::exit(1);
+        }
+        thread.ended_at = Some(chrono::Utc::now());
+        for _ in 0..2 {
+            match EventGraphStore::promote_thread_sequence_edges(graph.connection(), thread_id) {
+                Ok(n) => promoted = n,
+                Err(e) => {
+                    eprintln!("promote thread edges failed: {e}");
+                    break;
+                }
+            }
+        }
+    }
+
+    println!("seeded EVG thread");
+    println!("  thread_id     : {thread_id}");
+    println!("  source        : tracemind");
+    println!("  state         : {}", if keep_open { "open" } else { "ended" });
+    println!("  capture events: {}", captures.len());
+    println!("  query events  : 2");
+    println!("  total nodes   : {}", node_ids.len());
+    if !keep_open {
+        println!("  precedes edges: {} (visible: support>=2)", promoted);
+    }
+    println!();
+    println!("open the desktop app → Threads view to inspect.");
 }
 
 /// `tracemind contradictions list | resolve` — terminal mirror of the

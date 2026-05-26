@@ -1,0 +1,418 @@
+{
+  "pairs": [
+    {
+      "id": "fr-01",
+      "category": "factual_recall",
+      "store": ["My favourite tea is matcha."],
+      "query": "What is my favourite tea?",
+      "answers": ["matcha"]
+    },
+    {
+      "id": "fr-02",
+      "category": "factual_recall",
+      "store": ["Aaditya is the founder of TraceMind."],
+      "query": "Who founded TraceMind?",
+      "answers": ["Aaditya"]
+    },
+    {
+      "id": "fr-03",
+      "category": "factual_recall",
+      "store": ["The office WiFi password is acorn-mountain-42."],
+      "query": "What is the office WiFi password?",
+      "answers": ["acorn-mountain-42"]
+    },
+    {
+      "id": "fr-04",
+      "category": "factual_recall",
+      "store": ["I drive a 2019 Honda Civic."],
+      "query": "What car do I drive?",
+      "answers": ["2019 Honda Civic", "Honda Civic"]
+    },
+    {
+      "id": "fr-05",
+      "category": "factual_recall",
+      "store": ["My sister Priya lives in Bangalore."],
+      "query": "Where does my sister Priya live?",
+      "answers": ["Bangalore"]
+    },
+    {
+      "id": "fr-06",
+      "category": "factual_recall",
+      "store": ["The seed round target is two million dollars."],
+      "query": "What is the seed round target?",
+      "answers": ["two million", "two million dollars", "2 million", "$2M"]
+    },
+    {
+      "id": "fr-07",
+      "category": "factual_recall",
+      "store": ["My API key for OpenRouter starts with sk-or-v1."],
+      "query": "What does my OpenRouter API key start with?",
+      "answers": ["sk-or-v1"]
+    },
+    {
+      "id": "fr-08",
+      "category": "factual_recall",
+      "store": ["I take my coffee black with no sugar."],
+      "query": "How do I take my coffee?",
+      "answers": ["black with no sugar", "black", "no sugar"]
+    },
+    {
+      "id": "fr-09",
+      "category": "factual_recall",
+      "store": ["The investor I'm pitching tomorrow is Maya Reyes."],
+      "query": "Who is the investor I'm pitching tomorrow?",
+      "answers": ["Maya Reyes", "Maya"]
+    },
+    {
+      "id": "fr-10",
+      "category": "factual_recall",
+      "store": ["The Tauri app binary is at target/release/tracemind-app."],
+      "query": "Where is the Tauri app binary?",
+      "answers": ["target/release/tracemind-app"]
+    },
+
+    {
+      "id": "nr-01",
+      "category": "name_resolution",
+      "store": [
+        "My co-founder is Jordan Lee.",
+        "Jordan handles all the backend work."
+      ],
+      "query": "Who handles the backend work?",
+      "answers": ["Jordan", "Jordan Lee"]
+    },
+    {
+      "id": "nr-02",
+      "category": "name_resolution",
+      "store": [
+        "I had lunch with my advisor Dr Patel on Tuesday.",
+        "She suggested I read Hinton's 2022 paper."
+      ],
+      "query": "Who suggested I read Hinton's paper?",
+      "answers": ["Dr Patel", "Patel", "my advisor", "Dr Patel"]
+    },
+    {
+      "id": "nr-03",
+      "category": "name_resolution",
+      "store": [
+        "Met with Sarah from Sequoia at their office.",
+        "She mentioned they're focused on agent infrastructure this year."
+      ],
+      "query": "Who from Sequoia is focused on agent infrastructure?",
+      "answers": ["Sarah"]
+    },
+    {
+      "id": "nr-04",
+      "category": "name_resolution",
+      "store": [
+        "Picked up the new MacBook Pro yesterday.",
+        "It has 64GB of unified memory."
+      ],
+      "query": "How much unified memory does the MacBook have?",
+      "answers": ["64GB", "64 GB", "64"]
+    },
+    {
+      "id": "nr-05",
+      "category": "name_resolution",
+      "store": [
+        "Adopted a tabby cat named Pixel last week.",
+        "He keeps sleeping on my keyboard."
+      ],
+      "query": "What does Pixel keep doing?",
+      "answers": ["sleeping on my keyboard", "sleeping on the keyboard"]
+    },
+    {
+      "id": "nr-06",
+      "category": "name_resolution",
+      "store": [
+        "Hired Emma as our first ML engineer.",
+        "She joined from DeepMind last month."
+      ],
+      "query": "Where did Emma join from?",
+      "answers": ["DeepMind"]
+    },
+    {
+      "id": "nr-07",
+      "category": "name_resolution",
+      "store": [
+        "My therapist Dr Khan recommends journaling daily.",
+        "He says it helps with anxiety."
+      ],
+      "query": "What does Dr Khan say journaling helps with?",
+      "answers": ["anxiety"]
+    },
+    {
+      "id": "nr-08",
+      "category": "name_resolution",
+      "store": [
+        "Started dating Lila in March.",
+        "She runs a small design studio in Brooklyn."
+      ],
+      "query": "Where does Lila run her design studio?",
+      "answers": ["Brooklyn"]
+    },
+    {
+      "id": "nr-09",
+      "category": "name_resolution",
+      "store": [
+        "My landlord Bob is fixing the radiator on Thursday.",
+        "He left a note about it on the door."
+      ],
+      "query": "Who is fixing the radiator on Thursday?",
+      "answers": ["Bob", "my landlord", "Bob"]
+    },
+    {
+      "id": "nr-10",
+      "category": "name_resolution",
+      "store": [
+        "Carlos is the new partner at Andreessen.",
+        "He led the Series A for Honcho."
+      ],
+      "query": "Who led the Series A for Honcho?",
+      "answers": ["Carlos"]
+    },
+
+    {
+      "id": "dh-01",
+      "category": "decision_history",
+      "store": ["Decided to use Rust for the core engine, not Go."],
+      "query": "What language did I choose for the core engine?",
+      "answers": ["Rust"]
+    },
+    {
+      "id": "dh-02",
+      "category": "decision_history",
+      "store": ["Committed to shipping the MCP integration before the Tauri polish."],
+      "query": "Which surface am I shipping first, MCP or Tauri?",
+      "answers": ["MCP", "MCP integration"]
+    },
+    {
+      "id": "dh-03",
+      "category": "decision_history",
+      "store": ["Picked HDBSCAN over KMeans for the clustering substrate."],
+      "query": "What clustering algorithm did I pick?",
+      "answers": ["HDBSCAN"]
+    },
+    {
+      "id": "dh-04",
+      "category": "decision_history",
+      "store": ["Set the seed round ask to $1M, not $3M."],
+      "query": "What is the seed round ask?",
+      "answers": ["$1M", "1 million", "one million"]
+    },
+    {
+      "id": "dh-05",
+      "category": "decision_history",
+      "store": ["Chose BGE-small over Nomic for embeddings to keep the bundle under 1GB."],
+      "query": "Which embedding model did I choose?",
+      "answers": ["BGE-small", "BGE"]
+    },
+    {
+      "id": "dh-06",
+      "category": "decision_history",
+      "store": ["Decided to delete the Reason nav item and surface chains as verb cards."],
+      "query": "What did I decide about the Reason nav item?",
+      "answers": ["delete", "deleted", "remove"]
+    },
+    {
+      "id": "dh-07",
+      "category": "decision_history",
+      "store": ["Picked Sonoma School in Brooklyn for our kid over PS 321."],
+      "query": "Which school did I pick for our kid?",
+      "answers": ["Sonoma School", "Sonoma"]
+    },
+    {
+      "id": "dh-08",
+      "category": "decision_history",
+      "store": ["Going with Stripe over Lago for billing infrastructure."],
+      "query": "Which billing platform did I choose?",
+      "answers": ["Stripe"]
+    },
+    {
+      "id": "dh-09",
+      "category": "decision_history",
+      "store": ["Committed to a 6-week sprint cycle starting Monday."],
+      "query": "How long are my sprint cycles?",
+      "answers": ["6 weeks", "6-week", "six weeks"]
+    },
+    {
+      "id": "dh-10",
+      "category": "decision_history",
+      "store": ["Settled on Tailwind for styling instead of CSS modules."],
+      "query": "What did I pick for styling?",
+      "answers": ["Tailwind"]
+    },
+
+    {
+      "id": "cr-01",
+      "category": "contradiction_recovery",
+      "store": [
+        "I committed to lunch with Sam on Friday.",
+        "Actually, I moved that to Saturday."
+      ],
+      "query": "When am I meeting Sam?",
+      "answers": ["Saturday"]
+    },
+    {
+      "id": "cr-02",
+      "category": "contradiction_recovery",
+      "store": [
+        "Booked the flight to Tokyo for May 3rd.",
+        "No, rescheduled to May 10th because of the conference."
+      ],
+      "query": "When is my flight to Tokyo?",
+      "answers": ["May 10th", "May 10"]
+    },
+    {
+      "id": "cr-03",
+      "category": "contradiction_recovery",
+      "store": [
+        "The investor pitch will be Thursday afternoon.",
+        "Wait, Maya moved it to Wednesday morning."
+      ],
+      "query": "When is the investor pitch?",
+      "answers": ["Wednesday morning", "Wednesday"]
+    },
+    {
+      "id": "cr-04",
+      "category": "contradiction_recovery",
+      "store": [
+        "Hired Alex as our first designer.",
+        "Actually, Alex declined the offer; we're going with Riya instead."
+      ],
+      "query": "Who is our first designer?",
+      "answers": ["Riya"]
+    },
+    {
+      "id": "cr-05",
+      "category": "contradiction_recovery",
+      "store": [
+        "The seed round is $1M.",
+        "Updated to $1.5M after talking to Carlos."
+      ],
+      "query": "What is the seed round size?",
+      "answers": ["$1.5M", "1.5 million", "1.5M"]
+    },
+    {
+      "id": "cr-06",
+      "category": "contradiction_recovery",
+      "store": [
+        "Going with Stripe for billing.",
+        "Scratch that, we're using Lago instead."
+      ],
+      "query": "Which billing platform are we using?",
+      "answers": ["Lago"]
+    },
+    {
+      "id": "cr-07",
+      "category": "contradiction_recovery",
+      "store": [
+        "Demo day is on May 20.",
+        "Actually, demo day moved to May 27."
+      ],
+      "query": "When is demo day?",
+      "answers": ["May 27"]
+    },
+    {
+      "id": "cr-08",
+      "category": "contradiction_recovery",
+      "store": [
+        "We're hiring 3 engineers this quarter.",
+        "Updated to 5 engineers after the new round closed."
+      ],
+      "query": "How many engineers are we hiring this quarter?",
+      "answers": ["5", "5 engineers", "five"]
+    },
+    {
+      "id": "cr-09",
+      "category": "contradiction_recovery",
+      "store": [
+        "The book club meets at Cafe Vega.",
+        "Wait, no — we moved the book club to Lyra Coffee."
+      ],
+      "query": "Where does the book club meet?",
+      "answers": ["Lyra Coffee", "Lyra"]
+    },
+    {
+      "id": "cr-10",
+      "category": "contradiction_recovery",
+      "store": [
+        "Sarah is leading the Series A.",
+        "Actually, Sarah left Sequoia; the deal is now with Mike."
+      ],
+      "query": "Who is leading the Series A?",
+      "answers": ["Mike"]
+    },
+
+    {
+      "id": "tp-01",
+      "category": "temporal_pinning",
+      "store": ["My flight to Tokyo is on May 3rd, 2026."],
+      "query": "When is my flight to Tokyo?",
+      "answers": ["May 3rd, 2026", "May 3rd", "May 3"]
+    },
+    {
+      "id": "tp-02",
+      "category": "temporal_pinning",
+      "store": ["Demo day is scheduled for 2026-06-15."],
+      "query": "When is demo day?",
+      "answers": ["2026-06-15", "June 15", "June 15, 2026"]
+    },
+    {
+      "id": "tp-03",
+      "category": "temporal_pinning",
+      "store": ["Dinner with Maya next Tuesday at 7pm."],
+      "query": "When is dinner with Maya?",
+      "answers": ["next Tuesday", "Tuesday"]
+    },
+    {
+      "id": "tp-04",
+      "category": "temporal_pinning",
+      "store": ["The Stripe integration ships in 3 weeks."],
+      "query": "When does the Stripe integration ship?",
+      "answers": ["in 3 weeks", "3 weeks"]
+    },
+    {
+      "id": "tp-05",
+      "category": "temporal_pinning",
+      "store": ["The conference keynote is on October 15."],
+      "query": "When is the conference keynote?",
+      "answers": ["October 15"]
+    },
+    {
+      "id": "tp-06",
+      "category": "temporal_pinning",
+      "store": ["My passport expires on 2027-03-22."],
+      "query": "When does my passport expire?",
+      "answers": ["2027-03-22", "March 22, 2027", "March 22"]
+    },
+    {
+      "id": "tp-07",
+      "category": "temporal_pinning",
+      "store": ["The retreat starts tomorrow morning at 8am."],
+      "query": "When does the retreat start?",
+      "answers": ["tomorrow"]
+    },
+    {
+      "id": "tp-08",
+      "category": "temporal_pinning",
+      "store": ["I'm taking Friday off for a long weekend."],
+      "query": "When am I taking the day off?",
+      "answers": ["Friday"]
+    },
+    {
+      "id": "tp-09",
+      "category": "temporal_pinning",
+      "store": ["The fixed-rate mortgage period ends in 18 months."],
+      "query": "When does the fixed-rate period end?",
+      "answers": ["in 18 months", "18 months"]
+    },
+    {
+      "id": "tp-10",
+      "category": "temporal_pinning",
+      "store": ["The seed round closes by April 30, 2026."],
+      "query": "When does the seed round close?",
+      "answers": ["April 30, 2026", "April 30"]
+    }
+  ]
+}

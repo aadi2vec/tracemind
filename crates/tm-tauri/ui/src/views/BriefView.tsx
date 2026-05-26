@@ -31,6 +31,7 @@ import {
   type OutcomePolarity,
 } from "../api";
 import AnticipateCard from "./AnticipateCard";
+import LedgerScoreCard from "./LedgerScoreCard";
 import EntityDrawer from "./EntityDrawer";
 import TransclusionText from "./TransclusionText";
 import WmeCardsPanel from "./WmeCardsPanel";
@@ -67,7 +68,9 @@ function saveSet(key: string, set: Set<string>) {
   }
 }
 
-export default function BriefView() {
+export default function BriefView({
+  onOpenLedger,
+}: { onOpenLedger?: () => void } = {}) {
   const [brief, setBrief] = useState<BriefData | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
@@ -248,6 +251,8 @@ export default function BriefView() {
           contradictions: <span className="font-mono">{c.contradictions}</span>
         </span>
       </div>
+
+      <LedgerScoreCard onOpenLedger={onOpenLedger} />
 
       <AnticipateCard />
 

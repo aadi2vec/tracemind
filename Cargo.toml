@@ -30,6 +30,7 @@ members = [
     "crates/tm-pgm",
     "crates/tm-cluster",
     "crates/tm-bench-wme",
+    "crates/tm-bench-memory",
 ]
 
 [workspace.package]

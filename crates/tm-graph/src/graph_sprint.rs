@@ -57,6 +57,36 @@ pub fn ensure_schema(conn: &Connection) -> Result<()> {
         })?;
     }
 
+    // CTX-EVG-C — commitment fate (due_at + state) on event_nodes.
+    if !column_exists(conn, "event_nodes", "due_at")? {
+        conn.execute(
+            "ALTER TABLE event_nodes ADD COLUMN due_at INTEGER",
+            [],
+        )
+        .map_err(|e| {
+            TraceMindError::Storage(format!("alter event_nodes.due_at: {e}"))
+        })?;
+    }
+    if !column_exists(conn, "event_nodes", "state")? {
+        conn.execute(
+            "ALTER TABLE event_nodes ADD COLUMN state TEXT NOT NULL DEFAULT ''",
+            [],
+        )
+        .map_err(|e| {
+            TraceMindError::Storage(format!("alter event_nodes.state: {e}"))
+        })?;
+    }
+    // Partial indexes are cheap and only meaningful for commitments.
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_event_nodes_due
+           ON event_nodes(due_at) WHERE due_at IS NOT NULL;
+         CREATE INDEX IF NOT EXISTS idx_event_nodes_state
+           ON event_nodes(state) WHERE state != '';",
+    )
+    .map_err(|e| {
+        TraceMindError::Storage(format!("commitment idx: {e}"))
+    })?;
+
     seed_builtin_ontology(conn)?;
     Ok(())
 }
