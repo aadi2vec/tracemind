@@ -84,6 +84,40 @@ impl EventEdgeKind {
     }
 }
 
+/// CTX-EVG-C — fate of a commitment. Empty string is the schema sentinel
+/// meaning "not a commitment"; only commitment nodes use the populated
+/// variants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CommitmentState {
+    None,
+    Pending,
+    Kept,
+    Broken,
+    Abandoned,
+}
+
+impl CommitmentState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CommitmentState::None => "",
+            CommitmentState::Pending => "pending",
+            CommitmentState::Kept => "kept",
+            CommitmentState::Broken => "broken",
+            CommitmentState::Abandoned => "abandoned",
+        }
+    }
+    pub fn parse(s: &str) -> Self {
+        match s {
+            "pending" => CommitmentState::Pending,
+            "kept" => CommitmentState::Kept,
+            "broken" => CommitmentState::Broken,
+            "abandoned" => CommitmentState::Abandoned,
+            _ => CommitmentState::None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EventNode {
     pub id: Uuid,
@@ -94,6 +128,19 @@ pub struct EventNode {
     pub context_id: Option<Uuid>,
     pub thread_id: Option<Uuid>,
     pub salience: f64,
+    /// Commitment due timestamp (millis since epoch). None for non-commitments
+    /// or open-ended commitments.
+    #[serde(default)]
+    pub due_at: Option<i64>,
+    /// Commitment fate. `None` for non-commitments.
+    #[serde(default = "CommitmentState::default_none")]
+    pub state: CommitmentState,
+}
+
+impl CommitmentState {
+    fn default_none() -> Self {
+        CommitmentState::None
+    }
 }
 
 impl EventNode {
@@ -107,7 +154,19 @@ impl EventNode {
             context_id: None,
             thread_id: None,
             salience: 0.0,
+            due_at: None,
+            state: CommitmentState::None,
         }
+    }
+
+    /// CTX-EVG-C — convenience constructor for `Commitment` nodes. Starts
+    /// in `Pending` state; `due_at` is millis since epoch (None for
+    /// open-ended commitments).
+    pub fn commitment(payload_ref: impl Into<String>, due_at: Option<i64>) -> Self {
+        let mut n = Self::new(EventNodeKind::Commitment, payload_ref);
+        n.due_at = due_at;
+        n.state = CommitmentState::Pending;
+        n
     }
 }
 
@@ -131,8 +190,8 @@ impl EventGraphStore {
     pub fn insert_node(conn: &Connection, n: &EventNode) -> Result<()> {
         conn.execute(
             "INSERT OR REPLACE INTO event_nodes
-              (id, kind, ts, payload_ref, cluster_id, context_id, thread_id, salience)
-             VALUES (?,?,?,?,?,?,?,?)",
+              (id, kind, ts, payload_ref, cluster_id, context_id, thread_id, salience, due_at, state)
+             VALUES (?,?,?,?,?,?,?,?,?,?)",
             params![
                 n.id.to_string(),
                 n.kind.as_str(),
@@ -142,6 +201,8 @@ impl EventGraphStore {
                 n.context_id.map(|c| c.to_string()),
                 n.thread_id.map(|c| c.to_string()),
                 n.salience,
+                n.due_at,
+                n.state.as_str(),
             ],
         )
         .map_err(|e| TraceMindError::Storage(format!("insert ev node: {e}")))?;
@@ -327,48 +388,302 @@ impl EventGraphStore {
         Ok(promoted)
     }
 
+    /// CTX-EVG Slice B — promote `Precedes` edges *within a single
+    /// thread*. Walks the thread's event nodes in `ts` order and adds
+    /// a `Precedes` edge for every consecutive pair (a → b). Each pair
+    /// goes through `upsert_edge`, so calling this twice on the same
+    /// thread strengthens existing edges rather than duplicating them.
+    /// Returns the count of edges upserted.
+    ///
+    /// This is the *thread-scoped* counterpart to
+    /// `promote_sequence_edges`, which is global + cluster-keyed. We
+    /// need both: clusters give us topical structure, threads give us
+    /// session structure, and the EVG view wants to render both.
+    pub fn promote_thread_sequence_edges(
+        conn: &Connection,
+        thread_id: Uuid,
+    ) -> Result<usize> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, ts FROM event_nodes
+                 WHERE thread_id = ?
+                 ORDER BY ts ASC",
+            )
+            .map_err(|e| TraceMindError::Storage(format!("prep thread promote: {e}")))?;
+        let rows = stmt
+            .query_map(params![thread_id.to_string()], |row| {
+                let id: String = row.get(0)?;
+                let ts: i64 = row.get(1)?;
+                Ok((id, ts))
+            })
+            .map_err(|e| TraceMindError::Storage(format!("thread promote query: {e}")))?;
+
+        let mut seq: Vec<(Uuid, i64)> = Vec::new();
+        for r in rows {
+            let (id, ts) = r.map_err(|e| TraceMindError::Storage(e.to_string()))?;
+            if let Ok(uid) = Uuid::parse_str(&id) {
+                seq.push((uid, ts));
+            }
+        }
+        drop(stmt);
+
+        let mut promoted = 0usize;
+        for w in seq.windows(2) {
+            if w[0].0 == w[1].0 {
+                continue; // never self-loop
+            }
+            Self::upsert_edge(
+                conn,
+                w[0].0,
+                w[1].0,
+                EventEdgeKind::Precedes,
+                1.0,
+                None,
+            )?;
+            promoted += 1;
+        }
+        Ok(promoted)
+    }
+
     /// Read all event nodes (debug / dashboard).
     pub fn list_nodes(conn: &Connection, limit: usize) -> Result<Vec<EventNode>> {
         let mut stmt = conn
             .prepare(
-                "SELECT id, kind, ts, payload_ref, cluster_id, context_id, thread_id, salience
+                "SELECT id, kind, ts, payload_ref, cluster_id, context_id, thread_id, salience, due_at, state
                  FROM event_nodes ORDER BY ts DESC LIMIT ?",
             )
             .map_err(|e| TraceMindError::Storage(format!("prep nodes: {e}")))?;
         let rows = stmt
-            .query_map(params![limit as i64], |row| {
-                let id: String = row.get(0)?;
-                let kind: String = row.get(1)?;
-                let ts: i64 = row.get(2)?;
-                let pref: String = row.get(3)?;
-                let cl: Option<i64> = row.get(4)?;
-                let cid: Option<String> = row.get(5)?;
-                let tid: Option<String> = row.get(6)?;
-                let sal: f64 = row.get(7)?;
-                Ok((id, kind, ts, pref, cl, cid, tid, sal))
-            })
+            .query_map(params![limit as i64], row_to_event_node)
             .map_err(|e| TraceMindError::Storage(format!("nodes query: {e}")))?;
         let mut out = Vec::new();
         for r in rows {
-            let (id, kind, ts, pref, cl, cid, tid, sal) =
-                r.map_err(|e| TraceMindError::Storage(e.to_string()))?;
-            let Some(k) = EventNodeKind::parse(&kind) else {
-                continue;
-            };
-            out.push(EventNode {
-                id: Uuid::parse_str(&id)
-                    .map_err(|e| TraceMindError::Storage(format!("uuid: {e}")))?,
-                kind: k,
-                ts,
-                payload_ref: pref,
-                cluster_id: cl,
-                context_id: cid.and_then(|s| Uuid::parse_str(&s).ok()),
-                thread_id: tid.and_then(|s| Uuid::parse_str(&s).ok()),
-                salience: sal,
-            });
+            match r {
+                Ok(Some(n)) => out.push(n),
+                Ok(None) => continue,
+                Err(e) => return Err(TraceMindError::Storage(e.to_string())),
+            }
         }
         Ok(out)
     }
+
+    /// Fetch a single event node by id.
+    pub fn get_node(conn: &Connection, id: Uuid) -> Result<Option<EventNode>> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, kind, ts, payload_ref, cluster_id, context_id, thread_id, salience, due_at, state
+                 FROM event_nodes WHERE id = ?",
+            )
+            .map_err(|e| TraceMindError::Storage(format!("prep get_node: {e}")))?;
+        let mut rows = stmt
+            .query_map(params![id.to_string()], row_to_event_node)
+            .map_err(|e| TraceMindError::Storage(format!("get_node query: {e}")))?;
+        match rows.next() {
+            Some(Ok(Some(n))) => Ok(Some(n)),
+            Some(Ok(None)) => Ok(None),
+            Some(Err(e)) => Err(TraceMindError::Storage(e.to_string())),
+            None => Ok(None),
+        }
+    }
+
+    /// CTX-EVG-C — set a commitment node's `state`. No-op if the node is
+    /// not a commitment.
+    pub fn set_commitment_state(
+        conn: &Connection,
+        commitment_id: Uuid,
+        state: CommitmentState,
+    ) -> Result<()> {
+        conn.execute(
+            "UPDATE event_nodes SET state = ?
+             WHERE id = ? AND kind = 'commitment'",
+            params![state.as_str(), commitment_id.to_string()],
+        )
+        .map_err(|e| TraceMindError::Storage(format!("set_commitment_state: {e}")))?;
+        Ok(())
+    }
+
+    /// CTX-EVG-C — record an outcome's resolution of a commitment. Upserts
+    /// a `Resolves` edge (outcome → commitment) with strength = polarity
+    /// (+1.0 kept / -1.0 broken) and atomically flips the commitment's
+    /// state. Returns the resulting commitment state.
+    pub fn resolve_commitment(
+        conn: &Connection,
+        outcome_id: Uuid,
+        commitment_id: Uuid,
+        polarity: f64,
+    ) -> Result<CommitmentState> {
+        Self::upsert_edge(
+            conn,
+            outcome_id,
+            commitment_id,
+            EventEdgeKind::Resolves,
+            polarity,
+            None,
+        )?;
+        let new_state = if polarity >= 0.0 {
+            CommitmentState::Kept
+        } else {
+            CommitmentState::Broken
+        };
+        Self::set_commitment_state(conn, commitment_id, new_state)?;
+        Ok(new_state)
+    }
+
+    /// CTX-EVG-C — flip pending commitments whose `due_at` has lapsed and
+    /// which have no `Resolves` edge into `broken` state. Idempotent.
+    /// Returns the count of rows flipped on this call.
+    pub fn sweep_broken(conn: &Connection, now_ms: i64) -> Result<usize> {
+        let updated = conn
+            .execute(
+                "UPDATE event_nodes
+                 SET state = 'broken'
+                 WHERE kind = 'commitment'
+                   AND state = 'pending'
+                   AND due_at IS NOT NULL
+                   AND due_at < ?
+                   AND id NOT IN (
+                     SELECT to_id FROM event_edges WHERE kind = 'resolves'
+                   )",
+                params![now_ms],
+            )
+            .map_err(|e| TraceMindError::Storage(format!("sweep_broken: {e}")))?;
+        Ok(updated)
+    }
+
+    /// CTX-EVG-C — commitment ledger summary for a time window.
+    /// Counts commitments by state where the commitment's `ts` falls in
+    /// `[since_ms, until_ms)`. Also returns the visible node IDs so the
+    /// UI can render the subgraph beneath the score card.
+    pub fn commitment_ledger(
+        conn: &Connection,
+        since_ms: i64,
+        until_ms: i64,
+    ) -> Result<LedgerSummary> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, state FROM event_nodes
+                 WHERE kind = 'commitment' AND ts >= ? AND ts < ?
+                 ORDER BY ts DESC",
+            )
+            .map_err(|e| TraceMindError::Storage(format!("prep ledger: {e}")))?;
+        let rows = stmt
+            .query_map(params![since_ms, until_ms], |row| {
+                let id: String = row.get(0)?;
+                let st: String = row.get(1)?;
+                Ok((id, st))
+            })
+            .map_err(|e| TraceMindError::Storage(format!("ledger query: {e}")))?;
+        let mut summary = LedgerSummary::default();
+        for r in rows {
+            let (id, st) = r.map_err(|e| TraceMindError::Storage(e.to_string()))?;
+            let uid = match Uuid::parse_str(&id) {
+                Ok(u) => u,
+                Err(_) => continue,
+            };
+            summary.commitment_ids.push(uid);
+            match CommitmentState::parse(&st) {
+                CommitmentState::Kept => summary.kept += 1,
+                CommitmentState::Broken => summary.broken += 1,
+                CommitmentState::Pending => summary.pending += 1,
+                CommitmentState::Abandoned => summary.abandoned += 1,
+                CommitmentState::None => {}
+            }
+        }
+        Ok(summary)
+    }
+
+    /// CTX-EVG-C — list pending commitments in a thread (or all threads
+    /// when `thread_id` is None), ordered by `due_at` ascending (NULLs
+    /// last). Used by the resolution prompt to pick candidates.
+    pub fn pending_commitments(
+        conn: &Connection,
+        thread_id: Option<Uuid>,
+        limit: usize,
+    ) -> Result<Vec<EventNode>> {
+        let (sql, has_thread) = if thread_id.is_some() {
+            (
+                "SELECT id, kind, ts, payload_ref, cluster_id, context_id, thread_id, salience, due_at, state
+                 FROM event_nodes
+                 WHERE kind='commitment' AND state='pending' AND thread_id = ?
+                 ORDER BY (due_at IS NULL), due_at ASC, ts DESC
+                 LIMIT ?",
+                true,
+            )
+        } else {
+            (
+                "SELECT id, kind, ts, payload_ref, cluster_id, context_id, thread_id, salience, due_at, state
+                 FROM event_nodes
+                 WHERE kind='commitment' AND state='pending'
+                 ORDER BY (due_at IS NULL), due_at ASC, ts DESC
+                 LIMIT ?",
+                false,
+            )
+        };
+        let mut stmt = conn
+            .prepare(sql)
+            .map_err(|e| TraceMindError::Storage(format!("prep pending: {e}")))?;
+        let rows = if has_thread {
+            stmt.query_map(
+                params![thread_id.unwrap().to_string(), limit as i64],
+                row_to_event_node,
+            )
+        } else {
+            stmt.query_map(params![limit as i64], row_to_event_node)
+        }
+        .map_err(|e| TraceMindError::Storage(format!("pending query: {e}")))?;
+        let mut out = Vec::new();
+        for r in rows {
+            match r {
+                Ok(Some(n)) => out.push(n),
+                Ok(None) => continue,
+                Err(e) => return Err(TraceMindError::Storage(e.to_string())),
+            }
+        }
+        Ok(out)
+    }
+}
+
+/// CTX-EVG-C — counts for the commitment ledger window.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct LedgerSummary {
+    pub kept: u32,
+    pub broken: u32,
+    pub pending: u32,
+    pub abandoned: u32,
+    pub commitment_ids: Vec<Uuid>,
+}
+
+fn row_to_event_node(
+    row: &rusqlite::Row,
+) -> std::result::Result<Option<EventNode>, rusqlite::Error> {
+    let id: String = row.get(0)?;
+    let kind: String = row.get(1)?;
+    let ts: i64 = row.get(2)?;
+    let pref: String = row.get(3)?;
+    let cl: Option<i64> = row.get(4)?;
+    let cid: Option<String> = row.get(5)?;
+    let tid: Option<String> = row.get(6)?;
+    let sal: f64 = row.get(7)?;
+    let due_at: Option<i64> = row.get(8)?;
+    let state: String = row.get(9)?;
+    let Some(k) = EventNodeKind::parse(&kind) else {
+        return Ok(None);
+    };
+    let Ok(uid) = Uuid::parse_str(&id) else {
+        return Ok(None);
+    };
+    Ok(Some(EventNode {
+        id: uid,
+        kind: k,
+        ts,
+        payload_ref: pref,
+        cluster_id: cl,
+        context_id: cid.and_then(|s| Uuid::parse_str(&s).ok()),
+        thread_id: tid.and_then(|s| Uuid::parse_str(&s).ok()),
+        salience: sal,
+        due_at,
+        state: CommitmentState::parse(&state),
+    }))
 }
 
 fn row_to_edge(row: &rusqlite::Row) -> std::result::Result<EventEdge, rusqlite::Error> {
@@ -463,5 +778,185 @@ mod tests {
         }
         let promoted = EventGraphStore::promote_sequence_edges(&c).unwrap();
         assert_eq!(promoted, 3); // 1→2, 2→1, 1→3
+    }
+
+    #[test]
+    fn commitment_lifecycle_pending_to_kept_via_resolve() {
+        let c = fresh();
+        let commit = EventNode::commitment("c:1", Some(2_000));
+        let cid = commit.id;
+        EventGraphStore::insert_node(&c, &commit).unwrap();
+
+        let fetched = EventGraphStore::get_node(&c, cid).unwrap().unwrap();
+        assert_eq!(fetched.state, CommitmentState::Pending);
+        assert_eq!(fetched.due_at, Some(2_000));
+
+        let mut outcome = EventNode::new(EventNodeKind::Outcome, "o:1");
+        outcome.ts = 3_000;
+        EventGraphStore::insert_node(&c, &outcome).unwrap();
+
+        let new_state = EventGraphStore::resolve_commitment(&c, outcome.id, cid, 1.0)
+            .unwrap();
+        assert_eq!(new_state, CommitmentState::Kept);
+
+        // edge exists with strength +1.0
+        let edges = EventGraphStore::visible_edges(&c, Some(EventEdgeKind::Resolves))
+            .unwrap();
+        // singleton edge — below MIN_SUPPORT — must not be visible yet
+        assert_eq!(edges.len(), 0);
+
+        // second resolution (e.g. user revises) strengthens but stays Kept
+        let new_state2 = EventGraphStore::resolve_commitment(&c, outcome.id, cid, 1.0)
+            .unwrap();
+        assert_eq!(new_state2, CommitmentState::Kept);
+        let edges = EventGraphStore::visible_edges(&c, Some(EventEdgeKind::Resolves))
+            .unwrap();
+        assert_eq!(edges.len(), 1);
+
+        let fetched = EventGraphStore::get_node(&c, cid).unwrap().unwrap();
+        assert_eq!(fetched.state, CommitmentState::Kept);
+    }
+
+    #[test]
+    fn resolve_negative_polarity_marks_broken() {
+        let c = fresh();
+        let commit = EventNode::commitment("c:1", Some(2_000));
+        let cid = commit.id;
+        EventGraphStore::insert_node(&c, &commit).unwrap();
+        let mut outcome = EventNode::new(EventNodeKind::Outcome, "o:1");
+        outcome.ts = 3_000;
+        EventGraphStore::insert_node(&c, &outcome).unwrap();
+
+        let s = EventGraphStore::resolve_commitment(&c, outcome.id, cid, -1.0).unwrap();
+        assert_eq!(s, CommitmentState::Broken);
+        let fetched = EventGraphStore::get_node(&c, cid).unwrap().unwrap();
+        assert_eq!(fetched.state, CommitmentState::Broken);
+    }
+
+    #[test]
+    fn sweep_broken_flips_overdue_unresolved_only() {
+        let c = fresh();
+        // overdue, unresolved → should flip
+        let a = EventNode::commitment("a", Some(1_000));
+        // overdue but resolved → must NOT flip
+        let b = EventNode::commitment("b", Some(1_000));
+        // future due → must NOT flip
+        let c1 = EventNode::commitment("c", Some(10_000));
+        // no due_at → must NOT flip
+        let d = EventNode::commitment("d", None);
+        EventGraphStore::insert_node(&c, &a).unwrap();
+        EventGraphStore::insert_node(&c, &b).unwrap();
+        EventGraphStore::insert_node(&c, &c1).unwrap();
+        EventGraphStore::insert_node(&c, &d).unwrap();
+
+        let outcome = EventNode::new(EventNodeKind::Outcome, "o");
+        EventGraphStore::insert_node(&c, &outcome).unwrap();
+        EventGraphStore::resolve_commitment(&c, outcome.id, b.id, 1.0).unwrap();
+
+        let flipped = EventGraphStore::sweep_broken(&c, 5_000).unwrap();
+        assert_eq!(flipped, 1, "only the unresolved overdue commitment should flip");
+
+        assert_eq!(
+            EventGraphStore::get_node(&c, a.id).unwrap().unwrap().state,
+            CommitmentState::Broken
+        );
+        assert_eq!(
+            EventGraphStore::get_node(&c, b.id).unwrap().unwrap().state,
+            CommitmentState::Kept
+        );
+        assert_eq!(
+            EventGraphStore::get_node(&c, c1.id).unwrap().unwrap().state,
+            CommitmentState::Pending
+        );
+        assert_eq!(
+            EventGraphStore::get_node(&c, d.id).unwrap().unwrap().state,
+            CommitmentState::Pending
+        );
+
+        // idempotency: second sweep flips nothing new
+        let flipped2 = EventGraphStore::sweep_broken(&c, 5_000).unwrap();
+        assert_eq!(flipped2, 0);
+    }
+
+    #[test]
+    fn commitment_ledger_counts_by_state_in_window() {
+        let c = fresh();
+        let mut kept = EventNode::commitment("k", Some(100));
+        kept.ts = 50;
+        kept.state = CommitmentState::Kept;
+        let mut broken = EventNode::commitment("b", Some(100));
+        broken.ts = 60;
+        broken.state = CommitmentState::Broken;
+        let mut pending = EventNode::commitment("p", Some(9_999));
+        pending.ts = 70;
+        let mut out_of_window = EventNode::commitment("ow", Some(100));
+        out_of_window.ts = 9_999;
+        for n in [&kept, &broken, &pending, &out_of_window] {
+            EventGraphStore::insert_node(&c, n).unwrap();
+        }
+        let s = EventGraphStore::commitment_ledger(&c, 0, 1_000).unwrap();
+        assert_eq!(s.kept, 1);
+        assert_eq!(s.broken, 1);
+        assert_eq!(s.pending, 1);
+        assert_eq!(s.commitment_ids.len(), 3);
+    }
+
+    #[test]
+    fn pending_commitments_orders_by_due() {
+        let c = fresh();
+        let mut a = EventNode::commitment("a", Some(3_000));
+        a.ts = 10;
+        let mut b = EventNode::commitment("b", Some(1_000));
+        b.ts = 20;
+        let mut c2 = EventNode::commitment("c", None);
+        c2.ts = 30;
+        EventGraphStore::insert_node(&c, &a).unwrap();
+        EventGraphStore::insert_node(&c, &b).unwrap();
+        EventGraphStore::insert_node(&c, &c2).unwrap();
+
+        let p = EventGraphStore::pending_commitments(&c, None, 10).unwrap();
+        assert_eq!(p.len(), 3);
+        assert_eq!(p[0].id, b.id); // due=1000 first
+        assert_eq!(p[1].id, a.id); // due=3000
+        assert_eq!(p[2].id, c2.id); // no due_at last
+    }
+
+    #[test]
+    fn promote_thread_sequence_walks_thread_only() {
+        let c = fresh();
+        let thread_a = Uuid::new_v4();
+        let thread_b = Uuid::new_v4();
+        let make = |ts: i64, thread: Option<Uuid>| {
+            let mut n = EventNode::new(EventNodeKind::Capture, "p");
+            n.ts = ts;
+            n.thread_id = thread;
+            n
+        };
+        // Thread A has 3 nodes; Thread B has 2; one node is unthreaded.
+        let nodes = [
+            make(1, Some(thread_a)),
+            make(2, Some(thread_b)),
+            make(3, Some(thread_a)),
+            make(4, None),
+            make(5, Some(thread_a)),
+            make(6, Some(thread_b)),
+        ];
+        for n in &nodes {
+            EventGraphStore::insert_node(&c, n).unwrap();
+        }
+        let promoted = EventGraphStore::promote_thread_sequence_edges(&c, thread_a).unwrap();
+        // Thread A has 3 nodes → 2 consecutive pairs → 2 edges.
+        // Unthreaded + thread-B nodes must not contribute.
+        assert_eq!(promoted, 2);
+
+        // Calling again strengthens, doesn't duplicate.
+        let promoted2 = EventGraphStore::promote_thread_sequence_edges(&c, thread_a).unwrap();
+        assert_eq!(promoted2, 2);
+        let visible = EventGraphStore::visible_edges(&c, None).unwrap();
+        assert_eq!(
+            visible.len(),
+            2,
+            "second pass should strengthen, not duplicate"
+        );
     }
 }

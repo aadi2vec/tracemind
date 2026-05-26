@@ -1,3 +1,4 @@
+pub mod commitment;
 pub mod pipeline;
 pub mod extractor;
 pub mod gliner;
@@ -6,6 +7,7 @@ pub mod rate_limit;
 pub mod tags;
 pub mod triple_worker;
 
+pub use commitment::{detect_commitment, detect_commitment_with_now, CommitmentCandidate};
 pub use extractor::{EntityExtractor, HeuristicExtractor};
 pub use gliner::{GlinerExtractor, SpanHit, DEFAULT_LABELS, DEFAULT_THRESHOLD};
 pub use pipeline::{

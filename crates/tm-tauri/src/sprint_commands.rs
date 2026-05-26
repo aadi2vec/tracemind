@@ -13,7 +13,9 @@ use uuid::Uuid;
 
 use tm_graph::{
     algebra::{Algebra, GraphExpr, SetOp},
-    event_graph::{EventEdgeKind, EventGraphStore, EventNode, EventNodeKind},
+    event_graph::{
+        CommitmentState, EventEdgeKind, EventGraphStore, EventNode, EventNodeKind, LedgerSummary,
+    },
     ontology_proposals::ProposalStore,
     ontology_types::OntologyStore,
     portable_export::{approx_token_count, export_portable, write_to_path, PortableGraph},
@@ -67,6 +69,12 @@ pub fn cmd_thread_start(
     t.context_id = req.context_id.and_then(|s| Uuid::parse_str(&s).ok());
     let g = open_graph(&state)?;
     ThreadGraphStore::upsert(g.connection(), &t).map_err(|e| e.to_string())?;
+    // CTX-EVG Slice A — promote this thread to "active". Any subsequent
+    // ingest/query goes through this thread until the user calls
+    // `cmd_thread_end` or starts a different thread.
+    if let Ok(mut cur) = state.active_thread_id.lock() {
+        *cur = Some(t.id);
+    }
     Ok(to_dto(&t))
 }
 
@@ -77,7 +85,40 @@ pub fn cmd_thread_end(
 ) -> std::result::Result<(), String> {
     let id = Uuid::parse_str(&thread_id).map_err(|e| e.to_string())?;
     let g = open_graph(&state)?;
-    ThreadGraphStore::end_thread(g.connection(), id).map_err(|e| e.to_string())
+    ThreadGraphStore::end_thread(g.connection(), id).map_err(|e| e.to_string())?;
+    // CTX-EVG Slice B — when a thread closes, promote `Precedes` edges
+    // between consecutive event nodes inside it. Best-effort: a
+    // failure here must not break the `end` semantics. The first call
+    // creates edges with support=1 (below MIN_SUPPORT → invisible);
+    // re-ending the same thread (or a later cron pass) strengthens
+    // them above the floor.
+    let _ = tm_graph::event_graph::EventGraphStore::promote_thread_sequence_edges(
+        g.connection(),
+        id,
+    );
+    // CTX-EVG Slice A — clear the active-thread cell *only* if the
+    // thread we just ended is the one currently active. Ending a
+    // historical thread should not deactivate a different live one.
+    if let Ok(mut cur) = state.active_thread_id.lock() {
+        if cur.as_ref() == Some(&id) {
+            *cur = None;
+        }
+    }
+    Ok(())
+}
+
+/// CTX-EVG Slice A — read the currently-active thread id (if any).
+/// UI shows this as a small "active thread" pill so users always know
+/// which thread their captures/queries are landing in.
+#[tauri::command]
+pub fn cmd_thread_active(
+    state: State<'_, AppState>,
+) -> std::result::Result<Option<String>, String> {
+    let cur = state
+        .active_thread_id
+        .lock()
+        .map_err(|e| e.to_string())?;
+    Ok(cur.as_ref().map(|u| u.to_string()))
 }
 
 #[tauri::command]
@@ -696,3 +737,211 @@ pub fn cmd_anticipate(
         .collect())
 }
 
+// ─── CTX-EVG-C — Commitment Ledger ───────────────────────────────────
+
+#[derive(Serialize)]
+pub struct LedgerDto {
+    pub kept: u32,
+    pub broken: u32,
+    pub pending: u32,
+    pub abandoned: u32,
+    pub commitments: Vec<CommitmentDto>,
+    pub since_ms: i64,
+    pub until_ms: i64,
+}
+
+#[derive(Serialize)]
+pub struct CommitmentDto {
+    pub id: String,
+    pub payload_ref: String,
+    pub ts: i64,
+    pub due_at: Option<i64>,
+    pub state: String,
+    pub thread_id: Option<String>,
+    pub salience: f64,
+}
+
+fn node_to_commitment_dto(n: &EventNode) -> CommitmentDto {
+    CommitmentDto {
+        id: n.id.to_string(),
+        payload_ref: n.payload_ref.clone(),
+        ts: n.ts,
+        due_at: n.due_at,
+        state: n.state.as_str().to_string(),
+        thread_id: n.thread_id.map(|u| u.to_string()),
+        salience: n.salience,
+    }
+}
+
+/// CTX-EVG-C — homepage Commitment Ledger payload for a sliding window.
+/// `window_days = 0` means "all time" (since=0, until=∞-ish).
+#[tauri::command]
+pub fn cmd_commitment_ledger(
+    state: State<'_, AppState>,
+    window_days: u32,
+) -> std::result::Result<LedgerDto, String> {
+    let g = open_graph(&state)?;
+    // Run an opportunistic sweep so the ledger always reflects current
+    // broken state — cheap; same op already runs from ingest.
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let _ = EventGraphStore::sweep_broken(g.connection(), now_ms);
+
+    let (since_ms, until_ms) = if window_days == 0 {
+        (0, i64::MAX / 2)
+    } else {
+        let dur_ms = (window_days as i64) * 86_400_000;
+        (now_ms - dur_ms, now_ms + 86_400_000)
+    };
+
+    let summary: LedgerSummary =
+        EventGraphStore::commitment_ledger(g.connection(), since_ms, until_ms)
+            .map_err(|e| e.to_string())?;
+    let mut commitments = Vec::with_capacity(summary.commitment_ids.len());
+    for id in &summary.commitment_ids {
+        if let Some(n) = EventGraphStore::get_node(g.connection(), *id)
+            .map_err(|e| e.to_string())?
+        {
+            commitments.push(node_to_commitment_dto(&n));
+        }
+    }
+    Ok(LedgerDto {
+        kept: summary.kept,
+        broken: summary.broken,
+        pending: summary.pending,
+        abandoned: summary.abandoned,
+        commitments,
+        since_ms,
+        until_ms,
+    })
+}
+
+#[derive(Deserialize)]
+pub struct CommitmentResolveReq {
+    /// Existing Outcome event-node id (omit to auto-create one).
+    pub outcome_id: Option<String>,
+    /// Free-text outcome content used when `outcome_id` is omitted.
+    pub outcome_text: Option<String>,
+    pub commitment_id: String,
+    /// +1.0 = kept, -1.0 = broken. UI buttons send the exact value.
+    pub polarity: f64,
+}
+
+#[derive(Serialize)]
+pub struct CommitmentResolveResp {
+    pub state: String,
+    pub outcome_id: String,
+}
+
+/// CTX-EVG-C — record an outcome → commitment resolution. If
+/// `outcome_id` is absent, an Outcome node is created on the fly with
+/// `outcome_text` as payload. The active thread is attached when
+/// available so the EVG view threads the edge correctly.
+#[tauri::command]
+pub fn cmd_commitment_resolve(
+    state: State<'_, AppState>,
+    req: CommitmentResolveReq,
+) -> std::result::Result<CommitmentResolveResp, String> {
+    let cid = Uuid::parse_str(&req.commitment_id).map_err(|e| e.to_string())?;
+    let g = open_graph(&state)?;
+
+    let outcome_uid = if let Some(oid) = req.outcome_id {
+        Uuid::parse_str(&oid).map_err(|e| e.to_string())?
+    } else {
+        let text = req.outcome_text.unwrap_or_default();
+        let mut o = EventNode::new(EventNodeKind::Outcome, text);
+        o.thread_id = state.active_thread_id.lock().ok().and_then(|g| *g);
+        EventGraphStore::insert_node(g.connection(), &o).map_err(|e| e.to_string())?;
+        o.id
+    };
+
+    let new_state = EventGraphStore::resolve_commitment(
+        g.connection(),
+        outcome_uid,
+        cid,
+        req.polarity,
+    )
+    .map_err(|e| e.to_string())?;
+
+    Ok(CommitmentResolveResp {
+        state: new_state.as_str().to_string(),
+        outcome_id: outcome_uid.to_string(),
+    })
+}
+
+#[derive(Deserialize)]
+pub struct CommitmentSetStateReq {
+    pub commitment_id: String,
+    pub state: String,
+}
+
+/// CTX-EVG-C — manual state override (e.g. user marks something
+/// `abandoned` from the Ledger UI).
+#[tauri::command]
+pub fn cmd_commitment_set_state(
+    state: State<'_, AppState>,
+    req: CommitmentSetStateReq,
+) -> std::result::Result<(), String> {
+    let cid = Uuid::parse_str(&req.commitment_id).map_err(|e| e.to_string())?;
+    let target = CommitmentState::parse(&req.state);
+    if target == CommitmentState::None {
+        return Err(format!("invalid state: {}", req.state));
+    }
+    let g = open_graph(&state)?;
+    EventGraphStore::set_commitment_state(g.connection(), cid, target)
+        .map_err(|e| e.to_string())
+}
+
+/// CTX-EVG-C — propose up to 3 candidate commitments to resolve when an
+/// outcome is recorded. Ranks pending commitments in the active thread
+/// first (recency + due-date), then falls back to any thread.
+#[tauri::command]
+pub fn cmd_commitment_propose_resolution(
+    state: State<'_, AppState>,
+    _outcome_id: Option<String>,
+) -> std::result::Result<Vec<CommitmentDto>, String> {
+    let g = open_graph(&state)?;
+    let active = state.active_thread_id.lock().ok().and_then(|g| *g);
+    let mut out = EventGraphStore::pending_commitments(g.connection(), active, 3)
+        .map_err(|e| e.to_string())?;
+    if out.len() < 3 {
+        let global = EventGraphStore::pending_commitments(g.connection(), None, 3)
+            .map_err(|e| e.to_string())?;
+        for n in global {
+            if !out.iter().any(|x| x.id == n.id) {
+                out.push(n);
+            }
+            if out.len() >= 3 {
+                break;
+            }
+        }
+    }
+    Ok(out.iter().map(node_to_commitment_dto).collect())
+}
+
+#[derive(Deserialize)]
+pub struct CommitmentCreateReq {
+    pub text: String,
+    /// Optional millis-since-epoch due timestamp; falls back to heuristic
+    /// parsing of `text`.
+    pub due_at: Option<i64>,
+}
+
+/// CTX-EVG-C — explicit commitment creation (CLI `tracemind commit` and
+/// UI "Add commitment" both route here). Bypasses the ≥0.85 confidence
+/// gate; if a user explicitly says "this is a commitment", we trust it.
+#[tauri::command]
+pub fn cmd_commitment_create(
+    state: State<'_, AppState>,
+    req: CommitmentCreateReq,
+) -> std::result::Result<CommitmentDto, String> {
+    let g = open_graph(&state)?;
+    let due = req.due_at.or_else(|| {
+        tm_ingest::detect_commitment(&req.text)
+            .and_then(|c| c.due_at)
+    });
+    let mut node = EventNode::commitment(req.text, due);
+    node.thread_id = state.active_thread_id.lock().ok().and_then(|g| *g);
+    node.salience = 1.0; // explicit user intent
+    EventGraphStore::insert_node(g.connection(), &node).map_err(|e| e.to_string())?;
+    Ok(node_to_commitment_dto(&node))
+}

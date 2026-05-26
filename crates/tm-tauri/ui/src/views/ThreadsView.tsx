@@ -6,11 +6,13 @@
 // materialized graph (event nodes + entities + topic clusters +
 // commitments + capture signals) that the thread anchors.
 import { useEffect, useState } from "react";
+import { listen } from "@tauri-apps/api/event";
 import {
   threadStart,
   threadEnd,
   threadsList,
   threadMaterialize,
+  threadActive,
   type ThreadDto,
   type ThreadGraphDto,
   type ThreadSource,
@@ -36,6 +38,12 @@ export default function ThreadsView() {
   const [newSource, setNewSource] = useState<ThreadSource>("tracemind");
   const [creating, setCreating] = useState(false);
 
+  // CTX-EVG Slice B — current active thread id. We poll this on every
+  // refresh and listen for capture-events so the "Active" pill stays
+  // accurate even when ingest happens from outside the desktop app
+  // (CLI, MCP, capture daemon).
+  const [activeId, setActiveId] = useState<string | null>(null);
+
   const refresh = () => {
     threadsList(100)
       .then((rows) => {
@@ -43,10 +51,26 @@ export default function ThreadsView() {
         setErr("");
       })
       .catch((e) => setErr(String(e)));
+    threadActive()
+      .then(setActiveId)
+      .catch(() => {/* non-fatal */});
   };
 
   useEffect(() => {
     refresh();
+    // Auto-refresh on capture-events so the materialized panel's
+    // counts (event_node_ids etc.) update as the user keeps capturing
+    // into the active thread without forcing a manual reload.
+    const unlisten = listen("capture-event", () => {
+      refresh();
+      if (expanded) {
+        threadMaterialize(expanded).then(setDetail).catch(() => {/* */});
+      }
+    });
+    return () => {
+      unlisten.then((fn) => fn()).catch(() => {/* */});
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const expand = async (threadId: string) => {
@@ -154,11 +178,16 @@ export default function ThreadsView() {
         <div className="space-y-2">
           {threads.map((t) => {
             const open = t.ended_at === null;
+            const isActive = t.id === activeId;
             const isExpanded = expanded === t.id;
             return (
               <div
                 key={t.id}
-                className="rounded border border-tm-border bg-tm-surface overflow-hidden"
+                className={`rounded border ${
+                  isActive
+                    ? "border-tm-accent/60 bg-tm-accent/5"
+                    : "border-tm-border bg-tm-surface"
+                } overflow-hidden`}
               >
                 <div className="flex items-center gap-3 px-4 py-3">
                   <button
@@ -175,6 +204,11 @@ export default function ThreadsView() {
                       >
                         {open ? "open" : "ended"}
                       </span>
+                      {isActive && (
+                        <span className="text-xs px-1.5 py-0.5 rounded bg-tm-accent/20 text-tm-accent font-medium">
+                          active
+                        </span>
+                      )}
                       <span className="text-xs uppercase tracking-wider text-tm-muted">
                         {t.source}
                       </span>
