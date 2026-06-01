@@ -499,6 +499,55 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// ONT-2 — statistical Object Type proposer + accept/reject.
+    /// Mirrors the Tauri Settings panel for headless / MCP callers.
+    Ontology {
+        #[command(subcommand)]
+        action: OntologyAction,
+    },
+}
+
+#[derive(clap::Subcommand)]
+enum OntologyAction {
+    /// Run the c-TF-IDF proposer over current captured-signal clusters
+    /// and persist any new pending proposals. Prints the number of new
+    /// proposals written. Idempotent: existing Object Types and
+    /// previously-rejected names are skipped.
+    Propose {
+        /// Samples per cluster fed to the labeler. Default 25.
+        #[arg(long, default_value = "25")]
+        sample_cap: usize,
+        /// Minimum cluster size before a proposal is emitted.
+        #[arg(long, default_value = "5")]
+        min_cluster: usize,
+        /// Minimum c-TF-IDF score for the candidate top term.
+        #[arg(long, default_value = "0.02")]
+        min_term_score: f64,
+        /// Emit JSON instead of formatted text.
+        #[arg(long)]
+        json: bool,
+    },
+    /// List pending Object Type proposals waiting for accept/reject.
+    ListPending {
+        /// Truncate to N rows. Default 25.
+        #[arg(long, default_value = "25")]
+        limit: usize,
+        /// Emit JSON instead of formatted text.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Accept a pending proposal — promotes it to an Object Type and
+    /// stamps the row `accepted`.
+    Accept {
+        /// Proposal UUID (from `ontology list-pending`).
+        id: String,
+    },
+    /// Reject a pending proposal — keeps it out of the ontology and
+    /// stamps it `rejected` so the proposer won't badger.
+    Reject {
+        /// Proposal UUID (from `ontology list-pending`).
+        id: String,
+    },
 }
 
 #[derive(clap::Subcommand)]
@@ -2024,6 +2073,125 @@ fn main() {
                 eprintln!("today failed: {e}");
                 std::process::exit(1);
             }
+        }
+        Commands::Ontology { action } => {
+            if let Err(e) = cmd_ontology(&db_path, action) {
+                eprintln!("ontology failed: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+}
+
+/// ONT-2 — CLI surface for the statistical Object Type proposer.
+/// Headless mirror of the Settings → Ontology Proposals panel.
+fn cmd_ontology(db_path: &str, action: OntologyAction) -> Result<(), String> {
+    let graph = GraphStore::open(db_path).map_err(|e| format!("open graph: {e}"))?;
+    match action {
+        OntologyAction::Propose {
+            sample_cap,
+            min_cluster,
+            min_term_score,
+            json,
+        } => {
+            let clusters = graph
+                .cluster_sample_map(sample_cap)
+                .map_err(|e| format!("cluster sample map: {e}"))?;
+            let cfg = tm_reflect::ontology_proposer::ProposerConfig {
+                min_cluster_size: min_cluster,
+                min_term_score,
+                ..tm_reflect::ontology_proposer::ProposerConfig::default()
+            };
+            let proposals = tm_reflect::propose_object_types(&clusters, &cfg);
+            let written =
+                tm_reflect::persist_object_type_proposals(graph.connection(), &proposals)
+                    .map_err(|e| format!("persist proposals: {e}"))?;
+            if json {
+                let payload = serde_json::json!({
+                    "clusters_seen": clusters.len(),
+                    "candidates": proposals.len(),
+                    "written": written,
+                });
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&payload)
+                        .map_err(|e| format!("serialize: {e}"))?
+                );
+            } else {
+                println!(
+                    "proposer: clusters={} candidates={} new_pending={}",
+                    clusters.len(),
+                    proposals.len(),
+                    written
+                );
+            }
+            Ok(())
+        }
+        OntologyAction::ListPending { limit, json } => {
+            let rows = tm_graph::ProposalStore::list_pending(graph.connection())
+                .map_err(|e| format!("list pending: {e}"))?;
+            let truncated: Vec<_> = rows.into_iter().take(limit).collect();
+            if json {
+                let payload = serde_json::json!({
+                    "count": truncated.len(),
+                    "rows": truncated.iter().map(|p| serde_json::json!({
+                        "id": p.id.to_string(),
+                        "kind": format!("{:?}", p.kind).to_lowercase(),
+                        "name": p.name,
+                        "evidence": p.evidence,
+                        "support_count": p.support_count,
+                        "status": p.status.as_str(),
+                        "created_at": p.created_at,
+                    })).collect::<Vec<_>>(),
+                });
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&payload)
+                        .map_err(|e| format!("serialize: {e}"))?
+                );
+                return Ok(());
+            }
+            if truncated.is_empty() {
+                println!("(no pending ontology proposals)");
+                return Ok(());
+            }
+            for p in &truncated {
+                let top_terms = p
+                    .evidence
+                    .get("top_terms")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| v.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    })
+                    .unwrap_or_default();
+                println!(
+                    "  [{}] {} — support {} — terms: {}  _(id {})_",
+                    format!("{:?}", p.kind).to_lowercase(),
+                    p.name,
+                    p.support_count,
+                    top_terms,
+                    p.id
+                );
+            }
+            println!("  ({} total)", truncated.len());
+            Ok(())
+        }
+        OntologyAction::Accept { id } => {
+            let uuid = Uuid::parse_str(&id).map_err(|_| format!("invalid uuid '{id}'"))?;
+            tm_graph::ProposalStore::accept(graph.connection(), uuid)
+                .map_err(|e| format!("accept: {e}"))?;
+            println!("accepted: {uuid}");
+            Ok(())
+        }
+        OntologyAction::Reject { id } => {
+            let uuid = Uuid::parse_str(&id).map_err(|_| format!("invalid uuid '{id}'"))?;
+            tm_graph::ProposalStore::reject(graph.connection(), uuid)
+                .map_err(|e| format!("reject: {e}"))?;
+            println!("rejected: {uuid}");
+            Ok(())
         }
     }
 }
