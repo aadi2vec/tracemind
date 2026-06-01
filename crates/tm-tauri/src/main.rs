@@ -1361,6 +1361,11 @@ struct ConsolidationResult {
     community_top_labels: Vec<String>,
     // SALIENCE — entity importance scores.
     salience_n_scored: usize,
+    // ONT-2 — Object Type proposer tick: how many *new* pending
+    // proposals were persisted this cycle. Skipped reasons mirror the
+    // cluster path so the UI can tell why nothing was emitted.
+    ontology_proposals_added: usize,
+    ontology_proposer_skipped_reason: Option<String>,
 }
 
 #[tauri::command]
@@ -1440,6 +1445,35 @@ async fn cmd_consolidate(state: State<'_, AppState>) -> Result<ConsolidationResu
         }
         Err(e) => {
             tracing::warn!(error = %e, "recompute_community_labels failed");
+        }
+    }
+
+    // ONT-2 — passive Object Type proposer tick. Runs after the
+    // cluster + community refresh because the proposer reads
+    // `captured_signals.cluster_id`; before the refresh, freshly-ingested
+    // signals would be invisible. Cheap (single c-TF-IDF pass over the
+    // same cluster sample map the labeler already walked) and idempotent
+    // (existing ObjectTypes and previously-rejected names are skipped).
+    // The ontology grows without the user having to click "Run proposer".
+    match graph.cluster_sample_map(25) {
+        Ok(clusters) if clusters.is_empty() => {
+            result.ontology_proposer_skipped_reason =
+                Some("no clustered signals".into());
+        }
+        Ok(clusters) => {
+            let cfg = tm_reflect::ontology_proposer::ProposerConfig::default();
+            let proposals = tm_reflect::propose_object_types(&clusters, &cfg);
+            match tm_reflect::persist_object_type_proposals(graph.connection(), &proposals) {
+                Ok(n) => result.ontology_proposals_added = n,
+                Err(e) => {
+                    result.ontology_proposer_skipped_reason =
+                        Some(format!("persist failed: {e}"));
+                }
+            }
+        }
+        Err(e) => {
+            result.ontology_proposer_skipped_reason =
+                Some(format!("cluster sample map: {e}"));
         }
     }
 

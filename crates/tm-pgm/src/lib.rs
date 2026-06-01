@@ -665,6 +665,13 @@ pub struct AnticipateRow {
     pub probability: f64,
     /// Total support behind the posterior (sum across parents).
     pub support: u32,
+    /// ONT-2 link — the target variable's ontology binding, if any.
+    /// Same across every row of one `anticipate()` call (it's a property
+    /// of the target, not the value). Surfaces in MCP/Tauri so the UI
+    /// can render a typed badge ("[Thread]") next to the forecast.
+    /// `None` when the target variable is untyped (e.g. `event_kind`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub object_type: Option<String>,
 }
 
 /// "Given this evidence, what's likely next?" — reads PGM marginals.
@@ -678,19 +685,22 @@ pub fn anticipate(
     top_k: usize,
 ) -> Result<Vec<AnticipateRow>> {
     let post = posterior(conn, target, evidence)?;
-    let support: u32 = match PgmStore::get_variable_by_name(conn, target)? {
+    let target_var = PgmStore::get_variable_by_name(conn, target)?;
+    let support: u32 = match &target_var {
         Some(v) => PgmStore::parents_of(conn, v.id)?
             .into_iter()
             .map(|d| d.support_count)
             .sum(),
         None => 0,
     };
+    let object_type = target_var.as_ref().and_then(|v| v.object_type.clone());
     let mut out: Vec<AnticipateRow> = post
         .into_iter()
         .map(|(value, probability)| AnticipateRow {
             value,
             probability,
             support,
+            object_type: object_type.clone(),
         })
         .collect();
     if out.len() > top_k {
@@ -815,6 +825,36 @@ mod tests {
         }
         // The Anticipate row should also carry a non-zero support count.
         assert!(rows.iter().any(|r| r.value == "query" && r.support >= 1));
+    }
+
+    #[test]
+    fn anticipate_propagates_target_object_type() {
+        let c = fresh();
+        // `context_id` is the typed baseline variable (ObjectType="Thread").
+        // Seed its domain so anticipate has something to score over.
+        ensure_baseline_variables(&c).unwrap();
+        let mut ctx_var = PgmStore::get_variable_by_name(&c, "context_id")
+            .unwrap()
+            .unwrap();
+        ctx_var.domain = vec!["t-a".into(), "t-b".into()];
+        PgmStore::upsert_variable(&c, &ctx_var).unwrap();
+
+        let mut o = Observation::default();
+        o.values.insert("context_id".into(), "t-a".into());
+        observe(&c, &o).unwrap();
+
+        let rows = anticipate(&c, "context_id", &Observation::default(), 5).unwrap();
+        assert!(!rows.is_empty());
+        // Every row must carry the target variable's ObjectType binding.
+        for r in &rows {
+            assert_eq!(r.object_type.as_deref(), Some("Thread"));
+        }
+
+        // Untyped target (`event_kind`) → object_type stays None.
+        let rows = anticipate(&c, "event_kind", &Observation::default(), 5).unwrap();
+        for r in &rows {
+            assert!(r.object_type.is_none(), "untyped target should not carry object_type");
+        }
     }
 
     #[test]

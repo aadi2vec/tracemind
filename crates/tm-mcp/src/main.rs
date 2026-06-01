@@ -1778,12 +1778,39 @@ fn handle_memory_consolidate(db_path: &str) -> Result<Value, String> {
     let consolidator = Consolidator::with_defaults(&graph);
     let report = consolidator.consolidate();
 
+    // ONT-2 — passive proposer tick. Mirrors the Tauri `cmd_consolidate`
+    // path so MCP-only deployments (Claude Code / Goose) also grow the
+    // ontology without a manual `tracemind ontology propose`. Failure
+    // never blocks the consolidate report — we just surface the reason.
+    let mut ontology_proposals_added: usize = 0;
+    let mut ontology_proposer_skipped_reason: Option<String> = None;
+    match graph.cluster_sample_map(25) {
+        Ok(clusters) if clusters.is_empty() => {
+            ontology_proposer_skipped_reason = Some("no clustered signals".into());
+        }
+        Ok(clusters) => {
+            let cfg = tm_reflect::ontology_proposer::ProposerConfig::default();
+            let proposals = tm_reflect::propose_object_types(&clusters, &cfg);
+            match tm_reflect::persist_object_type_proposals(graph.connection(), &proposals) {
+                Ok(n) => ontology_proposals_added = n,
+                Err(e) => {
+                    ontology_proposer_skipped_reason = Some(format!("persist failed: {e}"));
+                }
+            }
+        }
+        Err(e) => {
+            ontology_proposer_skipped_reason = Some(format!("cluster sample map: {e}"));
+        }
+    }
+
     Ok(json!({
         "entities_strengthened": report.entities_strengthened,
         "entities_decayed": report.entities_decayed,
         "entities_pruned": report.entities_pruned,
         "entities_merged": report.entities_merged,
-        "triples_pruned": report.triples_pruned
+        "triples_pruned": report.triples_pruned,
+        "ontology_proposals_added": ontology_proposals_added,
+        "ontology_proposer_skipped_reason": ontology_proposer_skipped_reason,
     }))
 }
 
