@@ -383,6 +383,12 @@ impl GraphStore {
             crate::feedback_fabric::init_schema(conn)?;
         }
 
+        // Q3.4: temporal KG columns (valid_from / valid_to on kg_relations).
+        {
+            let conn = store.kg.connection();
+            crate::contradiction_rate::ensure_temporal_columns(conn)?;
+        }
+
         // One-time backfill: emit a temporal fact for any entity / triple
         // that doesn't yet have one. Idempotent — `current_fact_id` skips
         // anything already tracked. Cheap (linear in #rows missing a fact).

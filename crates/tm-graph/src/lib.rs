@@ -1,6 +1,7 @@
 pub mod algebra;
 pub mod belief;
 pub mod community;
+pub mod contradiction_rate;
 pub mod context;
 pub mod deny_list;
 pub mod entity_resolve;
@@ -81,6 +82,13 @@ pub use feedback_fabric::{
     signals_for_hook,
     recent_signals_by_class,
     verb_affinity,
+};
+pub use contradiction_rate::{
+    ensure_temporal_columns,
+    detect_conflicts,
+    compute_contradiction_rate,
+    ContradictionRateStats,
+    TemporalConflict,
 };
 
 use tm_types::Predicate;
