@@ -16,8 +16,11 @@ pub mod ontology;
 pub mod ontology_proposals;
 pub mod ontology_types;
 pub mod pending_relations;
+pub mod policy_provenance;
 pub mod portable_export;
+pub mod head_to_head;
 pub mod salience;
+pub mod session_scope;
 pub mod store;
 pub mod thread_graph;
 
@@ -89,6 +92,17 @@ pub use contradiction_rate::{
     compute_contradiction_rate,
     ContradictionRateStats,
     TemporalConflict,
+};
+pub use session_scope::{
+    init_schema as init_session_schema,
+    upsert_session,
+    get_session,
+    recent_sessions,
+    SessionScope,
+};
+pub use head_to_head::{
+    Competitor, CompetitorResult, CompetitorScore, ContradictionTestCase,
+    HeadToHeadResult, mini_fixtures as h2h_mini_fixtures,
 };
 
 use tm_types::Predicate;

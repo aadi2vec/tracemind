@@ -389,6 +389,12 @@ impl GraphStore {
             crate::contradiction_rate::ensure_temporal_columns(conn)?;
         }
 
+        // Q3.5: session_id / host_id scoping.
+        {
+            let conn = store.kg.connection();
+            crate::session_scope::init_schema(conn)?;
+        }
+
         // One-time backfill: emit a temporal fact for any entity / triple
         // that doesn't yet have one. Idempotent — `current_fact_id` skips
         // anything already tracked. Cheap (linear in #rows missing a fact).
