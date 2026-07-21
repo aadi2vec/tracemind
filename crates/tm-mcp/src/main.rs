@@ -536,18 +536,21 @@ fn tools_list() -> Value {
             },
             {
                 "name": "memory_feedback",
-                "description": "Record per-result feedback that trains the retrieval bandit. `kind` selects the channel: `helpful` writes to `positive_signals` (F-1, default weight 0.3); `not_related` and `cross_context_bridge` write to `negative_signals` (C-0.7, default weight 1.0). All three kinds feed `finalize_pending_reward` so the bandit's reward = `(relevance + Σ positives − Σ negatives).clamp(0, 1)`. `query_id` is the UUID returned in the previous `memory_query` response.",
+                "description": "Q3.1 feedback signal fabric — record any of the three signal classes (explicit / implicit / behavioral) as first-class memory entries. Explicit: helpful, not_related, cross_context_bridge, card_accepted, card_rejected, outcome_edited. Implicit: retrieval_cited, retrieval_miss, proposal_silenced. Behavioral: verb_invoked. All signals attach to a `feedback_hook_id` returned by `memory_query` — pass it back to link signals to retrievals. Explicit retrieval signals also train the bandit.",
                 "inputSchema": {
                     "type": "object",
-                    "required": ["query_id", "result_id", "kind"],
+                    "required": ["kind"],
                     "properties": {
-                        "query_id":   {"type": "string", "description": "Query UUID returned by `memory_query`."},
-                        "result_id":  {"type": "string", "description": "Stable id of the result row receiving feedback (entity UUID or triple UUID)."},
-                        "kind":       {"type": "string", "enum": ["helpful", "not_related", "cross_context_bridge"], "description": "Feedback channel. `helpful` → positive_signals. `not_related` / `cross_context_bridge` → negative_signals."},
-                        "weight":     {"type": "number", "description": "Override default weight (helpful default 0.3, negative kinds default 1.0). Must be ≥ 0."},
-                        "context_id": {"type": "string", "description": "Optional context UUID for positive feedback (the active scope at click time)."},
-                        "context_a":  {"type": "string", "description": "For negative feedback that crosses a context boundary: the bad-result context."},
-                        "context_b":  {"type": "string", "description": "For negative feedback that crosses a context boundary: the query's active context."}
+                        "query_id":          {"type": "string", "description": "Query UUID from memory_query (for bandit-training kinds). Defaults to a new UUID if omitted."},
+                        "feedback_hook_id":  {"type": "string", "description": "feedback_hook_id from memory_query response — links this signal to a specific retrieval."},
+                        "result_id":         {"type": "string", "description": "Entity or triple UUID being rated (for explicit/implicit signals)."},
+                        "kind":              {"type": "string", "enum": ["helpful", "not_related", "cross_context_bridge", "card_accepted", "card_rejected", "outcome_edited", "retrieval_cited", "retrieval_miss", "proposal_silenced", "verb_invoked"], "description": "Signal kind. Class is derived automatically."},
+                        "weight":            {"type": "number", "description": "Override default weight (helpful 0.3, negative 1.0). Must be ≥ 0."},
+                        "context_id":        {"type": "string", "description": "Active context UUID for positive explicit feedback."},
+                        "context_a":         {"type": "string", "description": "cross_context_bridge: the bad-result context."},
+                        "context_b":         {"type": "string", "description": "cross_context_bridge: the query's active context."},
+                        "verb":              {"type": "string", "description": "For verb_invoked: the MCP verb name that was called."},
+                        "host_id":           {"type": "string", "description": "MCP host identifier (claude-code, goose, cursor, etc)."}
                     }
                 }
             },
@@ -1543,6 +1546,10 @@ async fn handle_memory_query(
 
     // Auto-routing: if the planner detected a reasoning/analogy query,
     // enrich the response with supplemental reasoning data.
+    // Q3.1: every retrieval response carries a feedback_hook_id so callers
+    // can attach any of the three signal classes back to this retrieval.
+    let feedback_hook_id = Uuid::new_v4();
+
     let mut response = json!({
         "answer": answer_value,
         "entities": entities,
@@ -1554,7 +1561,8 @@ async fn handle_memory_query(
         "plan": {
             "action": plan_action,
             "complexity": plan_complexity
-        }
+        },
+        "feedback_hook_id": feedback_hook_id.to_string(),
     });
 
     // Add confidence information when results are uncertain
@@ -2100,8 +2108,81 @@ fn handle_memory_feedback(params: &Value, db_path: &str) -> Result<Value, String
             }
             Ok(payload)
         }
+        // Q3.1: expanded signal fabric — explicit card/outcome signals
+        "card_accepted" | "card_rejected" | "outcome_edited" => {
+            let feedback_hook_id = params
+                .get("feedback_hook_id")
+                .and_then(|v| v.as_str())
+                .and_then(|s| Uuid::parse_str(s).ok())
+                .unwrap_or(query_id);
+            let score = match kind {
+                "card_accepted" => 1.0f32,
+                "card_rejected" => -1.0,
+                _ => 0.5, // outcome_edited is mildly positive
+            };
+            let target_id = Uuid::parse_str(result_id).ok();
+            let signal = tm_types::FeedbackSignal::new(
+                tm_types::FeedbackKind::from_str(kind)
+                    .unwrap_or(tm_types::FeedbackKind::CardAccepted),
+                feedback_hook_id,
+                target_id,
+                score,
+            );
+            let signal_id = graph
+                .record_feedback_signal(&signal)
+                .map_err(|e| format!("record_feedback_signal: {e}"))?;
+            Ok(json!({ "ok": true, "class": "explicit", "kind": kind, "signal_id": signal_id }))
+        }
+        // Q3.1: implicit signals — retrieval cited / miss / proposal silenced
+        "retrieval_cited" | "retrieval_miss" | "proposal_silenced" => {
+            let feedback_hook_id = params
+                .get("feedback_hook_id")
+                .and_then(|v| v.as_str())
+                .and_then(|s| Uuid::parse_str(s).ok())
+                .unwrap_or(query_id);
+            let score = if kind == "retrieval_cited" { 0.5f32 } else { -0.2 };
+            let signal = tm_types::FeedbackSignal::new(
+                tm_types::FeedbackKind::from_str(kind)
+                    .unwrap_or(tm_types::FeedbackKind::RetrievalCited),
+                feedback_hook_id,
+                Uuid::parse_str(result_id).ok(),
+                score,
+            );
+            let signal_id = graph
+                .record_feedback_signal(&signal)
+                .map_err(|e| format!("record_feedback_signal: {e}"))?;
+            Ok(json!({ "ok": true, "class": "implicit", "kind": kind, "signal_id": signal_id }))
+        }
+        // Q3.1: behavioral signals — verb invocations
+        "verb_invoked" => {
+            let verb = params
+                .get("verb")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            let feedback_hook_id = params
+                .get("feedback_hook_id")
+                .and_then(|v| v.as_str())
+                .and_then(|s| Uuid::parse_str(s).ok())
+                .unwrap_or(query_id);
+            let mut signal = tm_types::FeedbackSignal::new(
+                tm_types::FeedbackKind::VerbInvoked,
+                feedback_hook_id,
+                None,
+                1.0,
+            )
+            .with_verb(verb);
+            if let Some(host) = params.get("host_id").and_then(|v| v.as_str()) {
+                signal = signal.with_host(host);
+            }
+            let signal_id = graph
+                .record_feedback_signal(&signal)
+                .map_err(|e| format!("record_feedback_signal: {e}"))?;
+            Ok(json!({ "ok": true, "class": "behavioral", "kind": "verb_invoked", "verb": verb, "signal_id": signal_id }))
+        }
         other => Err(format!(
-            "invalid kind '{other}': expected one of helpful, not_related, cross_context_bridge"
+            "invalid kind '{other}': expected one of helpful, not_related, cross_context_bridge, \
+             card_accepted, card_rejected, outcome_edited, retrieval_cited, retrieval_miss, \
+             proposal_silenced, verb_invoked"
         )),
     }
 }

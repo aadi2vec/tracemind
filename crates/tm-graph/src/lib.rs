@@ -5,6 +5,7 @@ pub mod context;
 pub mod deny_list;
 pub mod entity_resolve;
 pub mod event_graph;
+pub mod feedback_fabric;
 pub mod graph_sprint;
 pub mod labeler;
 pub mod maintenance;
@@ -74,6 +75,13 @@ pub use ontology_types::{
 };
 pub use portable_export::{export_portable, PortableEdge, PortableGraph, PortableNode};
 pub use thread_graph::{Thread, ThreadGraph, ThreadGraphStore, ThreadSource};
+pub use feedback_fabric::{
+    init_schema as init_feedback_schema,
+    record_signal as record_feedback_signal,
+    signals_for_hook,
+    recent_signals_by_class,
+    verb_affinity,
+};
 
 use tm_types::Predicate;
 use uuid::Uuid;
