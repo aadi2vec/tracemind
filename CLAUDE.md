@@ -8,7 +8,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 # Build
 cargo build --release
 
-# Test the whole workspace (17 crates)
+# Test the whole workspace (30 crates)
 cargo test --workspace
 
 # Test individual crates
@@ -93,7 +93,7 @@ governance gate (PII + confidence) → heuristic NER (or `GlinerExtractor` if av
 
 **Query** (`tm-retrieval::RetrievalEngine`):
 1. `QueryPlanner` classifies (standard / temporal / decomposed / reasoning / analogy)
-2. `LinUcbBandit.select()` picks one of 5 arms (see table)
+2. `LinUcbBandit.select()` picks one of 6 arms (see table) — preceded by `QueryPlanner` memory-routing gate (`should_retrieve: bool`)
 3. Pipeline phases (varies by arm):
    - vector search → ColBERT rerank (arm 4 also runs MaxSim) → RRA fusion
    - signal hybrid path (raw captures via `graph.search_signals`)
