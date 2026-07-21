@@ -6041,6 +6041,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "tm-gepa"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "rand 0.8.5",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "tm-governance"
 version = "0.1.0"
 dependencies = [
@@ -6321,6 +6334,7 @@ dependencies = [
  "thiserror 1.0.69",
  "tm-intent",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
