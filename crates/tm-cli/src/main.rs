@@ -499,6 +499,11 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Q4.4 — Run nightly self-improvement tasks on-device.
+    /// Triggers GEPA spike, verb affinity update, tier cycle, and
+    /// contradiction rate computation. Results are persisted to
+    /// `~/.tracemind/nightly_runs.jsonl`.
+    Nightly,
 }
 
 #[derive(clap::Subcommand)]
@@ -2024,6 +2029,12 @@ fn main() {
                 eprintln!("today failed: {e}");
                 std::process::exit(1);
             }
+        }
+        Commands::Nightly => {
+            let scheduler = tm_controller::NightlyScheduler::new(dir.to_path_buf());
+            let record = scheduler.run();
+            scheduler.record(&record).ok();
+            println!("Nightly run complete: {:?}", record);
         }
     }
 }

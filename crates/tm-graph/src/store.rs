@@ -395,6 +395,12 @@ impl GraphStore {
             crate::session_scope::init_schema(conn)?;
         }
 
+        // Q4.14: policy provenance tables (mutations + rollbacks).
+        {
+            let conn = store.kg.connection();
+            crate::policy_provenance::init_schema(conn)?;
+        }
+
         // One-time backfill: emit a temporal fact for any entity / triple
         // that doesn't yet have one. Idempotent — `current_fact_id` skips
         // anything already tracked. Cheap (linear in #rows missing a fact).

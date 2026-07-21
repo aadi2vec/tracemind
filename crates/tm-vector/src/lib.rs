@@ -2,6 +2,7 @@ pub mod embed;
 pub mod bge_m3;
 pub mod space;
 pub mod composed_index;
+pub mod matryoshka;
 
 pub use embed::{Embedder, EmbedModel};
 pub use bge_m3::BgeM3DenseModel;
@@ -10,6 +11,7 @@ pub use space::{
     EntityTypeSpace, HostSessionSpace,
 };
 pub use composed_index::{ComposedIndex, VerbWeights, default_verb_weights};
+pub use matryoshka::{slice_and_normalize, tier_dim, MATRYOSHKA_DIMS};
 
 // ---------------------------------------------------------------------------
 // Dimension constants

@@ -104,6 +104,14 @@ pub use head_to_head::{
     Competitor, CompetitorResult, CompetitorScore, ContradictionTestCase,
     HeadToHeadResult, mini_fixtures as h2h_mini_fixtures,
 };
+pub use policy_provenance::{
+    init_schema as init_policy_provenance_schema,
+    record_mutation as record_policy_mutation,
+    record_rollback as record_policy_rollback,
+    recent_mutations as recent_policy_mutations,
+    rollback_count_by_kind as policy_rollback_count_by_kind,
+    StoredMutation,
+};
 
 use tm_types::Predicate;
 use uuid::Uuid;
