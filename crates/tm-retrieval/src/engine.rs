@@ -276,6 +276,9 @@ pub struct RetrievalEngine {
     view_filter: Option<ViewFilter>,
     /// Q3.2 — memory-routing gate. Fires before LinUCB arm selection.
     router: MemoryRouter,
+    /// Whether the routing gate is active. Defaults to false for backward
+    /// compat; the MCP layer enables it via `set_router_enabled(true)`.
+    router_enabled: bool,
 }
 
 #[derive(Debug)]
@@ -375,6 +378,7 @@ impl RetrievalEngine {
             cross_context: false,
             view_filter: None,
             router: MemoryRouter::default(),
+            router_enabled: false,
         })
     }
 
@@ -628,7 +632,7 @@ impl RetrievalEngine {
             recent_miss_rate: 0.0,  // populated from feedback signals in Q4
             is_command: false,
         };
-        if !self.router.should_retrieve(text, &router_ctx) {
+        if self.router_enabled && !self.router.should_retrieve(text, &router_ctx) {
             return Ok(RetrievalResult {
                 query_id: Uuid::new_v4(),
                 arm: u8::MAX,  // sentinel: not a bandit arm
@@ -2212,6 +2216,8 @@ mod tests {
             prefetch: PrefetchCache::new(),
             cross_context: false,
             view_filter: None,
+            router: MemoryRouter::default(),
+            router_enabled: false,
         };
 
         let result = engine.query("hello world").unwrap();
@@ -2258,6 +2264,8 @@ mod tests {
             prefetch: PrefetchCache::new(),
             cross_context: false,
             view_filter: None,
+            router: MemoryRouter::default(),
+            router_enabled: false,
         };
 
         // Prime an entry for "hello world" — even on an empty graph
@@ -2415,6 +2423,8 @@ mod tests {
             prefetch: PrefetchCache::new(),
             cross_context: false,
             view_filter: None,
+            router: MemoryRouter::default(),
+            router_enabled: false,
         };
 
         let now = chrono::Utc::now();
@@ -2512,6 +2522,8 @@ mod tests {
             prefetch: PrefetchCache::new(),
             cross_context: false,
             view_filter: None,
+            router: MemoryRouter::default(),
+            router_enabled: false,
         };
 
         // Seed at least one entity so the query produces real candidates.
@@ -2588,6 +2600,8 @@ mod tests {
             prefetch: PrefetchCache::new(),
             cross_context: false,
             view_filter: None,
+            router: MemoryRouter::default(),
+            router_enabled: false,
         };
 
         let now = chrono::Utc::now();
@@ -2656,6 +2670,8 @@ mod tests {
             prefetch: PrefetchCache::new(),
             cross_context: true,
             view_filter: None,
+            router: MemoryRouter::default(),
+            router_enabled: false,
         };
 
         let now = chrono::Utc::now();
