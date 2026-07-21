@@ -31,6 +31,12 @@ pub struct TraceMindConfig {
     pub max_answer_chars: usize,
     /// Number of top traces to splice into the answer.
     pub top_k_traces: usize,
+    /// Reasoning Quality benchmark — when `Some`, force every retrieval
+    /// to use this bandit arm. Bypasses LinUCB (planner-driven overrides
+    /// still take precedence). Used by the `--force-arm` and
+    /// `--compare-arms` CLI flags to ablate the multi-hop graph
+    /// expansion arm against the shallow arm.
+    pub force_arm: Option<u8>,
 }
 
 impl Default for TraceMindConfig {
@@ -39,6 +45,7 @@ impl Default for TraceMindConfig {
             hash_embed: true,
             max_answer_chars: 200,
             top_k_traces: 1,
+            force_arm: None,
         }
     }
 }
@@ -58,9 +65,14 @@ pub struct TraceMindRunner {
 
 impl TraceMindRunner {
     pub fn new(config: TraceMindConfig) -> Self {
+        let arm_tag = match config.force_arm {
+            Some(a) => format!("-arm{}", a),
+            None => String::new(),
+        };
         let name = format!(
-            "tracemind-v0.1-{}",
-            if config.hash_embed { "hash" } else { "bge" }
+            "tracemind-v0.1-{}{}",
+            if config.hash_embed { "hash" } else { "bge" },
+            arm_tag,
         );
         Self {
             config,
@@ -84,12 +96,13 @@ impl TraceMindRunner {
         )
         .map_err(|e| format!("ingest open: {e:?}"))?;
 
-        let engine = RetrievalEngine::open(
+        let mut engine = RetrievalEngine::open(
             db_path.to_string_lossy().as_ref(),
             trace_path.to_string_lossy().as_ref(),
             self.config.hash_embed,
         )
         .map_err(|e| format!("retrieval open: {e:?}"))?;
+        engine.set_forced_arm(self.config.force_arm);
 
         self.workdir = Some(dir);
         self.pipeline = Some(pipeline);

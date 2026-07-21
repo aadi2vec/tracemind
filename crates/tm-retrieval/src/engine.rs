@@ -274,6 +274,13 @@ pub struct RetrievalEngine {
     /// [`ViewFilter::rejects_triple`] and dropped if the view rejects
     /// them. Set via [`set_view_filter`].
     view_filter: Option<ViewFilter>,
+    /// Reasoning Quality benchmark — when `Some`, bypass LinUCB and
+    /// force this arm for every query. Planner overrides
+    /// (`DirectLookup`, `ReasoningChain`) still take precedence so the
+    /// classifier remains honest. Set via [`set_forced_arm`]; never
+    /// touched in normal operation. Bandit reward registration still
+    /// runs at the end so a benchmark run won't pollute the policy.
+    forced_arm: Option<u8>,
 }
 
 #[derive(Debug)]
@@ -372,6 +379,7 @@ impl RetrievalEngine {
             prefetch: PrefetchCache::new(),
             cross_context: false,
             view_filter: None,
+            forced_arm: None,
         })
     }
 
@@ -403,6 +411,16 @@ impl RetrievalEngine {
     /// Read-only accessor for the currently-installed view filter.
     pub fn view_filter(&self) -> Option<&ViewFilter> {
         self.view_filter.as_ref()
+    }
+
+    /// Reasoning Quality benchmark — force every subsequent `query()`
+    /// to use the given bandit arm, bypassing LinUCB selection.
+    /// Planner-driven overrides (`DirectLookup`, `ReasoningChain`) still
+    /// take precedence so the planner classifier stays in the loop;
+    /// only the LinUCB-policy path is bypassed. Pass `None` to restore
+    /// normal selection. Use exclusively in benchmark/ablation contexts.
+    pub fn set_forced_arm(&mut self, arm: Option<u8>) {
+        self.forced_arm = arm;
     }
 
     /// Sprint D — hot-swap the active context on the live engine.
@@ -625,11 +643,18 @@ impl RetrievalEngine {
             PlanAction::ReasoningChain { .. } => {
                 UcbBandit::params_for_arm(2)
             }
-            _ => {
-                let hint = self.trajectory_store.as_ref()
-                    .and_then(|ts| ts.nearest_successful_arm(&query_embedding, 0.7))
-                    .map(|(arm, _sim)| arm);
-                self.linucb.select_with_hint(&query_embedding, hint)
+            _ => match self.forced_arm {
+                // Reasoning Quality benchmark — ablate the LinUCB
+                // policy by forcing a specific arm. Planner-driven
+                // overrides above still win so the classifier stays
+                // honest.
+                Some(a) => UcbBandit::params_for_arm(a),
+                None => {
+                    let hint = self.trajectory_store.as_ref()
+                        .and_then(|ts| ts.nearest_successful_arm(&query_embedding, 0.7))
+                        .map(|(arm, _sim)| arm);
+                    self.linucb.select_with_hint(&query_embedding, hint)
+                }
             }
         };
         let arm = params.arm;
@@ -638,11 +663,14 @@ impl RetrievalEngine {
         let arm_reason = match &plan.action {
             PlanAction::DirectLookup => format!("arm={} (DirectLookup override)", arm),
             PlanAction::ReasoningChain { .. } => format!("arm={} (ReasoningChain override)", arm),
-            _ => {
-                let hint = self.trajectory_store.as_ref()
-                    .and_then(|ts| ts.nearest_successful_arm(&query_embedding, 0.7))
-                    .map(|(a, _)| a);
-                format!("arm={} (LinUCB, trajectory_hint={:?})", arm, hint)
+            _ => match self.forced_arm {
+                Some(_) => format!("arm={} (forced — benchmark ablation)", arm),
+                None => {
+                    let hint = self.trajectory_store.as_ref()
+                        .and_then(|ts| ts.nearest_successful_arm(&query_embedding, 0.7))
+                        .map(|(a, _)| a);
+                    format!("arm={} (LinUCB, trajectory_hint={:?})", arm, hint)
+                }
             }
         };
 
@@ -2180,6 +2208,7 @@ mod tests {
             prefetch: PrefetchCache::new(),
             cross_context: false,
             view_filter: None,
+            forced_arm: None,
         };
 
         let result = engine.query("hello world").unwrap();
@@ -2226,6 +2255,7 @@ mod tests {
             prefetch: PrefetchCache::new(),
             cross_context: false,
             view_filter: None,
+            forced_arm: None,
         };
 
         // Prime an entry for "hello world" — even on an empty graph
@@ -2383,6 +2413,7 @@ mod tests {
             prefetch: PrefetchCache::new(),
             cross_context: false,
             view_filter: None,
+            forced_arm: None,
         };
 
         let now = chrono::Utc::now();
@@ -2480,6 +2511,7 @@ mod tests {
             prefetch: PrefetchCache::new(),
             cross_context: false,
             view_filter: None,
+            forced_arm: None,
         };
 
         // Seed at least one entity so the query produces real candidates.
@@ -2556,6 +2588,7 @@ mod tests {
             prefetch: PrefetchCache::new(),
             cross_context: false,
             view_filter: None,
+            forced_arm: None,
         };
 
         let now = chrono::Utc::now();
@@ -2624,6 +2657,7 @@ mod tests {
             prefetch: PrefetchCache::new(),
             cross_context: true,
             view_filter: None,
+            forced_arm: None,
         };
 
         let now = chrono::Utc::now();
