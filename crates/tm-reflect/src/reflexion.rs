@@ -72,7 +72,7 @@ impl SessionReflection {
             Some(format!(
                 "Hit rate below 30% with arm {arm_label}. Consider wider arm (more hops) or ColBERT reranking."
             ))
-        } else if hit_rate > 0.8 && query_count >= 3 {
+        } else if hit_rate >= 0.8 && query_count >= 3 {
             Some(format!("High hit rate with arm {arm_label}. Current policy appears well-calibrated."))
         } else {
             None

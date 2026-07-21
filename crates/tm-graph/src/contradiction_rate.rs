@@ -78,9 +78,9 @@ pub fn ensure_temporal_columns(conn: &Connection) -> Result<()> {
     );
     conn.execute_batch(
         "CREATE INDEX IF NOT EXISTS idx_relations_valid_from
-             ON kg_relations(source_id, name, valid_from);
+             ON kg_relations(source_id, rel_type, valid_from);
          CREATE INDEX IF NOT EXISTS idx_relations_valid_to
-             ON kg_relations(source_id, name, valid_to);",
+             ON kg_relations(source_id, rel_type, valid_to);",
     )
     .map_err(|e| TraceMindError::Storage(format!("temporal columns index: {e}")))?;
     Ok(())
@@ -104,7 +104,7 @@ pub fn detect_conflicts(conn: &Connection, limit: usize) -> Result<Vec<TemporalC
         .prepare(
             "SELECT
                 r1.source_id   AS subject_id,
-                r1.name        AS predicate,
+                r1.rel_type    AS predicate,
                 r1.target_id   AS obj_a,
                 r1.valid_from  AS vf_a,
                 r1.valid_to    AS vt_a,
@@ -114,7 +114,7 @@ pub fn detect_conflicts(conn: &Connection, limit: usize) -> Result<Vec<TemporalC
              FROM kg_relations r1
              JOIN kg_relations r2
                ON  r1.source_id = r2.source_id
-               AND r1.name      = r2.name
+               AND r1.rel_type  = r2.rel_type
                AND r1.target_id < r2.target_id
              WHERE
                -- Overlap check: [vf_a, vt_a] ∩ [vf_b, vt_b] ≠ ∅
@@ -170,7 +170,7 @@ pub fn compute_contradiction_rate(conn: &Connection) -> Result<ContradictionRate
     // Count distinct (source, predicate) pairs total
     let pairs_examined: usize = conn
         .query_row(
-            "SELECT COUNT(DISTINCT source_id || '|' || name) FROM kg_relations",
+            "SELECT COUNT(DISTINCT source_id || '|' || rel_type) FROM kg_relations",
             [],
             |row| row.get::<_, i64>(0),
         )
@@ -215,7 +215,7 @@ mod tests {
             "CREATE TABLE kg_relations (
                 id TEXT PRIMARY KEY,
                 source_id TEXT NOT NULL,
-                name TEXT NOT NULL,
+                rel_type TEXT NOT NULL,
                 target_id TEXT NOT NULL,
                 valid_from TEXT,
                 valid_to TEXT
@@ -242,13 +242,13 @@ mod tests {
 
         // Two WorksAt facts for same subject, different objects, overlapping windows
         conn.execute(
-            "INSERT INTO kg_relations (id, source_id, name, target_id, valid_from, valid_to)
+            "INSERT INTO kg_relations (id, source_id, rel_type, target_id, valid_from, valid_to)
              VALUES (?1, ?2, 'WorksAt', ?3, '2026-01-01T00:00:00Z', '2026-12-31T00:00:00Z')",
             params![Uuid::new_v4().to_string(), subj, obj_a],
         )
         .unwrap();
         conn.execute(
-            "INSERT INTO kg_relations (id, source_id, name, target_id, valid_from, valid_to)
+            "INSERT INTO kg_relations (id, source_id, rel_type, target_id, valid_from, valid_to)
              VALUES (?1, ?2, 'WorksAt', ?3, '2026-06-01T00:00:00Z', NULL)",
             params![Uuid::new_v4().to_string(), subj, obj_b],
         )
@@ -272,13 +272,13 @@ mod tests {
 
         // Two WorksAt facts with non-overlapping windows
         conn.execute(
-            "INSERT INTO kg_relations (id, source_id, name, target_id, valid_from, valid_to)
+            "INSERT INTO kg_relations (id, source_id, rel_type, target_id, valid_from, valid_to)
              VALUES (?1, ?2, 'WorksAt', ?3, '2025-01-01T00:00:00Z', '2025-12-31T00:00:00Z')",
             params![Uuid::new_v4().to_string(), subj, obj_a],
         )
         .unwrap();
         conn.execute(
-            "INSERT INTO kg_relations (id, source_id, name, target_id, valid_from, valid_to)
+            "INSERT INTO kg_relations (id, source_id, rel_type, target_id, valid_from, valid_to)
              VALUES (?1, ?2, 'WorksAt', ?3, '2026-01-01T00:00:00Z', NULL)",
             params![Uuid::new_v4().to_string(), subj, obj_b],
         )
