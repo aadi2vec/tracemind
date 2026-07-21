@@ -1,0 +1,42 @@
+[
+  {
+    "id": "beam-001",
+    "initial_claim": "Alice works at Acme Corp.",
+    "contradicting_claim": "Alice now works at Beta Corp after leaving Acme.",
+    "query": "Where does Alice work?",
+    "expected_answer": "Beta Corp",
+    "contradiction_should_surface": true
+  },
+  {
+    "id": "beam-002",
+    "initial_claim": "The team meeting is scheduled for Monday at 2pm.",
+    "contradicting_claim": "The team meeting has been moved to Wednesday at 3pm.",
+    "query": "When is the team meeting?",
+    "expected_answer": "Wednesday at 3pm",
+    "contradiction_should_surface": true
+  },
+  {
+    "id": "beam-003",
+    "initial_claim": "Bob is the senior backend engineer on the Falcon project.",
+    "contradicting_claim": "Bob was promoted to Staff Engineer last week.",
+    "query": "What is Bob's role?",
+    "expected_answer": "Staff Engineer",
+    "contradiction_should_surface": true
+  },
+  {
+    "id": "beam-004",
+    "initial_claim": "The production database is hosted in us-east-1.",
+    "contradicting_claim": "The production database was migrated to eu-west-1 for GDPR compliance.",
+    "query": "Which region hosts the production database?",
+    "expected_answer": "eu-west-1",
+    "contradiction_should_surface": true
+  },
+  {
+    "id": "beam-005",
+    "initial_claim": "Carol prefers to use Python for data pipelines.",
+    "contradicting_claim": "Carol switched to Rust for all new data pipeline work.",
+    "query": "What language does Carol prefer for data pipelines?",
+    "expected_answer": "Rust",
+    "contradiction_should_surface": true
+  }
+]

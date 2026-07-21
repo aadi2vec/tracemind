@@ -20,6 +20,7 @@ members = [
     "crates/tm-bench-triples",
     "crates/tm-answer",
     "crates/tm-bench-locomo",
+    "crates/tm-bench-longmem",
     "crates/tm-intent",
     "crates/tm-reflect",
     "crates/tm-world-model",
