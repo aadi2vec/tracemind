@@ -8,4 +8,4 @@ pub use policy::{PolicyCandidate, PolicyPrompt, PolicyWeights, MutationKind, Pol
 pub use pareto::{ParetoArchive, ParetoAxis, ParetoScore};
 pub use verifier::{AnchorEvalResult, VerifierGate, VerifierConfig};
 pub use mutation::{mutate, MutationConfig};
-pub use loop_runner::{GepaLoop, GepaConfig, GepaRunResult};
+pub use loop_runner::{GepaLoop, GepaConfig, GepaRunResult, CuratorPriorUpdate};

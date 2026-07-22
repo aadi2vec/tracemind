@@ -4,8 +4,9 @@
 //! charter §5 Pillar 2. Each registered Space contributes a score; the final
 //! score is a weighted sum normalised by verb weight vectors.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
+use uuid::Uuid;
 use crate::space::{ConfidenceSpace, MemoryMeta, RecencySpace, Space, TextSpace};
 
 // ---------------------------------------------------------------------------
@@ -68,17 +69,18 @@ pub fn default_verb_weights() -> Vec<VerbWeights> {
 /// Each registered Space contributes a score; the final score is a weighted
 /// sum. A pre-computed cosine similarity from `VectorStore` can be passed in
 /// as the `text` space score.
+///
+/// Q4.6: pinned memory IDs always score 1.0 regardless of other spaces.
 pub struct ComposedIndex {
     spaces: Vec<Box<dyn Space>>,
     verb_weights: Vec<VerbWeights>,
+    /// Q4.6 — pinned memory IDs always return score 1.0.
+    pinned_ids: HashSet<Uuid>,
 }
 
 impl ComposedIndex {
     pub fn new(spaces: Vec<Box<dyn Space>>, verb_weights: Vec<VerbWeights>) -> Self {
-        Self {
-            spaces,
-            verb_weights,
-        }
+        Self { spaces, verb_weights, pinned_ids: HashSet::new() }
     }
 
     /// Build the default three-space index (text + recency + confidence).
@@ -93,11 +95,32 @@ impl ComposedIndex {
         )
     }
 
+    /// Q4.6 — Pin a memory ID so it always scores 1.0.
+    pub fn pin(&mut self, id: Uuid) {
+        self.pinned_ids.insert(id);
+    }
+
+    /// Q4.6 — Unpin a memory ID.
+    pub fn unpin(&mut self, id: &Uuid) {
+        self.pinned_ids.remove(id);
+    }
+
+    /// Q4.6 — Replace the full pinned set (e.g., loaded from TierStore).
+    pub fn set_pinned(&mut self, ids: HashSet<Uuid>) {
+        self.pinned_ids = ids;
+    }
+
+    /// Whether a memory ID is currently pinned.
+    pub fn is_pinned(&self, id: &Uuid) -> bool {
+        self.pinned_ids.contains(id)
+    }
+
     /// Score a memory entry given a pre-computed text cosine similarity.
     ///
     /// `text_cosine` — cosine similarity from `VectorStore.search()` (0..1).
     /// `verb` — active MCP verb (recall / plan / contradict / reflect).
     ///          Defaults to "recall" if unknown.
+    /// Q4.6: pinned memories always return 1.0 regardless of other spaces.
     pub fn score(
         &self,
         query_text: &str,
@@ -105,6 +128,11 @@ impl ComposedIndex {
         text_cosine: f32,
         verb: Option<&str>,
     ) -> f32 {
+        // Q4.6 — pinned memories are always surfaced at maximum score.
+        if self.pinned_ids.contains(&meta.id) {
+            return 1.0;
+        }
+
         let verb = verb.unwrap_or("recall");
         let weights = self.weights_for_verb(verb);
 
@@ -181,6 +209,39 @@ mod tests {
         let n = vw.normalised();
         assert!((n["a"] - 0.5).abs() < 1e-6);
         assert!((n["b"] - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn pinned_memory_scores_one() {
+        let mut idx = ComposedIndex::default_three_space();
+        let meta = meta_now();
+        idx.pin(meta.id);
+        // A pinned memory always scores 1.0 regardless of cosine
+        assert_eq!(idx.score("anything", &meta, 0.1, Some("recall")), 1.0);
+    }
+
+    #[test]
+    fn unpinned_memory_uses_space_scoring() {
+        let mut idx = ComposedIndex::default_three_space();
+        let meta = meta_now();
+        let id = meta.id;
+        idx.pin(id);
+        idx.unpin(&id);
+        let s = idx.score("test", &meta, 0.5, Some("recall"));
+        // Should NOT be 1.0 after unpinning
+        assert!(s < 1.0, "unpinned memory should use normal scoring: {s}");
+        assert!(s >= 0.0);
+    }
+
+    #[test]
+    fn is_pinned_reflects_state() {
+        let mut idx = ComposedIndex::default_three_space();
+        let id = Uuid::new_v4();
+        assert!(!idx.is_pinned(&id));
+        idx.pin(id);
+        assert!(idx.is_pinned(&id));
+        idx.unpin(&id);
+        assert!(!idx.is_pinned(&id));
     }
 
     #[test]
