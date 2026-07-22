@@ -6003,11 +6003,14 @@ dependencies = [
 name = "tm-controller"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 1.0.69",
  "tm-types",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
