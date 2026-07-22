@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tm_controller::bandit::RetrievalParams;
-use tm_controller::{UcbBandit, LinUcbBandit, QueryPlanner, QueryPlan, PlanAction};
+use tm_controller::{UcbBandit, LinUcbBandit, QueryPlanner, QueryPlan, PlanAction, MemoryRouter, RouterContext};
 use tm_episodic::{ProcedureStore, TraceStore, TrajectoryStore};
 use tm_graph::{context::ActiveContext, GraphStore, ViewFilter};
 use tm_reason::CausalTrace;
@@ -274,6 +274,11 @@ pub struct RetrievalEngine {
     /// [`ViewFilter::rejects_triple`] and dropped if the view rejects
     /// them. Set via [`set_view_filter`].
     view_filter: Option<ViewFilter>,
+    /// Q3.2 — memory-routing gate. Fires before LinUCB arm selection.
+    router: MemoryRouter,
+    /// Whether the routing gate is active. Defaults to false for backward
+    /// compat; the MCP layer enables it via `set_router_enabled(true)`.
+    router_enabled: bool,
 }
 
 #[derive(Debug)]
@@ -372,6 +377,8 @@ impl RetrievalEngine {
             prefetch: PrefetchCache::new(),
             cross_context: false,
             view_filter: None,
+            router: MemoryRouter::default(),
+            router_enabled: false,
         })
     }
 
@@ -615,6 +622,35 @@ impl RetrievalEngine {
         let embed_start = Instant::now();
         let query_embedding = self.embedder.embed(text);
         let blended_embedding = self.blend_with_context(&query_embedding);
+
+        // ── Phase: routing gate (Q3.2) ──
+        // Fires before LinUCB arm selection. If the gate says skip,
+        // return an empty result immediately without hitting the DB.
+        let router_ctx = RouterContext {
+            host_id: None,          // populated by MCP layer via set_host_id()
+            working_memory_hit: false,
+            recent_miss_rate: 0.0,  // populated from feedback signals in Q4
+            is_command: false,
+        };
+        if self.router_enabled && !self.router.should_retrieve(text, &router_ctx) {
+            return Ok(RetrievalResult {
+                query_id: Uuid::new_v4(),
+                arm: u8::MAX,  // sentinel: not a bandit arm
+                entities: vec![],
+                triples: vec![],
+                traces: vec![],
+                related_entities: vec![],
+                signal_hits: vec![],
+                procedures: vec![],
+                phases: vec![],
+                causal_trace: CausalTrace::new(text, usize::MAX, "router-skip"),
+                reasoning_narrative: "routing gate: retrieval skipped".to_string(),
+                plan: Some(plan),
+                low_confidence: false,
+                suggested_queries: vec![],
+                latency_ms: start.elapsed().as_millis() as u32,
+            });
+        }
 
         // ── Phase: arm_select ──
         let arm_start = Instant::now();
@@ -2180,6 +2216,8 @@ mod tests {
             prefetch: PrefetchCache::new(),
             cross_context: false,
             view_filter: None,
+            router: MemoryRouter::default(),
+            router_enabled: false,
         };
 
         let result = engine.query("hello world").unwrap();
@@ -2226,6 +2264,8 @@ mod tests {
             prefetch: PrefetchCache::new(),
             cross_context: false,
             view_filter: None,
+            router: MemoryRouter::default(),
+            router_enabled: false,
         };
 
         // Prime an entry for "hello world" — even on an empty graph
@@ -2383,6 +2423,8 @@ mod tests {
             prefetch: PrefetchCache::new(),
             cross_context: false,
             view_filter: None,
+            router: MemoryRouter::default(),
+            router_enabled: false,
         };
 
         let now = chrono::Utc::now();
@@ -2480,6 +2522,8 @@ mod tests {
             prefetch: PrefetchCache::new(),
             cross_context: false,
             view_filter: None,
+            router: MemoryRouter::default(),
+            router_enabled: false,
         };
 
         // Seed at least one entity so the query produces real candidates.
@@ -2556,6 +2600,8 @@ mod tests {
             prefetch: PrefetchCache::new(),
             cross_context: false,
             view_filter: None,
+            router: MemoryRouter::default(),
+            router_enabled: false,
         };
 
         let now = chrono::Utc::now();
@@ -2624,6 +2670,8 @@ mod tests {
             prefetch: PrefetchCache::new(),
             cross_context: true,
             view_filter: None,
+            router: MemoryRouter::default(),
+            router_enabled: false,
         };
 
         let now = chrono::Utc::now();

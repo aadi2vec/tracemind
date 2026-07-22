@@ -15,6 +15,8 @@ pub mod bundled;
 pub mod recent;
 pub mod working_memory;
 pub mod capture_permissions;
+pub mod tier;
+pub mod feedback;
 
 pub use entity::*;
 pub use triple::*;
@@ -27,3 +29,5 @@ pub use time_range::*;
 pub use recent::*;
 pub use working_memory::*;
 pub use capture_permissions::*;
+pub use tier::*;
+pub use feedback::{FeedbackClass, FeedbackKind, FeedbackSignal};

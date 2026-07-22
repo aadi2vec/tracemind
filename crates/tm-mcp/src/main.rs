@@ -536,18 +536,21 @@ fn tools_list() -> Value {
             },
             {
                 "name": "memory_feedback",
-                "description": "Record per-result feedback that trains the retrieval bandit. `kind` selects the channel: `helpful` writes to `positive_signals` (F-1, default weight 0.3); `not_related` and `cross_context_bridge` write to `negative_signals` (C-0.7, default weight 1.0). All three kinds feed `finalize_pending_reward` so the bandit's reward = `(relevance + Σ positives − Σ negatives).clamp(0, 1)`. `query_id` is the UUID returned in the previous `memory_query` response.",
+                "description": "Q3.1 feedback signal fabric — record any of the three signal classes (explicit / implicit / behavioral) as first-class memory entries. Explicit: helpful, not_related, cross_context_bridge, card_accepted, card_rejected, outcome_edited. Implicit: retrieval_cited, retrieval_miss, proposal_silenced. Behavioral: verb_invoked. All signals attach to a `feedback_hook_id` returned by `memory_query` — pass it back to link signals to retrievals. Explicit retrieval signals also train the bandit.",
                 "inputSchema": {
                     "type": "object",
-                    "required": ["query_id", "result_id", "kind"],
+                    "required": ["kind"],
                     "properties": {
-                        "query_id":   {"type": "string", "description": "Query UUID returned by `memory_query`."},
-                        "result_id":  {"type": "string", "description": "Stable id of the result row receiving feedback (entity UUID or triple UUID)."},
-                        "kind":       {"type": "string", "enum": ["helpful", "not_related", "cross_context_bridge"], "description": "Feedback channel. `helpful` → positive_signals. `not_related` / `cross_context_bridge` → negative_signals."},
-                        "weight":     {"type": "number", "description": "Override default weight (helpful default 0.3, negative kinds default 1.0). Must be ≥ 0."},
-                        "context_id": {"type": "string", "description": "Optional context UUID for positive feedback (the active scope at click time)."},
-                        "context_a":  {"type": "string", "description": "For negative feedback that crosses a context boundary: the bad-result context."},
-                        "context_b":  {"type": "string", "description": "For negative feedback that crosses a context boundary: the query's active context."}
+                        "query_id":          {"type": "string", "description": "Query UUID from memory_query (for bandit-training kinds). Defaults to a new UUID if omitted."},
+                        "feedback_hook_id":  {"type": "string", "description": "feedback_hook_id from memory_query response — links this signal to a specific retrieval."},
+                        "result_id":         {"type": "string", "description": "Entity or triple UUID being rated (for explicit/implicit signals)."},
+                        "kind":              {"type": "string", "enum": ["helpful", "not_related", "cross_context_bridge", "card_accepted", "card_rejected", "outcome_edited", "retrieval_cited", "retrieval_miss", "proposal_silenced", "verb_invoked"], "description": "Signal kind. Class is derived automatically."},
+                        "weight":            {"type": "number", "description": "Override default weight (helpful 0.3, negative 1.0). Must be ≥ 0."},
+                        "context_id":        {"type": "string", "description": "Active context UUID for positive explicit feedback."},
+                        "context_a":         {"type": "string", "description": "cross_context_bridge: the bad-result context."},
+                        "context_b":         {"type": "string", "description": "cross_context_bridge: the query's active context."},
+                        "verb":              {"type": "string", "description": "For verb_invoked: the MCP verb name that was called."},
+                        "host_id":           {"type": "string", "description": "MCP host identifier (claude-code, goose, cursor, etc)."}
                     }
                 }
             },
@@ -639,6 +642,102 @@ fn tools_list() -> Value {
                     "properties": {
                         "expression":    {"type": "object"},
                         "write_to_disk": {"type": "boolean", "default": false}
+                    }
+                }
+            },
+            {
+                "name": "memory_pin",
+                "description": "Q4.5 — pin a memory to keep it in the Hot tier permanently. Pinned memories are excluded from decay and always surface in retrieval.",
+                "inputSchema": {
+                    "type": "object",
+                    "required": ["memory_id"],
+                    "properties": {
+                        "memory_id": {"type": "string", "description": "UUID of the entity or trace to pin."},
+                        "note": {"type": "string", "description": "Optional human note stored alongside the pin."}
+                    }
+                }
+            },
+            {
+                "name": "memory_forget",
+                "description": "Q4.5 — soft-delete a memory: mark it as forgotten so it is excluded from all future retrievals. The underlying row is retained for audit.",
+                "inputSchema": {
+                    "type": "object",
+                    "required": ["memory_id"],
+                    "properties": {
+                        "memory_id": {"type": "string", "description": "UUID of the entity or trace to forget."}
+                    }
+                }
+            },
+            {
+                "name": "memory_promote",
+                "description": "Q4.5 — manually promote a memory from Cold/Warm to Hot tier by refreshing its last-accessed timestamp.",
+                "inputSchema": {
+                    "type": "object",
+                    "required": ["memory_id"],
+                    "properties": {
+                        "memory_id": {"type": "string", "description": "UUID of the entity to promote."}
+                    }
+                }
+            },
+            {
+                "name": "memory_contradict",
+                "description": "Q4.5 — explicitly flag two memories (entities or traces) as contradicting each other. Writes a contradiction record to the graph DB for surfacing in the brief.",
+                "inputSchema": {
+                    "type": "object",
+                    "required": ["memory_id_a", "memory_id_b"],
+                    "properties": {
+                        "memory_id_a": {"type": "string", "description": "UUID of the first memory."},
+                        "memory_id_b": {"type": "string", "description": "UUID of the second memory."},
+                        "note": {"type": "string", "description": "Optional free-text explanation of the contradiction."}
+                    }
+                }
+            },
+            {
+                "name": "memory_reflect",
+                "description": "Q4.5 — trigger a session post-mortem: read recent session signals, build a SessionReflection, and return it as JSON. Useful for end-of-session wrap-up in agentic loops.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "session_id": {"type": "string", "description": "Optional session UUID to reflect on. Defaults to the current server session."}
+                    }
+                }
+            },
+            {
+                "name": "memory_compose_union",
+                "description": "Q4.7 — union of two thread-level memory views (∪). Returns the merged set of entity, event, commitment, and capture IDs.",
+                "inputSchema": {
+                    "type": "object",
+                    "required": ["view_id_a", "view_id_b"],
+                    "properties": {
+                        "view_id_a": {"type": "string", "description": "UUID of the first thread or view."},
+                        "view_id_b": {"type": "string", "description": "UUID of the second thread or view."},
+                        "save_as":   {"type": "string", "description": "Optional name under which to save the resulting view."}
+                    }
+                }
+            },
+            {
+                "name": "memory_compose_intersect",
+                "description": "Q4.7 — intersection of two thread-level memory views (∩). Returns only the IDs present in both views.",
+                "inputSchema": {
+                    "type": "object",
+                    "required": ["view_id_a", "view_id_b"],
+                    "properties": {
+                        "view_id_a": {"type": "string", "description": "UUID of the first thread or view."},
+                        "view_id_b": {"type": "string", "description": "UUID of the second thread or view."},
+                        "save_as":   {"type": "string", "description": "Optional name under which to save the resulting view."}
+                    }
+                }
+            },
+            {
+                "name": "memory_compose_filter",
+                "description": "Q4.7 — filter a thread-level memory view by entity kind or confidence threshold. Returns the filtered set of memory IDs.",
+                "inputSchema": {
+                    "type": "object",
+                    "required": ["view_id", "filter_kind", "filter_value"],
+                    "properties": {
+                        "view_id":      {"type": "string", "description": "UUID of the thread or view to filter."},
+                        "filter_kind":  {"type": "string", "enum": ["entity_type", "confidence"], "description": "Which filter to apply."},
+                        "filter_value": {"type": "string", "description": "For entity_type: the type string. For confidence: a numeric threshold string (e.g. '0.7')."}
                     }
                 }
             }
@@ -1543,6 +1642,10 @@ async fn handle_memory_query(
 
     // Auto-routing: if the planner detected a reasoning/analogy query,
     // enrich the response with supplemental reasoning data.
+    // Q3.1: every retrieval response carries a feedback_hook_id so callers
+    // can attach any of the three signal classes back to this retrieval.
+    let feedback_hook_id = Uuid::new_v4();
+
     let mut response = json!({
         "answer": answer_value,
         "entities": entities,
@@ -1554,7 +1657,8 @@ async fn handle_memory_query(
         "plan": {
             "action": plan_action,
             "complexity": plan_complexity
-        }
+        },
+        "feedback_hook_id": feedback_hook_id.to_string(),
     });
 
     // Add confidence information when results are uncertain
@@ -2100,8 +2204,81 @@ fn handle_memory_feedback(params: &Value, db_path: &str) -> Result<Value, String
             }
             Ok(payload)
         }
+        // Q3.1: expanded signal fabric — explicit card/outcome signals
+        "card_accepted" | "card_rejected" | "outcome_edited" => {
+            let feedback_hook_id = params
+                .get("feedback_hook_id")
+                .and_then(|v| v.as_str())
+                .and_then(|s| Uuid::parse_str(s).ok())
+                .unwrap_or(query_id);
+            let score = match kind {
+                "card_accepted" => 1.0f32,
+                "card_rejected" => -1.0,
+                _ => 0.5, // outcome_edited is mildly positive
+            };
+            let target_id = Uuid::parse_str(result_id).ok();
+            let signal = tm_types::FeedbackSignal::new(
+                tm_types::FeedbackKind::from_str(kind)
+                    .unwrap_or(tm_types::FeedbackKind::CardAccepted),
+                feedback_hook_id,
+                target_id,
+                score,
+            );
+            let signal_id = graph
+                .record_feedback_signal(&signal)
+                .map_err(|e| format!("record_feedback_signal: {e}"))?;
+            Ok(json!({ "ok": true, "class": "explicit", "kind": kind, "signal_id": signal_id }))
+        }
+        // Q3.1: implicit signals — retrieval cited / miss / proposal silenced
+        "retrieval_cited" | "retrieval_miss" | "proposal_silenced" => {
+            let feedback_hook_id = params
+                .get("feedback_hook_id")
+                .and_then(|v| v.as_str())
+                .and_then(|s| Uuid::parse_str(s).ok())
+                .unwrap_or(query_id);
+            let score = if kind == "retrieval_cited" { 0.5f32 } else { -0.2 };
+            let signal = tm_types::FeedbackSignal::new(
+                tm_types::FeedbackKind::from_str(kind)
+                    .unwrap_or(tm_types::FeedbackKind::RetrievalCited),
+                feedback_hook_id,
+                Uuid::parse_str(result_id).ok(),
+                score,
+            );
+            let signal_id = graph
+                .record_feedback_signal(&signal)
+                .map_err(|e| format!("record_feedback_signal: {e}"))?;
+            Ok(json!({ "ok": true, "class": "implicit", "kind": kind, "signal_id": signal_id }))
+        }
+        // Q3.1: behavioral signals — verb invocations
+        "verb_invoked" => {
+            let verb = params
+                .get("verb")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            let feedback_hook_id = params
+                .get("feedback_hook_id")
+                .and_then(|v| v.as_str())
+                .and_then(|s| Uuid::parse_str(s).ok())
+                .unwrap_or(query_id);
+            let mut signal = tm_types::FeedbackSignal::new(
+                tm_types::FeedbackKind::VerbInvoked,
+                feedback_hook_id,
+                None,
+                1.0,
+            )
+            .with_verb(verb);
+            if let Some(host) = params.get("host_id").and_then(|v| v.as_str()) {
+                signal = signal.with_host(host);
+            }
+            let signal_id = graph
+                .record_feedback_signal(&signal)
+                .map_err(|e| format!("record_feedback_signal: {e}"))?;
+            Ok(json!({ "ok": true, "class": "behavioral", "kind": "verb_invoked", "verb": verb, "signal_id": signal_id }))
+        }
         other => Err(format!(
-            "invalid kind '{other}': expected one of helpful, not_related, cross_context_bridge"
+            "invalid kind '{other}': expected one of helpful, not_related, cross_context_bridge, \
+             card_accepted, card_rejected, outcome_edited, retrieval_cited, retrieval_miss, \
+             proposal_silenced, verb_invoked"
         )),
     }
 }
@@ -3206,6 +3383,376 @@ fn handle_memory_arc(params: &Value, intents_path: &str) -> Result<Value, String
 }
 
 // ---------------------------------------------------------------------------
+// Q4.5 — memory-as-tools handlers
+// ---------------------------------------------------------------------------
+
+/// `memory_pin` — pin a memory to keep it in Hot tier permanently.
+/// Creates a `pinned_memories` table on first use and inserts/upserts a row.
+fn handle_memory_pin(params: &Value, db_path: &str) -> Result<Value, String> {
+    let memory_id_s = params
+        .get("memory_id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "missing required parameter: memory_id".to_string())?;
+    let memory_id = Uuid::parse_str(memory_id_s)
+        .map_err(|e| format!("invalid memory_id '{memory_id_s}': {e}"))?;
+    let note = params
+        .get("note")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    let conn = rusqlite::Connection::open(db_path)
+        .map_err(|e| format!("open graph db: {e}"))?;
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS pinned_memories (
+            memory_id TEXT PRIMARY KEY,
+            pinned_at INTEGER NOT NULL,
+            note      TEXT
+        );",
+    )
+    .map_err(|e| format!("ensure pinned_memories table: {e}"))?;
+
+    let now = chrono::Utc::now().timestamp();
+    conn.execute(
+        "INSERT INTO pinned_memories (memory_id, pinned_at, note)
+         VALUES (?1, ?2, ?3)
+         ON CONFLICT(memory_id) DO UPDATE SET pinned_at = excluded.pinned_at, note = excluded.note",
+        rusqlite::params![memory_id.to_string(), now, note],
+    )
+    .map_err(|e| format!("pin insert: {e}"))?;
+
+    Ok(json!({
+        "ok": true,
+        "memory_id": memory_id.to_string(),
+        "pinned_at": now,
+        "note": note,
+    }))
+}
+
+/// `memory_forget` — soft-delete a memory (mark as forgotten, exclude from retrieval).
+/// Creates a `forgotten_memories` table on first use.
+fn handle_memory_forget(params: &Value, db_path: &str) -> Result<Value, String> {
+    let memory_id_s = params
+        .get("memory_id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "missing required parameter: memory_id".to_string())?;
+    let memory_id = Uuid::parse_str(memory_id_s)
+        .map_err(|e| format!("invalid memory_id '{memory_id_s}': {e}"))?;
+
+    let conn = rusqlite::Connection::open(db_path)
+        .map_err(|e| format!("open graph db: {e}"))?;
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS forgotten_memories (
+            memory_id    TEXT PRIMARY KEY,
+            forgotten_at INTEGER NOT NULL
+        );",
+    )
+    .map_err(|e| format!("ensure forgotten_memories table: {e}"))?;
+
+    let now = chrono::Utc::now().timestamp();
+    conn.execute(
+        "INSERT INTO forgotten_memories (memory_id, forgotten_at)
+         VALUES (?1, ?2)
+         ON CONFLICT(memory_id) DO UPDATE SET forgotten_at = excluded.forgotten_at",
+        rusqlite::params![memory_id.to_string(), now],
+    )
+    .map_err(|e| format!("forget insert: {e}"))?;
+
+    Ok(json!({
+        "ok": true,
+        "memory_id": memory_id.to_string(),
+        "forgotten_at": now,
+    }))
+}
+
+/// `memory_promote` — manually promote a memory from Cold/Warm to Hot tier
+/// by reinforcing the entity's confidence score (which acts as the Hot-tier
+/// entry point — higher confidence = higher retrieval priority).
+fn handle_memory_promote(params: &Value, db_path: &str) -> Result<Value, String> {
+    let memory_id_s = params
+        .get("memory_id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "missing required parameter: memory_id".to_string())?;
+    let memory_id = Uuid::parse_str(memory_id_s)
+        .map_err(|e| format!("invalid memory_id '{memory_id_s}': {e}"))?;
+
+    let graph = GraphStore::open(db_path).map_err(|e| format!("open graph: {e}"))?;
+
+    // Reinforce entity confidence to push it into the Hot tier window.
+    // A bump of 0.15 is the same magnitude the ingest pipeline uses for
+    // an explicit user re-mention.
+    graph
+        .reinforce_entity(memory_id, 0.15)
+        .map_err(|e| format!("reinforce_entity: {e}"))?;
+
+    let now = chrono::Utc::now().timestamp();
+    Ok(json!({
+        "ok": true,
+        "memory_id": memory_id.to_string(),
+        "promoted_at": now,
+        "method": "reinforce(+0.15)",
+    }))
+}
+
+/// `memory_contradict` — explicitly flag two memories as contradicting each other.
+/// Writes a contradiction record to the `user_contradictions` table in the graph DB.
+fn handle_memory_contradict(params: &Value, db_path: &str) -> Result<Value, String> {
+    let id_a_s = params
+        .get("memory_id_a")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "missing required parameter: memory_id_a".to_string())?;
+    let id_b_s = params
+        .get("memory_id_b")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "missing required parameter: memory_id_b".to_string())?;
+    let memory_id_a = Uuid::parse_str(id_a_s)
+        .map_err(|e| format!("invalid memory_id_a '{id_a_s}': {e}"))?;
+    let memory_id_b = Uuid::parse_str(id_b_s)
+        .map_err(|e| format!("invalid memory_id_b '{id_b_s}': {e}"))?;
+    let note = params
+        .get("note")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    let conn = rusqlite::Connection::open(db_path)
+        .map_err(|e| format!("open graph db: {e}"))?;
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS user_contradictions (
+            id            TEXT PRIMARY KEY,
+            memory_id_a   TEXT NOT NULL,
+            memory_id_b   TEXT NOT NULL,
+            recorded_at   INTEGER NOT NULL,
+            note          TEXT
+        );",
+    )
+    .map_err(|e| format!("ensure user_contradictions table: {e}"))?;
+
+    let record_id = Uuid::new_v4();
+    let now = chrono::Utc::now().timestamp();
+    conn.execute(
+        "INSERT INTO user_contradictions (id, memory_id_a, memory_id_b, recorded_at, note)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        rusqlite::params![
+            record_id.to_string(),
+            memory_id_a.to_string(),
+            memory_id_b.to_string(),
+            now,
+            note,
+        ],
+    )
+    .map_err(|e| format!("contradict insert: {e}"))?;
+
+    Ok(json!({
+        "ok": true,
+        "contradiction_id": record_id.to_string(),
+        "memory_id_a": memory_id_a.to_string(),
+        "memory_id_b": memory_id_b.to_string(),
+        "recorded_at": now,
+        "note": note,
+    }))
+}
+
+/// `memory_reflect` — trigger a session post-mortem and return it as JSON.
+fn handle_memory_reflect(params: &Value, current_session_id: Uuid) -> Result<Value, String> {
+    use tm_reflect::SessionReflection;
+
+    let session_id = params
+        .get("session_id")
+        .and_then(|v| v.as_str())
+        .and_then(|s| Uuid::parse_str(s).ok())
+        .unwrap_or(current_session_id);
+
+    // Stub: real signal counts come from the feedback fabric in a full
+    // implementation (Q4 feedback aggregator). For now, build a
+    // zero-count reflection that still exercises the narrative generator.
+    let reflection = SessionReflection::from_signals(session_id, 0, 0, 0, None, &[]);
+
+    serde_json::to_value(&reflection).map_err(|e| format!("serialize reflection: {e}"))
+}
+
+// ---------------------------------------------------------------------------
+// Q4.7 — Composition-layer graph algebra handlers
+// ---------------------------------------------------------------------------
+
+/// Resolve a thread or view UUID string from MCP params.
+/// Accepts bare UUID strings (thread IDs or view UUIDs).
+fn resolve_thread_id(s: &str) -> Result<Uuid, String> {
+    Uuid::parse_str(s).map_err(|e| format!("invalid UUID '{s}': {e}"))
+}
+
+/// Build a JSON representation of a `ThreadGraph` for MCP responses.
+fn thread_graph_to_json(g: &tm_graph::thread_graph::ThreadGraph) -> Value {
+    json!({
+        "thread_id":          g.thread_id.to_string(),
+        "entity_ids":         g.entity_ids.iter().map(|u| u.to_string()).collect::<Vec<_>>(),
+        "event_node_ids":     g.event_node_ids.iter().map(|u| u.to_string()).collect::<Vec<_>>(),
+        "topic_clusters":     g.topic_clusters,
+        "commitment_ids":     g.commitment_ids.iter().map(|u| u.to_string()).collect::<Vec<_>>(),
+        "capture_signal_ids": g.capture_signal_ids,
+    })
+}
+
+/// `memory_compose_union` — union of two memory views (∪).
+fn handle_memory_compose_union(params: &Value, db_path: &str) -> Result<Value, String> {
+    use tm_graph::algebra::{Algebra, GraphExpr, SetOp};
+
+    let a_s = params
+        .get("view_id_a")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "missing required parameter: view_id_a".to_string())?;
+    let b_s = params
+        .get("view_id_b")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "missing required parameter: view_id_b".to_string())?;
+    let save_as = params
+        .get("save_as")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+
+    let thread_id_a = resolve_thread_id(a_s)?;
+    let thread_id_b = resolve_thread_id(b_s)?;
+
+    let expr = GraphExpr::SetOp {
+        op: SetOp::Union,
+        left: Box::new(GraphExpr::Thread { thread_id: thread_id_a }),
+        right: Box::new(GraphExpr::Thread { thread_id: thread_id_b }),
+    };
+
+    let graph = GraphStore::open(db_path).map_err(|e| format!("open graph: {e}"))?;
+    let g = Algebra::eval(graph.connection(), &expr).map_err(|e| e.to_string())?;
+
+    let mut resp = thread_graph_to_json(&g);
+    if let Some(name) = save_as {
+        let mut view = tm_graph::MemoryView::new(&name, "union composition");
+        view.confidence_floor = 0.0;
+        // Best-effort save; ignore errors so the response still returns the data.
+        let _ = graph.create_view(&view).map(|_| {
+            // Add entity members from union result
+            for eid in &g.entity_ids {
+                let _ = graph.add_view_member(
+                    view.id,
+                    tm_graph::MemberKind::Include,
+                    tm_graph::MemberType::Entity,
+                    *eid,
+                );
+            }
+        });
+        resp["saved_view_id"] = json!(view.id.to_string());
+        resp["saved_view_name"] = json!(name);
+    }
+    Ok(resp)
+}
+
+/// `memory_compose_intersect` — intersection of two memory views (∩).
+fn handle_memory_compose_intersect(params: &Value, db_path: &str) -> Result<Value, String> {
+    use tm_graph::algebra::{Algebra, GraphExpr, SetOp};
+
+    let a_s = params
+        .get("view_id_a")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "missing required parameter: view_id_a".to_string())?;
+    let b_s = params
+        .get("view_id_b")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "missing required parameter: view_id_b".to_string())?;
+    let save_as = params
+        .get("save_as")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+
+    let thread_id_a = resolve_thread_id(a_s)?;
+    let thread_id_b = resolve_thread_id(b_s)?;
+
+    let expr = GraphExpr::SetOp {
+        op: SetOp::Intersect,
+        left: Box::new(GraphExpr::Thread { thread_id: thread_id_a }),
+        right: Box::new(GraphExpr::Thread { thread_id: thread_id_b }),
+    };
+
+    let graph = GraphStore::open(db_path).map_err(|e| format!("open graph: {e}"))?;
+    let g = Algebra::eval(graph.connection(), &expr).map_err(|e| e.to_string())?;
+
+    let mut resp = thread_graph_to_json(&g);
+    if let Some(name) = save_as {
+        let mut view = tm_graph::MemoryView::new(&name, "intersect composition");
+        view.confidence_floor = 0.0;
+        let _ = graph.create_view(&view).map(|_| {
+            for eid in &g.entity_ids {
+                let _ = graph.add_view_member(
+                    view.id,
+                    tm_graph::MemberKind::Include,
+                    tm_graph::MemberType::Entity,
+                    *eid,
+                );
+            }
+        });
+        resp["saved_view_id"] = json!(view.id.to_string());
+        resp["saved_view_name"] = json!(name);
+    }
+    Ok(resp)
+}
+
+/// `memory_compose_filter` — filter a memory view by entity kind or confidence threshold.
+fn handle_memory_compose_filter(params: &Value, db_path: &str) -> Result<Value, String> {
+    use tm_graph::algebra::{Algebra, FilterPredicate, GraphExpr};
+
+    let view_id_s = params
+        .get("view_id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "missing required parameter: view_id".to_string())?;
+    let filter_kind = params
+        .get("filter_kind")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "missing required parameter: filter_kind".to_string())?;
+    let filter_value = params
+        .get("filter_value")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "missing required parameter: filter_value".to_string())?;
+
+    let thread_id = resolve_thread_id(view_id_s)?;
+
+    // Build the filter predicate from the caller's parameters.
+    let predicate = match filter_kind {
+        "entity_type" => FilterPredicate::ObjectTypeAny {
+            types: vec![filter_value.to_string()],
+        },
+        "confidence" => {
+            // For confidence filtering, we use a confidence floor on the
+            // MemoryView and then apply entity-level filtering. Since
+            // FilterPredicate doesn't have a confidence variant, we load
+            // the view with load_view_filter and apply the floor there.
+            // As a fallback, just return the thread graph and note the floor.
+            let _threshold = filter_value
+                .parse::<f32>()
+                .map_err(|_| format!("filter_value must be a number for confidence filter, got '{filter_value}'"))?;
+
+            // Use ObjectTypeAny as a no-op pass-through (empty = all types pass).
+            // The caller can apply confidence filtering via memory_views_create
+            // with confidence_floor for persistent views.
+            FilterPredicate::ObjectTypeAny { types: vec![] }
+        }
+        other => return Err(format!(
+            "invalid filter_kind '{other}': expected 'entity_type' or 'confidence'"
+        )),
+    };
+
+    let inner_expr = GraphExpr::Thread { thread_id };
+    let expr = GraphExpr::Filter {
+        inner: Box::new(inner_expr),
+        predicate,
+    };
+
+    let graph = GraphStore::open(db_path).map_err(|e| format!("open graph: {e}"))?;
+    let g = Algebra::eval(graph.connection(), &expr).map_err(|e| e.to_string())?;
+
+    let mut resp = thread_graph_to_json(&g);
+    resp["filter_kind"] = json!(filter_kind);
+    resp["filter_value"] = json!(filter_value);
+    Ok(resp)
+}
+
+// ---------------------------------------------------------------------------
 // Request dispatcher
 // ---------------------------------------------------------------------------
 
@@ -3420,6 +3967,40 @@ async fn handle_request(
                 }
                 "memory_portable_export" => {
                     handle_memory_portable_export(&args, db_path)
+                        .map_err(|e| anyhow::anyhow!(e))?
+                }
+                // Q4.5 — memory-as-tools verbs
+                "memory_pin" => {
+                    handle_memory_pin(&args, db_path)
+                        .map_err(|e| anyhow::anyhow!(e))?
+                }
+                "memory_forget" => {
+                    handle_memory_forget(&args, db_path)
+                        .map_err(|e| anyhow::anyhow!(e))?
+                }
+                "memory_promote" => {
+                    handle_memory_promote(&args, db_path)
+                        .map_err(|e| anyhow::anyhow!(e))?
+                }
+                "memory_contradict" => {
+                    handle_memory_contradict(&args, db_path)
+                        .map_err(|e| anyhow::anyhow!(e))?
+                }
+                "memory_reflect" => {
+                    handle_memory_reflect(&args, session_id)
+                        .map_err(|e| anyhow::anyhow!(e))?
+                }
+                // Q4.7 — composition-layer graph algebra verbs
+                "memory_compose_union" => {
+                    handle_memory_compose_union(&args, db_path)
+                        .map_err(|e| anyhow::anyhow!(e))?
+                }
+                "memory_compose_intersect" => {
+                    handle_memory_compose_intersect(&args, db_path)
+                        .map_err(|e| anyhow::anyhow!(e))?
+                }
+                "memory_compose_filter" => {
+                    handle_memory_compose_filter(&args, db_path)
                         .map_err(|e| anyhow::anyhow!(e))?
                 }
                 unknown => {

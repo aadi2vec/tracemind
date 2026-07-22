@@ -1,0 +1,49 @@
+[package]
+name = "tm-bench-longmem"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "tm-bench-longmem"
+path = "src/main.rs"
+
+[[bin]]
+name = "tm-bench-beam"
+path = "src/beam_main.rs"
+
+[lib]
+name = "tm_bench_longmem"
+path = "src/lib.rs"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+chrono = { workspace = true }
+tokio = { workspace = true }
+uuid = { workspace = true }
+async-trait = "0.1"
+tempfile = "3"
+
+# Optional: real TraceMind runner that exercises ingest + retrieval.
+[dependencies.tm-types]
+workspace = true
+optional = true
+
+[dependencies.tm-ingest]
+workspace = true
+optional = true
+
+[dependencies.tm-retrieval]
+workspace = true
+optional = true
+
+[features]
+default = []
+# Enable the real TraceMind runner. Pulls in tm-ingest + tm-retrieval which
+# transitively bring fastembed; build is heavier but produces real numbers.
+tracemind = ["dep:tm-types", "dep:tm-ingest", "dep:tm-retrieval"]

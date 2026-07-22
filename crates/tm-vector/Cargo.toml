@@ -8,3 +8,11 @@ tm-types = { workspace = true }
 tracing = { workspace = true }
 seahash = { workspace = true }
 fastembed = { workspace = true }
+dirs = "5"
+uuid = { workspace = true }
+chrono = { workspace = true }
+
+# For BGE-M3 ONNX loading (Q3.9 scaffold — uncomment when fully wiring in Q4)
+# ort = { version = "2", features = ["download-binaries"] }
+# tokenizers = "0.19"
+# ureq = "2"   # or reqwest for the auto-download helper

@@ -29,6 +29,7 @@ pub mod predictor;
 pub mod store;
 pub mod trainer;
 pub mod types;
+pub mod verb_affinity;
 
 pub use calibration::{evaluate, split_out_of_sample, CalibrationReport, PerClass};
 pub use features::{extract, feature_dim, normalize_tag, TagVocab, FIXED_FEATURES};
@@ -39,3 +40,7 @@ pub use predictor::{
 pub use store::{default_path, load, save, StoreError, DEFAULT_FILENAME};
 pub use trainer::{from_pairs, train, Example, TrainReport, TrainerConfig};
 pub use types::{OutcomePrediction, PolarityClass, PolarityDist};
+pub use verb_affinity::{
+    TimeBand, VerbAffinityModel, VerbObservation,
+    save as save_verb_affinity, load as load_verb_affinity, default_path as verb_affinity_path,
+};

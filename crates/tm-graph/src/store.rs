@@ -376,6 +376,31 @@ impl GraphStore {
             crate::graph_sprint::ensure_schema(conn)?;
         }
 
+        // Q3.1: feedback signal fabric — explicit / implicit / behavioral signals
+        // stored as first-class memories with UUID provenance.
+        {
+            let conn = store.kg.connection();
+            crate::feedback_fabric::init_schema(conn)?;
+        }
+
+        // Q3.4: temporal KG columns (valid_from / valid_to on kg_relations).
+        {
+            let conn = store.kg.connection();
+            crate::contradiction_rate::ensure_temporal_columns(conn)?;
+        }
+
+        // Q3.5: session_id / host_id scoping.
+        {
+            let conn = store.kg.connection();
+            crate::session_scope::init_schema(conn)?;
+        }
+
+        // Q4.14: policy provenance tables (mutations + rollbacks).
+        {
+            let conn = store.kg.connection();
+            crate::policy_provenance::init_schema(conn)?;
+        }
+
         // One-time backfill: emit a temporal fact for any entity / triple
         // that doesn't yet have one. Idempotent — `current_fact_id` skips
         // anything already tracked. Cheap (linear in #rows missing a fact).
@@ -996,6 +1021,40 @@ impl GraphStore {
     /// reward by `finalize_pending_reward`.
     pub fn positive_weight_for_query(&self, query_id: Uuid) -> Result<f32> {
         crate::context::positive_weight_for_query(self.kg.connection(), query_id)
+    }
+
+    // ─── Q3.1 Feedback signal fabric ─────────────────────────────────────
+
+    /// Record a first-class feedback signal with full provenance.
+    /// Use this for all three signal classes (Explicit / Implicit / Behavioral).
+    pub fn record_feedback_signal(
+        &self,
+        signal: &tm_types::FeedbackSignal,
+    ) -> Result<uuid::Uuid> {
+        crate::feedback_fabric::record_signal(self.kg.connection(), signal)
+    }
+
+    /// Retrieve all feedback signals for a given feedback_hook_id.
+    pub fn signals_for_hook(
+        &self,
+        hook_id: uuid::Uuid,
+    ) -> Result<Vec<tm_types::FeedbackSignal>> {
+        crate::feedback_fabric::signals_for_hook(self.kg.connection(), hook_id)
+    }
+
+    /// Most-recent N signals of the given class (Explicit/Implicit/Behavioral).
+    pub fn recent_feedback_signals(
+        &self,
+        class: tm_types::FeedbackClass,
+        limit: usize,
+    ) -> Result<Vec<tm_types::FeedbackSignal>> {
+        crate::feedback_fabric::recent_signals_by_class(self.kg.connection(), class, limit)
+    }
+
+    /// Verb affinity: (verb, weighted_count) pairs sorted by weight desc.
+    /// Used by Q4.12 user-behavior model to drive L2 space weights.
+    pub fn verb_affinity(&self, limit: usize) -> Result<Vec<(String, f64)>> {
+        crate::feedback_fabric::verb_affinity(self.kg.connection(), limit)
     }
 
     // ─── Memory Views (LM-11a) ──────────────────────────────────────────
