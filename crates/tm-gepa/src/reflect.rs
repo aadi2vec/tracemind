@@ -144,6 +144,8 @@ pub fn propose(parent: &RetrievalPolicy, report: &ScoreReport, step: f32) -> Vec
             push(parent.perturb_generic_boost(step * 40.0), "boost untyped-question coverage");
             push(parent.perturb_generic_boost(step * 120.0), "strongly boost untyped-question coverage");
             push(parent.perturb_generic_boost(-step * 40.0), "reduce untyped-question coverage");
+            push(parent.perturb_recency(step * 8.0), "prefer later memories more");
+            push(parent.perturb_recency(-step * 8.0), "prefer later memories less");
         }
         Diagnosis::PrecisionStarved => {
             push(

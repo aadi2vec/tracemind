@@ -196,6 +196,7 @@ impl TraceMindRunner {
                 continue;
             }
             if qkind.is_satisfied_by(&stripped, question) {
+                let recency = self.turn_recency(&stripped);
                 let score = evidence_score(
                     &stripped,
                     question,
@@ -210,6 +211,8 @@ impl TraceMindRunner {
                         self.policy.coverage_weight
                     },
                     self.policy.fit_weight,
+                    recency,
+                    self.policy.recency_weight,
                 );
                 answerable.push((score, stripped));
             } else if fallback.is_none() {
@@ -226,10 +229,14 @@ impl TraceMindRunner {
         // text accounts for is what separates "Renamed Loom to Memex" from
         // "I'm leaving Stripe to start a company" for a question about
         // renaming.
-        if let Some((_, best)) = answerable
-            .into_iter()
-            .max_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal))
-        {
+        // Supersession applies only when the question asks for the current
+        // state of a changing fact.
+        let recency_pref = if extract::asks_for_latest(question) {
+            self.policy.recency_weight
+        } else {
+            0.0
+        };
+        if let Some(best) = pick_answerable(answerable, recency_pref, |t| self.turn_recency(t)) {
             parts.push(best);
         }
 
@@ -261,7 +268,20 @@ impl TraceMindRunner {
         // Falls back to the full candidate when no extractor fires —
         // SQuAD F1 punishes long predictions on precision but rewards
         // recall, so the fallback is still better than empty.
-        let composed = extract::compose_short_answer(question, &joined);
+        // Resolve named answers against the graph's own NER rather than
+        // orthography — see `extract::resolve_named`.
+        let composed = if matches!(qkind, extract::QKind::Named) {
+            let lookup = |name: &str| -> Option<String> {
+                self.engine
+                    .as_ref()
+                    .and_then(|e| e.graph().find_entity_by_name_icase(name).ok().flatten())
+                    .map(|ent| format!("{:?}", ent.entity_type))
+            };
+            extract::resolve_named(&joined, question, &lookup)
+                .unwrap_or_else(|| joined.clone())
+        } else {
+            extract::compose_short_answer(question, &joined)
+        };
         truncate(&composed, self.config.max_answer_chars)
     }
 
@@ -311,6 +331,25 @@ impl TraceMindRunner {
     /// 3. If the winner is a question turn, return the next ingested
     ///    turn (the answering turn in a Q→A exchange).
     /// 4. None if no turn shares any content token.
+    /// Where a turn sits in the conversation, as a 0..1 fraction.
+    ///
+    /// Supersession proxy: 1.0 is the most recent statement. When two turns
+    /// both answer the question ("June 4th" and "July 9th"), the later one
+    /// is the current fact.
+    fn turn_recency(&self, text: &str) -> f32 {
+        if self.ingested_turns.len() < 2 {
+            return 1.0;
+        }
+        let needle = text.trim().to_lowercase();
+        let pos = self.ingested_turns.iter().position(|t| {
+            strip_speaker_prefix(t).trim().to_lowercase() == needle
+        });
+        match pos {
+            Some(i) => i as f32 / (self.ingested_turns.len() - 1) as f32,
+            None => 0.5,
+        }
+    }
+
     /// Apply a GEPA retrieval policy to the underlying engine.
     ///
     /// Called between candidate evaluations so each policy is measured
@@ -581,6 +620,8 @@ fn evidence_score(
     lexical_score: f32,
     coverage_weight: f32,
     fit_weight: f32,
+    recency: f32,
+    recency_weight: f32,
 ) -> f32 {
     let _ = (turn, question);
     let rank_prior = retrieval_score.max(0.01);
@@ -597,7 +638,10 @@ fn evidence_score(
     // own ranking is exactly the kind of trade-off the loop can search
     // better than it can be guessed.
     let fit = extract::answer_confidence(turn, question);
-    rank_prior * (1.0 + coverage_weight * coverage) * (1.0 + fit_weight * (fit - 0.6))
+    rank_prior
+        * (1.0 + coverage_weight * coverage)
+        * (1.0 + fit_weight * (fit - 0.6))
+        * (1.0 + recency_weight * recency)
 }
 
 fn truncate(s: &str, max_chars: usize) -> String {
@@ -759,6 +803,7 @@ impl TraceMindRunner {
         }
 
         let req = AnswerRequest {
+            nearby_topics: Vec::new(),
             question: question.to_string(),
             grounding,
             task: TaskKind::ShortAnswer,
@@ -893,5 +938,89 @@ impl TokenIdf {
         // maximum weight, which is correct — it is maximally discriminating
         // if some candidate does contain it.
         (1.0 + (n - df + 0.5) / (df + 0.5)).ln()
+    }
+}
+
+/// Choose among candidates that all satisfy the answer type.
+///
+/// Evidence score decides, unless the caller passes a non-zero
+/// `recency_weight` — then, among candidates within [`SUPERSESSION_BAND`]
+/// of the best, the *later* memory wins.
+///
+/// This is fact supersession, a defining property of a memory system rather
+/// than a retrieval trick: an offer that rose from $40M to $65M leaves both
+/// statements in the history and both type-check as answers.
+///
+/// It is deliberately **not** applied by default. Measured on the training
+/// split, both a blanket recency multiplier and a tie-break at any band
+/// width made things worse — many candidates score exactly equal, and
+/// flipping those to the later turn is wrong more often than right, because
+/// most facts are stated once and never revised. Callers enable it only
+/// when the question asks for the current state
+/// (see [`extract::asks_for_latest`]).
+fn pick_answerable(
+    answerable: Vec<(f32, String)>,
+    recency_weight: f32,
+    recency_of: impl Fn(&str) -> f32,
+) -> Option<String> {
+    if answerable.is_empty() {
+        return None;
+    }
+    let best = answerable
+        .iter()
+        .map(|(s, _)| *s)
+        .fold(f32::MIN, f32::max);
+    if best <= 0.0 {
+        return answerable.into_iter().next().map(|(_, t)| t);
+    }
+
+    let floor = best * (1.0 - SUPERSESSION_BAND);
+    let mut contenders: Vec<&(f32, String)> =
+        answerable.iter().filter(|(s, _)| *s >= floor).collect();
+    if contenders.len() > 1 && recency_weight > 0.0 {
+        contenders.sort_by(|a, b| {
+            recency_of(&a.1)
+                .partial_cmp(&recency_of(&b.1))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        return contenders.last().map(|(_, t)| t.clone());
+    }
+    answerable
+        .into_iter()
+        .max_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal))
+        .map(|(_, t)| t)
+}
+
+/// How close two candidates must be for recency to break the tie.
+const SUPERSESSION_BAND: f32 = 0.35;
+
+#[cfg(test)]
+mod supersession_tests {
+    use super::*;
+
+    #[test]
+    fn clear_winner_is_not_overridden_by_recency() {
+        let cands = vec![(1.0, "strong early".to_string()), (0.2, "weak late".to_string())];
+        let pick = pick_answerable(cands, 1.0, |t| if t.contains("late") { 1.0 } else { 0.0 });
+        assert_eq!(pick.as_deref(), Some("strong early"));
+    }
+
+    #[test]
+    fn near_tie_resolves_to_the_later_memory() {
+        let cands = vec![(1.0, "June 4th".to_string()), (0.95, "July 9th".to_string())];
+        let pick = pick_answerable(cands, 1.0, |t| if t.contains("July") { 1.0 } else { 0.0 });
+        assert_eq!(pick.as_deref(), Some("July 9th"), "later fact must supersede");
+    }
+
+    #[test]
+    fn recency_disabled_falls_back_to_score() {
+        let cands = vec![(1.0, "June 4th".to_string()), (0.95, "July 9th".to_string())];
+        let pick = pick_answerable(cands, 0.0, |t| if t.contains("July") { 1.0 } else { 0.0 });
+        assert_eq!(pick.as_deref(), Some("June 4th"));
+    }
+
+    #[test]
+    fn empty_input_yields_none() {
+        assert!(pick_answerable(vec![], 1.0, |_| 1.0).is_none());
     }
 }

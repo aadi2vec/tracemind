@@ -72,6 +72,11 @@ pub struct AnswerRequest {
     pub max_output_tokens: u32,
     /// Optional preferred tier; dispatcher may downgrade if unavailable.
     pub preferred_tier: Option<AnswerTier>,
+    /// Topics the system *does* know about, when it cannot answer the
+    /// question itself. Used to turn a dead end into a useful abstention:
+    /// "nothing on that; closest topics are X, Y" beats an empty string,
+    /// which is indistinguishable from a crash or a stopped daemon.
+    pub nearby_topics: Vec<String>,
 }
 
 impl AnswerRequest {
@@ -82,6 +87,7 @@ impl AnswerRequest {
             task,
             max_output_tokens: 256,
             preferred_tier: None,
+            nearby_topics: Vec::new(),
         }
     }
 

@@ -2145,9 +2145,23 @@ impl GraphStore {
     /// Log an entity access event (query_result, clicked, recommended, ingested).
     pub fn log_access(&self, entity_id: Uuid, event_type: &str, context: Option<&str>) -> Result<()> {
         let conn = self.kg.connection();
+        // Write the timestamp explicitly in RFC3339 rather than relying on
+        // the column's `datetime('now')` default. The default produces
+        // "2026-07-22 15:32:16" (space separator, no offset) while every
+        // range query binds `DateTime::to_rfc3339()`
+        // ("2026-07-22T14:32:16+00:00"). Those are compared as *strings*,
+        // and ' ' (0x20) sorts before 'T' (0x54), so a row written "now"
+        // always compares as earlier than a lower bound written an hour ago
+        // — making every access-log range query return nothing.
         conn.execute(
-            "INSERT INTO access_log (entity_id, event_type, context) VALUES (?1, ?2, ?3)",
-            params![entity_id.to_string(), event_type, context],
+            "INSERT INTO access_log (entity_id, event_type, context, created_at) \
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                entity_id.to_string(),
+                event_type,
+                context,
+                Utc::now().to_rfc3339()
+            ],
         )
         .map_err(|e| TraceMindError::Storage(format!("log_access: {e}")))?;
         Ok(())
@@ -2837,8 +2851,12 @@ impl GraphStore {
         let conn = self.kg.connection();
         let mut stmt = conn
             .prepare(
+                // `replace(created_at, ' ', 'T')` normalises rows written by
+                // older builds (which used the `datetime('now')` default) so
+                // they compare correctly against RFC3339 bounds.
                 "SELECT DISTINCT entity_id FROM access_log \
-                 WHERE created_at >= ?1 AND created_at < ?2 \
+                 WHERE replace(created_at, ' ', 'T') >= ?1 \
+                   AND replace(created_at, ' ', 'T') < ?2 \
                  ORDER BY created_at DESC",
             )
             .map_err(|e| TraceMindError::Storage(format!("access log range: {e}")))?;
@@ -3903,6 +3921,32 @@ mod tests {
         let accessed = store.get_accessed_entities_in_range(start, end).unwrap();
 
         assert!(accessed.contains(&e1.id), "should find the accessed entity");
+    }
+
+    /// Regression: access-log range queries silently returned nothing
+    /// because rows were stored as "YYYY-MM-DD HH:MM:SS" and compared as
+    /// strings against RFC3339 bounds.
+    #[test]
+    fn accessed_range_matches_rows_written_by_older_builds() {
+        let store = GraphStore::open(":memory:").unwrap();
+        let e1 = make_entity("Legacy", EntityType::Concept);
+        store.upsert_entity(&e1).unwrap();
+        // Simulate an old row: space separator, no offset.
+        let legacy_ts = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+        store
+            .kg
+            .connection()
+            .execute(
+                "INSERT INTO access_log (entity_id, event_type, created_at) VALUES (?1, ?2, ?3)",
+                params![e1.id.to_string(), "query_result", legacy_ts],
+            )
+            .unwrap();
+
+        let now = Utc::now();
+        let accessed = store
+            .get_accessed_entities_in_range(now - chrono::Duration::hours(1), now + chrono::Duration::hours(1))
+            .unwrap();
+        assert!(accessed.contains(&e1.id), "legacy-format rows must still match");
     }
 
     #[test]

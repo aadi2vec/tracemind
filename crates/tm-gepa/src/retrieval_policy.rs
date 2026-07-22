@@ -21,7 +21,17 @@ use std::collections::BTreeMap;
 /// Space names the fusion policy can weight.
 pub const SPACE_NAMES: &[&str] = &["text", "lexical", "recency", "confidence"];
 
+fn default_coverage_weight() -> f32 { 0.08 }
+fn default_fit_weight() -> f32 { 1.0 }
+fn default_generic_coverage_boost() -> f32 { 15.4 }
+fn default_recency_weight() -> f32 { 0.0 }
+
 /// A concrete, executable retrieval configuration.
+///
+/// Newer scalar fields carry `serde` defaults so a `policy.json` promoted
+/// by an older build keeps loading after an upgrade. Without that, adding a
+/// knob silently reverts every user's tuned policy to the compiled-in
+/// defaults — the file fails to parse and the fallback path swallows it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RetrievalPolicy {
     /// Fusion weights per space. `BTreeMap` so serialisation and equality
@@ -33,29 +43,39 @@ pub struct RetrievalPolicy {
     pub candidate_multiplier: usize,
     /// How much question-token coverage of a candidate's text boosts it
     /// during answer selection, relative to its retrieval score.
+    #[serde(default = "default_coverage_weight")]
     pub coverage_weight: f32,
     /// How much a syntactic match between question and candidate structure
     /// (e.g. the question's trailing preposition having an object in the
     /// candidate) boosts it during answer selection.
+    #[serde(default = "default_fit_weight")]
     pub fit_weight: f32,
     /// Multiplier applied to `coverage_weight` for questions with no
     /// answer-type constraint ("why…?"). There, every candidate passes the
     /// type filter, so lexical overlap is the only signal separating them
     /// and deserves far more weight than it does for typed questions.
+    #[serde(default = "default_generic_coverage_boost")]
     pub generic_coverage_boost: f32,
+    /// How strongly a *later* memory outranks an earlier one during answer
+    /// selection. Conversations restate and revise: a defence moves from
+    /// June to July, an offer rises from $40M to $65M. Both statements are
+    /// in the history and both type-check, so without a recency preference
+    /// the answer is decided by cosine noise. 0 disables supersession.
+    #[serde(default = "default_recency_weight")]
+    pub recency_weight: f32,
 }
 
 impl Default for RetrievalPolicy {
     fn default() -> Self {
-        // Values below are the output of a GEPA run against the LoCoMo
-        // anchor set (docs/REVIEW-2026-07.md), not hand-picked: the loop
-        // moved mean F1 from 69.91 to 75.49 over 75 executed rollouts, with
-        // the final gain coming from the system-aware merge step.
+        // Output of a GEPA run against `fixtures/locomo-train.json` — the
+        // *training* split. `locomo-mini.json` is held out and only ever
+        // scored, never tuned on, so the number reported there is a
+        // generalisation measurement rather than a fit.
         let mut space_weights = BTreeMap::new();
-        space_weights.insert("text".to_string(), 0.478);
-        space_weights.insert("lexical".to_string(), 0.348);
-        space_weights.insert("recency".to_string(), 0.087);
-        space_weights.insert("confidence".to_string(), 0.087);
+        space_weights.insert("text".to_string(), 0.534);
+        space_weights.insert("lexical".to_string(), 0.311);
+        space_weights.insert("recency".to_string(), 0.078);
+        space_weights.insert("confidence".to_string(), 0.078);
         Self {
             space_weights,
             min_score: 0.15,
@@ -63,6 +83,7 @@ impl Default for RetrievalPolicy {
             coverage_weight: 0.08,
             fit_weight: 1.0,
             generic_coverage_boost: 15.4,
+            recency_weight: 0.0,
         }
     }
 }
@@ -123,6 +144,13 @@ impl RetrievalPolicy {
         next
     }
 
+    /// Perturb the supersession (recency) preference.
+    pub fn perturb_recency(&self, delta: f32) -> Self {
+        let mut next = self.clone();
+        next.recency_weight = (next.recency_weight + delta).clamp(0.0, 4.0);
+        next
+    }
+
     /// Widen or narrow candidate generation.
     pub fn perturb_candidates(&self, delta: i32) -> Self {
         let mut next = self.clone();
@@ -163,6 +191,7 @@ impl RetrievalPolicy {
                 self.generic_coverage_boost,
                 other.generic_coverage_boost,
             ),
+            recency_weight: lerp(self.recency_weight, other.recency_weight),
         }
     }
 
@@ -175,13 +204,14 @@ impl RetrievalPolicy {
             .map(|(k, v)| format!("{k}={:.3}", v))
             .collect();
         format!(
-            "{}|min={:.3}|cm={}|cov={:.3}|fit={:.3}|gcb={:.3}",
+            "{}|min={:.3}|cm={}|cov={:.3}|fit={:.3}|gcb={:.3}|rec={:.3}",
             parts.join(","),
             self.min_score,
             self.candidate_multiplier,
             self.coverage_weight,
             self.fit_weight,
-            self.generic_coverage_boost
+            self.generic_coverage_boost,
+            self.recency_weight
         )
     }
 }
@@ -260,6 +290,19 @@ mod tests {
         let m = a.merge(&b, 0.5);
         assert!(m.coverage_weight > a.coverage_weight);
         assert!(m.coverage_weight < b.coverage_weight);
+    }
+
+    /// A policy file written by an older build (missing newer fields) must
+    /// still load, or an upgrade silently discards the user's tuned policy.
+    #[test]
+    fn older_policy_files_still_deserialize() {
+        let legacy = r#"{"space_weights":{"text":0.5,"lexical":0.5},
+                         "min_score":0.2,"candidate_multiplier":6}"#;
+        let p: RetrievalPolicy = serde_json::from_str(legacy).expect("legacy policy must load");
+        assert_eq!(p.candidate_multiplier, 6);
+        assert!((p.min_score - 0.2).abs() < 1e-6);
+        assert_eq!(p.fit_weight, default_fit_weight());
+        assert_eq!(p.recency_weight, default_recency_weight());
     }
 
     #[test]

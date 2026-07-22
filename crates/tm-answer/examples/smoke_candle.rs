@@ -43,6 +43,7 @@ async fn main() -> anyhow::Result<()> {
 
     for q in questions {
         let req = AnswerRequest {
+            nearby_topics: Vec::new(),
             question: q.to_string(),
             grounding: grounding.clone(),
             task: TaskKind::ShortAnswer,

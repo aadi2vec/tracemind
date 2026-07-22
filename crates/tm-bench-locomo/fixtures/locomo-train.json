@@ -1,0 +1,268 @@
+{
+  "_comment": "GEPA TRAINING SPLIT. Authored independently of locomo-mini.json, which is the held-out evaluation set. Optimisation runs must use this file; locomo-mini.json is only ever scored, never tuned on. Conversations deliberately vary phrasing, entity density, and the position of the answer-bearing turn so a policy fitted here is not fitted to one wording.",
+  "samples": [
+    {
+      "sample_id": "maya-relocation",
+      "sessions": [
+        {
+          "session_id": "s1",
+          "date": "2026-01-08",
+          "turns": [
+            { "speaker": "Maya", "text": "I accepted the offer at Datadog. Starting February 2nd." },
+            { "speaker": "Sam", "text": "Congrats! Are you moving?" },
+            { "speaker": "Maya", "text": "Yes, relocating from Austin to Boston for it." },
+            { "speaker": "Sam", "text": "What team?" },
+            { "speaker": "Maya", "text": "Observability infrastructure. Reporting to a manager named Devi." }
+          ]
+        },
+        {
+          "session_id": "s2",
+          "date": "2026-01-22",
+          "turns": [
+            { "speaker": "Maya", "text": "Signed a lease in Somerville, not downtown like I planned." },
+            { "speaker": "Sam", "text": "How much?" },
+            { "speaker": "Maya", "text": "$3200 a month, which is brutal compared to Austin." },
+            { "speaker": "Sam", "text": "Worth it?" },
+            { "speaker": "Maya", "text": "The commute is 20 minutes so yes." }
+          ]
+        },
+        {
+          "session_id": "s3",
+          "date": "2026-02-14",
+          "turns": [
+            { "speaker": "Maya", "text": "Two weeks in. The onboarding was rough but the team is great." },
+            { "speaker": "Sam", "text": "Still on observability?" },
+            { "speaker": "Maya", "text": "They moved me to the storage team in week one. Long story." }
+          ]
+        }
+      ],
+      "questions": [
+        { "id": "q1", "question": "Where did Maya move to?", "answers": ["Boston"], "category": "single_hop" },
+        { "id": "q2", "question": "Which company did Maya join?", "answers": ["Datadog"], "category": "single_hop" },
+        { "id": "q3", "question": "When did Maya start her new job?", "answers": ["February 2nd", "February 2"], "category": "temporal" },
+        { "id": "q4", "question": "Who is Maya's manager?", "answers": ["Devi"], "category": "single_hop" },
+        { "id": "q5", "question": "How much is Maya's rent?", "answers": ["$3200", "$3200 a month"], "category": "single_hop" },
+        { "id": "q6", "question": "Which neighbourhood did Maya sign a lease in?", "answers": ["Somerville"], "category": "single_hop" },
+        { "id": "q7", "question": "Did Maya move to Seattle?", "answers": ["No, Boston", "No"], "category": "adversarial" },
+        { "id": "q8", "question": "Which team is Maya on now?", "answers": ["storage", "the storage team"], "category": "multi_hop" },
+        { "id": "q9", "question": "Did Maya stay on the observability team?", "answers": ["No", "No, storage"], "category": "adversarial" }
+      ]
+    },
+    {
+      "sample_id": "theo-restaurant",
+      "sessions": [
+        {
+          "session_id": "s1",
+          "date": "2026-02-03",
+          "turns": [
+            { "speaker": "Theo", "text": "We're opening the restaurant on March 15th." },
+            { "speaker": "Ida", "text": "What's it called?" },
+            { "speaker": "Theo", "text": "Calling it Ember. Wood-fired everything." },
+            { "speaker": "Ida", "text": "Where?" },
+            { "speaker": "Theo", "text": "On Valencia Street, the old bakery space." }
+          ]
+        },
+        {
+          "session_id": "s2",
+          "date": "2026-02-20",
+          "turns": [
+            { "speaker": "Theo", "text": "Hired a head chef. Her name is Rosa, she came from Quince." },
+            { "speaker": "Ida", "text": "Nice pedigree. Menu size?" },
+            { "speaker": "Theo", "text": "Twelve dishes to start. I wanted twenty but Rosa talked me down." }
+          ]
+        },
+        {
+          "session_id": "s3",
+          "date": "2026-03-18",
+          "turns": [
+            { "speaker": "Theo", "text": "We opened three days late, on the 18th. Permit delay." },
+            { "speaker": "Ida", "text": "How was night one?" },
+            { "speaker": "Theo", "text": "Ninety covers. Way past what we projected." }
+          ]
+        }
+      ],
+      "questions": [
+        { "id": "q1", "question": "What is Theo's restaurant called?", "answers": ["Ember"], "category": "single_hop" },
+        { "id": "q2", "question": "Who did Theo hire as head chef?", "answers": ["Rosa"], "category": "single_hop" },
+        { "id": "q3", "question": "Which street is the restaurant on?", "answers": ["Valencia", "Valencia Street"], "category": "single_hop" },
+        { "id": "q4", "question": "Where did Rosa work before?", "answers": ["Quince"], "category": "single_hop" },
+        { "id": "q5", "question": "How many dishes are on the opening menu?", "answers": ["Twelve", "12"], "category": "single_hop" },
+        { "id": "q6", "question": "When did the restaurant actually open?", "answers": ["March 18th", "the 18th", "March 18"], "category": "temporal" },
+        { "id": "q7", "question": "Did Ember open on March 15th?", "answers": ["No", "No, March 18th"], "category": "adversarial" },
+        { "id": "q8", "question": "Why did the opening slip?", "answers": ["Permit delay", "a permit delay"], "category": "multi_hop" }
+      ]
+    },
+    {
+      "sample_id": "nadia-thesis",
+      "sessions": [
+        {
+          "session_id": "s1",
+          "date": "2026-01-12",
+          "turns": [
+            { "speaker": "Nadia", "text": "My thesis defence is scheduled for June 4th." },
+            { "speaker": "Omar", "text": "On what exactly?" },
+            { "speaker": "Nadia", "text": "Sparse attention for long-context retrieval." },
+            { "speaker": "Omar", "text": "Who's on your committee?" },
+            { "speaker": "Nadia", "text": "Chaired by Professor Lindqvist, plus two externals." }
+          ]
+        },
+        {
+          "session_id": "s2",
+          "date": "2026-03-02",
+          "turns": [
+            { "speaker": "Nadia", "text": "Chapter four got rejected by my advisor. Rewriting the whole evaluation." },
+            { "speaker": "Omar", "text": "Ouch. Does that push the defence?" },
+            { "speaker": "Nadia", "text": "Moved it to July 9th to be safe." }
+          ]
+        },
+        {
+          "session_id": "s3",
+          "date": "2026-07-10",
+          "turns": [
+            { "speaker": "Nadia", "text": "Passed with minor revisions!" },
+            { "speaker": "Omar", "text": "Amazing. How long was it?" },
+            { "speaker": "Nadia", "text": "Two hours and ten minutes of questions." }
+          ]
+        }
+      ],
+      "questions": [
+        { "id": "q1", "question": "When is Nadia's defence?", "answers": ["July 9th", "July 9"], "category": "temporal" },
+        { "id": "q2", "question": "Who chairs Nadia's committee?", "answers": ["Lindqvist", "Professor Lindqvist"], "category": "single_hop" },
+        { "id": "q3", "question": "What is Nadia's thesis about?", "answers": ["Sparse attention for long-context retrieval", "sparse attention"], "category": "single_hop" },
+        { "id": "q4", "question": "Which chapter did her advisor reject?", "answers": ["Chapter four", "four", "chapter 4"], "category": "single_hop" },
+        { "id": "q5", "question": "Did Nadia defend in June?", "answers": ["No", "No, July 9th"], "category": "adversarial" },
+        { "id": "q6", "question": "Why was the defence moved?", "answers": ["Chapter four was rejected", "rewriting the evaluation", "chapter four got rejected"], "category": "multi_hop" },
+        { "id": "q7", "question": "Did Nadia pass?", "answers": ["Yes", "Yes, with minor revisions"], "category": "adversarial" }
+      ]
+    },
+    {
+      "sample_id": "raj-cycling",
+      "sessions": [
+        {
+          "session_id": "s1",
+          "date": "2026-04-02",
+          "turns": [
+            { "speaker": "Raj", "text": "Registered for the Dolomites gran fondo in September." },
+            { "speaker": "Pia", "text": "Distance?" },
+            { "speaker": "Raj", "text": "138 kilometres with 4000 metres of climbing." },
+            { "speaker": "Pia", "text": "Target?" },
+            { "speaker": "Raj", "text": "I'd like to go under seven hours." }
+          ]
+        },
+        {
+          "session_id": "s2",
+          "date": "2026-06-15",
+          "turns": [
+            { "speaker": "Raj", "text": "Cracked a rib in a crash at the Tuesday crit." },
+            { "speaker": "Pia", "text": "Are you out?" },
+            { "speaker": "Raj", "text": "Six weeks off the bike. The fondo is still on though." }
+          ]
+        },
+        {
+          "session_id": "s3",
+          "date": "2026-09-14",
+          "turns": [
+            { "speaker": "Raj", "text": "Finished in 7:22:05. Missed the target but I'll take it." },
+            { "speaker": "Pia", "text": "After a broken rib that's strong." },
+            { "speaker": "Raj", "text": "Bike held up too. The new Campagnolo groupset was worth it." }
+          ]
+        }
+      ],
+      "questions": [
+        { "id": "q1", "question": "Which event did Raj register for?", "answers": ["Dolomites gran fondo", "the Dolomites gran fondo", "Dolomites"], "category": "single_hop" },
+        { "id": "q2", "question": "What was Raj's target time?", "answers": ["under seven hours", "seven hours", "sub seven hours"], "category": "single_hop" },
+        { "id": "q3", "question": "What was Raj's finish time?", "answers": ["7:22:05"], "category": "single_hop" },
+        { "id": "q4", "question": "How long was the course?", "answers": ["138 kilometres", "138 km", "138"], "category": "single_hop" },
+        { "id": "q5", "question": "What injury did Raj have?", "answers": ["Cracked a rib", "a cracked rib", "broken rib"], "category": "single_hop" },
+        { "id": "q6", "question": "Did Raj beat his target?", "answers": ["No", "No, 7:22:05"], "category": "adversarial" },
+        { "id": "q7", "question": "Which groupset did Raj use?", "answers": ["Campagnolo"], "category": "single_hop" },
+        { "id": "q8", "question": "When did Raj ride the fondo?", "answers": ["September", "September 14"], "category": "temporal" }
+      ]
+    },
+    {
+      "sample_id": "ines-acquisition",
+      "sessions": [
+        {
+          "session_id": "s1",
+          "date": "2026-05-06",
+          "turns": [
+            { "speaker": "Ines", "text": "We got an inbound from Cloudflare about acquiring us." },
+            { "speaker": "Gus", "text": "Number?" },
+            { "speaker": "Ines", "text": "They floated $40M, all stock." },
+            { "speaker": "Gus", "text": "Would you take it?" },
+            { "speaker": "Ines", "text": "Not at that price. We just closed our Series A." }
+          ]
+        },
+        {
+          "session_id": "s2",
+          "date": "2026-05-28",
+          "turns": [
+            { "speaker": "Ines", "text": "They came back at $65M with half cash." },
+            { "speaker": "Gus", "text": "That's a real move." },
+            { "speaker": "Ines", "text": "Board meets Thursday to vote on it." }
+          ]
+        },
+        {
+          "session_id": "s3",
+          "date": "2026-06-11",
+          "turns": [
+            { "speaker": "Ines", "text": "We signed. $65M, closing in August." },
+            { "speaker": "Gus", "text": "What happens to the team?" },
+            { "speaker": "Ines", "text": "Everyone gets offers. I'm staying on for two years." }
+          ]
+        }
+      ],
+      "questions": [
+        { "id": "q1", "question": "Which company is acquiring Ines's startup?", "answers": ["Cloudflare"], "category": "single_hop" },
+        { "id": "q2", "question": "How much did they finally agree on?", "answers": ["$65M", "65 million"], "category": "single_hop" },
+        { "id": "q3", "question": "When does the deal close?", "answers": ["August"], "category": "temporal" },
+        { "id": "q4", "question": "Did Ines accept the first offer?", "answers": ["No", "No, $65M"], "category": "adversarial" },
+        { "id": "q5", "question": "How long is Ines staying on?", "answers": ["two years", "2 years"], "category": "single_hop" },
+        { "id": "q6", "question": "Why did Ines reject the first offer?", "answers": ["They just closed their Series A", "just closed a Series A", "the price"], "category": "multi_hop" }
+      ]
+    },
+    {
+      "sample_id": "kofi-language",
+      "sessions": [
+        {
+          "session_id": "s1",
+          "date": "2026-02-11",
+          "turns": [
+            { "speaker": "Kofi", "text": "Started learning Portuguese for the Lisbon move." },
+            { "speaker": "Ana", "text": "Which app?" },
+            { "speaker": "Kofi", "text": "Using Anki plus a tutor named Beatriz twice a week." },
+            { "speaker": "Ana", "text": "Goal?" },
+            { "speaker": "Kofi", "text": "B2 by the end of the year." }
+          ]
+        },
+        {
+          "session_id": "s2",
+          "date": "2026-05-19",
+          "turns": [
+            { "speaker": "Kofi", "text": "Took the placement test. Came out at A2, lower than I hoped." },
+            { "speaker": "Ana", "text": "Still progress." },
+            { "speaker": "Kofi", "text": "Switching to three sessions a week with Beatriz." }
+          ]
+        },
+        {
+          "session_id": "s3",
+          "date": "2026-06-30",
+          "turns": [
+            { "speaker": "Kofi", "text": "Move is confirmed for October, not August." },
+            { "speaker": "Ana", "text": "More study time then." },
+            { "speaker": "Kofi", "text": "Exactly. Might actually hit B2." }
+          ]
+        }
+      ],
+      "questions": [
+        { "id": "q1", "question": "Which language is Kofi learning?", "answers": ["Portuguese"], "category": "single_hop" },
+        { "id": "q2", "question": "Who is Kofi's tutor?", "answers": ["Beatriz"], "category": "single_hop" },
+        { "id": "q3", "question": "Which city is Kofi moving to?", "answers": ["Lisbon"], "category": "single_hop" },
+        { "id": "q4", "question": "When is Kofi moving?", "answers": ["October"], "category": "temporal" },
+        { "id": "q5", "question": "What level did Kofi place at?", "answers": ["A2"], "category": "single_hop" },
+        { "id": "q6", "question": "Did Kofi place at B2?", "answers": ["No", "No, A2"], "category": "adversarial" },
+        { "id": "q7", "question": "Which tool is Kofi using to study?", "answers": ["Anki"], "category": "single_hop" }
+      ]
+    }
+  ]
+}

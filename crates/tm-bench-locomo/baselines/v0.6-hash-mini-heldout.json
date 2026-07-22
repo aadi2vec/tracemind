@@ -1,0 +1,311 @@
+{
+  "runner": "tracemind-v0.1-hash",
+  "timestamp": "2026-07-22T15:29:12.853488+00:00",
+  "total_questions": 20,
+  "total_samples": 3,
+  "overall_f1": 48.333336,
+  "overall_exact_match": 40.0,
+  "by_category": {
+    "adversarial": {
+      "count": 3,
+      "f1": 38.888893,
+      "exact_match": 0.0
+    },
+    "multi_hop": {
+      "count": 3,
+      "f1": 33.333336,
+      "exact_match": 33.333336
+    },
+    "single_hop": {
+      "count": 12,
+      "f1": 45.833336,
+      "exact_match": 41.666664
+    },
+    "temporal": {
+      "count": 2,
+      "f1": 100.0,
+      "exact_match": 100.0
+    }
+  },
+  "wall_seconds": 0.739855791,
+  "outcomes": [
+    {
+      "sample_id": "alice-tokyo",
+      "question_id": "q1",
+      "category": "temporal",
+      "question": "When is Alice flying to Tokyo?",
+      "prediction": "May 3rd",
+      "references": [
+        "May 3rd",
+        "May 3",
+        "3rd of May"
+      ],
+      "f1": 1.0,
+      "exact_match": 1.0,
+      "latency_ms": 6
+    },
+    {
+      "sample_id": "alice-tokyo",
+      "question_id": "q2",
+      "category": "single_hop",
+      "question": "What is Alice's talk about?",
+      "prediction": "NeurIPS regional. I'll be there three days.",
+      "references": [
+        "Local memory systems for consumer apps",
+        "local memory systems"
+      ],
+      "f1": 0.0,
+      "exact_match": 0.0,
+      "latency_ms": 8
+    },
+    {
+      "sample_id": "alice-tokyo",
+      "question_id": "q3",
+      "category": "multi_hop",
+      "question": "Why is Alice going to Tokyo?",
+      "prediction": "Local memory systems for consumer apps.",
+      "references": [
+        "To present at NeurIPS regional",
+        "NeurIPS regional conference",
+        "conference"
+      ],
+      "f1": 0.0,
+      "exact_match": 0.0,
+      "latency_ms": 7
+    },
+    {
+      "sample_id": "alice-tokyo",
+      "question_id": "q4",
+      "category": "single_hop",
+      "question": "Where is Alice staying in Tokyo?",
+      "prediction": "JFK",
+      "references": [
+        "Shinjuku",
+        "a hotel in Shinjuku"
+      ],
+      "f1": 0.0,
+      "exact_match": 0.0,
+      "latency_ms": 6
+    },
+    {
+      "sample_id": "alice-tokyo",
+      "question_id": "q5",
+      "category": "single_hop",
+      "question": "Which airport did Alice fly into?",
+      "prediction": "Tokyo",
+      "references": [
+        "Haneda"
+      ],
+      "f1": 0.0,
+      "exact_match": 0.0,
+      "latency_ms": 7
+    },
+    {
+      "sample_id": "alice-tokyo",
+      "question_id": "q6",
+      "category": "adversarial",
+      "question": "Did Alice fly to Tokyo on May 1st?",
+      "prediction": "No, Local",
+      "references": [
+        "No, May 3rd",
+        "No"
+      ],
+      "f1": 0.6666667,
+      "exact_match": 0.0,
+      "latency_ms": 6
+    },
+    {
+      "sample_id": "carol-startup",
+      "question_id": "q1",
+      "category": "single_hop",
+      "question": "What was Carol's previous employer?",
+      "prediction": "Sequoia",
+      "references": [
+        "Stripe"
+      ],
+      "f1": 0.0,
+      "exact_match": 0.0,
+      "latency_ms": 8
+    },
+    {
+      "sample_id": "carol-startup",
+      "question_id": "q2",
+      "category": "single_hop",
+      "question": "Who led Carol's pre-seed round?",
+      "prediction": "Stripe",
+      "references": [
+        "Sequoia"
+      ],
+      "f1": 0.0,
+      "exact_match": 0.0,
+      "latency_ms": 7
+    },
+    {
+      "sample_id": "carol-startup",
+      "question_id": "q3",
+      "category": "single_hop",
+      "question": "How much did Carol raise?",
+      "prediction": "$1.5M",
+      "references": [
+        "$2.5M",
+        "2.5 million"
+      ],
+      "f1": 0.5,
+      "exact_match": 0.0,
+      "latency_ms": 7
+    },
+    {
+      "sample_id": "carol-startup",
+      "question_id": "q4",
+      "category": "single_hop",
+      "question": "What did Carol rename her company to?",
+      "prediction": "Memex",
+      "references": [
+        "Memex"
+      ],
+      "f1": 1.0,
+      "exact_match": 1.0,
+      "latency_ms": 7
+    },
+    {
+      "sample_id": "carol-startup",
+      "question_id": "q5",
+      "category": "multi_hop",
+      "question": "Why did Carol rename the company?",
+      "prediction": "I'm leaving Stripe to start a company.",
+      "references": [
+        "Loom was trademarked",
+        "the original name was trademarked",
+        "trademark"
+      ],
+      "f1": 0.0,
+      "exact_match": 0.0,
+      "latency_ms": 7
+    },
+    {
+      "sample_id": "carol-startup",
+      "question_id": "q6",
+      "category": "single_hop",
+      "question": "Who is Carol's first hire?",
+      "prediction": "Priya",
+      "references": [
+        "Priya"
+      ],
+      "f1": 1.0,
+      "exact_match": 1.0,
+      "latency_ms": 7
+    },
+    {
+      "sample_id": "carol-startup",
+      "question_id": "q7",
+      "category": "adversarial",
+      "question": "Did Carol raise from Andreessen Horowitz?",
+      "prediction": "No, I'm",
+      "references": [
+        "No, from Sequoia",
+        "No"
+      ],
+      "f1": 0.5,
+      "exact_match": 0.0,
+      "latency_ms": 8
+    },
+    {
+      "sample_id": "ethan-marathon",
+      "question_id": "q1",
+      "category": "single_hop",
+      "question": "What marathon did Ethan run?",
+      "prediction": "Yeah",
+      "references": [
+        "Boston",
+        "Boston Marathon"
+      ],
+      "f1": 0.0,
+      "exact_match": 0.0,
+      "latency_ms": 6
+    },
+    {
+      "sample_id": "ethan-marathon",
+      "question_id": "q2",
+      "category": "single_hop",
+      "question": "What was Ethan's goal time?",
+      "prediction": "Sub-3:00",
+      "references": [
+        "sub-3:00",
+        "Sub-3:00",
+        "under three hours"
+      ],
+      "f1": 1.0,
+      "exact_match": 1.0,
+      "latency_ms": 7
+    },
+    {
+      "sample_id": "ethan-marathon",
+      "question_id": "q3",
+      "category": "single_hop",
+      "question": "What was Ethan's finish time?",
+      "prediction": "2:58:42",
+      "references": [
+        "2:58:42"
+      ],
+      "f1": 1.0,
+      "exact_match": 1.0,
+      "latency_ms": 6
+    },
+    {
+      "sample_id": "ethan-marathon",
+      "question_id": "q4",
+      "category": "multi_hop",
+      "question": "Did Ethan beat his goal?",
+      "prediction": "Yes",
+      "references": [
+        "Yes",
+        "Yes, he ran 2:58:42 vs sub-3:00 goal"
+      ],
+      "f1": 1.0,
+      "exact_match": 1.0,
+      "latency_ms": 8
+    },
+    {
+      "sample_id": "ethan-marathon",
+      "question_id": "q5",
+      "category": "temporal",
+      "question": "When did Ethan run Boston?",
+      "prediction": "April 20",
+      "references": [
+        "April 20",
+        "April 20 2026"
+      ],
+      "f1": 1.0,
+      "exact_match": 1.0,
+      "latency_ms": 7
+    },
+    {
+      "sample_id": "ethan-marathon",
+      "question_id": "q6",
+      "category": "single_hop",
+      "question": "Which training method did Ethan use?",
+      "prediction": "Hanson",
+      "references": [
+        "Hanson",
+        "Hanson method"
+      ],
+      "f1": 1.0,
+      "exact_match": 1.0,
+      "latency_ms": 8
+    },
+    {
+      "sample_id": "ethan-marathon",
+      "question_id": "q7",
+      "category": "adversarial",
+      "question": "Did Ethan miss his sub-3:00 goal?",
+      "prediction": "Yes",
+      "references": [
+        "No, he ran 2:58:42",
+        "No"
+      ],
+      "f1": 0.0,
+      "exact_match": 0.0,
+      "latency_ms": 7
+    }
+  ]
+}

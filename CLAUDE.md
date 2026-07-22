@@ -102,6 +102,15 @@ core types ────────────── tm-types  (zero I/O; every
 **Ingest** (`tm-ingest::IngestPipeline`):
 governance gate (PII + confidence) → heuristic NER (or `GlinerExtractor` if available) → `GraphStore.upsert()` (entities + typed triples) → `VectorStore.embed()` (BGE-small via fastembed) → `TraceStore.append()` Ingest event → `RecentStore.append()` ring buffer for capture-feedback
 
+**Reward** (`tm-retrieval`): the bandit updates **only on evidence** — explicit
+`memory_feedback`, or clicks/dwell on an `Interactive` host. An un-evidenced query
+registers nothing. MCP defaults to `HostKind::Agentic`, where inter-tool-call
+timing carries no information.
+
+**Grounding** (`tm-retrieval::Grounding`): every result is `Found` / `Uncertain` /
+`NotStored`. The answer layer abstains explicitly rather than returning an empty
+string, naming nearby topics it does know.
+
 **Retrieval policy** (`tm-gepa::RetrievalPolicy`, loaded from `~/.tracemind/policy.json`):
 `ComposedIndex` fusion weights (`text` dense · `lexical` BM25 · `recency` · `confidence`) plus score floor, candidate width, and answer-selection weights. Produced by `tm-bench-locomo --gepa`, promoted with `tracemind policy set <report>`, applied at `RetrievalEngine::open()`. Falls back to compiled-in defaults when absent or corrupt.
 
@@ -187,9 +196,17 @@ Selection: structured tasks prefer Tier 1; open-ended prefers Tier 2 → Tier 1 
 - **`tm-bench`** — ingest + retrieval microbenchmarks
 - **`tm-bench-ner`** — GLiNER NER quality eval against labeled sets
 - **`tm-bench-ner-e2e`** — end-to-end round-trip
-- **`tm-bench-locomo`** — published LoCoMo scoring harness (token F1 + EM, 5 categories: single_hop / multi_hop / temporal / open_domain / adversarial). CI gate fails any PR that drops > 0.5 F1. Current mini-set baseline: **F1 75.49 / EM 65.00** (v0.5, 2026-07-22, BGE; hash scores 48.33). Also runs the GEPA optimisation loop via `--gepa`. See `docs/H2-AUDIT-2026-07.md`.
+- **`tm-bench-locomo`** — published LoCoMo scoring harness (token F1 + EM, 5 categories). Two splits:
+  - `fixtures/locomo-train.json` (45 q) — **GEPA tunes here**. Current: F1 50.32 / EM 42.22.
+  - `fixtures/locomo-mini.json` (20 q) — **held out**, only ever scored. Current: F1 70.49 / EM 60.00 (BGE); 48.33 hash.
 
-  Caveat: the mini fixture is 20 questions, and the GEPA anchor set is the same 20 — the tuned policy is fitted, not validated. Do not quote 75.49 externally before a held-out split on real LoCoMo. The pre-v0.5 figure of 49.27 was produced with the retrieval engine returning nothing (see audit §2.2) and is not a comparable system metric.
+  Never tune on the held-out split. `mini` scores higher than `train` because the
+  span extractors were originally developed against it and retain that fit —
+  **50.32 is the number to plan against**. See `docs/MVP-STATUS-2026-07.md`.
+
+  Gates: `regression_gate` (F1 drop) and `embedder_separation_gate` (fails when a
+  trained encoder does not beat `--hash-embed`, the condition that hid a dead
+  retrieval path for four releases).
 
 ### Roadmap
 

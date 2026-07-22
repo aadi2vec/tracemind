@@ -61,7 +61,7 @@ impl VerbWeights {
 /// defaults awaiting their own anchor sets.
 pub fn default_verb_weights() -> Vec<VerbWeights> {
     vec![
-        VerbWeights::new("recall",     &[("text", 0.478), ("lexical", 0.348), ("recency", 0.087), ("confidence", 0.087)]),
+        VerbWeights::new("recall",     &[("text", 0.534), ("lexical", 0.311), ("recency", 0.078), ("confidence", 0.078)]),
         VerbWeights::new("plan",       &[("text", 0.3), ("lexical", 0.2), ("recency", 0.35), ("confidence", 0.15)]),
         VerbWeights::new("contradict", &[("text", 0.35), ("lexical", 0.3), ("confidence", 0.2), ("recency", 0.15)]),
         VerbWeights::new("reflect",    &[("text", 0.25), ("lexical", 0.15), ("recency", 0.45), ("confidence", 0.15)]),

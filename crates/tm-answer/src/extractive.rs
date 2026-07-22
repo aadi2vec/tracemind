@@ -48,7 +48,7 @@ impl ExtractiveBackend {
 
     fn synthesize(&self, req: &AnswerRequest) -> String {
         if req.grounding.is_empty() {
-            return format!("No memories found for: {}", req.question);
+            return abstain(req);
         }
 
         let question_tokens = tokenize_query(&req.question);
@@ -365,7 +365,9 @@ mod tests {
         let req = AnswerRequest::new("who is alice?", TaskKind::ShortAnswer);
         let resp = backend.answer(&req).await.unwrap();
         assert_eq!(resp.tier, AnswerTier::Extractive);
-        assert!(resp.text.contains("No memories"));
+        // Abstention wording changed: an empty result now says so
+        // explicitly rather than emitting a bare "No memories found".
+        assert!(resp.text.contains("nothing stored"), "got {}", resp.text);
         assert!(resp.citations.is_empty());
     }
 
@@ -459,5 +461,82 @@ mod tests {
         let s_irrelevant = sentence_overlap_score(irrelevant, &question_tokens);
         assert!(s_relevant > s_irrelevant,
             "relevant={s_relevant:.3} should > irrelevant={s_irrelevant:.3}");
+    }
+}
+
+/// Build an explicit abstention.
+///
+/// A memory system that returns nothing has told the user three
+/// indistinguishable things: "you never told me", "the capture daemon is
+/// not running", and "retrieval is broken". Naming the first case, and
+/// offering the topics that *are* stored, is what makes the answer
+/// actionable — and a well-scoped "I don't know" builds more trust than a
+/// confident wrong answer, which is the failure mode a benchmark optimised
+/// on token overlap actively rewards.
+fn abstain(req: &AnswerRequest) -> String {
+    if req.nearby_topics.is_empty() {
+        format!(
+            "I have nothing stored about that. (Question: {})",
+            req.question
+        )
+    } else {
+        let topics = req
+            .nearby_topics
+            .iter()
+            .take(5)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(
+            "I have nothing stored that answers that. Closest topics I do know about: {topics}."
+        )
+    }
+}
+
+#[cfg(test)]
+mod abstain_tests {
+    use super::*;
+    use crate::types::TaskKind;
+
+    #[test]
+    fn abstention_is_never_empty() {
+        let req = AnswerRequest::new("who is Bob?", TaskKind::ShortAnswer);
+        let out = abstain(&req);
+        assert!(!out.trim().is_empty());
+        assert!(out.contains("nothing stored"), "got {out}");
+    }
+
+    #[test]
+    fn abstention_offers_nearby_topics_when_known() {
+        let mut req = AnswerRequest::new("who is Bob?", TaskKind::ShortAnswer);
+        req.nearby_topics = vec!["Alice".into(), "Tokyo".into()];
+        let out = abstain(&req);
+        assert!(out.contains("Alice"), "got {out}");
+        assert!(out.contains("Tokyo"), "got {out}");
+    }
+
+    #[test]
+    fn abstention_caps_topic_list() {
+        let mut req = AnswerRequest::new("q", TaskKind::ShortAnswer);
+        req.nearby_topics = (0..20).map(|i| format!("topic{i}")).collect();
+        let out = abstain(&req);
+        assert!(!out.contains("topic5"), "should cap at 5: {out}");
+    }
+
+    #[test]
+    fn empty_grounding_never_yields_an_empty_answer() {
+        let backend = ExtractiveBackend::default();
+        for task in [
+            TaskKind::ShortAnswer,
+            TaskKind::OpenEndedSynthesis,
+            TaskKind::Summarization,
+            TaskKind::StructuredExtraction,
+        ] {
+            let req = AnswerRequest::new("anything", task);
+            assert!(
+                !backend.synthesize(&req).trim().is_empty(),
+                "empty answer for {task:?}"
+            );
+        }
     }
 }

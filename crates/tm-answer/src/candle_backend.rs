@@ -558,7 +558,21 @@ mod tests {
         assert!(p.contains("<|im_start|>assistant"));
         assert!(p.contains("[1] Alice is a software engineer."));
         assert!(p.contains("Question: who is alice?"));
-        assert!(p.to_lowercase().contains("cite"));
+        // ShortAnswer deliberately *forbids* citation markers — the answer
+        // must be the bare span. Citation behaviour is asserted on
+        // OpenEndedSynthesis below, where it actually applies.
+        assert!(
+            p.to_lowercase().contains("no citation markers"),
+            "got {p}"
+        );
+    }
+
+    #[test]
+    fn open_ended_prompt_asks_for_inline_citations() {
+        let req = AnswerRequest::new("summarise alice", TaskKind::OpenEndedSynthesis)
+            .with_grounding(vec![chunk("t1", "Alice is a software engineer.")]);
+        let p = build_candle_prompt(&req);
+        assert!(p.to_lowercase().contains("cite"), "got {p}");
     }
 
     #[test]

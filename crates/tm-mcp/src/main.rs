@@ -1614,7 +1614,7 @@ async fn handle_memory_query(
     // grounded prose answer (Tier 0 baseline; Tier 1 when local-llm feature
     // is on and weights are present).
     let grounding = answerer::grounding_from(&result, 6);
-    let req = answerer::short_answer_request(text, grounding);
+    let req = answerer::short_answer_request_with_context(text, &result, grounding);
     let answer_value: Value = match answerer.answer(&req).await {
         Ok(resp) => {
             let cites: Vec<Value> = resp
@@ -1633,6 +1633,10 @@ async fn handle_memory_query(
                 "tier": format!("{:?}", resp.tier).to_lowercase(),
                 "citations": cites,
                 "latency_ms": resp.latency_ms,
+                // Tells the caller whether to trust this answer, and lets a
+                // host distinguish "nothing is stored" from "retrieval
+                // failed" — which an empty string cannot express.
+                "grounding": result.grounding,
             })
         }
         Err(e) => {
@@ -2247,7 +2251,40 @@ fn handle_memory_feedback(params: &Value, db_path: &str) -> Result<Value, String
             let signal_id = graph
                 .record_feedback_signal(&signal)
                 .map_err(|e| format!("record_feedback_signal: {e}"))?;
-            Ok(json!({ "ok": true, "class": "implicit", "kind": kind, "signal_id": signal_id }))
+
+            // Also route the retrieval-outcome signals into the bandit's
+            // reward channels. Recording them only as `feedback_signals`
+            // rows left them inert: on an agentic host they are the *only*
+            // implicit evidence available (there is no click and no dwell),
+            // so if they do not reach the controller nothing does.
+            //
+            // `proposal_silenced` is about a surfaced card, not about
+            // whether retrieval found the right memory, so it stays out of
+            // the retrieval reward.
+            let mut trained = false;
+            match kind {
+                "retrieval_cited" => {
+                    graph
+                        .write_positive_signal(query_id, result_id, kind, None, 0.3)
+                        .map_err(|e| format!("write_positive_signal: {e}"))?;
+                    trained = true;
+                }
+                "retrieval_miss" => {
+                    graph
+                        .write_negative_signal(query_id, result_id, kind, None, None, 0.5)
+                        .map_err(|e| format!("write_negative_signal: {e}"))?;
+                    trained = true;
+                }
+                _ => {}
+            }
+
+            Ok(json!({
+                "ok": true,
+                "class": "implicit",
+                "kind": kind,
+                "signal_id": signal_id,
+                "trains_bandit": trained,
+            }))
         }
         // Q3.1: behavioral signals — verb invocations
         "verb_invoked" => {

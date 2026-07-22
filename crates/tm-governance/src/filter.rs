@@ -65,6 +65,62 @@ impl GovernanceFilter {
 
     /// Phone: a sequence of 10 consecutive digits (ignoring spaces, dashes, parens) or +1 followed
     /// by 10 digits (ignoring the same separators).
+    /// Whether the character at `idx` is a letter, i.e. the digit run is
+    /// glued to an identifier rather than standing alone.
+    ///
+    /// Without this guard, hex strings match the numeric detectors: a UUID
+    /// or commit SHA contains long digit runs separated by dashes, and
+    /// "collect ten digits skipping dashes" happily consumes them. That
+    /// silently rejects exactly the content TraceMind exists to capture —
+    /// UUIDs, SHAs, hashes and IDs are everywhere in a developer's
+    /// clipboard — and the rejection is invisible, because the ingest gate
+    /// simply drops the memory.
+    fn is_letter_at(chars: &[char], idx: usize) -> bool {
+        chars.get(idx).map(|c| c.is_ascii_alphabetic()).unwrap_or(false)
+    }
+
+    /// A numeric run is only PII-like if no whitespace-delimited token it
+    /// spans contains a letter.
+    ///
+    /// Checking only the immediately adjacent characters is not enough: a
+    /// ten-digit run inside a UUID often ends on a `-`, so the next
+    /// character is a separator rather than the hex letter that follows it.
+    /// Widening to the enclosing token is what actually distinguishes
+    /// `550e8400-e29b-41d4-…` from `415-555-0132`.
+    fn has_token_boundaries(chars: &[char], start: usize, end: usize) -> bool {
+        let n = chars.len();
+        // Expand to the whitespace-delimited span containing [start, end).
+        let mut lo = start.min(n);
+        while lo > 0 && !chars[lo - 1].is_whitespace() {
+            lo -= 1;
+        }
+        let mut hi = end.min(n);
+        while hi < n && !chars[hi].is_whitespace() {
+            hi += 1;
+        }
+        !chars[lo..hi].iter().any(|c| c.is_ascii_alphabetic())
+    }
+
+    /// Total digits in the whitespace-delimited token spanning `[start, end)`.
+    ///
+    /// Length is the other half of the identifier test. A phone number's
+    /// token holds about ten digits; a UUID's holds thirty-two. Matching
+    /// "ten digits, ignoring dashes" therefore fires on the *first ten* of a
+    /// far longer identifier, and checking only the adjacent character
+    /// cannot see that — the eleventh digit is usually behind a dash.
+    fn token_digit_count(chars: &[char], start: usize, end: usize) -> usize {
+        let n = chars.len();
+        let mut lo = start.min(n);
+        while lo > 0 && !chars[lo - 1].is_whitespace() {
+            lo -= 1;
+        }
+        let mut hi = end.min(n);
+        while hi < n && !chars[hi].is_whitespace() {
+            hi += 1;
+        }
+        chars[lo..hi].iter().filter(|c| c.is_ascii_digit()).count()
+    }
+
     fn has_phone(text: &str) -> bool {
         // Strip separators and look for 10-digit (or +1 + 10-digit) runs in the original text by
         // scanning windows of characters.
@@ -111,7 +167,15 @@ impl GovernanceFilter {
                 // Make sure there are no extra digits immediately after (avoid matching part of
                 // a longer digit sequence that isn't a phone)
                 let trailing_digit = k < n && chars[k].is_ascii_digit();
-                if !trailing_digit {
+                // …and that the run is not glued to letters, which is what
+                // a hex identifier looks like.
+                // A phone token carries ~10-11 digits; anything materially
+                // longer is an identifier that merely starts with ten.
+                let plausible_length = Self::token_digit_count(&chars, i, k) <= 11;
+                if !trailing_digit
+                    && plausible_length
+                    && Self::has_token_boundaries(&chars, i, k)
+                {
                     // Also check that the run we consumed was actually phone-like: if no +1 prefix,
                     // ensure this 10-digit run isn't just a raw unbroken 16-digit CC number.
                     // We'll let has_credit_card handle that; accept here.
@@ -166,7 +230,12 @@ impl GovernanceFilter {
             // Ensure no extra digits immediately adjacent (word boundary)
             let before_ok = i == 0 || !bytes[i - 1].is_ascii_digit();
             let after_ok = (i + 11) >= len || !bytes[i + 11].is_ascii_digit();
-            if before_ok && after_ok {
+            let chars: Vec<char> = text.chars().collect();
+            if before_ok
+                && after_ok
+                && Self::token_digit_count(&chars, i, i + 11) <= 9
+                && Self::has_token_boundaries(&chars, i, i + 11)
+            {
                 return true;
             }
         }
@@ -198,10 +267,15 @@ impl GovernanceFilter {
                 }
             }
             if digits == 16 {
-                // No extra digit on either side
+                // No extra digit on either side, and not embedded in an
+                // identifier (hex strings are digits plus a-f).
                 let before_ok = i == 0 || !chars[i - 1].is_ascii_digit();
                 let after_ok = k >= n || !chars[k].is_ascii_digit();
-                if before_ok && after_ok {
+                if before_ok
+                    && after_ok
+                    && Self::token_digit_count(&chars, i, k) <= 16
+                    && Self::has_token_boundaries(&chars, i, k)
+                {
                     return true;
                 }
             }
@@ -264,5 +338,52 @@ mod tests {
     fn clean_text_at_threshold() {
         let result = filter().check("the weather is nice today", 0.4);
         assert!(result.is_ok());
+    }
+}
+
+#[cfg(test)]
+mod identifier_false_positive_tests {
+    use super::*;
+
+    /// UUIDs, commit SHAs and hashes are ubiquitous in the content
+    /// TraceMind captures. Treating them as PII silently drops the memory,
+    /// and the drop is invisible to the user.
+    #[test]
+    fn uuids_are_not_pii() {
+        // Digit-heavy UUIDs that previously tripped the phone detector.
+        for uuid in [
+            "550e8400-e29b-41d4-a716-446655440000",
+            "12345678-9012-3456-7890-123456789012",
+            "00112233-4455-6677-8899-001122334455",
+        ] {
+            let text = format!("Deployed build {uuid} to staging");
+            assert!(
+                !GovernanceFilter::contains_pii(&text),
+                "UUID flagged as PII: {uuid}"
+            );
+        }
+    }
+
+    #[test]
+    fn commit_shas_are_not_pii() {
+        let text = "Reverted a1b2c3d4556677889900112233445566778899 after the outage";
+        assert!(!GovernanceFilter::contains_pii(text), "SHA flagged as PII");
+    }
+
+    /// The detectors must still catch the real thing.
+    #[test]
+    fn real_phone_numbers_are_still_detected() {
+        assert!(GovernanceFilter::contains_pii("call me at 415-555-0132"));
+        assert!(GovernanceFilter::contains_pii("+1 415 555 0132"));
+    }
+
+    #[test]
+    fn real_ssn_is_still_detected() {
+        assert!(GovernanceFilter::contains_pii("ssn 123-45-6789"));
+    }
+
+    #[test]
+    fn real_credit_card_is_still_detected() {
+        assert!(GovernanceFilter::contains_pii("card 4111 1111 1111 1111"));
     }
 }

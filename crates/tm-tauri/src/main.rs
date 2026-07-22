@@ -5726,6 +5726,10 @@ fn main() {
     }
     let retrieval = RetrievalEngine::open(&db_path, &trace_path, false)
         .expect("failed to open retrieval engine");
+    // The desktop app is the one surface where clicks and dwell are real
+    // user actions, so it opts in to timing-derived reward signals.
+    let mut retrieval = retrieval;
+    retrieval.set_host_kind(tm_retrieval::HostKind::Interactive);
     let trace_store = TraceStore::open(&trace_path)
         .expect("failed to open trace store");
 

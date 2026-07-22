@@ -2268,11 +2268,20 @@ mod tests {
         // Store the same topic multiple times. Novel content is classified as
         // Priority (tier 2) by the classifier, so the normal consolidate() pass
         // (tier-union) and consolidate_priority() should both find these signals.
+        // Assert each store succeeded rather than discarding the result.
+        // The original `let _ = ...` swallowed failures, so when one of the
+        // three signals did not land the test failed later at the aggregate
+        // count with no indication of which call went wrong.
         for _ in 0..3 {
-            let _ = pipeline.ingest_fast(
-                &format!("{} — version {}", s, Uuid::new_v4()),
-                "test",
-                Uuid::new_v4(),
+            let txt = format!("{} — version {}", s, Uuid::new_v4());
+            let r = pipeline
+                .ingest_fast(&txt, "test", Uuid::new_v4())
+                .expect("ingest_fast should succeed");
+            assert!(
+                r.skipped.is_none(),
+                "signal was skipped: {:?} (tier {:?})",
+                r.skipped,
+                r.priority
             );
         }
         // Use min_cluster_size=1 so even singleton priority signals promote —
