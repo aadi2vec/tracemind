@@ -19,6 +19,11 @@ llama-cpp-2 = { version = "0.1", optional = true }
 # HF Hub for first-run model download. Already used by tm-rerank.
 hf-hub = { version = "0.4", optional = true }
 
+# Tier 1 (candle variant). Pure Rust ML — no cmake. Used for Qwen2.5-0.5B GGUF.
+candle-core = { version = "0.9", optional = true }
+candle-transformers = { version = "0.9", optional = true }
+tokenizers = { version = "0.21", optional = true, default-features = false, features = ["onig"] }
+
 [dev-dependencies]
 tempfile = "3"
 
@@ -28,5 +33,7 @@ default = []
 local-llm = ["dep:llama-cpp-2", "dep:hf-hub"]
 # Apple Silicon Metal acceleration for Tier 1 (macOS only). Implies local-llm.
 local-llm-metal = ["local-llm", "llama-cpp-2/metal"]
+# Tier 1 (candle): pure-Rust Qwen2.5-0.5B Q4_K_M synthesis. No cmake required.
+candle-llm = ["dep:candle-core", "dep:candle-transformers", "dep:hf-hub", "dep:tokenizers"]
 # Tier 2: Apple FoundationModels (macOS Tahoe 26+, Apple Silicon).
 apple-fm = []
