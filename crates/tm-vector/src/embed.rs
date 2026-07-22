@@ -237,7 +237,7 @@ impl Embedder {
             EmbedBackend::Hash => hash_embed(text, self.dim),
             EmbedBackend::OnnxDense(model) => {
                 debug!("[embed] encoding {:?} with BGE-M3 ONNX", &text[..text.len().min(60)]);
-                let guard = model.lock().expect("bge-m3 mutex poisoned");
+                let mut guard = model.lock().expect("bge-m3 mutex poisoned");
                 guard
                     .embed(&[text])
                     .map(|mut v| v.remove(0))
@@ -266,7 +266,7 @@ impl Embedder {
             }
             EmbedBackend::Hash => texts.iter().map(|t| hash_embed(t, self.dim)).collect(),
             EmbedBackend::OnnxDense(model) => {
-                let guard = model.lock().expect("bge-m3 mutex poisoned");
+                let mut guard = model.lock().expect("bge-m3 mutex poisoned");
                 guard
                     .embed(texts)
                     .unwrap_or_else(|e| {

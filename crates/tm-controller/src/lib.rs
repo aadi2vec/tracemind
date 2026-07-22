@@ -1,8 +1,10 @@
 pub mod bandit;
 pub mod planner;
+pub mod query_rewriter;
 pub mod router;
 pub mod scheduler;
 pub use bandit::{UcbBandit, LinUcbBandit, NUM_ARMS};
 pub use planner::{QueryPlanner, QueryPlan, PlanAction};
+pub use query_rewriter::{QueryRewriter, QueryVariant};
 pub use router::{MemoryRouter, RouterContext};
 pub use scheduler::{NightlyRunRecord, NightlyScheduler};

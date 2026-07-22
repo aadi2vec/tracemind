@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tm_controller::bandit::RetrievalParams;
-use tm_controller::{UcbBandit, LinUcbBandit, QueryPlanner, QueryPlan, PlanAction, MemoryRouter, RouterContext};
+use tm_controller::{UcbBandit, LinUcbBandit, QueryPlanner, QueryPlan, PlanAction, MemoryRouter, RouterContext, QueryRewriter};
 use tm_episodic::{ProcedureStore, TraceStore, TrajectoryStore};
 use tm_graph::{context::ActiveContext, GraphStore, ViewFilter};
 use tm_reason::CausalTrace;
@@ -279,6 +279,8 @@ pub struct RetrievalEngine {
     /// Whether the routing gate is active. Defaults to false for backward
     /// compat; the MCP layer enables it via `set_router_enabled(true)`.
     router_enabled: bool,
+    /// Query rewriter — expands queries into variants for higher recall.
+    rewriter: QueryRewriter,
 }
 
 #[derive(Debug)]
@@ -379,6 +381,7 @@ impl RetrievalEngine {
             view_filter: None,
             router: MemoryRouter::default(),
             router_enabled: false,
+            rewriter: QueryRewriter::new(4),
         })
     }
 
@@ -597,6 +600,22 @@ impl RetrievalEngine {
     /// 3. Fallback cascade: if results score poorly, try next bandit arm
     pub fn query(&mut self, text: &str) -> Result<RetrievalResult> {
         let start = Instant::now();
+
+        // ── Phase: query expansion ──
+        // Generate multi-variant queries for simple/bandit cases.
+        // Expanded variants are merged via query_decomposed (RRA fusion).
+        let expansion_plan = self.planner.plan(text);
+        let is_simple = matches!(
+            expansion_plan.action,
+            PlanAction::DirectLookup | PlanAction::BanditRetrieval
+        );
+        if is_simple {
+            let variants = self.rewriter.expand(text);
+            if variants.len() > 1 {
+                let sub_queries: Vec<String> = variants.into_iter().map(|v| v.query).collect();
+                return self.query_decomposed(text, &sub_queries, &expansion_plan, start);
+            }
+        }
 
         // ── Phase: plan ──
         let phase_start = Instant::now();
@@ -2218,6 +2237,7 @@ mod tests {
             view_filter: None,
             router: MemoryRouter::default(),
             router_enabled: false,
+            rewriter: QueryRewriter::new(4),
         };
 
         let result = engine.query("hello world").unwrap();
@@ -2266,6 +2286,7 @@ mod tests {
             view_filter: None,
             router: MemoryRouter::default(),
             router_enabled: false,
+            rewriter: QueryRewriter::new(4),
         };
 
         // Prime an entry for "hello world" — even on an empty graph
@@ -2425,6 +2446,7 @@ mod tests {
             view_filter: None,
             router: MemoryRouter::default(),
             router_enabled: false,
+            rewriter: QueryRewriter::new(4),
         };
 
         let now = chrono::Utc::now();
@@ -2524,6 +2546,7 @@ mod tests {
             view_filter: None,
             router: MemoryRouter::default(),
             router_enabled: false,
+            rewriter: QueryRewriter::new(4),
         };
 
         // Seed at least one entity so the query produces real candidates.
@@ -2602,6 +2625,7 @@ mod tests {
             view_filter: None,
             router: MemoryRouter::default(),
             router_enabled: false,
+            rewriter: QueryRewriter::new(4),
         };
 
         let now = chrono::Utc::now();
@@ -2672,6 +2696,7 @@ mod tests {
             view_filter: None,
             router: MemoryRouter::default(),
             router_enabled: false,
+            rewriter: QueryRewriter::new(4),
         };
 
         let now = chrono::Utc::now();

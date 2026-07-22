@@ -12,7 +12,10 @@ dirs = "5"
 uuid = { workspace = true }
 chrono = { workspace = true }
 
-# For BGE-M3 ONNX loading (Q3.9 scaffold — uncomment when fully wiring in Q4)
-# ort = { version = "2", features = ["download-binaries"] }
-# tokenizers = "0.19"
-# ureq = "2"   # or reqwest for the auto-download helper
+# BGE-M3 ONNX loading — versions pinned to match what fastembed pulls transitively.
+# ort's ndarray feature is already enabled by fastembed; we re-declare here so
+# rustc sees our crate as a direct user of those features.
+ort = { version = "=2.0.0-rc.10", features = ["ndarray", "std"] }
+ndarray = "0.16"
+tokenizers = { version = "0.22", default-features = false, features = ["onig"] }
+hf-hub = "0.4"
