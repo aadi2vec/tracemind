@@ -29,10 +29,18 @@ tempfile = "3"
 tm-types = { workspace = true, optional = true }
 tm-ingest = { workspace = true, optional = true }
 tm-retrieval = { workspace = true, optional = true }
+tm-gepa = { workspace = true, optional = true }
+tm-vector = { workspace = true, optional = true }
+# Optional: Tier-1 LLM synthesis (candle Qwen2.5-0.5B). Adds real LLM answer
+# generation over retrieved grounding — the lever from ~49 → high F1.
+tm-answer = { workspace = true, optional = true, features = ["candle-llm"] }
 
 [features]
 default = []
 # Enable the real TraceMind runner. Pulls in tm-ingest + tm-retrieval which
 # transitively bring fastembed; build is heavier but the runner produces
 # publishable LoCoMo numbers against the actual stack.
-tracemind = ["dep:tm-types", "dep:tm-ingest", "dep:tm-retrieval"]
+tracemind = ["dep:tm-types", "dep:tm-ingest", "dep:tm-retrieval", "dep:tm-gepa", "dep:tm-vector"]
+# Tier-1 LLM synthesis via candle. Combine with `tracemind`:
+#   cargo run --release -p tm-bench-locomo --features "tracemind,tier1" -- --tier1
+tier1 = ["dep:tm-answer"]

@@ -61,17 +61,27 @@ pub struct CandleConfig {
 
 impl Default for CandleConfig {
     fn default() -> Self {
-        let base = std::env::var_os("TM_DATA_DIR")
-            .map(PathBuf::from)
-            .or_else(|| home_dir().map(|h| h.join(".tracemind")))
-            .unwrap_or_else(|| PathBuf::from(".tracemind"));
+        // Model home: always `~/.tracemind/models` (independent of TM_DATA_DIR,
+        // which the benchmark points at throwaway temp dirs). Weights are large
+        // and shared across runs, so they live under the real home.
+        let models_dir = home_dir()
+            .map(|h| h.join(".tracemind").join("models"))
+            .unwrap_or_else(|| PathBuf::from(".tracemind/models"));
+
+        // Allow overriding the model filename (e.g. the 1.5B variant) without
+        // a recompile: `TM_CANDLE_MODEL=qwen2.5-1.5b-instruct-q4_k_m.gguf`.
+        let file = std::env::var("TM_CANDLE_MODEL")
+            .unwrap_or_else(|_| CANDLE_HF_FILE.to_string());
+
         Self {
-            model_path: base.join("models").join(CANDLE_HF_FILE),
+            model_path: models_dir.join(&file),
             hf_repo: CANDLE_HF_REPO.to_string(),
-            hf_file: CANDLE_HF_FILE.to_string(),
+            hf_file: file,
             max_new_tokens: 256,
-            temperature: 0.1,
-            top_p: 0.95,
+            // Near-greedy: factual short-answer extraction wants determinism,
+            // not diversity. Keeps the model from wandering into explanations.
+            temperature: 0.0,
+            top_p: 1.0,
         }
     }
 }
@@ -95,6 +105,7 @@ fn home_dir() -> Option<PathBuf> {
 // Backend struct — always present so the type is usable without the feature
 // ---------------------------------------------------------------------------
 
+#[derive(Clone)]
 pub struct CandleBackend {
     config: CandleConfig,
     #[allow(dead_code)]
@@ -113,7 +124,7 @@ struct InnerState {
 
 #[cfg(feature = "candle-llm")]
 struct LoadedCandle {
-    model: candle_transformers::models::quantized_llama::ModelWeights,
+    model: candle_transformers::models::quantized_qwen2::ModelWeights,
     tokenizer: tokenizers::Tokenizer,
     device: candle_core::Device,
 }
@@ -176,7 +187,7 @@ async fn run_candle_inference(
 ) -> Result<AnswerResponse> {
     use candle_core::{quantized::gguf_file, Device, Tensor};
     use candle_transformers::generation::LogitsProcessor;
-    use candle_transformers::models::quantized_llama::ModelWeights;
+    use candle_transformers::models::quantized_qwen2::ModelWeights;
 
     if !backend.weights_present() {
         // Try to download the model on first use.
@@ -273,15 +284,11 @@ async fn run_candle_inference(
         let mut logits_processor =
             LogitsProcessor::new(42, Some(temperature), Some(top_p));
 
-        // Get first generated token from prefill.
+        // quantized_qwen2 already selects the last position internally, so
+        // `forward` returns [batch, vocab]. Squeeze the batch dim → [vocab].
         let logits_last = logits
             .squeeze(0)
             .map_err(|e| AnswerError::Inference(format!("squeeze: {e}")))?;
-        let seq_len = logits_last.dim(0)
-            .map_err(|e| AnswerError::Inference(format!("dim: {e}")))?;
-        let logits_last = logits_last
-            .narrow(0, seq_len - 1, 1)
-            .map_err(|e| AnswerError::Inference(format!("narrow: {e}")))?;
 
         let mut next_token = logits_processor
             .sample(&logits_last)
@@ -417,10 +424,17 @@ pub fn build_candle_prompt(req: &AnswerRequest) -> String {
 fn candle_system_prompt(task: TaskKind) -> &'static str {
     match task {
         TaskKind::ShortAnswer => {
-            "You are TraceMind, a local-only memory assistant. Answer the user's \
-             question using ONLY the supplied memories. Be concise (1–3 sentences). \
-             Cite memories inline as [1], [2]. If the memories don't answer the \
-             question, say so."
+            "You are TraceMind, a local-only memory assistant. Answer the question using \
+             ONLY the supplied memories. Output ONLY the answer itself — the shortest \
+             span that answers THIS question. No preamble, no 'the answer is', no 'the \
+             correct fact', no citation markers like [1], no trailing sentence, no period. \
+             If the question starts with Did/Was/Is/Does/Are/Were: reply exactly 'Yes' or \
+             'No'; and if the premise is factually false, reply 'No, ' followed by the \
+             correct fact drawn from the memories. \
+             If a quantity was later raised, upsized, or corrected, answer with the FINAL \
+             value, not the first one mentioned. \
+             Do not confuse a goal/target with the actual result, or a venue with a topic. \
+             Reply 'unknown' only if the memories genuinely lack the answer."
         }
         TaskKind::OpenEndedSynthesis => {
             "You are TraceMind, a local-only memory assistant. Synthesize a grounded \

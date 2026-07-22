@@ -9,11 +9,44 @@ use tm_graph::{context::ActiveContext, GraphStore, ViewFilter};
 use tm_reason::CausalTrace;
 use tm_rerank::{ColbertReranker, RerankCandidate};
 use tm_types::{Entity, Procedure, Result, Trace, TraceEventType, TraceMindError, Triple};
-use tm_vector::{Embedder, EmbedModel};
+use tm_vector::{Bm25Index, ComposedIndex, Embedder, EmbedModel};
 use tracing::info;
 use uuid::Uuid;
 
 use crate::prefetch::{PrefetchCache, PrefetchStats};
+
+/// Floor on the *fused* ComposedIndex score for a signal to be returned.
+/// Tuned against the LoCoMo anchor set; GEPA-mutable policy parameter.
+pub const SIGNAL_MIN_SIM: f32 = 0.15;
+
+/// Permissive cosine floor used only for *candidate generation*, before
+/// lexical fusion. Deliberately low: an exact-token match that dense cosine
+/// scores poorly must still reach the BM25 stage to be rescued.
+pub const SIGNAL_CANDIDATE_MIN_SIM: f32 = 0.02;
+
+/// Default candidate pool width, as a multiple of the requested top_k.
+pub const SIGNAL_CANDIDATE_MULTIPLIER: usize = 4;
+
+/// The GEPA policy type applied to this engine.
+pub use tm_gepa::RetrievalPolicy as RetrievalPolicyConfig;
+
+/// Half-life for the `recency` space over raw captures.
+pub const RECENCY_HALF_LIFE_DAYS: f32 = 30.0;
+
+/// Neutral-high confidence assigned to raw captures, which carry no
+/// per-row governance score of their own.
+pub const SIGNAL_BASE_CONFIDENCE: f32 = 0.7;
+
+/// Collapse a per-sub-query signal map into a single best-first ranking.
+fn rank_signal_hits(map: HashMap<i64, SignalHit>) -> Vec<SignalHit> {
+    let mut hits: Vec<SignalHit> = map.into_values().collect();
+    hits.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    hits
+}
 
 /// Recent query embedding cache for relevance gating and recommendations.
 struct RecentQueryCache {
@@ -281,6 +314,15 @@ pub struct RetrievalEngine {
     router_enabled: bool,
     /// Query rewriter — expands queries into variants for higher recall.
     rewriter: QueryRewriter,
+    /// Q3.10 — composed multi-space index. Owns how the dense (`text`),
+    /// sparse (`lexical`), `recency`, and `confidence` spaces combine into
+    /// a single ranking score. Its verb weights are the artifact the GEPA
+    /// loop mutates.
+    composed_index: ComposedIndex,
+    /// GEPA-tunable floor on the fused signal score.
+    signal_min_score: f32,
+    /// GEPA-tunable candidate pool width, as a multiple of top_k.
+    candidate_multiplier: usize,
 }
 
 #[derive(Debug)]
@@ -356,13 +398,30 @@ impl RetrievalEngine {
         let bandit = UcbBandit::load(&bandit_path);
         let linucb = LinUcbBandit::load(&linucb_path);
 
+        // Q4.4/Q4.14 — load the active GEPA policy from disk, if one has
+        // been promoted. Without this the optimisation loop's output could
+        // never reach a running instance: the tuned weights would live only
+        // in the benchmark process that produced them. A missing or
+        // unparseable file falls back to the compiled-in defaults rather
+        // than failing to open the engine.
+        let policy_path = parent.join("policy.json");
+        let loaded_policy = std::fs::read_to_string(&policy_path)
+            .ok()
+            .and_then(|raw| match serde_json::from_str::<RetrievalPolicyConfig>(&raw) {
+                Ok(p) => Some(p),
+                Err(e) => {
+                    info!("[retrieval] ignoring unparseable policy.json: {e}");
+                    None
+                }
+            });
+
         // Try to auto-open procedure and trajectory stores from sibling files
         let proc_path = parent.join("procedures.jsonl");
         let procedure_store = ProcedureStore::open(&proc_path).ok();
         let traj_path = parent.join("trajectories.jsonl");
         let trajectory_store = TrajectoryStore::open(&traj_path).ok();
 
-        Ok(Self {
+        let mut engine = Self {
             graph,
             trace_store,
             embedder,
@@ -382,7 +441,15 @@ impl RetrievalEngine {
             router: MemoryRouter::default(),
             router_enabled: false,
             rewriter: QueryRewriter::new(4),
-        })
+            composed_index: ComposedIndex::default_hybrid(),
+            signal_min_score: SIGNAL_MIN_SIM,
+            candidate_multiplier: SIGNAL_CANDIDATE_MULTIPLIER,
+        };
+        if let Some(policy) = loaded_policy {
+            info!("[retrieval] applying promoted GEPA policy from policy.json");
+            engine.apply_policy(&policy);
+        }
+        Ok(engine)
     }
 
     /// Toggle cross-context retrieval. When `true`, ignores the active
@@ -772,21 +839,8 @@ impl RetrievalEngine {
         // moment it lands, without waiting for consolidation.
         let ss_start = Instant::now();
         let signal_top_k = (params.top_k / 2).max(3);
-        let raw_signal_hits = self
-            .graph
-            .search_signals(&blended_embedding, signal_top_k, 0.2)
-            .unwrap_or_default();
-        let raw_hit_count = raw_signal_hits.len();
-        ws.signal_hits = raw_signal_hits
-            .into_iter()
-            .map(|(sig, score)| SignalHit {
-                signal_id: sig.id,
-                text: sig.raw_text,
-                source: sig.source,
-                score,
-                created_at: sig.created_at,
-            })
-            .collect();
+        ws.signal_hits = self.search_signal_hits(text, &blended_embedding, signal_top_k);
+        let raw_hit_count = ws.signal_hits.len();
         ws.record_phase(
             "signal_search",
             vs_count,
@@ -1238,11 +1292,26 @@ impl RetrievalEngine {
         let mut seen_entity_ids: HashSet<Uuid> = HashSet::new();
         let mut seen_triple_ids: HashSet<Uuid> = HashSet::new();
         let mut causal = CausalTrace::new(original_text, 0, "decomposed");
+        // Hybrid raw-text recall, fused across sub-queries. Keyed by
+        // signal_id so a capture matched by several variants is kept once,
+        // at its best score.
+        let mut signal_by_id: HashMap<i64, SignalHit> = HashMap::new();
 
         for sub_q in sub_queries {
             // Use a narrow retrieval for each sub-query (arm 0 for speed)
             let sub_embedding = self.embedder.embed(sub_q);
             let sub_params = UcbBandit::params_for_arm(1); // medium arm per sub-query
+
+            for hit in self.search_signal_hits(sub_q, &sub_embedding, sub_params.top_k) {
+                signal_by_id
+                    .entry(hit.signal_id)
+                    .and_modify(|e| {
+                        if hit.score > e.score {
+                            e.score = hit.score;
+                        }
+                    })
+                    .or_insert(hit);
+            }
 
             if let Ok(candidates) = self.graph.search_vectors(&sub_embedding, sub_params.top_k) {
                 for (rank, (id, score)) in candidates.iter().enumerate() {
@@ -1367,7 +1436,7 @@ impl RetrievalEngine {
                 decision: format!("{} sub-queries merged", sub_queries.len()),
             }],
             reasoning_narrative,
-            signal_hits: Vec::new(),
+            signal_hits: rank_signal_hits(signal_by_id),
             related_entities,
         })
     }
@@ -1612,7 +1681,9 @@ impl RetrievalEngine {
             procedures: self.match_procedures(original_text),
             phases,
             reasoning_narrative,
-            signal_hits: Vec::new(),
+            // Temporal queries ("when did I…") are exactly the case where the
+            // raw sentence carries the answer and the entity name does not.
+            signal_hits: self.search_signal_hits(original_text, &temporal_query_embedding, 8),
             related_entities,
         })
     }
@@ -1626,6 +1697,132 @@ impl RetrievalEngine {
     /// cache. See TM-UX-001 Phase C.
     pub fn refresh_graph(&self) -> Result<()> {
         self.graph.reload_maps()
+    }
+
+    /// Apply a GEPA-produced retrieval policy to the live query path.
+    ///
+    /// This is what makes the optimisation loop meaningful: the artifact
+    /// the loop mutates has to be the same one retrieval reads. Sets the
+    /// `recall` verb's fusion weights on the `ComposedIndex` plus the two
+    /// scalar knobs the signal path consults.
+    pub fn apply_policy(&mut self, policy: &RetrievalPolicyConfig) {
+        let pairs: Vec<(&str, f32)> = policy
+            .space_weights
+            .iter()
+            .map(|(k, v)| (k.as_str(), *v))
+            .collect();
+        let mut weights = tm_vector::default_verb_weights();
+        // Replace only the `recall` vector; the other verbs keep their
+        // defaults until the loop is extended to score them too.
+        if let Some(slot) = weights.iter_mut().find(|w| w.verb == "recall") {
+            *slot = tm_vector::VerbWeights::new("recall", &pairs);
+        }
+        self.composed_index.set_verb_weights(weights);
+        self.signal_min_score = policy.min_score;
+        self.candidate_multiplier = policy.candidate_multiplier.max(1);
+    }
+
+    /// The policy currently in force.
+    pub fn current_policy(&self) -> RetrievalPolicyConfig {
+        let mut space_weights = std::collections::BTreeMap::new();
+        for vw in self.composed_index.verb_weights() {
+            if vw.verb == "recall" {
+                for (k, v) in &vw.weights {
+                    space_weights.insert(k.clone(), *v);
+                }
+            }
+        }
+        RetrievalPolicyConfig {
+            space_weights,
+            min_score: self.signal_min_score,
+            candidate_multiplier: self.candidate_multiplier,
+            // Answer-selection weights live in the answer layer, not the
+            // engine; report the policy defaults so a round-trip through
+            // current_policy() stays a valid policy.
+            ..RetrievalPolicyConfig::default()
+        }
+    }
+
+    /// Hybrid signal search — raw captured text that has not yet been
+    /// consolidated into graph entities.
+    ///
+    /// Extracted so every retrieval path can call it. The planner-routed
+    /// paths (`query_decomposed`, `query_temporal`) previously returned
+    /// `signal_hits: Vec::new()` unconditionally, which meant any query the
+    /// planner classified as decomposed or temporal could only ever surface
+    /// *entity names* — never the sentence the user actually wrote. Query
+    /// expansion routes most simple queries through `query_decomposed`, so
+    /// in practice that disabled raw-text recall for the majority of
+    /// queries.
+    /// Hybrid dense + sparse ranking (Q3.10 — `ComposedIndex` on the live
+    /// query path).
+    ///
+    /// Candidates are generated at a *permissive* cosine floor and then
+    /// re-ranked by fusing four spaces through `ComposedIndex`: dense cosine
+    /// (`text`), BM25 (`lexical`), time decay (`recency`), and governance
+    /// confidence. Generating wide and ranking narrow is what lets the
+    /// lexical space rescue an exact-token match that dense cosine buried —
+    /// filtering at `SIGNAL_MIN_SIM` *before* fusion would discard those
+    /// candidates before BM25 ever saw them.
+    fn search_signal_hits(&self, query_text: &str, embedding: &[f32], top_k: usize) -> Vec<SignalHit> {
+        // Wide candidate generation: 4x the requested depth (floored at 32)
+        // at a permissive similarity cut.
+        let candidate_k = (top_k * self.candidate_multiplier).max(32);
+        let raw = self
+            .graph
+            .search_signals(embedding, candidate_k, SIGNAL_CANDIDATE_MIN_SIM)
+            .unwrap_or_default();
+        if raw.is_empty() {
+            return Vec::new();
+        }
+
+        let docs: Vec<String> = raw.iter().map(|(s, _)| s.raw_text.clone()).collect();
+        let bm25 = Bm25Index::build(&docs);
+        let lexical_scores = bm25.normalised_scores(query_text);
+
+        let now = chrono::Utc::now();
+        let mut scored: Vec<(f32, SignalHit)> = raw
+            .into_iter()
+            .enumerate()
+            .map(|(i, (sig, cosine))| {
+                let age_days =
+                    (now - sig.created_at).num_seconds() as f32 / 86_400.0;
+                let recency = 2f32.powf(-age_days / RECENCY_HALF_LIFE_DAYS);
+
+                let mut spaces: HashMap<String, f32> = HashMap::new();
+                spaces.insert("text".to_string(), cosine.clamp(0.0, 1.0));
+                spaces.insert("lexical".to_string(), lexical_scores[i]);
+                spaces.insert("recency".to_string(), recency);
+                // Raw captures carry no per-row governance score; they were
+                // admitted by the ingest gate, so treat them as neutral-high
+                // rather than fabricating a confidence.
+                spaces.insert("confidence".to_string(), SIGNAL_BASE_CONFIDENCE);
+
+                let fused = self.composed_index.score_precomputed(&spaces, Some("recall"));
+                (
+                    fused,
+                    SignalHit {
+                        signal_id: sig.id,
+                        text: sig.raw_text,
+                        source: sig.source,
+                        score: fused,
+                        created_at: sig.created_at,
+                    },
+                )
+            })
+            .filter(|(fused, _)| *fused >= self.signal_min_score)
+            .collect();
+
+        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        scored.truncate(top_k);
+
+        let mut hits: Vec<SignalHit> = scored.into_iter().map(|(_, h)| h).collect();
+        hits.retain(|h| {
+            self.graph
+                .signal_in_active_scope(h.signal_id, self.cross_context)
+                .unwrap_or(true)
+        });
+        hits
     }
 
     /// Return per-arm `(pull_count, average_reward)` statistics from the bandit.
@@ -2208,6 +2405,57 @@ impl Drop for RetrievalEngine {
 mod tests {
     use super::*;
 
+    /// A GEPA-promoted `policy.json` must actually change the running
+    /// engine's configuration. Without this link the optimisation loop's
+    /// output lives only in the process that produced it, and every claim
+    /// about self-improvement is unbacked.
+    #[test]
+    fn open_applies_promoted_policy_from_disk() {
+        let dir = std::env::temp_dir().join(format!("tm_pol_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("test.db").to_str().unwrap().to_string();
+        let traces = dir.join("traces.jsonl").to_str().unwrap().to_string();
+
+        std::fs::write(
+            dir.join("policy.json"),
+            r#"{"space_weights":{"text":1.0,"lexical":0.0,"recency":0.0,"confidence":0.0},
+                "min_score":0.77,"candidate_multiplier":9,
+                "coverage_weight":0.0,"fit_weight":0.0,"generic_coverage_boost":1.0}"#,
+        )
+        .unwrap();
+
+        let engine = RetrievalEngine::open(&db, &traces, true).unwrap();
+        let active = engine.current_policy();
+        assert_eq!(active.candidate_multiplier, 9, "policy.json was not applied");
+        assert!((active.min_score - 0.77).abs() < 1e-5, "min_score = {}", active.min_score);
+        let w = active.normalised_weights();
+        assert!(w["text"] > 0.99, "text weight = {}", w["text"]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A corrupt policy file must not stop the engine from opening — the
+    /// product has to keep working on compiled-in defaults.
+    #[test]
+    fn open_falls_back_when_policy_is_corrupt() {
+        let dir = std::env::temp_dir().join(format!("tm_polbad_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("test.db").to_str().unwrap().to_string();
+        let traces = dir.join("traces.jsonl").to_str().unwrap().to_string();
+        std::fs::write(dir.join("policy.json"), "{ not json").unwrap();
+
+        let engine = RetrievalEngine::open(&db, &traces, true)
+            .expect("engine must open despite a corrupt policy file");
+        let active = engine.current_policy();
+        assert_eq!(
+            active.candidate_multiplier,
+            SIGNAL_CANDIDATE_MULTIPLIER,
+            "should have fallen back to defaults"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn query_returns_ok_and_updates_bandit() {
         let dir = std::env::temp_dir().join(format!("tm_ret_{}", uuid::Uuid::new_v4()));
@@ -2238,6 +2486,9 @@ mod tests {
             router: MemoryRouter::default(),
             router_enabled: false,
             rewriter: QueryRewriter::new(4),
+            composed_index: ComposedIndex::default_hybrid(),
+            signal_min_score: SIGNAL_MIN_SIM,
+            candidate_multiplier: SIGNAL_CANDIDATE_MULTIPLIER,
         };
 
         let result = engine.query("hello world").unwrap();
@@ -2287,6 +2538,9 @@ mod tests {
             router: MemoryRouter::default(),
             router_enabled: false,
             rewriter: QueryRewriter::new(4),
+            composed_index: ComposedIndex::default_hybrid(),
+            signal_min_score: SIGNAL_MIN_SIM,
+            candidate_multiplier: SIGNAL_CANDIDATE_MULTIPLIER,
         };
 
         // Prime an entry for "hello world" — even on an empty graph
@@ -2447,6 +2701,9 @@ mod tests {
             router: MemoryRouter::default(),
             router_enabled: false,
             rewriter: QueryRewriter::new(4),
+            composed_index: ComposedIndex::default_hybrid(),
+            signal_min_score: SIGNAL_MIN_SIM,
+            candidate_multiplier: SIGNAL_CANDIDATE_MULTIPLIER,
         };
 
         let now = chrono::Utc::now();
@@ -2547,6 +2804,9 @@ mod tests {
             router: MemoryRouter::default(),
             router_enabled: false,
             rewriter: QueryRewriter::new(4),
+            composed_index: ComposedIndex::default_hybrid(),
+            signal_min_score: SIGNAL_MIN_SIM,
+            candidate_multiplier: SIGNAL_CANDIDATE_MULTIPLIER,
         };
 
         // Seed at least one entity so the query produces real candidates.
@@ -2626,6 +2886,9 @@ mod tests {
             router: MemoryRouter::default(),
             router_enabled: false,
             rewriter: QueryRewriter::new(4),
+            composed_index: ComposedIndex::default_hybrid(),
+            signal_min_score: SIGNAL_MIN_SIM,
+            candidate_multiplier: SIGNAL_CANDIDATE_MULTIPLIER,
         };
 
         let now = chrono::Utc::now();
@@ -2697,6 +2960,9 @@ mod tests {
             router: MemoryRouter::default(),
             router_enabled: false,
             rewriter: QueryRewriter::new(4),
+            composed_index: ComposedIndex::default_hybrid(),
+            signal_min_score: SIGNAL_MIN_SIM,
+            candidate_multiplier: SIGNAL_CANDIDATE_MULTIPLIER,
         };
 
         let now = chrono::Utc::now();

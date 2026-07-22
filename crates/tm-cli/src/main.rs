@@ -253,6 +253,14 @@ enum Commands {
     },
     /// Show bandit arm statistics
     Status,
+    /// Inspect or promote the GEPA-tuned retrieval policy.
+    ///
+    /// The optimisation loop runs in `tm-bench-locomo --gepa` against an
+    /// anchor set; this is how its output reaches a running instance.
+    Policy {
+        #[command(subcommand)]
+        action: PolicyAction,
+    },
     /// Show the most recent capture events from the ring buffer
     /// (what the capture daemon / MCP server just ingested).
     Recent {
@@ -1084,6 +1092,20 @@ enum CaptureAction {
     },
 }
 
+#[derive(clap::Subcommand, Debug)]
+enum PolicyAction {
+    /// Print the policy currently in force.
+    Show,
+    /// Promote a policy produced by a GEPA run (its `best_policy` field,
+    /// or a bare policy object) into `~/.tracemind/policy.json`.
+    Set {
+        /// Path to the GEPA run report, or a JSON file holding a policy.
+        path: PathBuf,
+    },
+    /// Delete `policy.json`, reverting to the compiled-in defaults.
+    Reset,
+}
+
 #[derive(clap::Subcommand)]
 enum ProcAction {
     /// Add a new procedure (steps as "action1;action2;action3")
@@ -1807,6 +1829,85 @@ fn main() {
             }
         }
 
+        Commands::Policy { action } => {
+            let policy_path = data_dir().join("policy.json");
+            match action {
+                PolicyAction::Show => {
+                    let (policy, source) = match std::fs::read_to_string(&policy_path) {
+                        Ok(raw) => match serde_json::from_str::<tm_gepa::RetrievalPolicy>(&raw) {
+                            Ok(p) => (p, format!("{}", policy_path.display())),
+                            Err(e) => {
+                                eprintln!("policy.json is unparseable ({e}); showing defaults");
+                                (tm_gepa::RetrievalPolicy::default(), "compiled-in defaults".into())
+                            }
+                        },
+                        Err(_) => (
+                            tm_gepa::RetrievalPolicy::default(),
+                            "compiled-in defaults".into(),
+                        ),
+                    };
+                    println!("source: {source}");
+                    for (space, w) in policy.normalised_weights() {
+                        println!("  {space:<12} {w:.3}");
+                    }
+                    println!("  min_score      {:.3}", policy.min_score);
+                    println!("  cand_mult      {}", policy.candidate_multiplier);
+                    println!("  coverage_wt    {:.3}", policy.coverage_weight);
+                    println!("  fit_wt         {:.3}", policy.fit_weight);
+                    println!("  generic_boost  {:.3}", policy.generic_coverage_boost);
+                }
+                PolicyAction::Set { path } => {
+                    let raw = match std::fs::read_to_string(&path) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            eprintln!("cannot read {}: {e}", path.display());
+                            std::process::exit(1);
+                        }
+                    };
+                    let value: serde_json::Value = match serde_json::from_str(&raw) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            eprintln!("{} is not valid JSON: {e}", path.display());
+                            std::process::exit(1);
+                        }
+                    };
+                    // Accept either a GEPA run report or a bare policy.
+                    let policy_value = value
+                        .pointer("/result/best_policy")
+                        .or_else(|| value.pointer("/best_policy"))
+                        .cloned()
+                        .unwrap_or(value);
+                    let policy: tm_gepa::RetrievalPolicy =
+                        match serde_json::from_value(policy_value) {
+                            Ok(p) => p,
+                            Err(e) => {
+                                eprintln!("no retrieval policy found in {}: {e}", path.display());
+                                std::process::exit(1);
+                            }
+                        };
+                    let encoded = serde_json::to_string_pretty(&policy)
+                        .expect("policy serialises");
+                    if let Err(e) = std::fs::write(&policy_path, encoded) {
+                        eprintln!("cannot write {}: {e}", policy_path.display());
+                        std::process::exit(1);
+                    }
+                    println!("promoted policy to {}", policy_path.display());
+                    println!("it takes effect on the next query (CLI, MCP, or desktop app)");
+                }
+                PolicyAction::Reset => {
+                    match std::fs::remove_file(&policy_path) {
+                        Ok(()) => println!("removed {}", policy_path.display()),
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                            println!("no policy.json; already on compiled-in defaults")
+                        }
+                        Err(e) => {
+                            eprintln!("cannot remove {}: {e}", policy_path.display());
+                            std::process::exit(1);
+                        }
+                    }
+                }
+            }
+        }
         Commands::Status => {
             let bandit = UcbBandit::load(&bandit_path);
             let stats = bandit.arm_stats();

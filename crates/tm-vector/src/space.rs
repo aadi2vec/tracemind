@@ -61,6 +61,26 @@ impl Space for TextSpace {
     }
 }
 
+/// Lexical space: BM25 sparse relevance.
+///
+/// Like [`TextSpace`], this is a declaration rather than a scorer — BM25
+/// needs the document body and corpus statistics, neither of which is
+/// present in [`MemoryMeta`]. Callers compute the score with
+/// [`crate::lexical::Bm25Index`] and fuse it via
+/// [`crate::composed_index::ComposedIndex::score_precomputed`]. Registering
+/// it here keeps `space_names()` an honest description of the index.
+pub struct LexicalSpace;
+
+impl Space for LexicalSpace {
+    fn name(&self) -> &str {
+        "lexical"
+    }
+
+    fn score(&self, _query_text: &str, _id: Uuid, _meta: &MemoryMeta) -> f32 {
+        0.0
+    }
+}
+
 /// Recency space: time-decay scoring.
 pub struct RecencySpace {
     pub half_life_days: f32,

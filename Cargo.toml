@@ -86,6 +86,7 @@ tm-vector = { path = "crates/tm-vector" }
 tm-episodic = { path = "crates/tm-episodic" }
 tm-governance = { path = "crates/tm-governance" }
 tm-controller = { path = "crates/tm-controller" }
+tm-gepa = { path = "crates/tm-gepa" }
 tm-ingest = { path = "crates/tm-ingest" }
 tm-retrieval = { path = "crates/tm-retrieval" }
 tm-reason = { path = "crates/tm-reason" }

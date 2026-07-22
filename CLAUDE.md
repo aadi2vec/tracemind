@@ -52,6 +52,12 @@ cargo build -p tm-bench-locomo --features tracemind --release   # real LoCoMo ru
 cargo build -p tm-answer --features local-llm --release         # Tier 1 LLM (900MB GGUF)
 cargo build -p tm-answer --features apple-fm --release          # Tier 2 Apple FM (macOS 26+)
 
+# GEPA self-improvement loop (executes every candidate against the real stack)
+./target/release/tm-bench-locomo \
+  --dataset crates/tm-bench-locomo/fixtures/locomo-mini.json \
+  --runner tracemind --real-embeddings --gepa --gepa-rounds 14 \
+  --output /tmp/gepa-run.json
+
 # Override data directory (default: ~/.tracemind/)
 TM_DATA_DIR=/tmp/tm-test ./target/release/tracemind ingest "test"
 
@@ -77,8 +83,13 @@ retrieval ─────────────── tm-retrieval ── tm-r
 ingest ────────────────── tm-ingest ── tm-governance (PII + confidence gate)
                           │         ── (GLiNER NER via ONNX, optional auto-download)
                           │
+self-improvement ──────── tm-gepa (RetrievalPolicy + per-instance Pareto
+                          │          archive + executing verifier gate +
+                          │          reflective mutation + merge + Curator)
+                          │
 storage ───────────────── tm-graph (SQLite, KG-R1 4-action traversal)
-                          tm-vector (BGE-small ONNX, 384d, cosine)
+                          tm-vector (BGE-small ONNX 384d + BM25 lexical;
+                          │          ComposedIndex fuses the two)
                           tm-episodic (TraceStore, TrajectoryStore, ProcedureStore, RecentStore)
                           │
 benchmarks (standalone) ─ tm-bench, tm-bench-locomo
@@ -90,6 +101,9 @@ core types ────────────── tm-types  (zero I/O; every
 
 **Ingest** (`tm-ingest::IngestPipeline`):
 governance gate (PII + confidence) → heuristic NER (or `GlinerExtractor` if available) → `GraphStore.upsert()` (entities + typed triples) → `VectorStore.embed()` (BGE-small via fastembed) → `TraceStore.append()` Ingest event → `RecentStore.append()` ring buffer for capture-feedback
+
+**Retrieval policy** (`tm-gepa::RetrievalPolicy`, loaded from `~/.tracemind/policy.json`):
+`ComposedIndex` fusion weights (`text` dense · `lexical` BM25 · `recency` · `confidence`) plus score floor, candidate width, and answer-selection weights. Produced by `tm-bench-locomo --gepa`, promoted with `tracemind policy set <report>`, applied at `RetrievalEngine::open()`. Falls back to compiled-in defaults when absent or corrupt.
 
 **Query** (`tm-retrieval::RetrievalEngine`):
 1. `QueryPlanner` classifies (standard / temporal / decomposed / reasoning / analogy)
@@ -173,7 +187,9 @@ Selection: structured tasks prefer Tier 1; open-ended prefers Tier 2 → Tier 1 
 - **`tm-bench`** — ingest + retrieval microbenchmarks
 - **`tm-bench-ner`** — GLiNER NER quality eval against labeled sets
 - **`tm-bench-ner-e2e`** — end-to-end round-trip
-- **`tm-bench-locomo`** — published LoCoMo scoring harness (token F1 + EM, 5 categories: single_hop / multi_hop / temporal / open_domain / adversarial). CI gate fails any PR that drops > 0.5 F1. Current mini-set baseline: **F1 49.27 / EM 30.00** (v0.4, 2026-05-09, both BGE and hash; lift from `tm-bench-locomo::extract` Tier-0 span extractors). See `docs/DESIGN.md` §13.
+- **`tm-bench-locomo`** — published LoCoMo scoring harness (token F1 + EM, 5 categories: single_hop / multi_hop / temporal / open_domain / adversarial). CI gate fails any PR that drops > 0.5 F1. Current mini-set baseline: **F1 75.49 / EM 65.00** (v0.5, 2026-07-22, BGE; hash scores 48.33). Also runs the GEPA optimisation loop via `--gepa`. See `docs/H2-AUDIT-2026-07.md`.
+
+  Caveat: the mini fixture is 20 questions, and the GEPA anchor set is the same 20 — the tuned policy is fitted, not validated. Do not quote 75.49 externally before a held-out split on real LoCoMo. The pre-v0.5 figure of 49.27 was produced with the retrieval engine returning nothing (see audit §2.2) and is not a comparable system metric.
 
 ### Roadmap
 

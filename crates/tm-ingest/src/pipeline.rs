@@ -462,6 +462,34 @@ impl IngestPipeline {
             let _ = self.graph.upsert_entity_tags(ent.id, &combined, "auto");
         }
 
+        // 7c. Persist the raw text as a searchable signal.
+        //
+        // Without this, everything ingested through the slow path (CLI
+        // `tracemind ingest`, MCP `memory_store`) is recallable only as
+        // *entity names* — the sentence the user actually wrote is lost to
+        // retrieval, because `search_signals` reads `captured_signals` and
+        // only `ingest_fast` (the capture daemon) was writing there. That
+        // made "what did I say about X" unanswerable for every non-daemon
+        // ingest. Tier 3 (Normal) matches what `ingest_fast` assigns to
+        // ordinary prose. Failures are non-fatal: the entity/triple graph
+        // is already committed and must not be rolled back over a signal
+        // row.
+        let hash64 = seahash::hash(text.as_bytes());
+        if !self.graph.signal_exists(hash64) {
+            let signal_embedding = self.embedder.embed(text);
+            if let Err(e) = self.graph.insert_signal_with_embedding(
+                "ingest",
+                text,
+                hash64,
+                session_id,
+                &signal_embedding,
+                None,
+                SignalPriority::Normal.tier(),
+            ) {
+                tracing::debug!("[ingest] signal persist failed: {e}");
+            }
+        }
+
         // 8. Build trace record with full provenance.
         let mut trace = Trace::new(session_id, TraceEventType::Ingest, &content_hash);
         trace.raw_text = Some(text.to_string());
@@ -2255,7 +2283,7 @@ mod tests {
         let stats = pipeline
             .consolidate(50, 1, 0.0)
             .expect("consolidate should succeed");
-        assert!(stats.signals_scanned >= 3, "should have scanned stored signals");
+        assert!(stats.signals_scanned >= 3, "should have scanned stored signals (got {})", stats.signals_scanned);
         assert!(
             stats.clusters_formed >= 1,
             "should have formed at least one cluster (got {})",

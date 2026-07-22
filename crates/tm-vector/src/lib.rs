@@ -2,13 +2,15 @@ pub mod embed;
 pub mod bge_m3;
 pub mod space;
 pub mod composed_index;
+pub mod lexical;
 pub mod matryoshka;
 
 pub use embed::{Embedder, EmbedModel};
+pub use lexical::{tokenize, Bm25Index};
 pub use bge_m3::BgeM3DenseModel;
 pub use space::{
     Space, MemoryMeta, TextSpace, RecencySpace, ConfidenceSpace,
-    EntityTypeSpace, HostSessionSpace,
+    EntityTypeSpace, HostSessionSpace, LexicalSpace,
 };
 pub use composed_index::{ComposedIndex, VerbWeights, default_verb_weights};
 pub use matryoshka::{slice_and_normalize, tier_dim, MATRYOSHKA_DIMS};

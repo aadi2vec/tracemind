@@ -7,7 +7,7 @@
 use std::collections::{HashMap, HashSet};
 
 use uuid::Uuid;
-use crate::space::{ConfidenceSpace, MemoryMeta, RecencySpace, Space, TextSpace};
+use crate::space::{ConfidenceSpace, LexicalSpace, MemoryMeta, RecencySpace, Space, TextSpace};
 
 // ---------------------------------------------------------------------------
 // VerbWeights
@@ -51,12 +51,20 @@ impl VerbWeights {
 // ---------------------------------------------------------------------------
 
 /// Default verb weight vectors (charter §5 Pillar 2).
+///
+/// `lexical` is the BM25 sparse space. It carries real weight on `recall`
+/// because exact tokens (names, times, amounts) are what make a stored turn
+/// *the* answer, and dense cosine over short conversational turns routinely
+/// ranks a topically-similar turn above the one holding the literal answer.
+/// The `recall` vector is the output of a GEPA run against the LoCoMo
+/// anchor set (see `docs/REVIEW-2026-07.md`); the others are hand-set
+/// defaults awaiting their own anchor sets.
 pub fn default_verb_weights() -> Vec<VerbWeights> {
     vec![
-        VerbWeights::new("recall",     &[("text", 0.6), ("recency", 0.2), ("confidence", 0.2)]),
-        VerbWeights::new("plan",       &[("text", 0.4), ("recency", 0.4), ("confidence", 0.2)]),
-        VerbWeights::new("contradict", &[("text", 0.5), ("confidence", 0.3), ("recency", 0.2)]),
-        VerbWeights::new("reflect",    &[("text", 0.3), ("recency", 0.5), ("confidence", 0.2)]),
+        VerbWeights::new("recall",     &[("text", 0.478), ("lexical", 0.348), ("recency", 0.087), ("confidence", 0.087)]),
+        VerbWeights::new("plan",       &[("text", 0.3), ("lexical", 0.2), ("recency", 0.35), ("confidence", 0.15)]),
+        VerbWeights::new("contradict", &[("text", 0.35), ("lexical", 0.3), ("confidence", 0.2), ("recency", 0.15)]),
+        VerbWeights::new("reflect",    &[("text", 0.25), ("lexical", 0.15), ("recency", 0.45), ("confidence", 0.15)]),
     ]
 }
 
@@ -88,6 +96,20 @@ impl ComposedIndex {
         Self::new(
             vec![
                 Box::new(TextSpace),
+                Box::new(RecencySpace::default()),
+                Box::new(ConfidenceSpace),
+            ],
+            default_verb_weights(),
+        )
+    }
+
+    /// Build the default hybrid index: dense `text` + sparse `lexical` +
+    /// `recency` + `confidence`. This is what the live retrieval path uses.
+    pub fn default_hybrid() -> Self {
+        Self::new(
+            vec![
+                Box::new(TextSpace),
+                Box::new(LexicalSpace),
                 Box::new(RecencySpace::default()),
                 Box::new(ConfidenceSpace),
             ],
@@ -151,6 +173,45 @@ impl ComposedIndex {
             total += w * raw_score;
         }
         total.clamp(0.0, 1.0)
+    }
+
+    /// Fuse pre-computed per-space scores using this verb's weight vector.
+    ///
+    /// Some spaces cannot be scored from [`MemoryMeta`] alone — `text` needs
+    /// the cosine from the vector store and `lexical` needs the document body
+    /// and corpus statistics. Callers that already hold those scores fuse
+    /// them here so the weight vector stays the single source of truth for
+    /// how spaces combine (and stays GEPA-mutable in one place).
+    ///
+    /// Unknown space names are ignored. Weights are renormalised over the
+    /// spaces actually supplied, so omitting a space degrades gracefully
+    /// instead of silently shrinking every score.
+    pub fn score_precomputed(&self, scores: &HashMap<String, f32>, verb: Option<&str>) -> f32 {
+        let weights = self.weights_for_verb(verb.unwrap_or("recall"));
+        let mut total = 0.0f32;
+        let mut weight_sum = 0.0f32;
+        for (space, score) in scores {
+            let w = weights.get(space).copied().unwrap_or(0.0);
+            if w <= 0.0 {
+                continue;
+            }
+            total += w * score;
+            weight_sum += w;
+        }
+        if weight_sum <= 0.0 {
+            return 0.0;
+        }
+        (total / weight_sum).clamp(0.0, 1.0)
+    }
+
+    /// Replace this index's verb weight vectors (used by the GEPA loop to
+    /// apply a mutated policy without rebuilding the spaces).
+    pub fn set_verb_weights(&mut self, weights: Vec<VerbWeights>) {
+        self.verb_weights = weights;
+    }
+
+    pub fn verb_weights(&self) -> &[VerbWeights] {
+        &self.verb_weights
     }
 
     fn weights_for_verb(&self, verb: &str) -> HashMap<String, f32> {
