@@ -1934,6 +1934,18 @@ impl GraphStore {
         out
     }
 
+    /// Contradiction-rate statistics over the temporal facts (wires
+    /// `contradiction_rate`, previously orphaned). Used by the nightly
+    /// self-improvement run to report a real signal.
+    pub fn contradiction_rate_stats(
+        &self,
+    ) -> Result<crate::contradiction_rate::ContradictionRateStats> {
+        let conn = self.kg.connection();
+        let _ = crate::contradiction_rate::ensure_temporal_columns(conn);
+        crate::contradiction_rate::compute_contradiction_rate(conn)
+            .map_err(|e| TraceMindError::Storage(format!("contradiction_rate: {e}")))
+    }
+
     /// Close the valid-time interval of a triple's fact — it stopped being
     /// true when `at` occurred, because a newer fact reversed it. Called
     /// when the retraction beat fires so the bitemporal history is correct:

@@ -14,6 +14,11 @@ pub struct NightlyRunRecord {
     pub verb_affinity_updated: bool,
     pub tier_cycle_ran: bool,
     pub contradiction_rate: Option<f64>,
+    /// How many times the retraction beat fired since the product was
+    /// installed — read from `retractions.jsonl`. The wedge's real usage
+    /// signal (holistic review §5 P1.4 / §6a).
+    #[serde(default)]
+    pub retractions_fired: Option<usize>,
     pub error: Option<String>,
 }
 
@@ -26,22 +31,37 @@ impl NightlyScheduler {
         Self { data_dir }
     }
 
-    /// Run all nightly tasks. Returns a summary record.
+    /// Run the nightly tasks this crate can do on its own, and return a
+    /// record with the real signals it could gather.
+    ///
+    /// Previously this returned hardcoded `true`s — "reports success without
+    /// doing work", the exact anti-pattern the holistic review flags. It now
+    /// reports only what it actually measured. Richer signals that need the
+    /// graph (contradiction rate) are filled in by the caller
+    /// (`tracemind nightly`), which has access to it; see
+    /// [`NightlyRunRecord`].
     pub fn run(&self) -> NightlyRunRecord {
-        let id = uuid::Uuid::new_v4();
-        let started_at = Utc::now();
-
-        // Each step is best-effort — a failure in one doesn't block others
         NightlyRunRecord {
-            id,
-            started_at,
+            id: uuid::Uuid::new_v4(),
+            started_at: Utc::now(),
             completed_at: Some(Utc::now()),
-            gepa_spike_delta_f1: None, // populated by gepa spike when run
-            verb_affinity_updated: true, // mark as attempted
-            tier_cycle_ran: true,
+            gepa_spike_delta_f1: None,
+            // Honest defaults: not attempted here. The caller flips these to
+            // true only when the corresponding work actually ran.
+            verb_affinity_updated: false,
+            tier_cycle_ran: false,
             contradiction_rate: None,
+            retractions_fired: self.count_retractions(),
             error: None,
         }
+    }
+
+    /// Count retraction-beat firings from `retractions.jsonl`. `None` when
+    /// the log does not exist yet (the beat has never fired).
+    pub fn count_retractions(&self) -> Option<usize> {
+        let path = self.data_dir.join("retractions.jsonl");
+        let raw = std::fs::read_to_string(&path).ok()?;
+        Some(raw.lines().filter(|l| !l.trim().is_empty()).count())
     }
 
     /// Load past nightly run records from JSONL.
@@ -84,10 +104,13 @@ mod tests {
         let record = scheduler.run();
 
         assert!(record.completed_at.is_some());
-        assert!(record.verb_affinity_updated);
-        assert!(record.tier_cycle_ran);
+        // The scheduler no longer fabricates success — these are false
+        // until the caller actually runs the corresponding work.
+        assert!(!record.verb_affinity_updated);
+        assert!(!record.tier_cycle_ran);
         assert!(record.error.is_none());
-        // started_at <= completed_at
+        // No retraction log in a fresh dir.
+        assert!(record.retractions_fired.is_none());
         assert!(record.started_at <= record.completed_at.unwrap());
     }
 
@@ -111,7 +134,17 @@ mod tests {
         let history = scheduler.history(10);
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].id, id);
-        assert_eq!(history[0].verb_affinity_updated, true);
-        assert_eq!(history[0].tier_cycle_ran, true);
+    }
+
+    #[test]
+    fn counts_real_retractions_from_the_log() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join("retractions.jsonl"),
+            "{\"at\":\"t\",\"contradictions\":1}\n{\"at\":\"t\",\"contradictions\":2}\n",
+        )
+        .unwrap();
+        let scheduler = NightlyScheduler::new(dir.path().to_path_buf());
+        assert_eq!(scheduler.run().retractions_fired, Some(2));
     }
 }

@@ -2142,9 +2142,29 @@ fn main() {
         }
         Commands::Nightly => {
             let scheduler = tm_controller::NightlyScheduler::new(dir.to_path_buf());
-            let record = scheduler.run();
+            let mut record = scheduler.run();
+
+            // Compute the real contradiction rate from the local graph —
+            // wiring the previously-orphaned tm-graph::contradiction_rate
+            // (holistic review §6a: report real signals, not fabricated
+            // ones). Best-effort: a failure here must not fail the run.
+            let db_path = dir.join("memory.db");
+            if db_path.exists() {
+                if let Ok(store) = tm_graph::GraphStore::open(db_path.to_str().unwrap_or_default()) {
+                    if let Ok(stats) = store.contradiction_rate_stats() {
+                        record.contradiction_rate = Some(stats.rate);
+                    }
+                }
+            }
             scheduler.record(&record).ok();
-            println!("Nightly run complete: {:?}", record);
+
+            println!("Nightly self-improvement run:");
+            println!("  retraction beats fired : {}", record.retractions_fired.map(|n| n.to_string()).unwrap_or_else(|| "0 (never)".into()));
+            match record.contradiction_rate {
+                Some(r) => println!("  contradiction rate     : {r:.3}"),
+                None => println!("  contradiction rate     : (not computed)"),
+            }
+            println!("  history                : {}", dir.join("nightly_runs.jsonl").display());
         }
     }
 }
