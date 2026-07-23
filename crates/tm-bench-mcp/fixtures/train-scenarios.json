@@ -1,0 +1,37 @@
+{
+  "_comment": "TRAINING split for tool-description optimisation. Distinct utterances from core-scenarios.json (the held-out set). The optimiser tunes descriptions here; core-scenarios.json is only ever scored, never optimised on.",
+  "scenarios": [
+    { "id": "t-store-1", "utterance": "Remember that my flight to Tokyo is on May 3rd", "expected_tool": "memory_store" },
+    { "id": "t-store-2", "utterance": "Jot down that Carol raised a seed round from Sequoia", "expected_tool": "memory_store" },
+    { "id": "t-store-3", "utterance": "Make a note that the API deadline is Friday", "expected_tool": "memory_store" },
+    { "id": "t-store-4", "utterance": "Store the fact that we chose Postgres over MySQL", "expected_tool": "memory_store" },
+    { "id": "t-store-5", "utterance": "Log that I finished the marathon in 2:58", "expected_tool": "memory_store" },
+    { "id": "t-store-6", "utterance": "Don't let me forget the meeting is at 3pm tomorrow", "expected_tool": "memory_store" },
+
+    { "id": "t-query-1", "utterance": "What time is my flight again?", "expected_tool": "memory_query" },
+    { "id": "t-query-2", "utterance": "Remind me who Carol raised money from", "expected_tool": "memory_query" },
+    { "id": "t-query-3", "utterance": "When is the API deadline?", "expected_tool": "memory_query" },
+    { "id": "t-query-4", "utterance": "Tell me what database we picked", "expected_tool": "memory_query" },
+    { "id": "t-query-5", "utterance": "How fast did I run the marathon?", "expected_tool": "memory_query" },
+
+    { "id": "t-contradict-1", "utterance": "I'm flying on May 5th now — is that different from what I told you?", "expected_tool": "memory_contradict" },
+    { "id": "t-contradict-2", "utterance": "We're switching to MySQL, does that conflict with an earlier decision?", "expected_tool": "memory_contradict" },
+    { "id": "t-contradict-3", "utterance": "Saying the deadline is Monday — does that contradict anything?", "expected_tool": "memory_contradict" },
+    { "id": "t-contradict-4", "utterance": "Is it inconsistent to say Carol raised from Andreessen?", "expected_tool": "memory_contradict" },
+
+    { "id": "t-forget-1", "utterance": "Erase everything about the Tokyo trip", "expected_tool": "memory_forget" },
+    { "id": "t-forget-2", "utterance": "Forget what I said about the marathon", "expected_tool": "memory_forget" },
+    { "id": "t-forget-3", "utterance": "Remove the memory of the MySQL decision", "expected_tool": "memory_forget" },
+
+    { "id": "t-compose-1", "utterance": "Gather the context from my hiring and fundraising threads", "expected_tool": "memory_compose" },
+    { "id": "t-compose-2", "utterance": "Merge what I know across the launch and roadmap conversations", "expected_tool": "memory_compose" },
+    { "id": "t-compose-3", "utterance": "Assemble the relevant context from earlier chats for this session", "expected_tool": "memory_compose" },
+
+    { "id": "t-feedback-1", "utterance": "That recall was spot on, it was helpful", "expected_tool": "memory_feedback" },
+    { "id": "t-feedback-2", "utterance": "The memory you pulled was irrelevant, mark it a miss", "expected_tool": "memory_feedback" },
+
+    { "id": "t-none-1", "utterance": "Translate this paragraph into Spanish", "expected_tool": "none" },
+    { "id": "t-none-2", "utterance": "Explain how a transformer attention head works", "expected_tool": "none" },
+    { "id": "t-none-3", "utterance": "Generate a unit test for this parser", "expected_tool": "none" }
+  ]
+}

@@ -6232,6 +6232,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "tm-bench-mcp"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap 4.6.0",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "tm-bench-memory"
 version = "0.1.0"
 dependencies = [

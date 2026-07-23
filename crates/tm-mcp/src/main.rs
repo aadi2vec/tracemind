@@ -37,12 +37,115 @@ fn data_dir() -> std::path::PathBuf {
 // Tool descriptors
 // ---------------------------------------------------------------------------
 
+/// The core tool surface a host sees by default.
+///
+/// The holistic review (docs/HOLISTIC-REVIEW-2026-07.md §6a) found that
+/// advertising 51 tools is the single largest unforced error in the product:
+/// the tool descriptions *are* the only prompt TraceMind controls inside a
+/// host's context, and every extra tool is one more chance for the model to
+/// call the wrong thing. This is the "subtract, then sharpen" set — the six
+/// verbs that carry the whole loop:
+///
+/// - `memory_store`      — deposit context
+/// - `memory_query`      — draw context
+/// - `memory_feedback`   — close the reward loop
+/// - `memory_contradict` — the retraction beat (the wedge)
+/// - `memory_compose`    — cross-conversation composition (the moat)
+/// - `memory_forget`     — the trust primitive
+///
+/// Every other tool stays fully callable — a host that names it still gets
+/// dispatched — but is hidden from `tools/list` unless the operator opts in
+/// to the advanced surface. Hiding, not removing, keeps power users and the
+/// benchmark harness whole while shrinking the surface the host must reason
+/// over.
+pub const CORE_TOOLS: &[&str] = &[
+    "memory_store",
+    "memory_query",
+    "memory_feedback",
+    "memory_contradict",
+    "memory_compose",
+    "memory_forget",
+];
+
+/// Whether the advanced (full) tool surface is advertised.
+///
+/// Off by default. Enable with `TM_MCP_ADVANCED=1` in the host's MCP server
+/// config. The benchmark harness sets it so it can exercise every tool.
+pub fn advanced_surface_enabled() -> bool {
+    std::env::var("TM_MCP_ADVANCED")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+/// The tool list actually advertised to the host: full when the advanced
+/// surface is on, otherwise filtered to [`CORE_TOOLS`], with any tuned
+/// description overrides applied.
+fn tools_list_filtered() -> Value {
+    let mut list = tools_list_for_surface(advanced_surface_enabled());
+    apply_description_overrides(&mut list, &load_description_overrides());
+    list
+}
+
+/// Load `{tool_name: description}` overrides from `~/.tracemind/mcp-descriptions.json`.
+///
+/// This is the description analog of the retrieval engine's `policy.json`:
+/// the GEPA-over-descriptions loop (produced by `tm-bench-mcp --optimize-on`)
+/// writes tuned descriptions here, and the server applies them at
+/// `tools/list` time — so the optimisation reaches the running host rather
+/// than living in the benchmark. Missing or unparseable file → compiled-in
+/// descriptions, never a failure.
+fn load_description_overrides() -> std::collections::BTreeMap<String, String> {
+    let path = data_dir().join("mcp-descriptions.json");
+    std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_default()
+}
+
+/// Replace advertised descriptions with any override present for that tool.
+fn apply_description_overrides(
+    list: &mut Value,
+    overrides: &std::collections::BTreeMap<String, String>,
+) {
+    if overrides.is_empty() {
+        return;
+    }
+    if let Some(arr) = list.get_mut("tools").and_then(|t| t.as_array_mut()) {
+        for tool in arr.iter_mut() {
+            let Some(name) = tool.get("name").and_then(|n| n.as_str()).map(str::to_string) else {
+                continue;
+            };
+            if let Some(desc) = overrides.get(&name) {
+                tool["description"] = Value::String(desc.clone());
+            }
+        }
+    }
+}
+
+/// Pure filter — `advanced` decides the surface, no environment read. Kept
+/// separate so it is testable without racing on a process-global env var.
+fn tools_list_for_surface(advanced: bool) -> Value {
+    let mut full = tools_list();
+    if advanced {
+        return full;
+    }
+    if let Some(arr) = full.get_mut("tools").and_then(|t| t.as_array_mut()) {
+        arr.retain(|tool| {
+            tool.get("name")
+                .and_then(|n| n.as_str())
+                .map(|n| CORE_TOOLS.contains(&n))
+                .unwrap_or(false)
+        });
+    }
+    full
+}
+
 fn tools_list() -> Value {
     json!({
         "tools": [
             {
                 "name": "memory_store",
-                "description": "Ingest text into TraceMind memory, extracting entities and triples. Response also carries a `context` field with pre-existing memories related to the stored text (top-3 entities + top-3 1-hop neighbours), so callers see \"here's what I already knew\" without a second query.",
+                "description": "Remember, note, save, record, log, or store a durable fact, decision, plan, or preference the user shares — anything worth recalling later. Call this proactively whenever the user tells you something to keep track of. Extracts entities and returns what was already known about them, so you see \"here is what I already knew\" without a second call.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -155,7 +258,7 @@ fn tools_list() -> Value {
             },
             {
                 "name": "memory_query",
-                "description": "Query TraceMind memory with natural-language text. Returns relevant entities and triples. Defaults to the active context; set cross_context=true to bridge all contexts. LM-11d: pass `view` to apply a saved Memory View splice, or `include_entity`/`exclude_entity` for one-shot UUID filters.",
+                "description": "Recall, retrieve, look up, or remind the user of something from the past — what they told you, decided, or asked about before. Call this before answering anything that references earlier context. Returns the relevant remembered facts. Set cross_context=true to search across all conversations.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -536,7 +639,7 @@ fn tools_list() -> Value {
             },
             {
                 "name": "memory_feedback",
-                "description": "Q3.1 feedback signal fabric — record any of the three signal classes (explicit / implicit / behavioral) as first-class memory entries. Explicit: helpful, not_related, cross_context_bridge, card_accepted, card_rejected, outcome_edited. Implicit: retrieval_cited, retrieval_miss, proposal_silenced. Behavioral: verb_invoked. All signals attach to a `feedback_hook_id` returned by `memory_query` — pass it back to link signals to retrievals. Explicit retrieval signals also train the bandit.",
+                "description": "Record whether a memory you surfaced was helpful or an unrelated miss, so recall improves over time. Call this after the user reacts to a recalled memory. (Records explicit / implicit / behavioral feedback signals.) Explicit: helpful, not_related, cross_context_bridge, card_accepted, card_rejected, outcome_edited. Implicit: retrieval_cited, retrieval_miss, proposal_silenced. Behavioral: verb_invoked. All signals attach to a `feedback_hook_id` returned by `memory_query` — pass it back to link signals to retrievals. Explicit retrieval signals also train the bandit.",
                 "inputSchema": {
                     "type": "object",
                     "required": ["kind"],
@@ -624,7 +727,7 @@ fn tools_list() -> Value {
             },
             {
                 "name": "memory_compose",
-                "description": "Sprint GRAPH — evaluate a graph-algebra expression and return the materialized thread graph (entities + topics + commitments + captures). Expression is the same JSON shape as `GraphExpr` (node:thread / set_op / filter / bridge).",
+                "description": "Compose, combine, gather, assemble, merge, or pull together context from the user's past conversation threads into the current one — union, intersect, or filter what several earlier chats knew. Use when the user wants context from prior conversations brought into this one.",
                 "inputSchema": {
                     "type": "object",
                     "required": ["expression"],
@@ -659,7 +762,7 @@ fn tools_list() -> Value {
             },
             {
                 "name": "memory_forget",
-                "description": "Q4.5 — soft-delete a memory: mark it as forgotten so it is excluded from all future retrievals. The underlying row is retained for audit.",
+                "description": "Forget, delete, erase, or remove a stored memory or entity at the user's request, excluding it from all future recall. Use when the user asks you to forget something. Local and reversible from the audit log.",
                 "inputSchema": {
                     "type": "object",
                     "required": ["memory_id"],
@@ -681,7 +784,7 @@ fn tools_list() -> Value {
             },
             {
                 "name": "memory_contradict",
-                "description": "Q4.5 — explicitly flag two memories (entities or traces) as contradicting each other. Writes a contradiction record to the graph DB for surfacing in the brief.",
+                "description": "Check whether a new statement clashes with, conflicts with, contradicts, or is inconsistent with something the user told you before — the retraction beat. Call this when the user says something that might reverse an earlier fact or decision, so you can surface \"you told me the opposite last time.\"",
                 "inputSchema": {
                     "type": "object",
                     "required": ["memory_id_a", "memory_id_b"],
@@ -3819,7 +3922,7 @@ async fn handle_request(
             }))
         }
 
-        "tools/list" => Ok(tools_list()),
+        "tools/list" => Ok(tools_list_filtered()),
 
         "tools/call" => {
             let params = request.get("params").unwrap_or(&Value::Null);
@@ -5633,5 +5736,99 @@ mod tests {
 
         std::env::remove_var("TM_DATA_DIR");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ── Tool-surface tiering (holistic review §6a) ──────────────────────
+
+    fn advertised_names(list: &Value) -> Vec<String> {
+        list["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn core_surface_advertises_exactly_the_core_six() {
+        let names = advertised_names(&tools_list_for_surface(false));
+        assert_eq!(names.len(), CORE_TOOLS.len(), "advertised: {names:?}");
+        for t in CORE_TOOLS {
+            assert!(names.contains(&t.to_string()), "core tool {t} missing");
+        }
+    }
+
+    #[test]
+    fn advanced_flag_reveals_the_full_surface() {
+        let full = advertised_names(&tools_list_for_surface(true));
+        assert!(
+            full.len() > CORE_TOOLS.len(),
+            "advanced surface should be larger, got {}",
+            full.len()
+        );
+        for t in CORE_TOOLS {
+            assert!(full.contains(&t.to_string()), "core tool {t} lost in advanced");
+        }
+    }
+
+    /// Every core tool must have a real definition in the master list — a
+    /// typo in CORE_TOOLS would otherwise silently advertise nothing.
+    #[test]
+    fn every_core_tool_exists_in_the_master_list() {
+        let all = advertised_names(&tools_list());
+        for t in CORE_TOOLS {
+            assert!(all.contains(&t.to_string()), "CORE_TOOLS lists unknown tool {t}");
+        }
+    }
+
+    /// Hidden tools must still be dispatchable — hiding is not removing.
+    /// This guards the contract the benchmark harness and power users rely
+    /// on: a tool absent from `tools/list` is still callable by name.
+    #[test]
+    fn hidden_tools_are_still_in_the_master_definition() {
+        let all = advertised_names(&tools_list());
+        // A representative advanced tool that must remain callable.
+        assert!(all.contains(&"memory_reason".to_string()));
+        assert!(all.contains(&"memory_brief".to_string()));
+    }
+
+    #[test]
+    fn description_overrides_replace_advertised_text() {
+        let mut list = tools_list_for_surface(false);
+        let mut ov = std::collections::BTreeMap::new();
+        ov.insert("memory_store".to_string(), "TUNED store description".to_string());
+        apply_description_overrides(&mut list, &ov);
+        let store = list["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"] == "memory_store")
+            .unwrap();
+        assert_eq!(store["description"], "TUNED store description");
+    }
+
+    #[test]
+    fn empty_overrides_leave_descriptions_untouched() {
+        let before = tools_list_for_surface(false);
+        let mut after = before.clone();
+        apply_description_overrides(&mut after, &std::collections::BTreeMap::new());
+        assert_eq!(before, after);
+    }
+
+    /// The rewritten core descriptions must contain the intent verbs a host
+    /// keys on — the "sharpen" fix the MCP benchmark validated (55%->80%).
+    #[test]
+    fn core_descriptions_contain_intent_verbs() {
+        let list = tools_list_for_surface(false);
+        let desc = |name: &str| -> String {
+            list["tools"].as_array().unwrap().iter()
+                .find(|t| t["name"] == name).unwrap()["description"]
+                .as_str().unwrap().to_lowercase()
+        };
+        assert!(desc("memory_store").contains("remember"));
+        assert!(desc("memory_query").contains("recall") || desc("memory_query").contains("retrieve"));
+        assert!(desc("memory_contradict").contains("contradict") || desc("memory_contradict").contains("conflict"));
+        assert!(desc("memory_forget").contains("forget") || desc("memory_forget").contains("delete"));
+        assert!(desc("memory_compose").contains("compose") || desc("memory_compose").contains("combine"));
     }
 }

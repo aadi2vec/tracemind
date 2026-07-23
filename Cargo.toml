@@ -33,6 +33,7 @@ members = [
     "crates/tm-bench-wme",
     "crates/tm-bench-memory",
     "crates/tm-gepa",
+    "crates/tm-bench-mcp",
 ]
 
 [workspace.package]
