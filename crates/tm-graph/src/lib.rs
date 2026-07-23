@@ -1,4 +1,5 @@
 pub mod algebra;
+pub mod simhash;
 pub mod belief;
 pub mod community;
 pub mod contradiction_rate;

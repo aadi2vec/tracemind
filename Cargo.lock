@@ -6273,19 +6273,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "tm-bench-wme"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "serde",
- "serde_json",
- "tempfile",
- "tm-reflect",
- "tm-types",
- "uuid",
-]
-
-[[package]]
 name = "tm-capture"
 version = "0.1.0"
 dependencies = [
@@ -6361,22 +6348,6 @@ dependencies = [
  "thiserror 1.0.69",
  "tm-types",
  "tracing",
- "uuid",
-]
-
-[[package]]
-name = "tm-engram"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 1.0.69",
- "tm-intent",
- "tm-temporal",
- "tm-tms",
- "tm-types",
  "uuid",
 ]
 
@@ -6500,18 +6471,6 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
- "uuid",
-]
-
-[[package]]
-name = "tm-modal"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "serde",
- "serde_json",
- "thiserror 1.0.69",
- "tm-types",
  "uuid",
 ]
 

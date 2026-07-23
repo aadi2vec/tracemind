@@ -323,6 +323,9 @@ impl GraphStore {
                 ("cluster_id", "INTEGER"),
                 ("promoted_entity", "TEXT"),
                 ("priority_tier", "INTEGER DEFAULT 3"),
+                // SimHash signature for the two-stage ANN search path. NULL
+                // on rows from older builds; backfilled lazily at search time.
+                ("simhash", "INTEGER"),
             ] {
                 let sql = format!("ALTER TABLE captured_signals ADD COLUMN {col} {ty}");
                 let _ = conn.execute(&sql, []); // Ignore error if column already exists
@@ -2338,12 +2341,14 @@ impl GraphStore {
         priority_tier: i64,
     ) -> Result<i64> {
         let blob: Vec<u8> = embedding.iter().flat_map(|f| f.to_le_bytes()).collect();
+        // SimHash signature for the two-stage ANN prefilter (stored as i64).
+        let simhash = crate::simhash::signature(embedding) as i64;
         let conn = self.kg.connection();
         let ctx = self.active_context_id.borrow().map(|u| u.to_string());
         conn.execute(
             "INSERT INTO captured_signals \
-             (source, raw_text, content_hash, relevance_score, ingested, session_id, embedding, priority_tier, context_id) \
-             VALUES (?1, ?2, ?3, ?4, 0, ?5, ?6, ?7, ?8)",
+             (source, raw_text, content_hash, relevance_score, ingested, session_id, embedding, priority_tier, context_id, simhash) \
+             VALUES (?1, ?2, ?3, ?4, 0, ?5, ?6, ?7, ?8, ?9)",
             params![
                 source,
                 raw_text,
@@ -2352,7 +2357,8 @@ impl GraphStore {
                 session_id.to_string(),
                 blob,
                 priority_tier,
-                ctx
+                ctx,
+                simhash
             ],
         )
         .map_err(|e| TraceMindError::Storage(format!("insert_signal_with_embedding: {e}")))?;
@@ -2548,6 +2554,134 @@ impl GraphStore {
         crate::community::set_community_label(&self.kg, community_id, label, terms_json)
     }
 
+    /// Stage 1 of the two-stage signal search: return the ids of the best
+    /// candidates by SimHash Hamming distance, unioned with a recency window.
+    ///
+    /// Loads only `(id, simhash, embedding-when-signature-missing)` so the
+    /// hot path never materialises full embeddings for the whole corpus.
+    /// The candidate budget scales with `top_k` but stays generous, because
+    /// Hamming is nearly free and the exact rerank restores precision.
+    fn signal_ann_candidates(&self, query_sig: u64, top_k: usize) -> Result<Vec<i64>> {
+        use std::collections::HashSet;
+
+        // How many candidates to hand to the exact reranker, and how many of
+        // the most-recent signals to always include regardless of signature.
+        let candidate_k = (top_k * 8).max(256);
+        let recency_window = (top_k * 4).max(128);
+
+        let conn = self.kg.connection();
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, simhash, embedding FROM captured_signals \
+                 WHERE cluster_id IS NULL AND embedding IS NOT NULL AND priority_tier < 4",
+            )
+            .map_err(|e| TraceMindError::Storage(format!("prep ann scan: {e}")))?;
+
+        let rows = stmt
+            .query_map([], |row| {
+                let id: i64 = row.get(0)?;
+                let sig: Option<i64> = row.get(1)?;
+                // Only fetch the blob when the signature is missing (older row).
+                let blob: Option<Vec<u8>> = if sig.is_none() { row.get(2)? } else { None };
+                Ok((id, sig, blob))
+            })
+            .map_err(|e| TraceMindError::Storage(format!("ann scan: {e}")))?;
+
+        // (hamming, id), plus a running record of the most-recent ids.
+        let mut by_hamming: Vec<(u32, i64)> = Vec::new();
+        for row in rows {
+            let (id, sig, blob) = row.map_err(|e| TraceMindError::Storage(e.to_string()))?;
+            let signature = match sig {
+                Some(s) => s as u64,
+                None => {
+                    // Backfill: compute from the embedding and persist so the
+                    // next query is on the fast path.
+                    let emb: Vec<f32> = blob
+                        .unwrap_or_default()
+                        .chunks_exact(4)
+                        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                        .collect();
+                    let s = crate::simhash::signature(&emb);
+                    let _ = conn.execute(
+                        "UPDATE captured_signals SET simhash = ?1 WHERE id = ?2",
+                        params![s as i64, id],
+                    );
+                    s
+                }
+            };
+            by_hamming.push((crate::simhash::hamming(query_sig, signature), id));
+        }
+
+        if by_hamming.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Recency window: the highest ids (most recently inserted).
+        let mut recent_ids: Vec<i64> = by_hamming.iter().map(|(_, id)| *id).collect();
+        recent_ids.sort_unstable_by(|a, b| b.cmp(a));
+        recent_ids.truncate(recency_window);
+
+        // Top candidates by Hamming distance.
+        by_hamming.sort_by_key(|(h, _)| *h);
+        let mut chosen: HashSet<i64> = by_hamming
+            .iter()
+            .take(candidate_k)
+            .map(|(_, id)| *id)
+            .collect();
+        chosen.extend(recent_ids);
+        Ok(chosen.into_iter().collect())
+    }
+
+    /// Load full [`CapturedSignal`] rows for a specific set of ids.
+    fn load_signals_by_ids(&self, ids: &[i64]) -> Result<Vec<CapturedSignal>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let conn = self.kg.connection();
+        let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let sql = format!(
+            "SELECT id, source, raw_text, content_hash, session_id, embedding, created_at \
+             FROM captured_signals WHERE id IN ({placeholders})"
+        );
+        let mut stmt = conn
+            .prepare(&sql)
+            .map_err(|e| TraceMindError::Storage(format!("prep load_by_ids: {e}")))?;
+        let params_vec: Vec<&dyn rusqlite::ToSql> =
+            ids.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+        let rows = stmt
+            .query_map(params_vec.as_slice(), |row| {
+                let id: i64 = row.get(0)?;
+                let source: String = row.get(1)?;
+                let raw_text: String = row.get(2)?;
+                let hash_i64: i64 = row.get(3)?;
+                let session_str: Option<String> = row.get(4)?;
+                let blob: Vec<u8> = row.get(5)?;
+                let created_str: String = row.get(6)?;
+                Ok((id, source, raw_text, hash_i64, session_str, blob, created_str))
+            })
+            .map_err(|e| TraceMindError::Storage(format!("load_by_ids: {e}")))?;
+
+        let mut out = Vec::new();
+        for row in rows {
+            let (id, source, raw_text, hash_i64, session_str, blob, created_str) =
+                row.map_err(|e| TraceMindError::Storage(e.to_string()))?;
+            let embedding: Vec<f32> = blob
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
+            out.push(CapturedSignal {
+                id,
+                source,
+                raw_text,
+                content_hash: hash_i64 as u64,
+                session_id: session_str.and_then(|s| Uuid::parse_str(&s).ok()),
+                embedding,
+                created_at: created_str.parse::<DateTime<Utc>>().unwrap_or_else(|_| Utc::now()),
+            });
+        }
+        Ok(out)
+    }
+
     /// Search unpromoted signals by cosine similarity to a query embedding.
     /// Used by the hybrid retrieval path so fresh captures are findable even
     /// before consolidation has promoted them to entities.
@@ -2560,13 +2694,30 @@ impl GraphStore {
         top_k: usize,
         min_sim: f32,
     ) -> Result<Vec<(CapturedSignal, f32)>> {
-        // Load candidates — in practice this is bounded because most signals get consolidated.
-        // For large backlogs, we could use ANN; for now linear scan is fine (SQLite is already slow-ish).
-        let signals = self.unconsolidated_signals_by_tier(None, 2000)?;
-        if signals.is_empty() {
+        // Two-stage ANN (holistic review §5 P2.6). The previous
+        // implementation loaded the oldest 2,000 full embeddings and
+        // cosine-scored them — a *silent* recall cliff, because past 2,000
+        // unconsolidated captures the newest memories were dropped with no
+        // error. Instead:
+        //
+        //   Stage 1 (cheap): load only (id, simhash) — 8 bytes each — for
+        //   *every* unconsolidated non-ephemeral signal, and rank by Hamming
+        //   distance to the query signature. No 384-dim work, no cap.
+        //   Stage 2 (exact): load full embeddings for the top Hamming
+        //   candidates plus a recency window (so a brand-new memory whose
+        //   signature happens to differ is never dropped) and cosine-score
+        //   only those.
+        let query_sig = crate::simhash::signature(query_embedding);
+
+        // Stage 1: signature scan. Rows missing a signature (older builds)
+        // are backfilled from their embedding so they still participate.
+        let candidate_ids = self.signal_ann_candidates(query_sig, top_k)?;
+        if candidate_ids.is_empty() {
             return Ok(Vec::new());
         }
 
+        // Stage 2: exact cosine on the candidate set only.
+        let signals = self.load_signals_by_ids(&candidate_ids)?;
         let mut scored: Vec<(CapturedSignal, f32)> = signals
             .into_iter()
             .filter_map(|s| {
@@ -4396,5 +4547,114 @@ mod tests {
         let promoted = store.accept_pending(pending_id, "ok").unwrap();
         // Unknown name falls through to Custom — original text preserved.
         assert_eq!(promoted.predicate, Predicate::Custom("mentored".to_string()));
+    }
+
+    // ── Two-stage ANN signal search (review §5 P2.6) ────────────────────
+
+    fn onehot(dim: usize, i: usize) -> Vec<f32> {
+        let mut v = vec![0.0f32; dim];
+        v[i % dim] = 1.0;
+        v
+    }
+
+    #[test]
+    fn signal_search_finds_the_exact_match() {
+        let store = GraphStore::open(":memory:").unwrap();
+        let dim = 16;
+        for i in 0..50 {
+            store
+                .insert_signal_with_embedding(
+                    "test",
+                    &format!("signal {i}"),
+                    i as u64,
+                    Uuid::new_v4(),
+                    &onehot(dim, i),
+                    None,
+                    3,
+                )
+                .unwrap();
+        }
+        // Query identical to signal 7's embedding.
+        let hits = store.search_signals(&onehot(dim, 7), 3, 0.5).unwrap();
+        assert!(!hits.is_empty(), "search returned nothing");
+        assert_eq!(hits[0].0.raw_text, "signal 7", "top hit should be the exact match");
+    }
+
+    /// The whole point of the rewrite: a memory inserted *after* thousands of
+    /// others must still be findable. The old `ORDER BY id ASC LIMIT 2000`
+    /// dropped exactly these. The recency window guarantees it here even at
+    /// scale, and the SimHash prefilter finds it by similarity regardless.
+    #[test]
+    fn newest_signal_is_never_silently_dropped() {
+        let store = GraphStore::open(":memory:").unwrap();
+        let dim = 32;
+        // Fill with many unrelated signals.
+        for i in 0..2500 {
+            store
+                .insert_signal_with_embedding(
+                    "bulk",
+                    &format!("bulk {i}"),
+                    i as u64,
+                    Uuid::new_v4(),
+                    &onehot(dim, i),
+                    None,
+                    3,
+                )
+                .unwrap();
+        }
+        // Insert a distinctive newest signal.
+        let needle = {
+            let mut v = vec![0.0f32; dim];
+            v[3] = 1.0;
+            v[7] = 1.0; // distinctive pattern
+            v
+        };
+        store
+            .insert_signal_with_embedding("fresh", "the needle", 99999, Uuid::new_v4(), &needle, None, 3)
+            .unwrap();
+
+        let hits = store.search_signals(&needle, 5, 0.3).unwrap();
+        assert!(
+            hits.iter().any(|(s, _)| s.raw_text == "the needle"),
+            "the newest signal was dropped — the silent-cliff regression is back"
+        );
+    }
+
+    /// The two-stage result should agree with an exact brute-force scan on
+    /// the top hit (the prefilter + rerank must not degrade the winner).
+    #[test]
+    fn two_stage_agrees_with_brute_force_on_top_hit() {
+        let store = GraphStore::open(":memory:").unwrap();
+        // dim >= n so every one-hot index is unique (no cosine ties that
+        // would make "the" top hit ambiguous).
+        let dim = 128;
+        let n = 120;
+        let mut embeddings = Vec::new();
+        for i in 0..n {
+            // Slightly perturbed one-hots so cosines differ but stay distinct.
+            let mut v = onehot(dim, i);
+            v[(i + 1) % dim] += 0.3;
+            let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+            for x in v.iter_mut() {
+                *x /= norm;
+            }
+            store
+                .insert_signal_with_embedding("t", &format!("s{i}"), i as u64, Uuid::new_v4(), &v, None, 3)
+                .unwrap();
+            embeddings.push((format!("s{i}"), v));
+        }
+        let query = &embeddings[42].1;
+
+        // Brute-force top hit.
+        let brute = embeddings
+            .iter()
+            .map(|(name, e)| (name, cosine_sim_slice(query, e)))
+            .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
+            .unwrap()
+            .0
+            .clone();
+
+        let hits = store.search_signals(query, 1, 0.0).unwrap();
+        assert_eq!(hits[0].0.raw_text, brute, "two-stage disagreed with brute force");
     }
 }

@@ -25,12 +25,9 @@ members = [
     "crates/tm-reflect",
     "crates/tm-world-model",
     "crates/tm-temporal",
-    "crates/tm-modal",
     "crates/tm-tms",
-    "crates/tm-engram",
     "crates/tm-pgm",
     "crates/tm-cluster",
-    "crates/tm-bench-wme",
     "crates/tm-bench-memory",
     "crates/tm-gepa",
     "crates/tm-bench-mcp",
@@ -96,9 +93,7 @@ tm-intent = { path = "crates/tm-intent" }
 tm-reflect = { path = "crates/tm-reflect" }
 tm-world-model = { path = "crates/tm-world-model" }
 tm-temporal = { path = "crates/tm-temporal" }
-tm-modal = { path = "crates/tm-modal" }
 tm-tms = { path = "crates/tm-tms" }
-tm-engram = { path = "crates/tm-engram" }
 tm-pgm = { path = "crates/tm-pgm" }
 tm-cluster = { path = "crates/tm-cluster" }
 
