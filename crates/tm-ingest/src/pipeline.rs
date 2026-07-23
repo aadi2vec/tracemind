@@ -462,6 +462,22 @@ impl IngestPipeline {
         }
         let triples = accepted_triples;
 
+        // 7a. Close the valid-time interval of every fact the retraction beat
+        //     just reversed. The old fact stopped being true when this store
+        //     happened, so its `valid_to` is set to now — an as-of query
+        //     before this instant still returns the old value, after it does
+        //     not. This is what makes supersession correct rather than a
+        //     message (holistic review §5 P1.5). Soft-fail: a temporal write
+        //     must never lose the graph write that already committed.
+        if !contradictions.is_empty() {
+            let now = chrono::Utc::now();
+            for c in &contradictions {
+                if let Err(e) = self.graph.supersede_triple(c.old_triple_id, now) {
+                    tracing::debug!("[ingest] supersede_triple failed: {e}");
+                }
+            }
+        }
+
         // 7b. LM-5b — derive + persist auto-tags. Hashtags from raw text
         // + entity-type label per entity. Cluster-label tags layer in
         // later from the consolidator once CLU-6 backfills cluster_id.

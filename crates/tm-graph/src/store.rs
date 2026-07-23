@@ -1926,11 +1926,22 @@ impl GraphStore {
                         predicate: pred,
                         old_object,
                         new_object,
+                        old_triple_id: e.id,
                     });
                 }
             }
         }
         out
+    }
+
+    /// Close the valid-time interval of a triple's fact — it stopped being
+    /// true when `at` occurred, because a newer fact reversed it. Called
+    /// when the retraction beat fires so the bitemporal history is correct:
+    /// an as-of query before `at` still returns the old value.
+    pub fn supersede_triple(&self, old_triple_id: Uuid, at: DateTime<Utc>) -> Result<()> {
+        self.temporal
+            .close_validity(old_triple_id, FACT_TYPE_TRIPLE, at)
+            .map_err(temporal_err)
     }
 
     /// Entity display name, or `fallback` if the entity is unknown.
@@ -3815,6 +3826,10 @@ pub struct StoreContradiction {
     pub new_object: String,
     /// A ready-to-surface sentence for the host.
     pub message: String,
+    /// The triple whose fact is being reversed (its validity should be
+    /// closed). Skipped in the host-facing JSON; used internally.
+    #[serde(skip)]
+    pub old_triple_id: Uuid,
 }
 
 /// Predicates where a subject is expected to have a single object, so a
@@ -4520,6 +4535,48 @@ mod tests {
         // Restating the same fact is not a contradiction.
         let same = functional_triple(carol.id, stripe.id);
         assert!(store.detect_store_contradictions(&[same]).is_empty());
+    }
+
+    /// Supersession is correct in *valid time*, not just a message: after a
+    /// reversal, an as-of query before the reversal still returns the old
+    /// fact, and after it the old fact is no longer valid. This is P1.5 —
+    /// what makes the retraction beat trustworthy.
+    #[test]
+    fn superseding_a_triple_closes_its_valid_time() {
+        let store = GraphStore::open(":memory:").unwrap();
+        let carol = make_entity("Carol", EntityType::Person);
+        let stripe = make_entity("Stripe", EntityType::Organization);
+        store.upsert_entity(&carol).unwrap();
+        store.upsert_entity(&stripe).unwrap();
+
+        let t0 = Utc::now() - chrono::Duration::minutes(10);
+        let mut old = functional_triple(carol.id, stripe.id);
+        old.created_at = t0;
+        old.updated_at = t0;
+        store.upsert_triple(&old).unwrap();
+
+        // Valid at t0 + 1min (before reversal).
+        let before = t0 + chrono::Duration::minutes(1);
+        assert!(
+            store.triple_at(old.id, before).unwrap().is_some(),
+            "old fact should be valid before the reversal"
+        );
+
+        // Reverse it now.
+        let at = Utc::now();
+        store.supersede_triple(old.id, at).unwrap();
+
+        // Still valid *before* the reversal instant.
+        assert!(
+            store.triple_at(old.id, before).unwrap().is_some(),
+            "history before the reversal must be preserved"
+        );
+        // No longer valid after.
+        let after = at + chrono::Duration::minutes(1);
+        assert!(
+            store.triple_at(old.id, after).unwrap().is_none(),
+            "old fact must not be valid after it was superseded"
+        );
     }
 
     #[test]
