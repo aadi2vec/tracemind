@@ -67,7 +67,7 @@ pub use pending_relations::{
     PendingRelation, PendingStatus, ACCEPT_THRESHOLD as PENDING_ACCEPT_THRESHOLD,
     PENDING_FLOOR, SCHEMA_VERSION as PENDING_RELATIONS_SCHEMA_VERSION,
 };
-pub use store::{Backlink, CapturedSignal, GraphStore, PendingRouteOutcome, TripleDetail};
+pub use store::{Backlink, CapturedSignal, GraphStore, PendingRouteOutcome, StoreContradiction, TripleDetail};
 
 pub use algebra::{Algebra, GraphExpr, SetOp};
 pub use event_graph::{EventEdge, EventEdgeKind, EventGraphStore, EventNode, EventNodeKind};

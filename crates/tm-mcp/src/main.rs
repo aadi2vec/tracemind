@@ -1054,17 +1054,58 @@ async fn handle_memory_store(
         }
     };
 
+    // The retraction beat (holistic review §5 P1.4). If this store reversed
+    // a previously-recorded fact, surface it prominently so the host raises
+    // it — "you told me the opposite last time." Instrumented: every fired
+    // beat is logged as a first-class feedback signal so we can measure how
+    // often the wedge actually triggers in real sessions.
+    let contradictions: Vec<Value> = result
+        .contradictions
+        .iter()
+        .map(|c| {
+            json!({
+                "message": c.message,
+                "subject": c.subject,
+                "predicate": c.predicate,
+                "old": c.old_object,
+                "new": c.new_object,
+            })
+        })
+        .collect();
+    if !contradictions.is_empty() {
+        record_retraction_fired("", result.contradictions.len());
+    }
+
     Ok(json!({
         "stored": true,
         "entities": result.entities.len(),
         "triples": result.triples.len(),
         "candidates_mined": mined_count,
         "outcome_proposals": outcome_proposals,
+        // Surfaced first and named so the host cannot miss it.
+        "contradictions": contradictions,
+        "retraction_beat": !contradictions.is_empty(),
         "context": {
             "memories": context_memories,
             "related": context_related,
         }
     }))
+}
+
+/// Instrument the retraction beat: append a line to `retractions.jsonl` in
+/// the data dir so we can count how often the wedge fires across real
+/// sessions. This is the metric the review asks for (§5 P1.4) — the beat
+/// should be the *most* measured behaviour, not the least. Soft-fail.
+fn record_retraction_fired(_db_path: &str, count: usize) {
+    let path = data_dir().join("retractions.jsonl");
+    let line = json!({
+        "at": chrono::Utc::now().to_rfc3339(),
+        "contradictions": count,
+    });
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        use std::io::Write;
+        let _ = writeln!(f, "{line}");
+    }
 }
 
 /// `memory_store_structured` — typed-schema ingestion for callers that have

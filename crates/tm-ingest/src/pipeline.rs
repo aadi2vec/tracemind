@@ -51,6 +51,9 @@ pub struct IngestResult {
     pub memory_ops: Vec<(String, MemoryOp)>,
     /// True if the selective ingestion gate rejected this input.
     pub skip_gate: bool,
+    /// The retraction beat: contradictions this store introduced against
+    /// previously-recorded facts. Empty when nothing was reversed.
+    pub contradictions: Vec<tm_graph::StoreContradiction>,
 }
 
 /// Result of the fast-path ingestion (embed-first, extract-later).
@@ -261,6 +264,7 @@ impl IngestPipeline {
                 content_hash,
                 memory_ops: vec![],
                 skip_gate: true,
+                contradictions: Vec::new(),
             });
         }
 
@@ -431,6 +435,15 @@ impl IngestPipeline {
         // 6. Extract typed triples via pattern matching, then fill with co-occurrence.
         let triples = self.extractor.extract_triples(text, &entities);
 
+        // 6b. The retraction beat (holistic review §5 P1.4). Detect
+        //     contradictions *before* routing the new triples into the
+        //     graph, while the previously-stored value is still the only one
+        //     on record for that (subject, functional-predicate). This is the
+        //     wedge behaviour surfaced automatically on every store — the
+        //     host no longer needs to call a separate tool with UUIDs it does
+        //     not have.
+        let contradictions = self.graph.detect_store_contradictions(&triples);
+
         // 7. LM-9 confidence routing — accept high-confidence triples
         //    immediately, queue mid-confidence ones in the pending pool,
         //    drop the rest. Keep `triples` populated with the accepted
@@ -505,6 +518,7 @@ impl IngestPipeline {
             content_hash,
             memory_ops,
             skip_gate: false,
+            contradictions,
         })
     }
     // -----------------------------------------------------------------------

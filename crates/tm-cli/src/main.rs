@@ -1224,6 +1224,15 @@ fn main() {
             }
             println!("  + {} co-occurrence triples", result.triples.len() - typed.len());
 
+            // The retraction beat (holistic review §5 P1.4). Surface any
+            // fact this store reversed — the wedge behaviour.
+            if !result.contradictions.is_empty() {
+                println!("  ⚠ Retraction:");
+                for c in &result.contradictions {
+                    println!("    {}", c.message);
+                }
+            }
+
             // Sprint C: mine commitment candidates from the ingested text.
             // Soft-fail: any miner / store error is logged via eprintln! and
             // never blocks the ingest path.

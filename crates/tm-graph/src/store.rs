@@ -1885,6 +1885,62 @@ impl GraphStore {
         Ok(out)
     }
 
+    /// Detect contradictions introduced by a set of freshly-extracted
+    /// triples, by looking for an existing triple that shares the new
+    /// triple's subject and a *functional* predicate but names a different
+    /// object.
+    ///
+    /// Only functional predicates are checked — relations where a subject is
+    /// expected to have a single object, so a second value is a genuine
+    /// reversal ("works_at", "lives_in", "renamed_to") rather than a set
+    /// membership ("collaborates_with", "references") where multiple objects
+    /// are normal. This keeps the retraction beat from crying wolf on facts
+    /// that legitimately accumulate.
+    pub fn detect_store_contradictions(&self, new_triples: &[Triple]) -> Vec<StoreContradiction> {
+        let mut out = Vec::new();
+        for t in new_triples {
+            if !is_functional_predicate(&t.predicate) {
+                continue;
+            }
+            let existing = match self.get_triples_for_entity(t.subject_id) {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+            for e in &existing {
+                if e.id == t.id {
+                    continue;
+                }
+                if e.subject_id == t.subject_id
+                    && predicate_key(&e.predicate) == predicate_key(&t.predicate)
+                    && e.object_id != t.object_id
+                {
+                    let subject = self.entity_name_or(t.subject_id, "something");
+                    let old_object = self.entity_name_or(e.object_id, "something");
+                    let new_object = self.entity_name_or(t.object_id, "something");
+                    let pred = humanize_predicate(&t.predicate);
+                    out.push(StoreContradiction {
+                        message: format!(
+                            "You told me {subject} {pred} {old_object}, but now it's {new_object}."
+                        ),
+                        subject,
+                        predicate: pred,
+                        old_object,
+                        new_object,
+                    });
+                }
+            }
+        }
+        out
+    }
+
+    /// Entity display name, or `fallback` if the entity is unknown.
+    pub fn entity_name_or(&self, id: Uuid, fallback: &str) -> String {
+        self.get_entity(id)
+            .ok()
+            .map(|e| e.name)
+            .unwrap_or_else(|| fallback.to_string())
+    }
+
     pub fn get_triples_for_entity(&self, entity_id: Uuid) -> Result<Vec<Triple>> {
         let entity_map = self.entity_map.borrow();
         let &skg_id = entity_map.get(&entity_id).ok_or_else(|| {
@@ -3747,6 +3803,66 @@ fn prop_datetime(val: Option<&serde_json::Value>) -> DateTime<Utc> {
 }
 
 /// Cosine similarity between two slices. Returns 0.0 for mismatched/empty vectors.
+/// A store-time contradiction: a new fact whose (subject, predicate) already
+/// had a *different* object on record. The retraction beat in data form.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct StoreContradiction {
+    pub subject: String,
+    pub predicate: String,
+    /// What was on record before.
+    pub old_object: String,
+    /// What the new statement asserts.
+    pub new_object: String,
+    /// A ready-to-surface sentence for the host.
+    pub message: String,
+}
+
+/// Predicates where a subject is expected to have a single object, so a
+/// second, different object is a genuine reversal rather than a set that
+/// legitimately grows. The retraction beat only fires on these.
+fn is_functional_predicate(p: &Predicate) -> bool {
+    match p {
+        Predicate::WorksAt | Predicate::DependsOn | Predicate::HasProperty => true,
+        Predicate::Custom(s) => {
+            let s = s.to_lowercase();
+            [
+                "works_at", "lives_in", "located_in", "renamed_to", "based_in", "reports_to",
+                "married_to", "born_in", "is_a", "employed_by", "member_of", "assigned_to",
+                "due_on", "scheduled_for", "priced_at", "costs",
+            ]
+            .contains(&s.as_str())
+        }
+        _ => false,
+    }
+}
+
+/// A stable key for comparing predicates by name.
+fn predicate_key(p: &Predicate) -> String {
+    match p {
+        Predicate::Custom(s) => s.to_lowercase(),
+        other => format!("{other:?}").to_lowercase(),
+    }
+}
+
+/// Human-readable predicate for the retraction message: `WorksAt` → "works
+/// at", `renamed_to` → "renamed to".
+fn humanize_predicate(p: &Predicate) -> String {
+    match p {
+        Predicate::Custom(s) => s.replace('_', " ").to_lowercase(),
+        other => {
+            let dbg = format!("{other:?}");
+            let mut out = String::new();
+            for (i, ch) in dbg.chars().enumerate() {
+                if ch.is_uppercase() && i > 0 {
+                    out.push(' ');
+                }
+                out.push(ch.to_ascii_lowercase());
+            }
+            out
+        }
+    }
+}
+
 fn cosine_sim_slice(a: &[f32], b: &[f32]) -> f32 {
     if a.len() != b.len() || a.is_empty() {
         return 0.0;
@@ -4361,6 +4477,68 @@ mod tests {
         let mut t = Triple::new(subject, Predicate::CollaboratesWith, object, confidence);
         t.source_id = Some("test-cap".to_string());
         t
+    }
+
+    fn functional_triple(subject: Uuid, object: Uuid) -> Triple {
+        let mut t = Triple::new(subject, Predicate::WorksAt, object, 0.9);
+        t.source_id = Some("test-cap".to_string());
+        t
+    }
+
+    // ── The retraction beat (review §5 P1.4) ────────────────────────────
+
+    #[test]
+    fn retraction_beat_fires_on_a_reversed_functional_fact() {
+        let store = GraphStore::open(":memory:").unwrap();
+        let carol = make_entity("Carol", EntityType::Person);
+        let stripe = make_entity("Stripe", EntityType::Organization);
+        let datadog = make_entity("Datadog", EntityType::Organization);
+        for e in [&carol, &stripe, &datadog] {
+            store.upsert_entity(e).unwrap();
+        }
+        // First: Carol works_at Stripe.
+        store.upsert_triple(&functional_triple(carol.id, stripe.id)).unwrap();
+
+        // Now she says Datadog — the retraction beat must fire.
+        let new = functional_triple(carol.id, datadog.id);
+        let hits = store.detect_store_contradictions(&[new]);
+        assert_eq!(hits.len(), 1, "expected one contradiction, got {hits:?}");
+        assert_eq!(hits[0].old_object, "Stripe");
+        assert_eq!(hits[0].new_object, "Datadog");
+        assert!(hits[0].message.contains("Stripe") && hits[0].message.contains("Datadog"));
+    }
+
+    #[test]
+    fn retraction_beat_stays_silent_when_the_object_is_unchanged() {
+        let store = GraphStore::open(":memory:").unwrap();
+        let carol = make_entity("Carol", EntityType::Person);
+        let stripe = make_entity("Stripe", EntityType::Organization);
+        store.upsert_entity(&carol).unwrap();
+        store.upsert_entity(&stripe).unwrap();
+        store.upsert_triple(&functional_triple(carol.id, stripe.id)).unwrap();
+
+        // Restating the same fact is not a contradiction.
+        let same = functional_triple(carol.id, stripe.id);
+        assert!(store.detect_store_contradictions(&[same]).is_empty());
+    }
+
+    #[test]
+    fn retraction_beat_does_not_cry_wolf_on_set_predicates() {
+        // collaborates_with is non-functional — a second collaborator is
+        // normal accumulation, not a reversal.
+        let store = GraphStore::open(":memory:").unwrap();
+        let alice = make_entity("Alice", EntityType::Person);
+        let bob = make_entity("Bob", EntityType::Person);
+        let carol = make_entity("Carol", EntityType::Person);
+        for e in [&alice, &bob, &carol] {
+            store.upsert_entity(e).unwrap();
+        }
+        store.upsert_triple(&make_triple(alice.id, bob.id, 0.9)).unwrap();
+        let new = make_triple(alice.id, carol.id, 0.9); // collaborates_with
+        assert!(
+            store.detect_store_contradictions(&[new]).is_empty(),
+            "set-membership predicate must not trigger the retraction beat"
+        );
     }
 
     #[test]
