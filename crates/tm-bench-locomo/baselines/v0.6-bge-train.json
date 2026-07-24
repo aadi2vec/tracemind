@@ -1,0 +1,654 @@
+{
+  "runner": "tracemind-v0.1-bge",
+  "timestamp": "2026-07-22T15:29:21.796494+00:00",
+  "total_questions": 45,
+  "total_samples": 6,
+  "overall_f1": 50.31746,
+  "overall_exact_match": 42.22222,
+  "by_category": {
+    "adversarial": {
+      "count": 8,
+      "f1": 62.5,
+      "exact_match": 37.5
+    },
+    "multi_hop": {
+      "count": 4,
+      "f1": 0.0,
+      "exact_match": 0.0
+    },
+    "single_hop": {
+      "count": 27,
+      "f1": 48.677246,
+      "exact_match": 44.444447
+    },
+    "temporal": {
+      "count": 6,
+      "f1": 75.0,
+      "exact_match": 66.66667
+    }
+  },
+  "wall_seconds": 8.937686875,
+  "outcomes": [
+    {
+      "sample_id": "maya-relocation",
+      "question_id": "q1",
+      "category": "single_hop",
+      "question": "Where did Maya move to?",
+      "prediction": "Boston",
+      "references": [
+        "Boston"
+      ],
+      "f1": 1.0,
+      "exact_match": 1.0,
+      "latency_ms": 25
+    },
+    {
+      "sample_id": "maya-relocation",
+      "question_id": "q2",
+      "category": "single_hop",
+      "question": "Which company did Maya join?",
+      "prediction": "Austin",
+      "references": [
+        "Datadog"
+      ],
+      "f1": 0.0,
+      "exact_match": 0.0,
+      "latency_ms": 27
+    },
+    {
+      "sample_id": "maya-relocation",
+      "question_id": "q3",
+      "category": "temporal",
+      "question": "When did Maya start her new job?",
+      "prediction": "February 2nd",
+      "references": [
+        "February 2nd",
+        "February 2"
+      ],
+      "f1": 1.0,
+      "exact_match": 1.0,
+      "latency_ms": 24
+    },
+    {
+      "sample_id": "maya-relocation",
+      "question_id": "q4",
+      "category": "single_hop",
+      "question": "Who is Maya's manager?",
+      "prediction": "Devi",
+      "references": [
+        "Devi"
+      ],
+      "f1": 1.0,
+      "exact_match": 1.0,
+      "latency_ms": 22
+    },
+    {
+      "sample_id": "maya-relocation",
+      "question_id": "q5",
+      "category": "single_hop",
+      "question": "How much is Maya's rent?",
+      "prediction": "$3200",
+      "references": [
+        "$3200",
+        "$3200 a month"
+      ],
+      "f1": 1.0,
+      "exact_match": 1.0,
+      "latency_ms": 30
+    },
+    {
+      "sample_id": "maya-relocation",
+      "question_id": "q6",
+      "category": "single_hop",
+      "question": "Which neighbourhood did Maya sign a lease in?",
+      "prediction": "Somerville",
+      "references": [
+        "Somerville"
+      ],
+      "f1": 1.0,
+      "exact_match": 1.0,
+      "latency_ms": 38
+    },
+    {
+      "sample_id": "maya-relocation",
+      "question_id": "q7",
+      "category": "adversarial",
+      "question": "Did Maya move to Seattle?",
+      "prediction": "No, Austin",
+      "references": [
+        "No, Boston",
+        "No"
+      ],
+      "f1": 0.6666667,
+      "exact_match": 0.0,
+      "latency_ms": 12
+    },
+    {
+      "sample_id": "maya-relocation",
+      "question_id": "q8",
+      "category": "multi_hop",
+      "question": "Which team is Maya on now?",
+      "prediction": "Austin",
+      "references": [
+        "storage",
+        "the storage team"
+      ],
+      "f1": 0.0,
+      "exact_match": 0.0,
+      "latency_ms": 27
+    },
+    {
+      "sample_id": "maya-relocation",
+      "question_id": "q9",
+      "category": "adversarial",
+      "question": "Did Maya stay on the observability team?",
+      "prediction": "Yes",
+      "references": [
+        "No",
+        "No, storage"
+      ],
+      "f1": 0.0,
+      "exact_match": 0.0,
+      "latency_ms": 26
+    },
+    {
+      "sample_id": "theo-restaurant",
+      "question_id": "q1",
+      "category": "single_hop",
+      "question": "What is Theo's restaurant called?",
+      "prediction": "Quince",
+      "references": [
+        "Ember"
+      ],
+      "f1": 0.0,
+      "exact_match": 0.0,
+      "latency_ms": 59
+    },
+    {
+      "sample_id": "theo-restaurant",
+      "question_id": "q2",
+      "category": "single_hop",
+      "question": "Who did Theo hire as head chef?",
+      "prediction": "Quince",
+      "references": [
+        "Rosa"
+      ],
+      "f1": 0.0,
+      "exact_match": 0.0,
+      "latency_ms": 28
+    },
+    {
+      "sample_id": "theo-restaurant",
+      "question_id": "q3",
+      "category": "single_hop",
+      "question": "Which street is the restaurant on?",
+      "prediction": "Valencia Street",
+      "references": [
+        "Valencia",
+        "Valencia Street"
+      ],
+      "f1": 1.0,
+      "exact_match": 1.0,
+      "latency_ms": 7
+    },
+    {
+      "sample_id": "theo-restaurant",
+      "question_id": "q4",
+      "category": "single_hop",
+      "question": "Where did Rosa work before?",
+      "prediction": "Quince",
+      "references": [
+        "Quince"
+      ],
+      "f1": 1.0,
+      "exact_match": 1.0,
+      "latency_ms": 26
+    },
+    {
+      "sample_id": "theo-restaurant",
+      "question_id": "q5",
+      "category": "single_hop",
+      "question": "How many dishes are on the opening menu?",
+      "prediction": "We're opening the restaurant on March 15th.",
+      "references": [
+        "Twelve",
+        "12"
+      ],
+      "f1": 0.0,
+      "exact_match": 0.0,
+      "latency_ms": 10
+    },
+    {
+      "sample_id": "theo-restaurant",
+      "question_id": "q6",
+      "category": "temporal",
+      "question": "When did the restaurant actually open?",
+      "prediction": "March 15th",
+      "references": [
+        "March 18th",
+        "the 18th",
+        "March 18"
+      ],
+      "f1": 0.5,
+      "exact_match": 0.0,
+      "latency_ms": 5
+    },
+    {
+      "sample_id": "theo-restaurant",
+      "question_id": "q7",
+      "category": "adversarial",
+      "question": "Did Ember open on March 15th?",
+      "prediction": "No, Calling",
+      "references": [
+        "No",
+        "No, March 18th"
+      ],
+      "f1": 0.6666667,
+      "exact_match": 0.0,
+      "latency_ms": 39
+    },
+    {
+      "sample_id": "theo-restaurant",
+      "question_id": "q8",
+      "category": "multi_hop",
+      "question": "Why did the opening slip?",
+      "prediction": "We're opening the restaurant on March 15th.",
+      "references": [
+        "Permit delay",
+        "a permit delay"
+      ],
+      "f1": 0.0,
+      "exact_match": 0.0,
+      "latency_ms": 5
+    },
+    {
+      "sample_id": "nadia-thesis",
+      "question_id": "q1",
+      "category": "temporal",
+      "question": "When is Nadia's defence?",
+      "prediction": "June 4th",
+      "references": [
+        "July 9th",
+        "July 9"
+      ],
+      "f1": 0.0,
+      "exact_match": 0.0,
+      "latency_ms": 27
+    },
+    {
+      "sample_id": "nadia-thesis",
+      "question_id": "q2",
+      "category": "single_hop",
+      "question": "Who chairs Nadia's committee?",
+      "prediction": "Professor Lindqvist",
+      "references": [
+        "Lindqvist",
+        "Professor Lindqvist"
+      ],
+      "f1": 1.0,
+      "exact_match": 1.0,
+      "latency_ms": 21
+    },
+    {
+      "sample_id": "nadia-thesis",
+      "question_id": "q3",
+      "category": "single_hop",
+      "question": "What is Nadia's thesis about?",
+      "prediction": "My thesis defence is scheduled for June 4th.",
+      "references": [
+        "Sparse attention for long-context retrieval",
+        "sparse attention"
+      ],
+      "f1": 0.14285713,
+      "exact_match": 0.0,
+      "latency_ms": 21
+    },
+    {
+      "sample_id": "nadia-thesis",
+      "question_id": "q4",
+      "category": "single_hop",
+      "question": "Which chapter did her advisor reject?",
+      "prediction": "Rewriting",
+      "references": [
+        "Chapter four",
+        "four",
+        "chapter 4"
+      ],
+      "f1": 0.0,
+      "exact_match": 0.0,
+      "latency_ms": 5
+    },
+    {
+      "sample_id": "nadia-thesis",
+      "question_id": "q5",
+      "category": "adversarial",
+      "question": "Did Nadia defend in June?",
+      "prediction": "Yes",
+      "references": [
+        "No",
+        "No, July 9th"
+      ],
+      "f1": 0.0,
+      "exact_match": 0.0,
+      "latency_ms": 21
+    },
+    {
+      "sample_id": "nadia-thesis",
+      "question_id": "q6",
+      "category": "multi_hop",
+      "question": "Why was the defence moved?",
+      "prediction": "Moved it to July 9th to be safe.",
+      "references": [
+        "Chapter four was rejected",
+        "rewriting the evaluation",
+        "chapter four got rejected"
+      ],
+      "f1": 0.0,
+      "exact_match": 0.0,
+      "latency_ms": 6
+    },
+    {
+      "sample_id": "nadia-thesis",
+      "question_id": "q7",
+      "category": "adversarial",
+      "question": "Did Nadia pass?",
+      "prediction": "Yes",
+      "references": [
+        "Yes",
+        "Yes, with minor revisions"
+      ],
+      "f1": 1.0,
+      "exact_match": 1.0,
+      "latency_ms": 19
+    },
+    {
+      "sample_id": "raj-cycling",
+      "question_id": "q1",
+      "category": "single_hop",
+      "question": "Which event did Raj register for?",
+      "prediction": "Dolomites",
+      "references": [
+        "Dolomites gran fondo",
+        "the Dolomites gran fondo",
+        "Dolomites"
+      ],
+      "f1": 1.0,
+      "exact_match": 1.0,
+      "latency_ms": 23
+    },
+    {
+      "sample_id": "raj-cycling",
+      "question_id": "q2",
+      "category": "single_hop",
+      "question": "What was Raj's target time?",
+      "prediction": "7:22:05",
+      "references": [
+        "under seven hours",
+        "seven hours",
+        "sub seven hours"
+      ],
+      "f1": 0.0,
+      "exact_match": 0.0,
+      "latency_ms": 22
+    },
+    {
+      "sample_id": "raj-cycling",
+      "question_id": "q3",
+      "category": "single_hop",
+      "question": "What was Raj's finish time?",
+      "prediction": "7:22:05",
+      "references": [
+        "7:22:05"
+      ],
+      "f1": 1.0,
+      "exact_match": 1.0,
+      "latency_ms": 21
+    },
+    {
+      "sample_id": "raj-cycling",
+      "question_id": "q4",
+      "category": "single_hop",
+      "question": "How long was the course?",
+      "prediction": "Bike held up too. The new Campagnolo groupset was worth it.",
+      "references": [
+        "138 kilometres",
+        "138 km",
+        "138"
+      ],
+      "f1": 0.0,
+      "exact_match": 0.0,
+      "latency_ms": 5
+    },
+    {
+      "sample_id": "raj-cycling",
+      "question_id": "q5",
+      "category": "single_hop",
+      "question": "What injury did Raj have?",
+      "prediction": "Cracked",
+      "references": [
+        "Cracked a rib",
+        "a cracked rib",
+        "broken rib"
+      ],
+      "f1": 0.6666667,
+      "exact_match": 0.0,
+      "latency_ms": 18
+    },
+    {
+      "sample_id": "raj-cycling",
+      "question_id": "q6",
+      "category": "adversarial",
+      "question": "Did Raj beat his target?",
+      "prediction": "No, 7:22:05",
+      "references": [
+        "No",
+        "No, 7:22:05"
+      ],
+      "f1": 1.0,
+      "exact_match": 1.0,
+      "latency_ms": 24
+    },
+    {
+      "sample_id": "raj-cycling",
+      "question_id": "q7",
+      "category": "single_hop",
+      "question": "Which groupset did Raj use?",
+      "prediction": "Campagnolo",
+      "references": [
+        "Campagnolo"
+      ],
+      "f1": 1.0,
+      "exact_match": 1.0,
+      "latency_ms": 21
+    },
+    {
+      "sample_id": "raj-cycling",
+      "question_id": "q8",
+      "category": "temporal",
+      "question": "When did Raj ride the fondo?",
+      "prediction": "September",
+      "references": [
+        "September",
+        "September 14"
+      ],
+      "f1": 1.0,
+      "exact_match": 1.0,
+      "latency_ms": 20
+    },
+    {
+      "sample_id": "ines-acquisition",
+      "question_id": "q1",
+      "category": "single_hop",
+      "question": "Which company is acquiring Ines's startup?",
+      "prediction": "Cloudflare",
+      "references": [
+        "Cloudflare"
+      ],
+      "f1": 1.0,
+      "exact_match": 1.0,
+      "latency_ms": 26
+    },
+    {
+      "sample_id": "ines-acquisition",
+      "question_id": "q2",
+      "category": "single_hop",
+      "question": "How much did they finally agree on?",
+      "prediction": "$40M",
+      "references": [
+        "$65M",
+        "65 million"
+      ],
+      "f1": 0.0,
+      "exact_match": 0.0,
+      "latency_ms": 7
+    },
+    {
+      "sample_id": "ines-acquisition",
+      "question_id": "q3",
+      "category": "temporal",
+      "question": "When does the deal close?",
+      "prediction": "August",
+      "references": [
+        "August"
+      ],
+      "f1": 1.0,
+      "exact_match": 1.0,
+      "latency_ms": 5
+    },
+    {
+      "sample_id": "ines-acquisition",
+      "question_id": "q4",
+      "category": "adversarial",
+      "question": "Did Ines accept the first offer?",
+      "prediction": "No, $40M",
+      "references": [
+        "No",
+        "No, $65M"
+      ],
+      "f1": 0.6666667,
+      "exact_match": 0.0,
+      "latency_ms": 22
+    },
+    {
+      "sample_id": "ines-acquisition",
+      "question_id": "q5",
+      "category": "single_hop",
+      "question": "How long is Ines staying on?",
+      "prediction": "Everyone gets offers. I'm staying on for two years.",
+      "references": [
+        "two years",
+        "2 years"
+      ],
+      "f1": 0.3333333,
+      "exact_match": 0.0,
+      "latency_ms": 26
+    },
+    {
+      "sample_id": "ines-acquisition",
+      "question_id": "q6",
+      "category": "multi_hop",
+      "question": "Why did Ines reject the first offer?",
+      "prediction": "Everyone gets offers. I'm staying on for two years.",
+      "references": [
+        "They just closed their Series A",
+        "just closed a Series A",
+        "the price"
+      ],
+      "f1": 0.0,
+      "exact_match": 0.0,
+      "latency_ms": 24
+    },
+    {
+      "sample_id": "kofi-language",
+      "question_id": "q1",
+      "category": "single_hop",
+      "question": "Which language is Kofi learning?",
+      "prediction": "Lisbon",
+      "references": [
+        "Portuguese"
+      ],
+      "f1": 0.0,
+      "exact_match": 0.0,
+      "latency_ms": 26
+    },
+    {
+      "sample_id": "kofi-language",
+      "question_id": "q2",
+      "category": "single_hop",
+      "question": "Who is Kofi's tutor?",
+      "prediction": "Beatriz",
+      "references": [
+        "Beatriz"
+      ],
+      "f1": 1.0,
+      "exact_match": 1.0,
+      "latency_ms": 25
+    },
+    {
+      "sample_id": "kofi-language",
+      "question_id": "q3",
+      "category": "single_hop",
+      "question": "Which city is Kofi moving to?",
+      "prediction": "Move",
+      "references": [
+        "Lisbon"
+      ],
+      "f1": 0.0,
+      "exact_match": 0.0,
+      "latency_ms": 20
+    },
+    {
+      "sample_id": "kofi-language",
+      "question_id": "q4",
+      "category": "temporal",
+      "question": "When is Kofi moving?",
+      "prediction": "October",
+      "references": [
+        "October"
+      ],
+      "f1": 1.0,
+      "exact_match": 1.0,
+      "latency_ms": 39
+    },
+    {
+      "sample_id": "kofi-language",
+      "question_id": "q5",
+      "category": "single_hop",
+      "question": "What level did Kofi place at?",
+      "prediction": "Move",
+      "references": [
+        "A2"
+      ],
+      "f1": 0.0,
+      "exact_match": 0.0,
+      "latency_ms": 23
+    },
+    {
+      "sample_id": "kofi-language",
+      "question_id": "q6",
+      "category": "adversarial",
+      "question": "Did Kofi place at B2?",
+      "prediction": "No, A2",
+      "references": [
+        "No",
+        "No, A2"
+      ],
+      "f1": 1.0,
+      "exact_match": 1.0,
+      "latency_ms": 22
+    },
+    {
+      "sample_id": "kofi-language",
+      "question_id": "q7",
+      "category": "single_hop",
+      "question": "Which tool is Kofi using to study?",
+      "prediction": "Beatriz",
+      "references": [
+        "Anki"
+      ],
+      "f1": 0.0,
+      "exact_match": 0.0,
+      "latency_ms": 23
+    }
+  ]
+}

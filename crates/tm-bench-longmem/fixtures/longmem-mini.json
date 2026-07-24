@@ -1,0 +1,121 @@
+[
+  {
+    "id": "lme-001",
+    "category": "single_hop",
+    "context_turns": [
+      "Alice joined Acme Corp as a software engineer in March 2024.",
+      "She works on the infrastructure team and her manager is Bob."
+    ],
+    "question": "What company does Alice work for?",
+    "gold_answer": "Acme Corp",
+    "gold_spans": ["Acme Corp", "Acme"]
+  },
+  {
+    "id": "lme-002",
+    "category": "single_hop",
+    "context_turns": [
+      "The project deadline was set for June 15th.",
+      "The team decided to use Rust for the backend services."
+    ],
+    "question": "What language was chosen for the backend?",
+    "gold_answer": "Rust",
+    "gold_spans": ["Rust"]
+  },
+  {
+    "id": "lme-003",
+    "category": "multi_hop",
+    "context_turns": [
+      "Carol manages the data science team at Beta Inc.",
+      "The data science team's primary tool stack includes Python and Spark.",
+      "Beta Inc is headquartered in Austin, Texas."
+    ],
+    "question": "What city is Carol's employer based in?",
+    "gold_answer": "Austin",
+    "gold_spans": ["Austin", "Austin, Texas"]
+  },
+  {
+    "id": "lme-004",
+    "category": "multi_hop",
+    "context_turns": [
+      "Dave is the lead engineer on Project Falcon.",
+      "Project Falcon aims to reduce cloud costs by 40%.",
+      "Dave reports to the VP of Engineering, Elena."
+    ],
+    "question": "Who is the manager of the Project Falcon lead?",
+    "gold_answer": "Elena",
+    "gold_spans": ["Elena"]
+  },
+  {
+    "id": "lme-005",
+    "category": "temporal",
+    "context_turns": [
+      "In January, the team shipped version 1.0.",
+      "In April, version 2.0 introduced multi-tenant support.",
+      "By December the team had shipped version 3.0 with AI features."
+    ],
+    "question": "Which version introduced multi-tenant support?",
+    "gold_answer": "version 2.0",
+    "gold_spans": ["version 2.0", "2.0"]
+  },
+  {
+    "id": "lme-006",
+    "category": "temporal",
+    "context_turns": [
+      "The Q1 review happened on March 31st.",
+      "The Q2 review was scheduled for June 30th.",
+      "Frank joined the company after the Q1 review but before the Q2 review."
+    ],
+    "question": "When did Frank join relative to company reviews?",
+    "gold_answer": "after Q1 review but before Q2 review",
+    "gold_spans": [
+      "after the Q1 review but before the Q2 review",
+      "after Q1 and before Q2"
+    ]
+  },
+  {
+    "id": "lme-007",
+    "category": "open_domain",
+    "context_turns": [
+      "Grace is building a recommendation system for e-commerce.",
+      "She mentioned that collaborative filtering works well for their use case."
+    ],
+    "question": "What ML approach is Grace using for recommendations?",
+    "gold_answer": "collaborative filtering",
+    "gold_spans": ["collaborative filtering"]
+  },
+  {
+    "id": "lme-008",
+    "category": "open_domain",
+    "context_turns": [
+      "Henry is evaluating vector databases for their RAG pipeline.",
+      "He shortlisted Qdrant and Weaviate after initial benchmarking."
+    ],
+    "question": "Which vector databases did Henry shortlist?",
+    "gold_answer": "Qdrant and Weaviate",
+    "gold_spans": ["Qdrant and Weaviate", "Qdrant", "Weaviate"]
+  },
+  {
+    "id": "lme-009",
+    "category": "adversarial",
+    "context_turns": [
+      "The system uses PostgreSQL for its primary datastore.",
+      "Some teams have evaluated MySQL as an alternative.",
+      "The final decision was to remain on PostgreSQL for consistency."
+    ],
+    "question": "What database does the system use as its primary datastore?",
+    "gold_answer": "PostgreSQL",
+    "gold_spans": ["PostgreSQL"]
+  },
+  {
+    "id": "lme-010",
+    "category": "adversarial",
+    "context_turns": [
+      "Ivan said the meeting is on Tuesday.",
+      "Later, Jane said she thought the meeting might be Wednesday.",
+      "Ivan confirmed: the meeting is definitely Tuesday."
+    ],
+    "question": "What day is the meeting on?",
+    "gold_answer": "Tuesday",
+    "gold_spans": ["Tuesday"]
+  }
+]

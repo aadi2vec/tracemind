@@ -1,0 +1,31 @@
+[package]
+name = "tm-bench-mcp"
+version.workspace = true
+edition.workspace = true
+
+# The product IS the MCP server, and until now it was never measured as one
+# (holistic review §5 P0.1). This harness drives the real `tm-mcp` binary
+# over stdio JSON-RPC and scores three things:
+#
+#   1. Tool-selection accuracy — given the *advertised* tool descriptions,
+#      does a deterministic lexical selector pick the tool a host should
+#      call for each scripted utterance? This is a proxy for the host LLM
+#      that needs no model, and it is exactly the metric GEPA optimises when
+#      it rewrites tool descriptions (P0.2).
+#   2. Server latency — p50/p95 wall time per real tools/call.
+#   3. Contract validity — the server accepts core-tool calls and returns
+#      well-formed JSON-RPC responses.
+
+[lib]
+name = "tm_bench_mcp"
+path = "src/lib.rs"
+
+[[bin]]
+name = "tm-bench-mcp"
+path = "src/main.rs"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true, features = ["derive"] }

@@ -323,6 +323,9 @@ impl GraphStore {
                 ("cluster_id", "INTEGER"),
                 ("promoted_entity", "TEXT"),
                 ("priority_tier", "INTEGER DEFAULT 3"),
+                // SimHash signature for the two-stage ANN search path. NULL
+                // on rows from older builds; backfilled lazily at search time.
+                ("simhash", "INTEGER"),
             ] {
                 let sql = format!("ALTER TABLE captured_signals ADD COLUMN {col} {ty}");
                 let _ = conn.execute(&sql, []); // Ignore error if column already exists
@@ -374,6 +377,31 @@ impl GraphStore {
         {
             let conn = store.kg.connection();
             crate::graph_sprint::ensure_schema(conn)?;
+        }
+
+        // Q3.1: feedback signal fabric — explicit / implicit / behavioral signals
+        // stored as first-class memories with UUID provenance.
+        {
+            let conn = store.kg.connection();
+            crate::feedback_fabric::init_schema(conn)?;
+        }
+
+        // Q3.4: temporal KG columns (valid_from / valid_to on kg_relations).
+        {
+            let conn = store.kg.connection();
+            crate::contradiction_rate::ensure_temporal_columns(conn)?;
+        }
+
+        // Q3.5: session_id / host_id scoping.
+        {
+            let conn = store.kg.connection();
+            crate::session_scope::init_schema(conn)?;
+        }
+
+        // Q4.14: policy provenance tables (mutations + rollbacks).
+        {
+            let conn = store.kg.connection();
+            crate::policy_provenance::init_schema(conn)?;
         }
 
         // One-time backfill: emit a temporal fact for any entity / triple
@@ -996,6 +1024,40 @@ impl GraphStore {
     /// reward by `finalize_pending_reward`.
     pub fn positive_weight_for_query(&self, query_id: Uuid) -> Result<f32> {
         crate::context::positive_weight_for_query(self.kg.connection(), query_id)
+    }
+
+    // ─── Q3.1 Feedback signal fabric ─────────────────────────────────────
+
+    /// Record a first-class feedback signal with full provenance.
+    /// Use this for all three signal classes (Explicit / Implicit / Behavioral).
+    pub fn record_feedback_signal(
+        &self,
+        signal: &tm_types::FeedbackSignal,
+    ) -> Result<uuid::Uuid> {
+        crate::feedback_fabric::record_signal(self.kg.connection(), signal)
+    }
+
+    /// Retrieve all feedback signals for a given feedback_hook_id.
+    pub fn signals_for_hook(
+        &self,
+        hook_id: uuid::Uuid,
+    ) -> Result<Vec<tm_types::FeedbackSignal>> {
+        crate::feedback_fabric::signals_for_hook(self.kg.connection(), hook_id)
+    }
+
+    /// Most-recent N signals of the given class (Explicit/Implicit/Behavioral).
+    pub fn recent_feedback_signals(
+        &self,
+        class: tm_types::FeedbackClass,
+        limit: usize,
+    ) -> Result<Vec<tm_types::FeedbackSignal>> {
+        crate::feedback_fabric::recent_signals_by_class(self.kg.connection(), class, limit)
+    }
+
+    /// Verb affinity: (verb, weighted_count) pairs sorted by weight desc.
+    /// Used by Q4.12 user-behavior model to drive L2 space weights.
+    pub fn verb_affinity(&self, limit: usize) -> Result<Vec<(String, f64)>> {
+        crate::feedback_fabric::verb_affinity(self.kg.connection(), limit)
     }
 
     // ─── Memory Views (LM-11a) ──────────────────────────────────────────
@@ -1823,6 +1885,85 @@ impl GraphStore {
         Ok(out)
     }
 
+    /// Detect contradictions introduced by a set of freshly-extracted
+    /// triples, by looking for an existing triple that shares the new
+    /// triple's subject and a *functional* predicate but names a different
+    /// object.
+    ///
+    /// Only functional predicates are checked — relations where a subject is
+    /// expected to have a single object, so a second value is a genuine
+    /// reversal ("works_at", "lives_in", "renamed_to") rather than a set
+    /// membership ("collaborates_with", "references") where multiple objects
+    /// are normal. This keeps the retraction beat from crying wolf on facts
+    /// that legitimately accumulate.
+    pub fn detect_store_contradictions(&self, new_triples: &[Triple]) -> Vec<StoreContradiction> {
+        let mut out = Vec::new();
+        for t in new_triples {
+            if !is_functional_predicate(&t.predicate) {
+                continue;
+            }
+            let existing = match self.get_triples_for_entity(t.subject_id) {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+            for e in &existing {
+                if e.id == t.id {
+                    continue;
+                }
+                if e.subject_id == t.subject_id
+                    && predicate_key(&e.predicate) == predicate_key(&t.predicate)
+                    && e.object_id != t.object_id
+                {
+                    let subject = self.entity_name_or(t.subject_id, "something");
+                    let old_object = self.entity_name_or(e.object_id, "something");
+                    let new_object = self.entity_name_or(t.object_id, "something");
+                    let pred = humanize_predicate(&t.predicate);
+                    out.push(StoreContradiction {
+                        message: format!(
+                            "You told me {subject} {pred} {old_object}, but now it's {new_object}."
+                        ),
+                        subject,
+                        predicate: pred,
+                        old_object,
+                        new_object,
+                        old_triple_id: e.id,
+                    });
+                }
+            }
+        }
+        out
+    }
+
+    /// Contradiction-rate statistics over the temporal facts (wires
+    /// `contradiction_rate`, previously orphaned). Used by the nightly
+    /// self-improvement run to report a real signal.
+    pub fn contradiction_rate_stats(
+        &self,
+    ) -> Result<crate::contradiction_rate::ContradictionRateStats> {
+        let conn = self.kg.connection();
+        let _ = crate::contradiction_rate::ensure_temporal_columns(conn);
+        crate::contradiction_rate::compute_contradiction_rate(conn)
+            .map_err(|e| TraceMindError::Storage(format!("contradiction_rate: {e}")))
+    }
+
+    /// Close the valid-time interval of a triple's fact — it stopped being
+    /// true when `at` occurred, because a newer fact reversed it. Called
+    /// when the retraction beat fires so the bitemporal history is correct:
+    /// an as-of query before `at` still returns the old value.
+    pub fn supersede_triple(&self, old_triple_id: Uuid, at: DateTime<Utc>) -> Result<()> {
+        self.temporal
+            .close_validity(old_triple_id, FACT_TYPE_TRIPLE, at)
+            .map_err(temporal_err)
+    }
+
+    /// Entity display name, or `fallback` if the entity is unknown.
+    pub fn entity_name_or(&self, id: Uuid, fallback: &str) -> String {
+        self.get_entity(id)
+            .ok()
+            .map(|e| e.name)
+            .unwrap_or_else(|| fallback.to_string())
+    }
+
     pub fn get_triples_for_entity(&self, entity_id: Uuid) -> Result<Vec<Triple>> {
         let entity_map = self.entity_map.borrow();
         let &skg_id = entity_map.get(&entity_id).ok_or_else(|| {
@@ -2086,9 +2227,23 @@ impl GraphStore {
     /// Log an entity access event (query_result, clicked, recommended, ingested).
     pub fn log_access(&self, entity_id: Uuid, event_type: &str, context: Option<&str>) -> Result<()> {
         let conn = self.kg.connection();
+        // Write the timestamp explicitly in RFC3339 rather than relying on
+        // the column's `datetime('now')` default. The default produces
+        // "2026-07-22 15:32:16" (space separator, no offset) while every
+        // range query binds `DateTime::to_rfc3339()`
+        // ("2026-07-22T14:32:16+00:00"). Those are compared as *strings*,
+        // and ' ' (0x20) sorts before 'T' (0x54), so a row written "now"
+        // always compares as earlier than a lower bound written an hour ago
+        // — making every access-log range query return nothing.
         conn.execute(
-            "INSERT INTO access_log (entity_id, event_type, context) VALUES (?1, ?2, ?3)",
-            params![entity_id.to_string(), event_type, context],
+            "INSERT INTO access_log (entity_id, event_type, context, created_at) \
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                entity_id.to_string(),
+                event_type,
+                context,
+                Utc::now().to_rfc3339()
+            ],
         )
         .map_err(|e| TraceMindError::Storage(format!("log_access: {e}")))?;
         Ok(())
@@ -2265,12 +2420,14 @@ impl GraphStore {
         priority_tier: i64,
     ) -> Result<i64> {
         let blob: Vec<u8> = embedding.iter().flat_map(|f| f.to_le_bytes()).collect();
+        // SimHash signature for the two-stage ANN prefilter (stored as i64).
+        let simhash = crate::simhash::signature(embedding) as i64;
         let conn = self.kg.connection();
         let ctx = self.active_context_id.borrow().map(|u| u.to_string());
         conn.execute(
             "INSERT INTO captured_signals \
-             (source, raw_text, content_hash, relevance_score, ingested, session_id, embedding, priority_tier, context_id) \
-             VALUES (?1, ?2, ?3, ?4, 0, ?5, ?6, ?7, ?8)",
+             (source, raw_text, content_hash, relevance_score, ingested, session_id, embedding, priority_tier, context_id, simhash) \
+             VALUES (?1, ?2, ?3, ?4, 0, ?5, ?6, ?7, ?8, ?9)",
             params![
                 source,
                 raw_text,
@@ -2279,7 +2436,8 @@ impl GraphStore {
                 session_id.to_string(),
                 blob,
                 priority_tier,
-                ctx
+                ctx,
+                simhash
             ],
         )
         .map_err(|e| TraceMindError::Storage(format!("insert_signal_with_embedding: {e}")))?;
@@ -2475,6 +2633,134 @@ impl GraphStore {
         crate::community::set_community_label(&self.kg, community_id, label, terms_json)
     }
 
+    /// Stage 1 of the two-stage signal search: return the ids of the best
+    /// candidates by SimHash Hamming distance, unioned with a recency window.
+    ///
+    /// Loads only `(id, simhash, embedding-when-signature-missing)` so the
+    /// hot path never materialises full embeddings for the whole corpus.
+    /// The candidate budget scales with `top_k` but stays generous, because
+    /// Hamming is nearly free and the exact rerank restores precision.
+    fn signal_ann_candidates(&self, query_sig: u64, top_k: usize) -> Result<Vec<i64>> {
+        use std::collections::HashSet;
+
+        // How many candidates to hand to the exact reranker, and how many of
+        // the most-recent signals to always include regardless of signature.
+        let candidate_k = (top_k * 8).max(256);
+        let recency_window = (top_k * 4).max(128);
+
+        let conn = self.kg.connection();
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, simhash, embedding FROM captured_signals \
+                 WHERE cluster_id IS NULL AND embedding IS NOT NULL AND priority_tier < 4",
+            )
+            .map_err(|e| TraceMindError::Storage(format!("prep ann scan: {e}")))?;
+
+        let rows = stmt
+            .query_map([], |row| {
+                let id: i64 = row.get(0)?;
+                let sig: Option<i64> = row.get(1)?;
+                // Only fetch the blob when the signature is missing (older row).
+                let blob: Option<Vec<u8>> = if sig.is_none() { row.get(2)? } else { None };
+                Ok((id, sig, blob))
+            })
+            .map_err(|e| TraceMindError::Storage(format!("ann scan: {e}")))?;
+
+        // (hamming, id), plus a running record of the most-recent ids.
+        let mut by_hamming: Vec<(u32, i64)> = Vec::new();
+        for row in rows {
+            let (id, sig, blob) = row.map_err(|e| TraceMindError::Storage(e.to_string()))?;
+            let signature = match sig {
+                Some(s) => s as u64,
+                None => {
+                    // Backfill: compute from the embedding and persist so the
+                    // next query is on the fast path.
+                    let emb: Vec<f32> = blob
+                        .unwrap_or_default()
+                        .chunks_exact(4)
+                        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                        .collect();
+                    let s = crate::simhash::signature(&emb);
+                    let _ = conn.execute(
+                        "UPDATE captured_signals SET simhash = ?1 WHERE id = ?2",
+                        params![s as i64, id],
+                    );
+                    s
+                }
+            };
+            by_hamming.push((crate::simhash::hamming(query_sig, signature), id));
+        }
+
+        if by_hamming.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Recency window: the highest ids (most recently inserted).
+        let mut recent_ids: Vec<i64> = by_hamming.iter().map(|(_, id)| *id).collect();
+        recent_ids.sort_unstable_by(|a, b| b.cmp(a));
+        recent_ids.truncate(recency_window);
+
+        // Top candidates by Hamming distance.
+        by_hamming.sort_by_key(|(h, _)| *h);
+        let mut chosen: HashSet<i64> = by_hamming
+            .iter()
+            .take(candidate_k)
+            .map(|(_, id)| *id)
+            .collect();
+        chosen.extend(recent_ids);
+        Ok(chosen.into_iter().collect())
+    }
+
+    /// Load full [`CapturedSignal`] rows for a specific set of ids.
+    fn load_signals_by_ids(&self, ids: &[i64]) -> Result<Vec<CapturedSignal>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let conn = self.kg.connection();
+        let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let sql = format!(
+            "SELECT id, source, raw_text, content_hash, session_id, embedding, created_at \
+             FROM captured_signals WHERE id IN ({placeholders})"
+        );
+        let mut stmt = conn
+            .prepare(&sql)
+            .map_err(|e| TraceMindError::Storage(format!("prep load_by_ids: {e}")))?;
+        let params_vec: Vec<&dyn rusqlite::ToSql> =
+            ids.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+        let rows = stmt
+            .query_map(params_vec.as_slice(), |row| {
+                let id: i64 = row.get(0)?;
+                let source: String = row.get(1)?;
+                let raw_text: String = row.get(2)?;
+                let hash_i64: i64 = row.get(3)?;
+                let session_str: Option<String> = row.get(4)?;
+                let blob: Vec<u8> = row.get(5)?;
+                let created_str: String = row.get(6)?;
+                Ok((id, source, raw_text, hash_i64, session_str, blob, created_str))
+            })
+            .map_err(|e| TraceMindError::Storage(format!("load_by_ids: {e}")))?;
+
+        let mut out = Vec::new();
+        for row in rows {
+            let (id, source, raw_text, hash_i64, session_str, blob, created_str) =
+                row.map_err(|e| TraceMindError::Storage(e.to_string()))?;
+            let embedding: Vec<f32> = blob
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
+            out.push(CapturedSignal {
+                id,
+                source,
+                raw_text,
+                content_hash: hash_i64 as u64,
+                session_id: session_str.and_then(|s| Uuid::parse_str(&s).ok()),
+                embedding,
+                created_at: created_str.parse::<DateTime<Utc>>().unwrap_or_else(|_| Utc::now()),
+            });
+        }
+        Ok(out)
+    }
+
     /// Search unpromoted signals by cosine similarity to a query embedding.
     /// Used by the hybrid retrieval path so fresh captures are findable even
     /// before consolidation has promoted them to entities.
@@ -2487,13 +2773,30 @@ impl GraphStore {
         top_k: usize,
         min_sim: f32,
     ) -> Result<Vec<(CapturedSignal, f32)>> {
-        // Load candidates — in practice this is bounded because most signals get consolidated.
-        // For large backlogs, we could use ANN; for now linear scan is fine (SQLite is already slow-ish).
-        let signals = self.unconsolidated_signals_by_tier(None, 2000)?;
-        if signals.is_empty() {
+        // Two-stage ANN (holistic review §5 P2.6). The previous
+        // implementation loaded the oldest 2,000 full embeddings and
+        // cosine-scored them — a *silent* recall cliff, because past 2,000
+        // unconsolidated captures the newest memories were dropped with no
+        // error. Instead:
+        //
+        //   Stage 1 (cheap): load only (id, simhash) — 8 bytes each — for
+        //   *every* unconsolidated non-ephemeral signal, and rank by Hamming
+        //   distance to the query signature. No 384-dim work, no cap.
+        //   Stage 2 (exact): load full embeddings for the top Hamming
+        //   candidates plus a recency window (so a brand-new memory whose
+        //   signature happens to differ is never dropped) and cosine-score
+        //   only those.
+        let query_sig = crate::simhash::signature(query_embedding);
+
+        // Stage 1: signature scan. Rows missing a signature (older builds)
+        // are backfilled from their embedding so they still participate.
+        let candidate_ids = self.signal_ann_candidates(query_sig, top_k)?;
+        if candidate_ids.is_empty() {
             return Ok(Vec::new());
         }
 
+        // Stage 2: exact cosine on the candidate set only.
+        let signals = self.load_signals_by_ids(&candidate_ids)?;
         let mut scored: Vec<(CapturedSignal, f32)> = signals
             .into_iter()
             .filter_map(|s| {
@@ -2778,8 +3081,12 @@ impl GraphStore {
         let conn = self.kg.connection();
         let mut stmt = conn
             .prepare(
+                // `replace(created_at, ' ', 'T')` normalises rows written by
+                // older builds (which used the `datetime('now')` default) so
+                // they compare correctly against RFC3339 bounds.
                 "SELECT DISTINCT entity_id FROM access_log \
-                 WHERE created_at >= ?1 AND created_at < ?2 \
+                 WHERE replace(created_at, ' ', 'T') >= ?1 \
+                   AND replace(created_at, ' ', 'T') < ?2 \
                  ORDER BY created_at DESC",
             )
             .map_err(|e| TraceMindError::Storage(format!("access log range: {e}")))?;
@@ -3519,6 +3826,70 @@ fn prop_datetime(val: Option<&serde_json::Value>) -> DateTime<Utc> {
 }
 
 /// Cosine similarity between two slices. Returns 0.0 for mismatched/empty vectors.
+/// A store-time contradiction: a new fact whose (subject, predicate) already
+/// had a *different* object on record. The retraction beat in data form.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct StoreContradiction {
+    pub subject: String,
+    pub predicate: String,
+    /// What was on record before.
+    pub old_object: String,
+    /// What the new statement asserts.
+    pub new_object: String,
+    /// A ready-to-surface sentence for the host.
+    pub message: String,
+    /// The triple whose fact is being reversed (its validity should be
+    /// closed). Skipped in the host-facing JSON; used internally.
+    #[serde(skip)]
+    pub old_triple_id: Uuid,
+}
+
+/// Predicates where a subject is expected to have a single object, so a
+/// second, different object is a genuine reversal rather than a set that
+/// legitimately grows. The retraction beat only fires on these.
+fn is_functional_predicate(p: &Predicate) -> bool {
+    match p {
+        Predicate::WorksAt | Predicate::DependsOn | Predicate::HasProperty => true,
+        Predicate::Custom(s) => {
+            let s = s.to_lowercase();
+            [
+                "works_at", "lives_in", "located_in", "renamed_to", "based_in", "reports_to",
+                "married_to", "born_in", "is_a", "employed_by", "member_of", "assigned_to",
+                "due_on", "scheduled_for", "priced_at", "costs",
+            ]
+            .contains(&s.as_str())
+        }
+        _ => false,
+    }
+}
+
+/// A stable key for comparing predicates by name.
+fn predicate_key(p: &Predicate) -> String {
+    match p {
+        Predicate::Custom(s) => s.to_lowercase(),
+        other => format!("{other:?}").to_lowercase(),
+    }
+}
+
+/// Human-readable predicate for the retraction message: `WorksAt` → "works
+/// at", `renamed_to` → "renamed to".
+fn humanize_predicate(p: &Predicate) -> String {
+    match p {
+        Predicate::Custom(s) => s.replace('_', " ").to_lowercase(),
+        other => {
+            let dbg = format!("{other:?}");
+            let mut out = String::new();
+            for (i, ch) in dbg.chars().enumerate() {
+                if ch.is_uppercase() && i > 0 {
+                    out.push(' ');
+                }
+                out.push(ch.to_ascii_lowercase());
+            }
+            out
+        }
+    }
+}
+
 fn cosine_sim_slice(a: &[f32], b: &[f32]) -> f32 {
     if a.len() != b.len() || a.is_empty() {
         return 0.0;
@@ -3846,6 +4217,32 @@ mod tests {
         assert!(accessed.contains(&e1.id), "should find the accessed entity");
     }
 
+    /// Regression: access-log range queries silently returned nothing
+    /// because rows were stored as "YYYY-MM-DD HH:MM:SS" and compared as
+    /// strings against RFC3339 bounds.
+    #[test]
+    fn accessed_range_matches_rows_written_by_older_builds() {
+        let store = GraphStore::open(":memory:").unwrap();
+        let e1 = make_entity("Legacy", EntityType::Concept);
+        store.upsert_entity(&e1).unwrap();
+        // Simulate an old row: space separator, no offset.
+        let legacy_ts = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+        store
+            .kg
+            .connection()
+            .execute(
+                "INSERT INTO access_log (entity_id, event_type, created_at) VALUES (?1, ?2, ?3)",
+                params![e1.id.to_string(), "query_result", legacy_ts],
+            )
+            .unwrap();
+
+        let now = Utc::now();
+        let accessed = store
+            .get_accessed_entities_in_range(now - chrono::Duration::hours(1), now + chrono::Duration::hours(1))
+            .unwrap();
+        assert!(accessed.contains(&e1.id), "legacy-format rows must still match");
+    }
+
     #[test]
     fn test_colbert_token_cache() {
         let store = GraphStore::open(":memory:").unwrap();
@@ -4109,6 +4506,110 @@ mod tests {
         t
     }
 
+    fn functional_triple(subject: Uuid, object: Uuid) -> Triple {
+        let mut t = Triple::new(subject, Predicate::WorksAt, object, 0.9);
+        t.source_id = Some("test-cap".to_string());
+        t
+    }
+
+    // ── The retraction beat (review §5 P1.4) ────────────────────────────
+
+    #[test]
+    fn retraction_beat_fires_on_a_reversed_functional_fact() {
+        let store = GraphStore::open(":memory:").unwrap();
+        let carol = make_entity("Carol", EntityType::Person);
+        let stripe = make_entity("Stripe", EntityType::Organization);
+        let datadog = make_entity("Datadog", EntityType::Organization);
+        for e in [&carol, &stripe, &datadog] {
+            store.upsert_entity(e).unwrap();
+        }
+        // First: Carol works_at Stripe.
+        store.upsert_triple(&functional_triple(carol.id, stripe.id)).unwrap();
+
+        // Now she says Datadog — the retraction beat must fire.
+        let new = functional_triple(carol.id, datadog.id);
+        let hits = store.detect_store_contradictions(&[new]);
+        assert_eq!(hits.len(), 1, "expected one contradiction, got {hits:?}");
+        assert_eq!(hits[0].old_object, "Stripe");
+        assert_eq!(hits[0].new_object, "Datadog");
+        assert!(hits[0].message.contains("Stripe") && hits[0].message.contains("Datadog"));
+    }
+
+    #[test]
+    fn retraction_beat_stays_silent_when_the_object_is_unchanged() {
+        let store = GraphStore::open(":memory:").unwrap();
+        let carol = make_entity("Carol", EntityType::Person);
+        let stripe = make_entity("Stripe", EntityType::Organization);
+        store.upsert_entity(&carol).unwrap();
+        store.upsert_entity(&stripe).unwrap();
+        store.upsert_triple(&functional_triple(carol.id, stripe.id)).unwrap();
+
+        // Restating the same fact is not a contradiction.
+        let same = functional_triple(carol.id, stripe.id);
+        assert!(store.detect_store_contradictions(&[same]).is_empty());
+    }
+
+    /// Supersession is correct in *valid time*, not just a message: after a
+    /// reversal, an as-of query before the reversal still returns the old
+    /// fact, and after it the old fact is no longer valid. This is P1.5 —
+    /// what makes the retraction beat trustworthy.
+    #[test]
+    fn superseding_a_triple_closes_its_valid_time() {
+        let store = GraphStore::open(":memory:").unwrap();
+        let carol = make_entity("Carol", EntityType::Person);
+        let stripe = make_entity("Stripe", EntityType::Organization);
+        store.upsert_entity(&carol).unwrap();
+        store.upsert_entity(&stripe).unwrap();
+
+        let t0 = Utc::now() - chrono::Duration::minutes(10);
+        let mut old = functional_triple(carol.id, stripe.id);
+        old.created_at = t0;
+        old.updated_at = t0;
+        store.upsert_triple(&old).unwrap();
+
+        // Valid at t0 + 1min (before reversal).
+        let before = t0 + chrono::Duration::minutes(1);
+        assert!(
+            store.triple_at(old.id, before).unwrap().is_some(),
+            "old fact should be valid before the reversal"
+        );
+
+        // Reverse it now.
+        let at = Utc::now();
+        store.supersede_triple(old.id, at).unwrap();
+
+        // Still valid *before* the reversal instant.
+        assert!(
+            store.triple_at(old.id, before).unwrap().is_some(),
+            "history before the reversal must be preserved"
+        );
+        // No longer valid after.
+        let after = at + chrono::Duration::minutes(1);
+        assert!(
+            store.triple_at(old.id, after).unwrap().is_none(),
+            "old fact must not be valid after it was superseded"
+        );
+    }
+
+    #[test]
+    fn retraction_beat_does_not_cry_wolf_on_set_predicates() {
+        // collaborates_with is non-functional — a second collaborator is
+        // normal accumulation, not a reversal.
+        let store = GraphStore::open(":memory:").unwrap();
+        let alice = make_entity("Alice", EntityType::Person);
+        let bob = make_entity("Bob", EntityType::Person);
+        let carol = make_entity("Carol", EntityType::Person);
+        for e in [&alice, &bob, &carol] {
+            store.upsert_entity(e).unwrap();
+        }
+        store.upsert_triple(&make_triple(alice.id, bob.id, 0.9)).unwrap();
+        let new = make_triple(alice.id, carol.id, 0.9); // collaborates_with
+        assert!(
+            store.detect_store_contradictions(&[new]).is_empty(),
+            "set-membership predicate must not trigger the retraction beat"
+        );
+    }
+
     #[test]
     fn route_triple_accepts_high_confidence_directly() {
         let store = GraphStore::open(":memory:").expect("open db");
@@ -4293,5 +4794,114 @@ mod tests {
         let promoted = store.accept_pending(pending_id, "ok").unwrap();
         // Unknown name falls through to Custom — original text preserved.
         assert_eq!(promoted.predicate, Predicate::Custom("mentored".to_string()));
+    }
+
+    // ── Two-stage ANN signal search (review §5 P2.6) ────────────────────
+
+    fn onehot(dim: usize, i: usize) -> Vec<f32> {
+        let mut v = vec![0.0f32; dim];
+        v[i % dim] = 1.0;
+        v
+    }
+
+    #[test]
+    fn signal_search_finds_the_exact_match() {
+        let store = GraphStore::open(":memory:").unwrap();
+        let dim = 16;
+        for i in 0..50 {
+            store
+                .insert_signal_with_embedding(
+                    "test",
+                    &format!("signal {i}"),
+                    i as u64,
+                    Uuid::new_v4(),
+                    &onehot(dim, i),
+                    None,
+                    3,
+                )
+                .unwrap();
+        }
+        // Query identical to signal 7's embedding.
+        let hits = store.search_signals(&onehot(dim, 7), 3, 0.5).unwrap();
+        assert!(!hits.is_empty(), "search returned nothing");
+        assert_eq!(hits[0].0.raw_text, "signal 7", "top hit should be the exact match");
+    }
+
+    /// The whole point of the rewrite: a memory inserted *after* thousands of
+    /// others must still be findable. The old `ORDER BY id ASC LIMIT 2000`
+    /// dropped exactly these. The recency window guarantees it here even at
+    /// scale, and the SimHash prefilter finds it by similarity regardless.
+    #[test]
+    fn newest_signal_is_never_silently_dropped() {
+        let store = GraphStore::open(":memory:").unwrap();
+        let dim = 32;
+        // Fill with many unrelated signals.
+        for i in 0..2500 {
+            store
+                .insert_signal_with_embedding(
+                    "bulk",
+                    &format!("bulk {i}"),
+                    i as u64,
+                    Uuid::new_v4(),
+                    &onehot(dim, i),
+                    None,
+                    3,
+                )
+                .unwrap();
+        }
+        // Insert a distinctive newest signal.
+        let needle = {
+            let mut v = vec![0.0f32; dim];
+            v[3] = 1.0;
+            v[7] = 1.0; // distinctive pattern
+            v
+        };
+        store
+            .insert_signal_with_embedding("fresh", "the needle", 99999, Uuid::new_v4(), &needle, None, 3)
+            .unwrap();
+
+        let hits = store.search_signals(&needle, 5, 0.3).unwrap();
+        assert!(
+            hits.iter().any(|(s, _)| s.raw_text == "the needle"),
+            "the newest signal was dropped — the silent-cliff regression is back"
+        );
+    }
+
+    /// The two-stage result should agree with an exact brute-force scan on
+    /// the top hit (the prefilter + rerank must not degrade the winner).
+    #[test]
+    fn two_stage_agrees_with_brute_force_on_top_hit() {
+        let store = GraphStore::open(":memory:").unwrap();
+        // dim >= n so every one-hot index is unique (no cosine ties that
+        // would make "the" top hit ambiguous).
+        let dim = 128;
+        let n = 120;
+        let mut embeddings = Vec::new();
+        for i in 0..n {
+            // Slightly perturbed one-hots so cosines differ but stay distinct.
+            let mut v = onehot(dim, i);
+            v[(i + 1) % dim] += 0.3;
+            let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+            for x in v.iter_mut() {
+                *x /= norm;
+            }
+            store
+                .insert_signal_with_embedding("t", &format!("s{i}"), i as u64, Uuid::new_v4(), &v, None, 3)
+                .unwrap();
+            embeddings.push((format!("s{i}"), v));
+        }
+        let query = &embeddings[42].1;
+
+        // Brute-force top hit.
+        let brute = embeddings
+            .iter()
+            .map(|(name, e)| (name, cosine_sim_slice(query, e)))
+            .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
+            .unwrap()
+            .0
+            .clone();
+
+        let hits = store.search_signals(query, 1, 0.0).unwrap();
+        assert_eq!(hits[0].0.raw_text, brute, "two-stage disagreed with brute force");
     }
 }

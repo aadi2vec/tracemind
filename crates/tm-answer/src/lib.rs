@@ -12,6 +12,7 @@
 //! See `docs/PHASE4_DELIGHT.md` for the current strategy (Phase 3 completed; superseded).
 
 pub mod backend;
+pub mod candle_backend;
 pub mod extractive;
 pub mod tiered;
 pub mod types;
@@ -26,6 +27,10 @@ pub mod local_llm;
 pub mod apple_fm;
 
 pub use backend::{AnswerBackend, BackendAvailability};
+pub use candle_backend::{
+    default_candle_backend, CandleBackend, CandleConfig, CANDLE_HF_FILE, CANDLE_HF_REPO,
+    QWEN_0_5B_Q4_APPROX_BYTES,
+};
 pub use extractive::ExtractiveBackend;
 pub use local_llm::{
     default_model_path, LocalLlmBackend, LocalLlmConfig, HF_FILE_MOBILE, HF_FILE_PRIMARY,

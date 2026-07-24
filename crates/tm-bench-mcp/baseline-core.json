@@ -1,0 +1,159 @@
+{
+  "advertised_tools": 6,
+  "contract_failures": [],
+  "contract_ok": 4,
+  "contract_total": 4,
+  "latency_p50_ms": 20.851416,
+  "latency_p95_ms": 45.074083,
+  "selection": {
+    "accuracy": 0.800000011920929,
+    "correct": 16,
+    "f1": 0.8000000715255737,
+    "false_triggers": 1,
+    "outcomes": [
+      {
+        "correct": true,
+        "expected": "memory_store",
+        "id": "store-1",
+        "predicted": "memory_store",
+        "utterance": "Remember that I switched my database from Postgres to SQLite last week"
+      },
+      {
+        "correct": true,
+        "expected": "memory_store",
+        "id": "store-2",
+        "predicted": "memory_store",
+        "utterance": "Note this down: the launch is moved to March"
+      },
+      {
+        "correct": true,
+        "expected": "memory_store",
+        "id": "store-3",
+        "predicted": "memory_store",
+        "utterance": "Save the fact that Priya is joining as the ML engineer"
+      },
+      {
+        "correct": true,
+        "expected": "memory_store",
+        "id": "store-4",
+        "predicted": "memory_store",
+        "utterance": "Keep track of my decision to use Rust for the core"
+      },
+      {
+        "correct": true,
+        "expected": "memory_query",
+        "id": "query-1",
+        "predicted": "memory_query",
+        "utterance": "What did I say about the database migration earlier?"
+      },
+      {
+        "correct": true,
+        "expected": "memory_query",
+        "id": "query-2",
+        "predicted": "memory_query",
+        "utterance": "Recall who is joining the team"
+      },
+      {
+        "correct": true,
+        "expected": "memory_query",
+        "id": "query-3",
+        "predicted": "memory_query",
+        "utterance": "Look up what I decided about the language for the core"
+      },
+      {
+        "correct": false,
+        "expected": "memory_query",
+        "id": "query-4",
+        "predicted": "memory_store",
+        "utterance": "What do you remember about my launch date?"
+      },
+      {
+        "correct": false,
+        "expected": "memory_contradict",
+        "id": "contradict-1",
+        "predicted": "memory_query",
+        "utterance": "I'm going with MongoDB now — does that clash with anything I told you?"
+      },
+      {
+        "correct": true,
+        "expected": "memory_contradict",
+        "id": "contradict-2",
+        "predicted": "memory_contradict",
+        "utterance": "Check whether saying the launch is in June contradicts what I said before"
+      },
+      {
+        "correct": true,
+        "expected": "memory_contradict",
+        "id": "contradict-3",
+        "predicted": "memory_contradict",
+        "utterance": "Is this inconsistent with my earlier statement about the database?"
+      },
+      {
+        "correct": true,
+        "expected": "memory_forget",
+        "id": "forget-1",
+        "predicted": "memory_forget",
+        "utterance": "Delete everything you know about the MongoDB idea"
+      },
+      {
+        "correct": false,
+        "expected": "memory_forget",
+        "id": "forget-2",
+        "predicted": "memory_query",
+        "utterance": "Forget what I told you about Priya"
+      },
+      {
+        "correct": true,
+        "expected": "memory_compose",
+        "id": "compose-1",
+        "predicted": "memory_compose",
+        "utterance": "Pull together the context from my past conversations about the database for this new chat"
+      },
+      {
+        "correct": true,
+        "expected": "memory_compose",
+        "id": "compose-2",
+        "predicted": "memory_compose",
+        "utterance": "Combine what I know from the launch thread and the hiring thread"
+      },
+      {
+        "correct": true,
+        "expected": "memory_feedback",
+        "id": "feedback-1",
+        "predicted": "memory_feedback",
+        "utterance": "That memory you surfaced was exactly right, mark it helpful"
+      },
+      {
+        "correct": true,
+        "expected": "memory_feedback",
+        "id": "feedback-2",
+        "predicted": "memory_feedback",
+        "utterance": "That result was unrelated, it was a miss"
+      },
+      {
+        "correct": false,
+        "expected": null,
+        "id": "none-1",
+        "predicted": "memory_store",
+        "utterance": "Write me a haiku about the ocean"
+      },
+      {
+        "correct": true,
+        "expected": null,
+        "id": "none-2",
+        "predicted": null,
+        "utterance": "What is the capital of France?"
+      },
+      {
+        "correct": true,
+        "expected": null,
+        "id": "none-3",
+        "predicted": null,
+        "utterance": "Refactor this function to be more idiomatic"
+      }
+    ],
+    "precision": 0.7777777910232544,
+    "recall": 0.8235294222831726,
+    "total": 20
+  }
+}

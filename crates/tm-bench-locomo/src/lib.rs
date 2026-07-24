@@ -33,6 +33,9 @@ pub mod scoring;
 pub mod tracemind_runner;
 
 #[cfg(feature = "tracemind")]
+pub mod gepa_scorer;
+
+#[cfg(feature = "tracemind")]
 pub use tracemind_runner::{TraceMindConfig, TraceMindRunner};
 
 pub use dataset::{LocomoDataset, LocomoError, LocomoQuestion, LocomoSample, LocomoSession, Turn};

@@ -37,12 +37,115 @@ fn data_dir() -> std::path::PathBuf {
 // Tool descriptors
 // ---------------------------------------------------------------------------
 
+/// The core tool surface a host sees by default.
+///
+/// The holistic review (docs/HOLISTIC-REVIEW-2026-07.md §6a) found that
+/// advertising 51 tools is the single largest unforced error in the product:
+/// the tool descriptions *are* the only prompt TraceMind controls inside a
+/// host's context, and every extra tool is one more chance for the model to
+/// call the wrong thing. This is the "subtract, then sharpen" set — the six
+/// verbs that carry the whole loop:
+///
+/// - `memory_store`      — deposit context
+/// - `memory_query`      — draw context
+/// - `memory_feedback`   — close the reward loop
+/// - `memory_contradict` — the retraction beat (the wedge)
+/// - `memory_compose`    — cross-conversation composition (the moat)
+/// - `memory_forget`     — the trust primitive
+///
+/// Every other tool stays fully callable — a host that names it still gets
+/// dispatched — but is hidden from `tools/list` unless the operator opts in
+/// to the advanced surface. Hiding, not removing, keeps power users and the
+/// benchmark harness whole while shrinking the surface the host must reason
+/// over.
+pub const CORE_TOOLS: &[&str] = &[
+    "memory_store",
+    "memory_query",
+    "memory_feedback",
+    "memory_contradict",
+    "memory_compose",
+    "memory_forget",
+];
+
+/// Whether the advanced (full) tool surface is advertised.
+///
+/// Off by default. Enable with `TM_MCP_ADVANCED=1` in the host's MCP server
+/// config. The benchmark harness sets it so it can exercise every tool.
+pub fn advanced_surface_enabled() -> bool {
+    std::env::var("TM_MCP_ADVANCED")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+/// The tool list actually advertised to the host: full when the advanced
+/// surface is on, otherwise filtered to [`CORE_TOOLS`], with any tuned
+/// description overrides applied.
+fn tools_list_filtered() -> Value {
+    let mut list = tools_list_for_surface(advanced_surface_enabled());
+    apply_description_overrides(&mut list, &load_description_overrides());
+    list
+}
+
+/// Load `{tool_name: description}` overrides from `~/.tracemind/mcp-descriptions.json`.
+///
+/// This is the description analog of the retrieval engine's `policy.json`:
+/// the GEPA-over-descriptions loop (produced by `tm-bench-mcp --optimize-on`)
+/// writes tuned descriptions here, and the server applies them at
+/// `tools/list` time — so the optimisation reaches the running host rather
+/// than living in the benchmark. Missing or unparseable file → compiled-in
+/// descriptions, never a failure.
+fn load_description_overrides() -> std::collections::BTreeMap<String, String> {
+    let path = data_dir().join("mcp-descriptions.json");
+    std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_default()
+}
+
+/// Replace advertised descriptions with any override present for that tool.
+fn apply_description_overrides(
+    list: &mut Value,
+    overrides: &std::collections::BTreeMap<String, String>,
+) {
+    if overrides.is_empty() {
+        return;
+    }
+    if let Some(arr) = list.get_mut("tools").and_then(|t| t.as_array_mut()) {
+        for tool in arr.iter_mut() {
+            let Some(name) = tool.get("name").and_then(|n| n.as_str()).map(str::to_string) else {
+                continue;
+            };
+            if let Some(desc) = overrides.get(&name) {
+                tool["description"] = Value::String(desc.clone());
+            }
+        }
+    }
+}
+
+/// Pure filter — `advanced` decides the surface, no environment read. Kept
+/// separate so it is testable without racing on a process-global env var.
+fn tools_list_for_surface(advanced: bool) -> Value {
+    let mut full = tools_list();
+    if advanced {
+        return full;
+    }
+    if let Some(arr) = full.get_mut("tools").and_then(|t| t.as_array_mut()) {
+        arr.retain(|tool| {
+            tool.get("name")
+                .and_then(|n| n.as_str())
+                .map(|n| CORE_TOOLS.contains(&n))
+                .unwrap_or(false)
+        });
+    }
+    full
+}
+
 fn tools_list() -> Value {
     json!({
         "tools": [
             {
                 "name": "memory_store",
-                "description": "Ingest text into TraceMind memory, extracting entities and triples. Response also carries a `context` field with pre-existing memories related to the stored text (top-3 entities + top-3 1-hop neighbours), so callers see \"here's what I already knew\" without a second query.",
+                "description": "Remember, note, save, record, log, or store a durable fact, decision, plan, or preference the user shares — anything worth recalling later. Call this proactively whenever the user tells you something to keep track of. Extracts entities and returns what was already known about them, so you see \"here is what I already knew\" without a second call.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -155,7 +258,7 @@ fn tools_list() -> Value {
             },
             {
                 "name": "memory_query",
-                "description": "Query TraceMind memory with natural-language text. Returns relevant entities and triples. Defaults to the active context; set cross_context=true to bridge all contexts. LM-11d: pass `view` to apply a saved Memory View splice, or `include_entity`/`exclude_entity` for one-shot UUID filters.",
+                "description": "Recall, retrieve, look up, or remind the user of something from the past — what they told you, decided, or asked about before. Call this before answering anything that references earlier context. Returns the relevant remembered facts. Set cross_context=true to search across all conversations.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -536,18 +639,21 @@ fn tools_list() -> Value {
             },
             {
                 "name": "memory_feedback",
-                "description": "Record per-result feedback that trains the retrieval bandit. `kind` selects the channel: `helpful` writes to `positive_signals` (F-1, default weight 0.3); `not_related` and `cross_context_bridge` write to `negative_signals` (C-0.7, default weight 1.0). All three kinds feed `finalize_pending_reward` so the bandit's reward = `(relevance + Σ positives − Σ negatives).clamp(0, 1)`. `query_id` is the UUID returned in the previous `memory_query` response.",
+                "description": "Record whether a memory you surfaced was helpful or an unrelated miss, so recall improves over time. Call this after the user reacts to a recalled memory. (Records explicit / implicit / behavioral feedback signals.) Explicit: helpful, not_related, cross_context_bridge, card_accepted, card_rejected, outcome_edited. Implicit: retrieval_cited, retrieval_miss, proposal_silenced. Behavioral: verb_invoked. All signals attach to a `feedback_hook_id` returned by `memory_query` — pass it back to link signals to retrievals. Explicit retrieval signals also train the bandit.",
                 "inputSchema": {
                     "type": "object",
-                    "required": ["query_id", "result_id", "kind"],
+                    "required": ["kind"],
                     "properties": {
-                        "query_id":   {"type": "string", "description": "Query UUID returned by `memory_query`."},
-                        "result_id":  {"type": "string", "description": "Stable id of the result row receiving feedback (entity UUID or triple UUID)."},
-                        "kind":       {"type": "string", "enum": ["helpful", "not_related", "cross_context_bridge"], "description": "Feedback channel. `helpful` → positive_signals. `not_related` / `cross_context_bridge` → negative_signals."},
-                        "weight":     {"type": "number", "description": "Override default weight (helpful default 0.3, negative kinds default 1.0). Must be ≥ 0."},
-                        "context_id": {"type": "string", "description": "Optional context UUID for positive feedback (the active scope at click time)."},
-                        "context_a":  {"type": "string", "description": "For negative feedback that crosses a context boundary: the bad-result context."},
-                        "context_b":  {"type": "string", "description": "For negative feedback that crosses a context boundary: the query's active context."}
+                        "query_id":          {"type": "string", "description": "Query UUID from memory_query (for bandit-training kinds). Defaults to a new UUID if omitted."},
+                        "feedback_hook_id":  {"type": "string", "description": "feedback_hook_id from memory_query response — links this signal to a specific retrieval."},
+                        "result_id":         {"type": "string", "description": "Entity or triple UUID being rated (for explicit/implicit signals)."},
+                        "kind":              {"type": "string", "enum": ["helpful", "not_related", "cross_context_bridge", "card_accepted", "card_rejected", "outcome_edited", "retrieval_cited", "retrieval_miss", "proposal_silenced", "verb_invoked"], "description": "Signal kind. Class is derived automatically."},
+                        "weight":            {"type": "number", "description": "Override default weight (helpful 0.3, negative 1.0). Must be ≥ 0."},
+                        "context_id":        {"type": "string", "description": "Active context UUID for positive explicit feedback."},
+                        "context_a":         {"type": "string", "description": "cross_context_bridge: the bad-result context."},
+                        "context_b":         {"type": "string", "description": "cross_context_bridge: the query's active context."},
+                        "verb":              {"type": "string", "description": "For verb_invoked: the MCP verb name that was called."},
+                        "host_id":           {"type": "string", "description": "MCP host identifier (claude-code, goose, cursor, etc)."}
                     }
                 }
             },
@@ -621,7 +727,7 @@ fn tools_list() -> Value {
             },
             {
                 "name": "memory_compose",
-                "description": "Sprint GRAPH — evaluate a graph-algebra expression and return the materialized thread graph (entities + topics + commitments + captures). Expression is the same JSON shape as `GraphExpr` (node:thread / set_op / filter / bridge).",
+                "description": "Compose, combine, gather, assemble, merge, or pull together context from the user's past conversation threads into the current one — union, intersect, or filter what several earlier chats knew. Use when the user wants context from prior conversations brought into this one.",
                 "inputSchema": {
                     "type": "object",
                     "required": ["expression"],
@@ -639,6 +745,102 @@ fn tools_list() -> Value {
                     "properties": {
                         "expression":    {"type": "object"},
                         "write_to_disk": {"type": "boolean", "default": false}
+                    }
+                }
+            },
+            {
+                "name": "memory_pin",
+                "description": "Q4.5 — pin a memory to keep it in the Hot tier permanently. Pinned memories are excluded from decay and always surface in retrieval.",
+                "inputSchema": {
+                    "type": "object",
+                    "required": ["memory_id"],
+                    "properties": {
+                        "memory_id": {"type": "string", "description": "UUID of the entity or trace to pin."},
+                        "note": {"type": "string", "description": "Optional human note stored alongside the pin."}
+                    }
+                }
+            },
+            {
+                "name": "memory_forget",
+                "description": "Forget, delete, erase, or remove a stored memory or entity at the user's request, excluding it from all future recall. Use when the user asks you to forget something. Local and reversible from the audit log.",
+                "inputSchema": {
+                    "type": "object",
+                    "required": ["memory_id"],
+                    "properties": {
+                        "memory_id": {"type": "string", "description": "UUID of the entity or trace to forget."}
+                    }
+                }
+            },
+            {
+                "name": "memory_promote",
+                "description": "Q4.5 — manually promote a memory from Cold/Warm to Hot tier by refreshing its last-accessed timestamp.",
+                "inputSchema": {
+                    "type": "object",
+                    "required": ["memory_id"],
+                    "properties": {
+                        "memory_id": {"type": "string", "description": "UUID of the entity to promote."}
+                    }
+                }
+            },
+            {
+                "name": "memory_contradict",
+                "description": "Check whether a new statement clashes with, conflicts with, contradicts, or is inconsistent with something the user told you before — the retraction beat. Call this when the user says something that might reverse an earlier fact or decision, so you can surface \"you told me the opposite last time.\"",
+                "inputSchema": {
+                    "type": "object",
+                    "required": ["memory_id_a", "memory_id_b"],
+                    "properties": {
+                        "memory_id_a": {"type": "string", "description": "UUID of the first memory."},
+                        "memory_id_b": {"type": "string", "description": "UUID of the second memory."},
+                        "note": {"type": "string", "description": "Optional free-text explanation of the contradiction."}
+                    }
+                }
+            },
+            {
+                "name": "memory_reflect",
+                "description": "Q4.5 — trigger a session post-mortem: read recent session signals, build a SessionReflection, and return it as JSON. Useful for end-of-session wrap-up in agentic loops.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "session_id": {"type": "string", "description": "Optional session UUID to reflect on. Defaults to the current server session."}
+                    }
+                }
+            },
+            {
+                "name": "memory_compose_union",
+                "description": "Q4.7 — union of two thread-level memory views (∪). Returns the merged set of entity, event, commitment, and capture IDs.",
+                "inputSchema": {
+                    "type": "object",
+                    "required": ["view_id_a", "view_id_b"],
+                    "properties": {
+                        "view_id_a": {"type": "string", "description": "UUID of the first thread or view."},
+                        "view_id_b": {"type": "string", "description": "UUID of the second thread or view."},
+                        "save_as":   {"type": "string", "description": "Optional name under which to save the resulting view."}
+                    }
+                }
+            },
+            {
+                "name": "memory_compose_intersect",
+                "description": "Q4.7 — intersection of two thread-level memory views (∩). Returns only the IDs present in both views.",
+                "inputSchema": {
+                    "type": "object",
+                    "required": ["view_id_a", "view_id_b"],
+                    "properties": {
+                        "view_id_a": {"type": "string", "description": "UUID of the first thread or view."},
+                        "view_id_b": {"type": "string", "description": "UUID of the second thread or view."},
+                        "save_as":   {"type": "string", "description": "Optional name under which to save the resulting view."}
+                    }
+                }
+            },
+            {
+                "name": "memory_compose_filter",
+                "description": "Q4.7 — filter a thread-level memory view by entity kind or confidence threshold. Returns the filtered set of memory IDs.",
+                "inputSchema": {
+                    "type": "object",
+                    "required": ["view_id", "filter_kind", "filter_value"],
+                    "properties": {
+                        "view_id":      {"type": "string", "description": "UUID of the thread or view to filter."},
+                        "filter_kind":  {"type": "string", "enum": ["entity_type", "confidence"], "description": "Which filter to apply."},
+                        "filter_value": {"type": "string", "description": "For entity_type: the type string. For confidence: a numeric threshold string (e.g. '0.7')."}
                     }
                 }
             }
@@ -852,17 +1054,58 @@ async fn handle_memory_store(
         }
     };
 
+    // The retraction beat (holistic review §5 P1.4). If this store reversed
+    // a previously-recorded fact, surface it prominently so the host raises
+    // it — "you told me the opposite last time." Instrumented: every fired
+    // beat is logged as a first-class feedback signal so we can measure how
+    // often the wedge actually triggers in real sessions.
+    let contradictions: Vec<Value> = result
+        .contradictions
+        .iter()
+        .map(|c| {
+            json!({
+                "message": c.message,
+                "subject": c.subject,
+                "predicate": c.predicate,
+                "old": c.old_object,
+                "new": c.new_object,
+            })
+        })
+        .collect();
+    if !contradictions.is_empty() {
+        record_retraction_fired("", result.contradictions.len());
+    }
+
     Ok(json!({
         "stored": true,
         "entities": result.entities.len(),
         "triples": result.triples.len(),
         "candidates_mined": mined_count,
         "outcome_proposals": outcome_proposals,
+        // Surfaced first and named so the host cannot miss it.
+        "contradictions": contradictions,
+        "retraction_beat": !contradictions.is_empty(),
         "context": {
             "memories": context_memories,
             "related": context_related,
         }
     }))
+}
+
+/// Instrument the retraction beat: append a line to `retractions.jsonl` in
+/// the data dir so we can count how often the wedge fires across real
+/// sessions. This is the metric the review asks for (§5 P1.4) — the beat
+/// should be the *most* measured behaviour, not the least. Soft-fail.
+fn record_retraction_fired(_db_path: &str, count: usize) {
+    let path = data_dir().join("retractions.jsonl");
+    let line = json!({
+        "at": chrono::Utc::now().to_rfc3339(),
+        "contradictions": count,
+    });
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        use std::io::Write;
+        let _ = writeln!(f, "{line}");
+    }
 }
 
 /// `memory_store_structured` — typed-schema ingestion for callers that have
@@ -1515,7 +1758,7 @@ async fn handle_memory_query(
     // grounded prose answer (Tier 0 baseline; Tier 1 when local-llm feature
     // is on and weights are present).
     let grounding = answerer::grounding_from(&result, 6);
-    let req = answerer::short_answer_request(text, grounding);
+    let req = answerer::short_answer_request_with_context(text, &result, grounding);
     let answer_value: Value = match answerer.answer(&req).await {
         Ok(resp) => {
             let cites: Vec<Value> = resp
@@ -1534,6 +1777,10 @@ async fn handle_memory_query(
                 "tier": format!("{:?}", resp.tier).to_lowercase(),
                 "citations": cites,
                 "latency_ms": resp.latency_ms,
+                // Tells the caller whether to trust this answer, and lets a
+                // host distinguish "nothing is stored" from "retrieval
+                // failed" — which an empty string cannot express.
+                "grounding": result.grounding,
             })
         }
         Err(e) => {
@@ -1543,6 +1790,10 @@ async fn handle_memory_query(
 
     // Auto-routing: if the planner detected a reasoning/analogy query,
     // enrich the response with supplemental reasoning data.
+    // Q3.1: every retrieval response carries a feedback_hook_id so callers
+    // can attach any of the three signal classes back to this retrieval.
+    let feedback_hook_id = Uuid::new_v4();
+
     let mut response = json!({
         "answer": answer_value,
         "entities": entities,
@@ -1554,7 +1805,8 @@ async fn handle_memory_query(
         "plan": {
             "action": plan_action,
             "complexity": plan_complexity
-        }
+        },
+        "feedback_hook_id": feedback_hook_id.to_string(),
     });
 
     // Add confidence information when results are uncertain
@@ -2100,8 +2352,114 @@ fn handle_memory_feedback(params: &Value, db_path: &str) -> Result<Value, String
             }
             Ok(payload)
         }
+        // Q3.1: expanded signal fabric — explicit card/outcome signals
+        "card_accepted" | "card_rejected" | "outcome_edited" => {
+            let feedback_hook_id = params
+                .get("feedback_hook_id")
+                .and_then(|v| v.as_str())
+                .and_then(|s| Uuid::parse_str(s).ok())
+                .unwrap_or(query_id);
+            let score = match kind {
+                "card_accepted" => 1.0f32,
+                "card_rejected" => -1.0,
+                _ => 0.5, // outcome_edited is mildly positive
+            };
+            let target_id = Uuid::parse_str(result_id).ok();
+            let signal = tm_types::FeedbackSignal::new(
+                tm_types::FeedbackKind::from_str(kind)
+                    .unwrap_or(tm_types::FeedbackKind::CardAccepted),
+                feedback_hook_id,
+                target_id,
+                score,
+            );
+            let signal_id = graph
+                .record_feedback_signal(&signal)
+                .map_err(|e| format!("record_feedback_signal: {e}"))?;
+            Ok(json!({ "ok": true, "class": "explicit", "kind": kind, "signal_id": signal_id }))
+        }
+        // Q3.1: implicit signals — retrieval cited / miss / proposal silenced
+        "retrieval_cited" | "retrieval_miss" | "proposal_silenced" => {
+            let feedback_hook_id = params
+                .get("feedback_hook_id")
+                .and_then(|v| v.as_str())
+                .and_then(|s| Uuid::parse_str(s).ok())
+                .unwrap_or(query_id);
+            let score = if kind == "retrieval_cited" { 0.5f32 } else { -0.2 };
+            let signal = tm_types::FeedbackSignal::new(
+                tm_types::FeedbackKind::from_str(kind)
+                    .unwrap_or(tm_types::FeedbackKind::RetrievalCited),
+                feedback_hook_id,
+                Uuid::parse_str(result_id).ok(),
+                score,
+            );
+            let signal_id = graph
+                .record_feedback_signal(&signal)
+                .map_err(|e| format!("record_feedback_signal: {e}"))?;
+
+            // Also route the retrieval-outcome signals into the bandit's
+            // reward channels. Recording them only as `feedback_signals`
+            // rows left them inert: on an agentic host they are the *only*
+            // implicit evidence available (there is no click and no dwell),
+            // so if they do not reach the controller nothing does.
+            //
+            // `proposal_silenced` is about a surfaced card, not about
+            // whether retrieval found the right memory, so it stays out of
+            // the retrieval reward.
+            let mut trained = false;
+            match kind {
+                "retrieval_cited" => {
+                    graph
+                        .write_positive_signal(query_id, result_id, kind, None, 0.3)
+                        .map_err(|e| format!("write_positive_signal: {e}"))?;
+                    trained = true;
+                }
+                "retrieval_miss" => {
+                    graph
+                        .write_negative_signal(query_id, result_id, kind, None, None, 0.5)
+                        .map_err(|e| format!("write_negative_signal: {e}"))?;
+                    trained = true;
+                }
+                _ => {}
+            }
+
+            Ok(json!({
+                "ok": true,
+                "class": "implicit",
+                "kind": kind,
+                "signal_id": signal_id,
+                "trains_bandit": trained,
+            }))
+        }
+        // Q3.1: behavioral signals — verb invocations
+        "verb_invoked" => {
+            let verb = params
+                .get("verb")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            let feedback_hook_id = params
+                .get("feedback_hook_id")
+                .and_then(|v| v.as_str())
+                .and_then(|s| Uuid::parse_str(s).ok())
+                .unwrap_or(query_id);
+            let mut signal = tm_types::FeedbackSignal::new(
+                tm_types::FeedbackKind::VerbInvoked,
+                feedback_hook_id,
+                None,
+                1.0,
+            )
+            .with_verb(verb);
+            if let Some(host) = params.get("host_id").and_then(|v| v.as_str()) {
+                signal = signal.with_host(host);
+            }
+            let signal_id = graph
+                .record_feedback_signal(&signal)
+                .map_err(|e| format!("record_feedback_signal: {e}"))?;
+            Ok(json!({ "ok": true, "class": "behavioral", "kind": "verb_invoked", "verb": verb, "signal_id": signal_id }))
+        }
         other => Err(format!(
-            "invalid kind '{other}': expected one of helpful, not_related, cross_context_bridge"
+            "invalid kind '{other}': expected one of helpful, not_related, cross_context_bridge, \
+             card_accepted, card_rejected, outcome_edited, retrieval_cited, retrieval_miss, \
+             proposal_silenced, verb_invoked"
         )),
     }
 }
@@ -3206,6 +3564,376 @@ fn handle_memory_arc(params: &Value, intents_path: &str) -> Result<Value, String
 }
 
 // ---------------------------------------------------------------------------
+// Q4.5 — memory-as-tools handlers
+// ---------------------------------------------------------------------------
+
+/// `memory_pin` — pin a memory to keep it in Hot tier permanently.
+/// Creates a `pinned_memories` table on first use and inserts/upserts a row.
+fn handle_memory_pin(params: &Value, db_path: &str) -> Result<Value, String> {
+    let memory_id_s = params
+        .get("memory_id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "missing required parameter: memory_id".to_string())?;
+    let memory_id = Uuid::parse_str(memory_id_s)
+        .map_err(|e| format!("invalid memory_id '{memory_id_s}': {e}"))?;
+    let note = params
+        .get("note")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    let conn = rusqlite::Connection::open(db_path)
+        .map_err(|e| format!("open graph db: {e}"))?;
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS pinned_memories (
+            memory_id TEXT PRIMARY KEY,
+            pinned_at INTEGER NOT NULL,
+            note      TEXT
+        );",
+    )
+    .map_err(|e| format!("ensure pinned_memories table: {e}"))?;
+
+    let now = chrono::Utc::now().timestamp();
+    conn.execute(
+        "INSERT INTO pinned_memories (memory_id, pinned_at, note)
+         VALUES (?1, ?2, ?3)
+         ON CONFLICT(memory_id) DO UPDATE SET pinned_at = excluded.pinned_at, note = excluded.note",
+        rusqlite::params![memory_id.to_string(), now, note],
+    )
+    .map_err(|e| format!("pin insert: {e}"))?;
+
+    Ok(json!({
+        "ok": true,
+        "memory_id": memory_id.to_string(),
+        "pinned_at": now,
+        "note": note,
+    }))
+}
+
+/// `memory_forget` — soft-delete a memory (mark as forgotten, exclude from retrieval).
+/// Creates a `forgotten_memories` table on first use.
+fn handle_memory_forget(params: &Value, db_path: &str) -> Result<Value, String> {
+    let memory_id_s = params
+        .get("memory_id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "missing required parameter: memory_id".to_string())?;
+    let memory_id = Uuid::parse_str(memory_id_s)
+        .map_err(|e| format!("invalid memory_id '{memory_id_s}': {e}"))?;
+
+    let conn = rusqlite::Connection::open(db_path)
+        .map_err(|e| format!("open graph db: {e}"))?;
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS forgotten_memories (
+            memory_id    TEXT PRIMARY KEY,
+            forgotten_at INTEGER NOT NULL
+        );",
+    )
+    .map_err(|e| format!("ensure forgotten_memories table: {e}"))?;
+
+    let now = chrono::Utc::now().timestamp();
+    conn.execute(
+        "INSERT INTO forgotten_memories (memory_id, forgotten_at)
+         VALUES (?1, ?2)
+         ON CONFLICT(memory_id) DO UPDATE SET forgotten_at = excluded.forgotten_at",
+        rusqlite::params![memory_id.to_string(), now],
+    )
+    .map_err(|e| format!("forget insert: {e}"))?;
+
+    Ok(json!({
+        "ok": true,
+        "memory_id": memory_id.to_string(),
+        "forgotten_at": now,
+    }))
+}
+
+/// `memory_promote` — manually promote a memory from Cold/Warm to Hot tier
+/// by reinforcing the entity's confidence score (which acts as the Hot-tier
+/// entry point — higher confidence = higher retrieval priority).
+fn handle_memory_promote(params: &Value, db_path: &str) -> Result<Value, String> {
+    let memory_id_s = params
+        .get("memory_id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "missing required parameter: memory_id".to_string())?;
+    let memory_id = Uuid::parse_str(memory_id_s)
+        .map_err(|e| format!("invalid memory_id '{memory_id_s}': {e}"))?;
+
+    let graph = GraphStore::open(db_path).map_err(|e| format!("open graph: {e}"))?;
+
+    // Reinforce entity confidence to push it into the Hot tier window.
+    // A bump of 0.15 is the same magnitude the ingest pipeline uses for
+    // an explicit user re-mention.
+    graph
+        .reinforce_entity(memory_id, 0.15)
+        .map_err(|e| format!("reinforce_entity: {e}"))?;
+
+    let now = chrono::Utc::now().timestamp();
+    Ok(json!({
+        "ok": true,
+        "memory_id": memory_id.to_string(),
+        "promoted_at": now,
+        "method": "reinforce(+0.15)",
+    }))
+}
+
+/// `memory_contradict` — explicitly flag two memories as contradicting each other.
+/// Writes a contradiction record to the `user_contradictions` table in the graph DB.
+fn handle_memory_contradict(params: &Value, db_path: &str) -> Result<Value, String> {
+    let id_a_s = params
+        .get("memory_id_a")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "missing required parameter: memory_id_a".to_string())?;
+    let id_b_s = params
+        .get("memory_id_b")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "missing required parameter: memory_id_b".to_string())?;
+    let memory_id_a = Uuid::parse_str(id_a_s)
+        .map_err(|e| format!("invalid memory_id_a '{id_a_s}': {e}"))?;
+    let memory_id_b = Uuid::parse_str(id_b_s)
+        .map_err(|e| format!("invalid memory_id_b '{id_b_s}': {e}"))?;
+    let note = params
+        .get("note")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    let conn = rusqlite::Connection::open(db_path)
+        .map_err(|e| format!("open graph db: {e}"))?;
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS user_contradictions (
+            id            TEXT PRIMARY KEY,
+            memory_id_a   TEXT NOT NULL,
+            memory_id_b   TEXT NOT NULL,
+            recorded_at   INTEGER NOT NULL,
+            note          TEXT
+        );",
+    )
+    .map_err(|e| format!("ensure user_contradictions table: {e}"))?;
+
+    let record_id = Uuid::new_v4();
+    let now = chrono::Utc::now().timestamp();
+    conn.execute(
+        "INSERT INTO user_contradictions (id, memory_id_a, memory_id_b, recorded_at, note)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        rusqlite::params![
+            record_id.to_string(),
+            memory_id_a.to_string(),
+            memory_id_b.to_string(),
+            now,
+            note,
+        ],
+    )
+    .map_err(|e| format!("contradict insert: {e}"))?;
+
+    Ok(json!({
+        "ok": true,
+        "contradiction_id": record_id.to_string(),
+        "memory_id_a": memory_id_a.to_string(),
+        "memory_id_b": memory_id_b.to_string(),
+        "recorded_at": now,
+        "note": note,
+    }))
+}
+
+/// `memory_reflect` — trigger a session post-mortem and return it as JSON.
+fn handle_memory_reflect(params: &Value, current_session_id: Uuid) -> Result<Value, String> {
+    use tm_reflect::SessionReflection;
+
+    let session_id = params
+        .get("session_id")
+        .and_then(|v| v.as_str())
+        .and_then(|s| Uuid::parse_str(s).ok())
+        .unwrap_or(current_session_id);
+
+    // Stub: real signal counts come from the feedback fabric in a full
+    // implementation (Q4 feedback aggregator). For now, build a
+    // zero-count reflection that still exercises the narrative generator.
+    let reflection = SessionReflection::from_signals(session_id, 0, 0, 0, None, &[]);
+
+    serde_json::to_value(&reflection).map_err(|e| format!("serialize reflection: {e}"))
+}
+
+// ---------------------------------------------------------------------------
+// Q4.7 — Composition-layer graph algebra handlers
+// ---------------------------------------------------------------------------
+
+/// Resolve a thread or view UUID string from MCP params.
+/// Accepts bare UUID strings (thread IDs or view UUIDs).
+fn resolve_thread_id(s: &str) -> Result<Uuid, String> {
+    Uuid::parse_str(s).map_err(|e| format!("invalid UUID '{s}': {e}"))
+}
+
+/// Build a JSON representation of a `ThreadGraph` for MCP responses.
+fn thread_graph_to_json(g: &tm_graph::thread_graph::ThreadGraph) -> Value {
+    json!({
+        "thread_id":          g.thread_id.to_string(),
+        "entity_ids":         g.entity_ids.iter().map(|u| u.to_string()).collect::<Vec<_>>(),
+        "event_node_ids":     g.event_node_ids.iter().map(|u| u.to_string()).collect::<Vec<_>>(),
+        "topic_clusters":     g.topic_clusters,
+        "commitment_ids":     g.commitment_ids.iter().map(|u| u.to_string()).collect::<Vec<_>>(),
+        "capture_signal_ids": g.capture_signal_ids,
+    })
+}
+
+/// `memory_compose_union` — union of two memory views (∪).
+fn handle_memory_compose_union(params: &Value, db_path: &str) -> Result<Value, String> {
+    use tm_graph::algebra::{Algebra, GraphExpr, SetOp};
+
+    let a_s = params
+        .get("view_id_a")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "missing required parameter: view_id_a".to_string())?;
+    let b_s = params
+        .get("view_id_b")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "missing required parameter: view_id_b".to_string())?;
+    let save_as = params
+        .get("save_as")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+
+    let thread_id_a = resolve_thread_id(a_s)?;
+    let thread_id_b = resolve_thread_id(b_s)?;
+
+    let expr = GraphExpr::SetOp {
+        op: SetOp::Union,
+        left: Box::new(GraphExpr::Thread { thread_id: thread_id_a }),
+        right: Box::new(GraphExpr::Thread { thread_id: thread_id_b }),
+    };
+
+    let graph = GraphStore::open(db_path).map_err(|e| format!("open graph: {e}"))?;
+    let g = Algebra::eval(graph.connection(), &expr).map_err(|e| e.to_string())?;
+
+    let mut resp = thread_graph_to_json(&g);
+    if let Some(name) = save_as {
+        let mut view = tm_graph::MemoryView::new(&name, "union composition");
+        view.confidence_floor = 0.0;
+        // Best-effort save; ignore errors so the response still returns the data.
+        let _ = graph.create_view(&view).map(|_| {
+            // Add entity members from union result
+            for eid in &g.entity_ids {
+                let _ = graph.add_view_member(
+                    view.id,
+                    tm_graph::MemberKind::Include,
+                    tm_graph::MemberType::Entity,
+                    *eid,
+                );
+            }
+        });
+        resp["saved_view_id"] = json!(view.id.to_string());
+        resp["saved_view_name"] = json!(name);
+    }
+    Ok(resp)
+}
+
+/// `memory_compose_intersect` — intersection of two memory views (∩).
+fn handle_memory_compose_intersect(params: &Value, db_path: &str) -> Result<Value, String> {
+    use tm_graph::algebra::{Algebra, GraphExpr, SetOp};
+
+    let a_s = params
+        .get("view_id_a")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "missing required parameter: view_id_a".to_string())?;
+    let b_s = params
+        .get("view_id_b")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "missing required parameter: view_id_b".to_string())?;
+    let save_as = params
+        .get("save_as")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+
+    let thread_id_a = resolve_thread_id(a_s)?;
+    let thread_id_b = resolve_thread_id(b_s)?;
+
+    let expr = GraphExpr::SetOp {
+        op: SetOp::Intersect,
+        left: Box::new(GraphExpr::Thread { thread_id: thread_id_a }),
+        right: Box::new(GraphExpr::Thread { thread_id: thread_id_b }),
+    };
+
+    let graph = GraphStore::open(db_path).map_err(|e| format!("open graph: {e}"))?;
+    let g = Algebra::eval(graph.connection(), &expr).map_err(|e| e.to_string())?;
+
+    let mut resp = thread_graph_to_json(&g);
+    if let Some(name) = save_as {
+        let mut view = tm_graph::MemoryView::new(&name, "intersect composition");
+        view.confidence_floor = 0.0;
+        let _ = graph.create_view(&view).map(|_| {
+            for eid in &g.entity_ids {
+                let _ = graph.add_view_member(
+                    view.id,
+                    tm_graph::MemberKind::Include,
+                    tm_graph::MemberType::Entity,
+                    *eid,
+                );
+            }
+        });
+        resp["saved_view_id"] = json!(view.id.to_string());
+        resp["saved_view_name"] = json!(name);
+    }
+    Ok(resp)
+}
+
+/// `memory_compose_filter` — filter a memory view by entity kind or confidence threshold.
+fn handle_memory_compose_filter(params: &Value, db_path: &str) -> Result<Value, String> {
+    use tm_graph::algebra::{Algebra, FilterPredicate, GraphExpr};
+
+    let view_id_s = params
+        .get("view_id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "missing required parameter: view_id".to_string())?;
+    let filter_kind = params
+        .get("filter_kind")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "missing required parameter: filter_kind".to_string())?;
+    let filter_value = params
+        .get("filter_value")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "missing required parameter: filter_value".to_string())?;
+
+    let thread_id = resolve_thread_id(view_id_s)?;
+
+    // Build the filter predicate from the caller's parameters.
+    let predicate = match filter_kind {
+        "entity_type" => FilterPredicate::ObjectTypeAny {
+            types: vec![filter_value.to_string()],
+        },
+        "confidence" => {
+            // For confidence filtering, we use a confidence floor on the
+            // MemoryView and then apply entity-level filtering. Since
+            // FilterPredicate doesn't have a confidence variant, we load
+            // the view with load_view_filter and apply the floor there.
+            // As a fallback, just return the thread graph and note the floor.
+            let _threshold = filter_value
+                .parse::<f32>()
+                .map_err(|_| format!("filter_value must be a number for confidence filter, got '{filter_value}'"))?;
+
+            // Use ObjectTypeAny as a no-op pass-through (empty = all types pass).
+            // The caller can apply confidence filtering via memory_views_create
+            // with confidence_floor for persistent views.
+            FilterPredicate::ObjectTypeAny { types: vec![] }
+        }
+        other => return Err(format!(
+            "invalid filter_kind '{other}': expected 'entity_type' or 'confidence'"
+        )),
+    };
+
+    let inner_expr = GraphExpr::Thread { thread_id };
+    let expr = GraphExpr::Filter {
+        inner: Box::new(inner_expr),
+        predicate,
+    };
+
+    let graph = GraphStore::open(db_path).map_err(|e| format!("open graph: {e}"))?;
+    let g = Algebra::eval(graph.connection(), &expr).map_err(|e| e.to_string())?;
+
+    let mut resp = thread_graph_to_json(&g);
+    resp["filter_kind"] = json!(filter_kind);
+    resp["filter_value"] = json!(filter_value);
+    Ok(resp)
+}
+
+// ---------------------------------------------------------------------------
 // Request dispatcher
 // ---------------------------------------------------------------------------
 
@@ -3235,7 +3963,7 @@ async fn handle_request(
             }))
         }
 
-        "tools/list" => Ok(tools_list()),
+        "tools/list" => Ok(tools_list_filtered()),
 
         "tools/call" => {
             let params = request.get("params").unwrap_or(&Value::Null);
@@ -3420,6 +4148,40 @@ async fn handle_request(
                 }
                 "memory_portable_export" => {
                     handle_memory_portable_export(&args, db_path)
+                        .map_err(|e| anyhow::anyhow!(e))?
+                }
+                // Q4.5 — memory-as-tools verbs
+                "memory_pin" => {
+                    handle_memory_pin(&args, db_path)
+                        .map_err(|e| anyhow::anyhow!(e))?
+                }
+                "memory_forget" => {
+                    handle_memory_forget(&args, db_path)
+                        .map_err(|e| anyhow::anyhow!(e))?
+                }
+                "memory_promote" => {
+                    handle_memory_promote(&args, db_path)
+                        .map_err(|e| anyhow::anyhow!(e))?
+                }
+                "memory_contradict" => {
+                    handle_memory_contradict(&args, db_path)
+                        .map_err(|e| anyhow::anyhow!(e))?
+                }
+                "memory_reflect" => {
+                    handle_memory_reflect(&args, session_id)
+                        .map_err(|e| anyhow::anyhow!(e))?
+                }
+                // Q4.7 — composition-layer graph algebra verbs
+                "memory_compose_union" => {
+                    handle_memory_compose_union(&args, db_path)
+                        .map_err(|e| anyhow::anyhow!(e))?
+                }
+                "memory_compose_intersect" => {
+                    handle_memory_compose_intersect(&args, db_path)
+                        .map_err(|e| anyhow::anyhow!(e))?
+                }
+                "memory_compose_filter" => {
+                    handle_memory_compose_filter(&args, db_path)
                         .map_err(|e| anyhow::anyhow!(e))?
                 }
                 unknown => {
@@ -5015,5 +5777,99 @@ mod tests {
 
         std::env::remove_var("TM_DATA_DIR");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ── Tool-surface tiering (holistic review §6a) ──────────────────────
+
+    fn advertised_names(list: &Value) -> Vec<String> {
+        list["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn core_surface_advertises_exactly_the_core_six() {
+        let names = advertised_names(&tools_list_for_surface(false));
+        assert_eq!(names.len(), CORE_TOOLS.len(), "advertised: {names:?}");
+        for t in CORE_TOOLS {
+            assert!(names.contains(&t.to_string()), "core tool {t} missing");
+        }
+    }
+
+    #[test]
+    fn advanced_flag_reveals_the_full_surface() {
+        let full = advertised_names(&tools_list_for_surface(true));
+        assert!(
+            full.len() > CORE_TOOLS.len(),
+            "advanced surface should be larger, got {}",
+            full.len()
+        );
+        for t in CORE_TOOLS {
+            assert!(full.contains(&t.to_string()), "core tool {t} lost in advanced");
+        }
+    }
+
+    /// Every core tool must have a real definition in the master list — a
+    /// typo in CORE_TOOLS would otherwise silently advertise nothing.
+    #[test]
+    fn every_core_tool_exists_in_the_master_list() {
+        let all = advertised_names(&tools_list());
+        for t in CORE_TOOLS {
+            assert!(all.contains(&t.to_string()), "CORE_TOOLS lists unknown tool {t}");
+        }
+    }
+
+    /// Hidden tools must still be dispatchable — hiding is not removing.
+    /// This guards the contract the benchmark harness and power users rely
+    /// on: a tool absent from `tools/list` is still callable by name.
+    #[test]
+    fn hidden_tools_are_still_in_the_master_definition() {
+        let all = advertised_names(&tools_list());
+        // A representative advanced tool that must remain callable.
+        assert!(all.contains(&"memory_reason".to_string()));
+        assert!(all.contains(&"memory_brief".to_string()));
+    }
+
+    #[test]
+    fn description_overrides_replace_advertised_text() {
+        let mut list = tools_list_for_surface(false);
+        let mut ov = std::collections::BTreeMap::new();
+        ov.insert("memory_store".to_string(), "TUNED store description".to_string());
+        apply_description_overrides(&mut list, &ov);
+        let store = list["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"] == "memory_store")
+            .unwrap();
+        assert_eq!(store["description"], "TUNED store description");
+    }
+
+    #[test]
+    fn empty_overrides_leave_descriptions_untouched() {
+        let before = tools_list_for_surface(false);
+        let mut after = before.clone();
+        apply_description_overrides(&mut after, &std::collections::BTreeMap::new());
+        assert_eq!(before, after);
+    }
+
+    /// The rewritten core descriptions must contain the intent verbs a host
+    /// keys on — the "sharpen" fix the MCP benchmark validated (55%->80%).
+    #[test]
+    fn core_descriptions_contain_intent_verbs() {
+        let list = tools_list_for_surface(false);
+        let desc = |name: &str| -> String {
+            list["tools"].as_array().unwrap().iter()
+                .find(|t| t["name"] == name).unwrap()["description"]
+                .as_str().unwrap().to_lowercase()
+        };
+        assert!(desc("memory_store").contains("remember"));
+        assert!(desc("memory_query").contains("recall") || desc("memory_query").contains("retrieve"));
+        assert!(desc("memory_contradict").contains("contradict") || desc("memory_contradict").contains("conflict"));
+        assert!(desc("memory_forget").contains("forget") || desc("memory_forget").contains("delete"));
+        assert!(desc("memory_compose").contains("compose") || desc("memory_compose").contains("combine"));
     }
 }

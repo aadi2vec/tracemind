@@ -108,6 +108,30 @@ impl TemporalStore {
         Ok(())
     }
 
+    /// Close the *valid-time* interval of the current fact for `entity_id`:
+    /// set `valid_to` on the live (non-superseded, still-open) revision.
+    ///
+    /// This is what makes fact supersession correct rather than a message —
+    /// when a new fact reverses an old one ("works at Stripe" → "works at
+    /// Datadog"), the old fact stops being true in the world at `valid_to`,
+    /// so an as-of query before that instant still returns the old value and
+    /// one after returns nothing (until the new fact is recorded). Idempotent
+    /// and a no-op when there is no open fact.
+    pub fn close_validity(
+        &self,
+        entity_id: Uuid,
+        fact_type: &str,
+        valid_to: DateTime<Utc>,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE temporal_facts SET valid_to = ? \
+             WHERE entity_id = ? AND fact_type = ? \
+               AND superseded_at IS NULL AND valid_to IS NULL",
+            params![valid_to.to_rfc3339(), entity_id.to_string(), fact_type],
+        )?;
+        Ok(())
+    }
+
     pub fn update_fact(
         &self,
         old_fact_id: Uuid,
@@ -647,5 +671,33 @@ mod tests {
             .update_fact(Uuid::new_v4(), r#"{"x":1}"#, Utc::now(), None)
             .unwrap_err();
         assert!(matches!(err, StoreError::NotFound { .. }));
+    }
+
+    #[test]
+    fn close_validity_sets_valid_to_on_the_open_fact() {
+        let store = fresh_store();
+        let eid = Uuid::new_v4();
+        let t0 = Utc::now();
+        store.insert_fact(eid, "graph_triple", r#"{"o":"Stripe"}"#, t0, None).unwrap();
+
+        // Open fact has no valid_to.
+        let before = store.history(eid, "graph_triple").unwrap();
+        assert!(before[0].valid_time.to.is_none());
+
+        // Reversal closes it.
+        let t1 = t0 + chrono::Duration::minutes(1);
+        store.close_validity(eid, "graph_triple", t1).unwrap();
+
+        let after = store.history(eid, "graph_triple").unwrap();
+        assert_eq!(after[0].valid_time.to, Some(t1), "valid_to must be set");
+    }
+
+    #[test]
+    fn close_validity_is_a_noop_when_nothing_is_open() {
+        let store = fresh_store();
+        // No fact for this entity — must not error.
+        assert!(store
+            .close_validity(Uuid::new_v4(), "graph_triple", Utc::now())
+            .is_ok());
     }
 }

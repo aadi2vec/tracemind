@@ -162,9 +162,70 @@ pub fn regression_gate(
     Ok(())
 }
 
+/// Fail when a semantic embedder scores no better than the hash embedder.
+///
+/// This is the check that would have caught the defect described in
+/// `docs/H2-AUDIT-2026-07.md` §2.2: for four consecutive releases BGE and
+/// `--hash-embed` produced *byte-identical* scores, because the retrieval
+/// engine was returning nothing and the harness's own keyword fallback was
+/// producing every answer. A one-sided "did F1 drop" gate cannot see that —
+/// the number was stable, it just wasn't measuring the system.
+///
+/// A trained 384-dim encoder must beat a hash by a clear margin. If it does
+/// not, retrieval is disconnected from the score regardless of how good the
+/// score looks.
+pub fn embedder_separation_gate(
+    hash_report: &BenchmarkReport,
+    real_report: &BenchmarkReport,
+    min_margin: f32,
+) -> Result<(), String> {
+    let margin = real_report.overall_f1 - hash_report.overall_f1;
+    if margin < min_margin {
+        return Err(format!(
+            "embedder separation {:.2} below minimum {:.2} (hash {:.2} vs real {:.2}) — \
+             retrieval is probably not contributing to the score",
+            margin, min_margin, hash_report.overall_f1, real_report.overall_f1
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn report_with_f1(f1: f32) -> BenchmarkReport {
+        BenchmarkReport {
+            runner: "t".into(),
+            timestamp: "2026-07-22T00:00:00Z".into(),
+            total_questions: 20,
+            total_samples: 3,
+            overall_f1: f1,
+            overall_exact_match: 0.0,
+            by_category: BTreeMap::new(),
+            wall_seconds: 0.0,
+            outcomes: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn separation_gate_passes_when_real_embeddings_win() {
+        assert!(embedder_separation_gate(&report_with_f1(48.3), &report_with_f1(70.5), 5.0).is_ok());
+    }
+
+    /// The exact historical failure: identical scores from a trained encoder
+    /// and a hash must be treated as a broken benchmark, not a stable one.
+    #[test]
+    fn separation_gate_rejects_identical_scores() {
+        let err = embedder_separation_gate(&report_with_f1(49.27), &report_with_f1(49.27), 5.0)
+            .unwrap_err();
+        assert!(err.contains("separation"), "got {err}");
+    }
+
+    #[test]
+    fn separation_gate_rejects_a_thin_margin() {
+        assert!(embedder_separation_gate(&report_with_f1(49.0), &report_with_f1(51.0), 5.0).is_err());
+    }
 
     fn outcome(cat: Category, f1: f32, em: f32) -> QuestionOutcome {
         QuestionOutcome {

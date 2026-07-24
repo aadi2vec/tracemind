@@ -12,6 +12,7 @@ tm-types = { workspace = true }
 tm-graph = { workspace = true }
 tm-ingest = { workspace = true }
 tm-retrieval = { workspace = true }
+tm-gepa = { workspace = true }
 tm-episodic = { workspace = true }
 tm-controller = { workspace = true }
 tm-rerank = { path = "../tm-rerank" }

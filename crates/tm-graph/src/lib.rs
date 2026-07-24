@@ -1,10 +1,13 @@
 pub mod algebra;
+pub mod simhash;
 pub mod belief;
 pub mod community;
+pub mod contradiction_rate;
 pub mod context;
 pub mod deny_list;
 pub mod entity_resolve;
 pub mod event_graph;
+pub mod feedback_fabric;
 pub mod graph_sprint;
 pub mod labeler;
 pub mod maintenance;
@@ -14,8 +17,11 @@ pub mod ontology;
 pub mod ontology_proposals;
 pub mod ontology_types;
 pub mod pending_relations;
+pub mod policy_provenance;
 pub mod portable_export;
+pub mod head_to_head;
 pub mod salience;
+pub mod session_scope;
 pub mod store;
 pub mod thread_graph;
 
@@ -61,7 +67,7 @@ pub use pending_relations::{
     PendingRelation, PendingStatus, ACCEPT_THRESHOLD as PENDING_ACCEPT_THRESHOLD,
     PENDING_FLOOR, SCHEMA_VERSION as PENDING_RELATIONS_SCHEMA_VERSION,
 };
-pub use store::{Backlink, CapturedSignal, GraphStore, PendingRouteOutcome, TripleDetail};
+pub use store::{Backlink, CapturedSignal, GraphStore, PendingRouteOutcome, StoreContradiction, TripleDetail};
 
 pub use algebra::{Algebra, GraphExpr, SetOp};
 pub use event_graph::{EventEdge, EventEdgeKind, EventGraphStore, EventNode, EventNodeKind};
@@ -74,6 +80,39 @@ pub use ontology_types::{
 };
 pub use portable_export::{export_portable, PortableEdge, PortableGraph, PortableNode};
 pub use thread_graph::{Thread, ThreadGraph, ThreadGraphStore, ThreadSource};
+pub use feedback_fabric::{
+    init_schema as init_feedback_schema,
+    record_signal as record_feedback_signal,
+    signals_for_hook,
+    recent_signals_by_class,
+    verb_affinity,
+};
+pub use contradiction_rate::{
+    ensure_temporal_columns,
+    detect_conflicts,
+    compute_contradiction_rate,
+    ContradictionRateStats,
+    TemporalConflict,
+};
+pub use session_scope::{
+    init_schema as init_session_schema,
+    upsert_session,
+    get_session,
+    recent_sessions,
+    SessionScope,
+};
+pub use head_to_head::{
+    Competitor, CompetitorResult, CompetitorScore, ContradictionTestCase,
+    HeadToHeadResult, mini_fixtures as h2h_mini_fixtures,
+};
+pub use policy_provenance::{
+    init_schema as init_policy_provenance_schema,
+    record_mutation as record_policy_mutation,
+    record_rollback as record_policy_rollback,
+    recent_mutations as recent_policy_mutations,
+    rollback_count_by_kind as policy_rollback_count_by_kind,
+    StoredMutation,
+};
 
 use tm_types::Predicate;
 use uuid::Uuid;

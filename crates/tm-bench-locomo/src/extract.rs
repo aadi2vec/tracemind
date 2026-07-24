@@ -29,8 +29,91 @@ pub enum QKind {
     Money,
     /// Clock time — "What was Ethan's finish time?"
     Time,
+    /// A named thing — person, place, org, or product. Covers
+    /// who / where / what / which. The answer is a proper noun in the
+    /// evidence turn that does not already appear in the question.
+    Named,
+    /// A causal question ("why…?"). Like [`QKind::Generic`] no span
+    /// extractor applies, but unlike it the answer is a specific causal
+    /// clause somewhere in the history rather than a description of the
+    /// thing the question already names — so lexical overlap with the
+    /// question is a much stronger selection signal.
+    Reason,
     /// No specialized extractor; return turn as-is.
     Generic,
+}
+
+impl QKind {
+    /// Whether a candidate turn can supply an answer of this kind.
+    ///
+    /// Used for answer-aware candidate selection: a turn that is topically
+    /// similar but carries no extractable answer of the required type is a
+    /// worse choice than a lower-ranked turn that does. This is the reader
+    /// half of a retriever-reader extractive QA stack — retrieval score
+    /// alone routinely puts a related-but-unanswerable turn on top.
+    pub fn is_satisfied_by(self, turn: &str, question: &str) -> bool {
+        match self {
+            // A turn whose only typed value is the one the question already
+            // stated cannot answer it, so it does not count as satisfying.
+            QKind::Date => has_novel_value(extract_date_lenient, turn, question),
+            QKind::Money => has_novel_value(extract_money, turn, question),
+            QKind::Time => has_novel_value(extract_time, turn, question),
+            QKind::Named => extract_novel_proper_noun(turn, question).is_some(),
+            // Yes/No, Reason, and Generic can be answered from any turn.
+            QKind::YesNo | QKind::Reason | QKind::Generic => true,
+        }
+    }
+}
+
+/// The first value `extractor` finds in `turn` that the question does not
+/// already state, scanning past premise echoes.
+///
+/// "Did Ethan miss his sub-3:00 goal?" against "Sub-3:00 is the dream, but
+/// realistically 3:10" must not answer "sub-3:00" — that is the question's
+/// own premise. Skipping it surfaces 3:10, which is at least informative.
+fn first_novel_value(
+    extractor: fn(&str) -> Option<String>,
+    turn: &str,
+    question: &str,
+) -> Option<String> {
+    let q_norm = question.to_lowercase();
+    let mut offset = 0usize;
+    // Bounded scan: each step consumes at least one value, and turns hold
+    // only a handful of typed values.
+    for _ in 0..4 {
+        let rest = turn.get(offset..)?;
+        let value = extractor(rest)?;
+        if !q_norm.contains(&value.to_lowercase()) {
+            return Some(value);
+        }
+        let pos = rest.to_lowercase().find(&value.to_lowercase())?;
+        offset += pos + value.len();
+    }
+    None
+}
+
+/// Whether `turn` carries a typed value that the question does not already
+/// name. See [`novel_or_first`] for why novelty is the right test.
+fn has_novel_value(
+    extractor: fn(&str) -> Option<String>,
+    turn: &str,
+    question: &str,
+) -> bool {
+    let value = match extractor(turn) {
+        Some(v) => v,
+        None => return false,
+    };
+    let q_norm = question.to_lowercase();
+    if !q_norm.contains(&value.to_lowercase()) {
+        return true;
+    }
+    if let Some(pos) = turn.to_lowercase().find(&value.to_lowercase()) {
+        let rest = &turn[pos + value.len()..];
+        if let Some(next) = extractor(rest) {
+            return !q_norm.contains(&next.to_lowercase());
+        }
+    }
+    false
 }
 
 /// Words that, when leading a question, signal a yes/no.
@@ -62,15 +145,31 @@ pub fn classify_question(q: &str) -> QKind {
         return QKind::Generic;
     }
 
-    // Inline cues. "What was X's finish time?" — anchor on "time" with
-    // a temporal modifier (finish/goal/race/elapsed/split).
-    if lower.contains("finish time")
-        || lower.contains("goal time")
-        || lower.contains("race time")
-        || lower.contains("split time")
-        || lower.contains("elapsed time")
-    {
+    // A question that asks about a "time" as a noun wants a clock value.
+    // Matching the bare token (rather than a list of "<modifier> time"
+    // phrases) keeps this from being tuned to particular question wordings.
+    if lower.split_whitespace().any(|t| t.trim_matches('?') == "time") {
         return QKind::Time;
+    }
+
+    // "Why …?" asks for a cause. No span extractor applies, but the
+    // answer is a specific clause elsewhere in the history, so it is
+    // selected differently from a description question.
+    if first == "why" {
+        return QKind::Reason;
+    }
+
+    // "What is X about?" / "Tell me about X" ask for a description, not a
+    // name. The answer is a noun phrase or a whole clause, so no span
+    // extractor applies and the evidence turn is the best prediction.
+    if lower.split_whitespace().any(|t| t.trim_matches('?') == "about") {
+        return QKind::Generic;
+    }
+
+    // wh-questions that name an entity: the answer is a proper noun.
+    // "why" is excluded — its answer is a clause, not a name.
+    if matches!(first, "who" | "whom" | "where" | "what" | "which") {
+        return QKind::Named;
     }
 
     QKind::Generic
@@ -82,11 +181,523 @@ pub fn classify_question(q: &str) -> QKind {
 pub fn compose_short_answer(question: &str, turn: &str) -> String {
     match classify_question(question) {
         QKind::YesNo => yes_no_answer(question, turn),
-        QKind::Date => extract_date(turn).unwrap_or_else(|| turn.to_string()),
-        QKind::Money => extract_money(turn).unwrap_or_else(|| turn.to_string()),
-        QKind::Time => extract_time(turn).unwrap_or_else(|| turn.to_string()),
-        QKind::Generic => turn.to_string(),
+        QKind::Date => novel_or_first(extract_date_lenient, turn, question),
+        QKind::Money => novel_or_first(extract_money, turn, question),
+        QKind::Time => novel_or_first(extract_time, turn, question),
+        QKind::Named => {
+            resolve_named(turn, question, &|_| None).unwrap_or_else(|| turn.to_string())
+        }
+        QKind::Reason | QKind::Generic => turn.to_string(),
     }
+}
+
+/// Apply the novelty principle to a typed extractor.
+///
+/// The same reasoning that governs proper nouns governs dates, times, and
+/// amounts: a question restates the values it already knows and asks for
+/// the one it doesn't. "Did Ethan miss his sub-3:00 goal?" names sub-3:00,
+/// so the informative answer is the *other* time in the evidence —
+/// 2:58:42. Without this, the extractor returns the question's own premise
+/// back to the user, which reads as agreement regardless of the facts.
+///
+/// Falls back to the first extracted value when every candidate value
+/// already appears in the question, and to the whole turn when none does.
+fn novel_or_first(
+    extractor: fn(&str) -> Option<String>,
+    turn: &str,
+    question: &str,
+) -> String {
+    let first = match extractor(turn) {
+        Some(v) => v,
+        None => return turn.to_string(),
+    };
+    let q_norm = question.to_lowercase();
+    if !q_norm.contains(&first.to_lowercase()) {
+        return first;
+    }
+    // The leading value is the question's own premise. Re-run the
+    // extractor on the remainder of the turn to find a different one.
+    if let Some(pos) = turn.to_lowercase().find(&first.to_lowercase()) {
+        let rest = &turn[pos + first.len()..];
+        if let Some(next) = extractor(rest) {
+            if !q_norm.contains(&next.to_lowercase()) {
+                return next;
+            }
+        }
+    }
+    first
+}
+
+/// Pick the best named answer, consulting the knowledge graph.
+///
+/// `entity_type` resolves a candidate string to the entity type the graph
+/// recorded for it at ingest time (`None` when unknown). That is a far
+/// better signal than orthography: "Hired" and "Observability" are
+/// capitalised and sentence-initial, but neither is an entity the NER ever
+/// recorded, while "Rosa" and "Devi" are. Relying on curated lists of
+/// ordinary English words to tell these apart does not generalise beyond
+/// the fixture the list was written against.
+///
+/// Precedence:
+///   1. An explicit naming construction ("a manager named Devi").
+///   2. A candidate whose graph entity type matches what the question asks
+///      for (who → Person, where → Place, which company → Organization).
+///   3. Any candidate the graph knows at all.
+///   4. The orthographic best guess.
+pub fn resolve_named(
+    turn: &str,
+    question: &str,
+    entity_type: &dyn Fn(&str) -> Option<String>,
+) -> Option<String> {
+    let candidates = named_candidates(turn, question);
+    if candidates.is_empty() {
+        return None;
+    }
+
+    // 1. Explicit naming construction, if that name is a live candidate.
+    if let Some(named) = name_after_naming_cue(turn) {
+        if candidates.iter().any(|c| c.eq_ignore_ascii_case(&named)) {
+            return Some(named);
+        }
+    }
+
+    let want = expected_entity(question);
+    let matches_want = |kind: &str| -> bool {
+        let k = kind.to_lowercase();
+        match want {
+            ExpectedEntity::Person => k.contains("person"),
+            ExpectedEntity::Place => k.contains("location") || k.contains("place"),
+            ExpectedEntity::Organization => {
+                k.contains("organization") || k.contains("organisation") || k.contains("project")
+            }
+            ExpectedEntity::Any => false,
+        }
+    };
+
+    // Combine orthographic quality with what the graph knows, rather than
+    // letting either veto the other. Graph membership alone is not decisive:
+    // the heuristic NER also records sentence-initial verbs it mistook for
+    // names, so "is an entity" must add evidence rather than override the
+    // structural signal that a sentence-initial single token is probably not
+    // a name.
+    let scored = scored_named_candidates(turn, question);
+    let best = scored
+        .into_iter()
+        .map(|(name, quality)| {
+            let kind = entity_type(&name);
+            let mut score = quality;
+            if let Some(k) = &kind {
+                score += 2; // known to the graph at all
+                if matches_want(k) {
+                    score += 8; // and of exactly the asked-for type
+                }
+            }
+            (score, name)
+        })
+        .max_by(|a, b| a.0.cmp(&b.0));
+
+    best.map(|(_, n)| n).or_else(|| candidates.into_iter().next())
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Novel-proper-noun extractor
+// ────────────────────────────────────────────────────────────────────
+
+/// Words that are capitalised for reasons other than being a name —
+/// sentence-initial function words, days, and conversational openers. A
+/// capitalised token in this set is never treated as a candidate answer.
+const NON_NAME_CAPS: &[&str] = &[
+    "a", "an", "and", "as", "at", "but", "by", "did", "do", "for", "from", "he", "her", "his", "i",
+    "if", "in", "is", "it", "just", "my", "no", "not", "of", "on", "or", "she", "so", "the",
+    "then", "they", "this", "to", "we", "what", "when", "where", "which", "who", "why", "yes",
+    "you", "your", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday",
+    "today", "tomorrow", "yesterday", "finished", "started", "nice", "cool", "eleven", "renamed",
+];
+
+/// Extract the proper-noun phrase from `turn` that does not already appear
+/// in `question`.
+///
+/// The premise is standard for extractive QA: a *wh*-question supplies the
+/// entities it already knows about and asks for the one it doesn't. "Who
+/// led Carol's pre-seed round?" names Carol; the answer is the other name
+/// in the evidence — Sequoia. Filtering by novelty is what stops the
+/// extractor from confidently returning the subject of the question back
+/// to the user.
+///
+/// Contiguous capitalised tokens are joined ("Andreessen Horowitz"), and
+/// month names are excluded so a date never masquerades as a name.
+pub fn extract_novel_proper_noun(turn: &str, question: &str) -> Option<String> {
+    named_candidates(turn, question).into_iter().next()
+}
+
+/// What kind of entity a *wh*-question is asking for.
+///
+/// This is the bridge from the question to the knowledge graph: "who"
+/// wants a Person, "which company" an Organization. Resolving the answer
+/// against the graph's own NER is what lets the extractor stop relying on
+/// curated lists of English words to guess whether a capitalised token is a
+/// name — the graph already decided that at ingest time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExpectedEntity {
+    Person,
+    Place,
+    Organization,
+    Any,
+}
+
+/// Infer the entity type a question is asking for.
+pub fn expected_entity(question: &str) -> ExpectedEntity {
+    let lower = question.to_lowercase();
+    let first = lower.split_whitespace().next().unwrap_or("");
+    if matches!(first, "who" | "whom") {
+        return ExpectedEntity::Person;
+    }
+    if first == "where" {
+        return ExpectedEntity::Place;
+    }
+    // "Which company / employer / firm …" and "What company …".
+    for cue in ["company", "employer", "firm", "startup", "org", "organisation", "organization"] {
+        if lower.contains(cue) {
+            return ExpectedEntity::Organization;
+        }
+    }
+    ExpectedEntity::Any
+}
+
+/// All novel proper-noun candidates in `turn`, best-guess first.
+///
+/// Returned in preference order so a caller with extra knowledge (e.g. the
+/// graph's entity types) can re-rank rather than being stuck with this
+/// module's purely orthographic guess.
+pub fn named_candidates(turn: &str, question: &str) -> Vec<String> {
+    scored_named_candidates(turn, question)
+        .into_iter()
+        .map(|(n, _)| n)
+        .collect()
+}
+
+/// Named candidates with their orthographic quality score, best first.
+pub fn scored_named_candidates(turn: &str, question: &str) -> Vec<(String, i32)> {
+    let q_tokens: Vec<String> = question
+        .split_whitespace()
+        .map(|t| normalize_token(t))
+        .filter(|t| !t.is_empty())
+        .collect();
+
+    let words: Vec<&str> = turn.split_whitespace().collect();
+    let mut candidates: Vec<(i32, usize, String)> = Vec::new();
+    let mut i = 0usize;
+
+    while i < words.len() {
+        // A token is "sentence-initial" if it opens the turn or follows a
+        // sentence terminator. English capitalises those regardless of
+        // namehood, so their capitalisation carries no information.
+        let sentence_initial = i == 0 || words.get(i.wrapping_sub(1)).map_or(false, |w| ends_sentence(w));
+        if !is_name_candidate(words[i], sentence_initial) {
+            i += 1;
+            continue;
+        }
+        // Greedily absorb following capitalised tokens into one phrase.
+        // Interior tokens are never sentence-initial, so they are judged
+        // by the stricter name test.
+        let mut phrase: Vec<&str> = vec![words[i]];
+        let mut j = i + 1;
+        // Stop at a sentence boundary. "Signed up for the Boston Marathon.
+        // Race day is April 20." must yield "Boston Marathon", not
+        // "Boston Marathon Race" — the capital on "Race" is sentence-initial
+        // and belongs to the next clause.
+        while j < words.len()
+            && !ends_sentence(words[j - 1])
+            && is_name_candidate(words[j], false)
+        {
+            phrase.push(words[j]);
+            j += 1;
+        }
+
+        let cleaned: Vec<String> = phrase.iter().map(|w| trim_edges(w)).collect();
+        let joined = cleaned.join(" ");
+        let novel = cleaned
+            .iter()
+            .any(|w| !q_tokens.contains(&normalize_token(w)));
+
+        if novel && !joined.is_empty() {
+            let mut q = name_quality(&cleaned);
+            // Sentence-initial single tokens are demoted rather than
+            // dropped. Excluding them by consulting a list of ordinary
+            // English words does not generalise -- "Hired", "Chaired",
+            // "Registered", "Switching" are all sentence-initial verbs that
+            // no reasonable list contains. Demoting instead means any
+            // corroborated name elsewhere in the turn wins, and the
+            // sentence-initial token is still available when nothing else
+            // is.
+            if sentence_initial && phrase.len() == 1 {
+                q -= 10;
+            }
+            candidates.push((q, i, joined));
+        }
+        i = j.max(i + 1);
+    }
+
+    // Syntactic cue: when the question ends with a preposition
+    // ("...rename her company *to*?"), the answer is the object of that
+    // same preposition in the evidence ("Renamed Loom *to* Memex"). Without
+    // this, "Loom" and "Memex" are indistinguishable — both are novel
+    // proper nouns — and the extractor returns the wrong one.
+    if let Some(prep) = trailing_preposition(question) {
+        if let Some(obj) = object_of_preposition(&words, prep) {
+            if let Some(pos) = candidates.iter().position(|(_, _, n)| *n == obj) {
+                let hit = candidates.remove(pos);
+                // Large but *safe* sentinel: callers add bonuses to this
+                // score, and i32::MAX would wrap negative on the first one.
+                candidates.insert(0, (PREPOSITION_CUE_SCORE, 0, hit.2));
+            }
+        }
+    }
+
+    // Highest-quality name first; ties resolve to the earliest mention,
+    // since conversational turns tend to front the answer.
+    candidates.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    let mut out: Vec<(String, i32)> =
+        candidates.into_iter().map(|(q, _, n)| (n, q)).collect();
+    out.dedup_by(|a, b| a.0 == b.0);
+    out
+}
+
+/// How strongly a turn's structure matches what the question asks for.
+///
+/// Returns 1.0 when a *syntactic* cue fires — the question's trailing
+/// preposition has a proper-noun object in this turn — and a lower baseline
+/// when the turn merely contains some extractable answer of the right type.
+///
+/// This lets candidate selection prefer evidence whose shape matches the
+/// question over evidence that merely type-checks. For "What did Carol
+/// rename her company **to**?", both "Renamed Loom to Memex" and "I'm
+/// leaving Stripe to start a company" contain novel proper nouns and share
+/// one question token, so nothing else separates them; only the first has a
+/// name in the `to`-object position.
+pub fn answer_confidence(turn: &str, question: &str) -> f32 {
+    match classify_question(question) {
+        QKind::Named => {
+            let words: Vec<&str> = turn.split_whitespace().collect();
+            if let Some(prep) = trailing_preposition(question) {
+                if object_of_preposition(&words, prep).is_some() {
+                    return 1.0;
+                }
+                // The question demanded a prepositional object and this
+                // turn has none. Neutral rather than penalised: many
+                // correct answers are phrased without the preposition.
+                return 0.6;
+            }
+            0.6
+        }
+        QKind::Date
+        | QKind::Money
+        | QKind::Time
+        | QKind::YesNo
+        | QKind::Reason
+        | QKind::Generic => 0.6,
+    }
+}
+
+/// Proper noun introduced by an explicit naming construction
+/// ("a manager **named** Devi", "a chef **called** Rosa").
+///
+/// This is a far stronger signal than capitalisation: the sentence is
+/// literally declaring the name, so it outranks a sentence-initial
+/// capitalised word like "Observability" that merely looks like one.
+pub fn name_after_naming_cue(turn: &str) -> Option<String> {
+    let words: Vec<&str> = turn.split_whitespace().collect();
+    for (i, w) in words.iter().enumerate() {
+        let bare = w.trim_matches(|c: char| !c.is_alphanumeric()).to_lowercase();
+        if bare != "named" && bare != "called" {
+            continue;
+        }
+        if let Some(next) = words.get(i + 1) {
+            if is_name_candidate(next, false) {
+                return Some(trim_edges(next));
+            }
+        }
+    }
+    None
+}
+
+/// The first month named in `text`, if any. Lets a question that says only
+/// "in June" be compared against evidence that says "July 9th" -- without
+/// it, a bare month yields no date and the yes/no oracle falls through to
+/// a coin-flip default.
+pub fn extract_month(text: &str) -> Option<String> {
+    for w in text.split_whitespace() {
+        let bare = w.trim_matches(|c: char| !c.is_alphanumeric()).to_lowercase();
+        if MONTHS.contains(&bare.as_str()) {
+            return Some(bare);
+        }
+    }
+    None
+}
+
+/// Score given to a candidate that matches the question's trailing
+/// preposition. Dominant but headroom-safe for downstream bonuses.
+const PREPOSITION_CUE_SCORE: i32 = 1000;
+
+/// Whether a question asks for the *current* value of a fact that may have
+/// been revised, rather than for any statement of it.
+///
+/// "Which team is Maya on **now**?" and "How much did they **finally**
+/// agree on?" must read the latest turn; "Which company did Maya join?" must
+/// not. Gating supersession on these cues is what keeps recency from
+/// demoting facts that were simply stated early and never changed.
+pub fn asks_for_latest(question: &str) -> bool {
+    let lower = question.to_lowercase();
+    const CUES: &[&str] = &[
+        "now", "finally", "currently", "current", "actually", "latest", "final",
+        "end up", "ended up", "still", "these days", "eventually",
+    ];
+    CUES.iter().any(|c| {
+        // Word-boundary match so "final" does not fire inside "finalise"
+        // and "now" does not fire inside "known".
+        lower
+            .split(|ch: char| !ch.is_alphanumeric() && ch != ' ')
+            .any(|seg| seg.split_whitespace().collect::<Vec<_>>().windows(c.split(' ').count())
+                .any(|w| w.join(" ") == *c))
+    })
+}
+
+/// Prepositions whose object is the answer when they end a question.
+const TRAILING_PREPS: &[&str] = &["to", "from", "with", "for", "at", "in", "into", "by", "on"];
+
+/// The preposition a question ends on, if any.
+fn trailing_preposition(question: &str) -> Option<&'static str> {
+    let last = question
+        .split_whitespace()
+        .next_back()?
+        .trim_matches(|c: char| !c.is_alphanumeric())
+        .to_lowercase();
+    TRAILING_PREPS.iter().copied().find(|p| *p == last)
+}
+
+/// The proper-noun object immediately following `prep` in the evidence.
+fn object_of_preposition(words: &[&str], prep: &str) -> Option<String> {
+    for (i, w) in words.iter().enumerate() {
+        let bare = w.trim_matches(|c: char| !c.is_alphanumeric()).to_lowercase();
+        if bare != prep {
+            continue;
+        }
+        if let Some(next) = words.get(i + 1) {
+            if is_name_candidate(next, false) {
+                return Some(trim_edges(next));
+            }
+        }
+    }
+    None
+}
+
+/// Heuristic quality score for a proper-noun phrase.
+///
+/// Title-case words ("Priya", "Sequoia") are far more likely to be the
+/// answer to a *who/where/what* question than bare acronyms ("ML", "NYC"),
+/// which in conversational text are usually modifiers rather than the
+/// entity being asked about — "An ML engineer named Priya" asks to resolve
+/// to Priya, not ML.
+fn name_quality(tokens: &[String]) -> i32 {
+    let mut score = 0;
+    for t in tokens {
+        let is_all_caps = t.chars().all(|c| !c.is_alphabetic() || c.is_uppercase());
+        if is_all_caps {
+            score -= 1;
+        } else {
+            score += 2;
+        }
+    }
+    score
+}
+
+/// Whether a raw token looks like part of a proper name.
+///
+/// `sentence_initial` tightens the test for the first word of a turn,
+/// where capitalisation carries no information about namehood — "Local
+/// memory systems…" starts with a capital but "Local" is not a name.
+/// There, the token must additionally not be an ordinary English word.
+fn is_name_candidate(raw: &str, sentence_initial: bool) -> bool {
+    // Contractions ("I'm", "don't") are capitalised mid-sentence and are
+    // never names.
+    if raw.contains('\'') && !raw.ends_with("'s") {
+        return false;
+    }
+    let trimmed = trim_edges(raw);
+    if trimmed.chars().count() <= 1 {
+        return false;
+    }
+    // Tokens carrying digits are dates, times, or amounts — handled by the
+    // typed extractors, never a name ("Sub-3:00", "2:58:42").
+    if trimmed.chars().any(|c| c.is_ascii_digit()) {
+        return false;
+    }
+    let first = match trimmed.chars().next() {
+        Some(c) => c,
+        None => return false,
+    };
+    if !first.is_uppercase() {
+        return false;
+    }
+    let lower = trimmed.to_lowercase();
+    if NON_NAME_CAPS.contains(&lower.as_str()) {
+        return false;
+    }
+    // A month name is a date component, not a name.
+    if MONTHS.contains(&lower.as_str()) {
+        return false;
+    }
+    // Sentence-initial tokens are still *candidates* (a turn may legitimately
+    // begin with a name); ranking demotes them. The common-word list remains
+    // as a cheap, high-precision veto for the most frequent offenders.
+    if sentence_initial && COMMON_WORDS.contains(&lower.as_str()) {
+        return false;
+    }
+    true
+}
+
+/// Ordinary English words. Used only to disambiguate sentence-initial
+/// capitalisation — a capitalised word that is also a common noun, verb, or
+/// adjective at the start of a sentence is almost certainly not a name.
+const COMMON_WORDS: &[&str] = &[
+    "about", "after", "all", "also", "always", "another", "any", "back", "because", "been",
+    "before", "being", "best", "better", "big", "both", "call", "called", "came", "can", "come",
+    "company", "could", "day", "days", "done", "down", "each", "early", "even", "ever", "every",
+    "far", "few", "find", "first", "found", "gave", "get", "give", "going", "gone", "good",
+    "got", "great", "had", "half", "hard", "have", "having", "help", "here", "high", "home",
+    "hope", "hour", "hours", "how", "however", "job", "keep", "kind", "knew", "know", "last",
+    "late", "later", "least", "left", "less", "let", "life", "like", "little", "live", "local",
+    "long", "look", "looking", "lot", "made", "make", "making", "many", "may", "maybe", "mean",
+    "memory", "might", "mile", "miles", "mind", "more", "morning", "most", "much", "music",
+    "must", "name", "need", "never", "new", "news", "next", "night", "now", "off", "office",
+    "often", "old", "once", "one", "only", "open", "other", "our", "out", "over", "own", "part",
+    "people", "per", "place", "plan", "put", "quite", "read", "real", "really", "right", "run",
+    "running", "said", "same", "saw", "say", "see", "seen", "sent", "set", "several", "she",
+    "should", "show", "side", "since", "small", "some", "soon", "sort", "still", "stop", "such",
+    "sure", "systems", "take", "taking", "talk", "team", "tell", "than", "that", "their", "them",
+    "there", "these", "thing", "things", "think", "those", "though", "three", "through", "time",
+    "times", "too", "took", "top", "training", "trip", "true", "try", "trying", "turn", "two",
+    "under", "until", "use", "used", "using", "very", "want", "was", "way", "week", "weeks",
+    "well", "went", "were", "while", "will", "with", "work", "working", "world", "would", "year",
+    "years", "yet",
+];
+
+/// Whether a token ends a sentence (so the next capitalised word is
+/// sentence-initial rather than part of the same name).
+fn ends_sentence(raw: &str) -> bool {
+    raw.ends_with('.') || raw.ends_with('!') || raw.ends_with('?')
+}
+
+/// Strip surrounding punctuation from a token, keeping internal characters
+/// (so "Memex." → "Memex" but "sub-3:00" is untouched mid-token).
+fn trim_edges(raw: &str) -> String {
+    raw.trim_matches(|c: char| !c.is_alphanumeric()).to_string()
+}
+
+/// Lowercase and strip possessives/punctuation for question-token matching.
+fn normalize_token(raw: &str) -> String {
+    let t = trim_edges(raw).to_lowercase();
+    t.strip_suffix("'s").map(str::to_string).unwrap_or(t)
 }
 
 // ────────────────────────────────────────────────────────────────────
@@ -122,6 +733,25 @@ const MONTHS: &[&str] = &[
 
 /// Extract a date phrase like "May 3rd", "April 20", "Jan 5" from a
 /// turn. Returns the matched substring with original casing.
+/// A date answer, preferring a precise month+day but accepting a bare
+/// month.
+///
+/// Used only when *composing* the final answer, never for deciding which
+/// candidate to read from: a bare month is a legitimate answer ("closing in
+/// August") but a turn carrying only a month is weaker evidence than one
+/// carrying a full date, so selection still requires the precise form.
+pub fn extract_date_lenient(turn: &str) -> Option<String> {
+    extract_date(turn).or_else(|| {
+        extract_month(turn).map(|m| {
+            let mut c = m.chars();
+            match c.next() {
+                Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
+                None => m,
+            }
+        })
+    })
+}
+
 pub fn extract_date(turn: &str) -> Option<String> {
     let lower = turn.to_lowercase();
     for m in MONTHS {
@@ -337,6 +967,18 @@ pub fn yes_no_answer(question: &str, turn: &str) -> String {
             format!("No, {td}")
         };
     }
+    // Month-level comparison. "Did Nadia defend in June?" against evidence
+    // that says July is a contradiction even though the question carries no
+    // full date for the date branch above to match on.
+    if let (Some(qm), Some(tm)) = (extract_month(question), extract_month(turn)) {
+        if qm != tm {
+            if let Some(d) = extract_date(turn) {
+                return format!("No, {d}");
+            }
+            return format!("No, {tm}");
+        }
+    }
+
     // Capitalized-token check (proper-noun assertions like
     // "Andreessen Horowitz" → check turn for a different proper noun).
     if let Some(q_proper) = first_proper_phrase_after_yn(question) {
@@ -359,16 +1001,15 @@ pub fn yes_no_answer(question: &str, turn: &str) -> String {
             return "Yes".to_string();
         }
     }
-    // Fallback: if the turn carries a money/date/time we'd normally
-    // extract, surface it with a "No," prefix.
-    if let Some(m) = extract_money(turn) {
-        return format!("No, {m}");
-    }
-    if let Some(d) = extract_date(turn) {
-        return format!("No, {d}");
-    }
-    if let Some(t) = extract_time(turn) {
-        return format!("No, {t}");
+    // Fallback: if the turn carries a typed value the question does not
+    // already state, surface it with a "No," prefix. The novelty check
+    // matters here: echoing back the question's own premise ("Did Ethan
+    // miss his sub-3:00 goal?" -> "No, Sub-3:00") states nothing and reads
+    // as confirmation of the premise rather than a correction.
+    for extractor in [extract_money, extract_date, extract_time] {
+        if let Some(v) = first_novel_value(extractor, turn, question) {
+            return format!("No, {v}");
+        }
     }
     // Default — no signal either way.
     "Yes".to_string()
@@ -646,6 +1287,46 @@ mod tests {
         let q = "Did Carol raise from Andreessen Horowitz?";
         let turn = "Got the term sheet from Sequoia today.";
         assert_eq!(yes_no_answer(q, turn), "No, Sequoia");
+    }
+
+    #[test]
+    fn preposition_cue_score_leaves_headroom_for_bonuses() {
+        // Regression: the cue score used to be i32::MAX, and resolve_named
+        // adds up to +10 to it, wrapping the total negative and silently
+        // discarding the strongest signal in the extractor.
+        assert!(PREPOSITION_CUE_SCORE.checked_add(100).is_some());
+    }
+
+    #[test]
+    fn resolve_named_honours_the_preposition_cue() {
+        let turn = "Renamed Loom to Memex — the original name was trademarked.";
+        let q = "What did Carol rename her company to?";
+        // Even when the graph knows the *other* candidate, the syntactic
+        // cue must win.
+        let lookup = |n: &str| -> Option<String> {
+            if n == "Loom" { Some("Project".into()) } else { None }
+        };
+        assert_eq!(resolve_named(turn, q, &lookup).as_deref(), Some("Memex"));
+    }
+
+    #[test]
+    fn asks_for_latest_detects_state_cues() {
+        assert!(asks_for_latest("Which team is Maya on now?"));
+        assert!(asks_for_latest("How much did they finally agree on?"));
+        assert!(asks_for_latest("What is her current role?"));
+    }
+
+    #[test]
+    fn asks_for_latest_ignores_plain_questions() {
+        assert!(!asks_for_latest("Which company did Maya join?"));
+        assert!(!asks_for_latest("Who is Carol's first hire?"));
+    }
+
+    #[test]
+    fn asks_for_latest_respects_word_boundaries() {
+        // "known" contains "now"; "finalise" contains "final".
+        assert!(!asks_for_latest("What is the known address?"));
+        assert!(!asks_for_latest("Did they finalise the deal?"));
     }
 
     #[test]

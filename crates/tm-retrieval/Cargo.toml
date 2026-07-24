@@ -9,6 +9,7 @@ tm-graph = { workspace = true }
 tm-vector = { workspace = true }  # for Embedder only
 tm-episodic = { workspace = true }
 tm-controller = { workspace = true }
+tm-gepa = { workspace = true }
 tm-rerank = { path = "../tm-rerank" }
 tm-reason = { workspace = true }
 serde = { workspace = true }

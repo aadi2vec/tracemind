@@ -70,6 +70,25 @@ struct Args {
     #[cfg(feature = "tracemind")]
     #[arg(long, default_value_t = false)]
     real_embeddings: bool,
+
+    /// For the tracemind runner: synthesize answers with the Tier-1 candle
+    /// LLM (Qwen2.5-0.5B) instead of the Tier-0 extractive picker. Requires
+    /// the `tier1` feature and the GGUF model.
+    #[cfg(feature = "tier1")]
+    #[arg(long, default_value_t = false)]
+    tier1: bool,
+
+    /// Run the GEPA optimisation loop against this dataset as the anchor
+    /// set instead of a single benchmark pass. Prints the tuned policy and
+    /// writes the full round history to `--output`.
+    #[cfg(feature = "tracemind")]
+    #[arg(long, default_value_t = false)]
+    gepa: bool,
+
+    /// GEPA rounds to run.
+    #[cfg(feature = "tracemind")]
+    #[arg(long, default_value_t = 6)]
+    gepa_rounds: usize,
 }
 
 #[tokio::main]
@@ -85,6 +104,13 @@ async fn main() -> anyhow::Result<()> {
         "loaded LoCoMo dataset"
     );
 
+    // GEPA mode: optimise a retrieval policy against this dataset rather
+    // than scoring a single configuration.
+    #[cfg(feature = "tracemind")]
+    if args.gepa {
+        return run_gepa(&args, dataset);
+    }
+
     let report = match args.runner {
         RunnerKind::Echo => run(EchoRunner, &dataset).await?,
         RunnerKind::Null => run(NullRunner, &dataset).await?,
@@ -92,6 +118,8 @@ async fn main() -> anyhow::Result<()> {
         RunnerKind::Tracemind => {
             let cfg = tm_bench_locomo::TraceMindConfig {
                 hash_embed: !args.real_embeddings,
+                #[cfg(feature = "tier1")]
+                use_tier1: args.tier1,
                 ..Default::default()
             };
             run(tm_bench_locomo::TraceMindRunner::new(cfg), &dataset).await?
@@ -187,4 +215,85 @@ async fn run<R: LocomoRunner>(
         outcomes,
         wall,
     ))
+}
+
+/// Run the GEPA optimisation loop with this dataset as the anchor set.
+///
+/// Every candidate policy is executed against the real ingest + retrieval
+/// stack by `LocomoPolicyScorer`, and promoted only if the verifier gate
+/// confirms no regression. The tuned policy is printed so it can be
+/// promoted into `default_verb_weights`, and the full round history —
+/// including each candidate's diagnosis and rationale — is written to
+/// `--output` as the audit trail.
+#[cfg(feature = "tracemind")]
+fn run_gepa(args: &Args, dataset: LocomoDataset) -> anyhow::Result<()> {
+    use tm_bench_locomo::gepa_scorer::LocomoPolicyScorer;
+    use tm_gepa::{OptimizeConfig, Optimizer, RetrievalPolicy};
+
+    let cfg = tm_bench_locomo::TraceMindConfig {
+        hash_embed: !args.real_embeddings,
+        #[cfg(feature = "tier1")]
+        use_tier1: args.tier1,
+        ..Default::default()
+    };
+
+    let mut scorer = LocomoPolicyScorer::new(dataset, cfg);
+    let mut opt = Optimizer::new(OptimizeConfig {
+        max_rounds: args.gepa_rounds,
+        ..Default::default()
+    });
+
+    println!("[gepa] optimising over {} anchors...", {
+        use tm_gepa::PolicyScorer;
+        scorer.anchor_count()
+    });
+
+    let result = opt.run(RetrievalPolicy::default(), &mut scorer);
+
+    println!();
+    println!("  baseline F1      {:.2}", result.baseline_f1);
+    println!("  best F1          {:.2}  (EM {:.2})", result.best_f1, result.best_em);
+    println!("  delta            {:+.2}", result.best_f1 - result.baseline_f1);
+    println!("  frontier ceiling {:.2}", result.frontier_ceiling);
+    println!(
+        "  rollouts         {} evaluated, {} promoted",
+        result.candidates_evaluated, result.candidates_accepted
+    );
+    if result.rollouts_per_f1_point.is_finite() {
+        println!("  rollouts per +1  {:.2}", result.rollouts_per_f1_point);
+    }
+    println!();
+    println!("  tuned policy:");
+    for (space, w) in result.best_policy.normalised_weights() {
+        println!("    {space:<12} {w:.3}");
+    }
+    println!("    min_score    {:.3}", result.best_policy.min_score);
+    println!("    cand_mult    {}", result.best_policy.candidate_multiplier);
+
+    if !result.unsolved.is_empty() {
+        println!();
+        println!("  unsolved by every candidate ({}):", result.unsolved.len());
+        for u in &result.unsolved {
+            println!("    {u}");
+        }
+    }
+
+    // Distil a Curator prior from this run so the next one starts informed.
+    let prior = tm_gepa::curate(&result.history, 2);
+    println!();
+    println!(
+        "  curator prior: amplify={:?} suppress={:?} (confidence {:.2})",
+        prior.amplify, prior.suppress, prior.confidence
+    );
+
+    if let Some(path) = &args.output {
+        let payload = serde_json::json!({
+            "result": &result,
+            "prior": &prior,
+        });
+        std::fs::write(path, serde_json::to_string_pretty(&payload)?)?;
+        println!("\n  history written to {}", path.display());
+    }
+
+    Ok(())
 }

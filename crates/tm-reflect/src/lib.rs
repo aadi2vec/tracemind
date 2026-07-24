@@ -26,11 +26,13 @@
 //! actions go through the existing `IntentStore` mutators.
 
 pub mod brief;
+pub mod curator;
 pub mod insights;
 pub mod matcher;
 pub mod ontology_proposer;
 pub mod outcome_prompt;
 pub mod pattern;
+pub mod reflexion;
 pub mod working_memory;
 
 pub use brief::{
@@ -57,4 +59,11 @@ pub use working_memory::{
     ContradictionInput, FeedbackKind, OutlierInput, SimilarMemoryInput, WmeConfig, WmeError,
     WmeResult, WorkingMemoryEngine, DEFAULT_SCORE_FLOOR, MAX_CARDS_PER_HOUR,
     PER_TARGET_COOLDOWN_SECS,
+};
+pub use reflexion::{
+    GepaSpikeConfig, GepaSpikeResult, ReflexionStore, SessionReflection,
+    run_gepa_spike,
+};
+pub use curator::{
+    Curator, MutationKind, PolicyMutation, PolicyMutationStore, PolicyRollback, PriorUpdate,
 };

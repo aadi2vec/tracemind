@@ -86,3 +86,34 @@ for entry in "${REPOS[@]}"; do
 done
 
 echo "[fetch-models] done. Set TM_MODELS_DIR=$(cd "$OUT_DIR" && pwd) to use these weights."
+
+# ---------------------------------------------------------------------------
+# Qwen2.5-0.5B-Instruct Q4_K_M — Tier-1 candle synthesis backend (~400 MB)
+# ---------------------------------------------------------------------------
+#
+# This GGUF is used by the `candle-llm` feature in `tm-answer` for on-device
+# synthesis without cmake. Download separately from the ONNX models above
+# because it goes to ~/.tracemind/models/ (not the HF cache layout).
+
+fetch_qwen_gguf () {
+    local dest="$HOME/.tracemind/models/qwen2.5-0.5b-instruct-q4_k_m.gguf"
+    if [[ -f "$dest" ]]; then
+        echo "[fetch-models] Qwen2.5-0.5B GGUF already present at $dest"
+        return 0
+    fi
+    mkdir -p "$(dirname "$dest")"
+    echo "[fetch-models] Downloading Qwen2.5-0.5B-Instruct Q4_K_M (~400 MB)..."
+    if command -v huggingface-cli &>/dev/null; then
+        huggingface-cli download \
+            Qwen/Qwen2.5-0.5B-Instruct-GGUF \
+            qwen2.5-0.5b-instruct-q4_k_m.gguf \
+            --local-dir "$(dirname "$dest")"
+    else
+        curl -fL \
+            "https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/qwen2.5-0.5b-instruct-q4_k_m.gguf" \
+            -o "$dest"
+    fi
+    echo "[fetch-models] Qwen2.5-0.5B GGUF ready at $dest"
+}
+
+fetch_qwen_gguf

@@ -3,17 +3,107 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tm_controller::bandit::RetrievalParams;
-use tm_controller::{UcbBandit, LinUcbBandit, QueryPlanner, QueryPlan, PlanAction};
+use tm_controller::{UcbBandit, LinUcbBandit, QueryPlanner, QueryPlan, PlanAction, MemoryRouter, RouterContext, QueryRewriter};
 use tm_episodic::{ProcedureStore, TraceStore, TrajectoryStore};
 use tm_graph::{context::ActiveContext, GraphStore, ViewFilter};
 use tm_reason::CausalTrace;
 use tm_rerank::{ColbertReranker, RerankCandidate};
 use tm_types::{Entity, Procedure, Result, Trace, TraceEventType, TraceMindError, Triple};
-use tm_vector::{Embedder, EmbedModel};
+use tm_vector::{Bm25Index, ComposedIndex, Embedder, EmbedModel};
 use tracing::info;
 use uuid::Uuid;
 
 use crate::prefetch::{PrefetchCache, PrefetchStats};
+
+/// How well-grounded a retrieval result is.
+///
+/// For a memory product, "I have nothing on that" is a *better* answer than
+/// a confident wrong one, and it is a completely different answer from "the
+/// daemon wasn't running" or "retrieval broke". Making the distinction
+/// explicit lets every surface say which one happened instead of returning
+/// an empty string, which is indistinguishable from all three.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Grounding {
+    /// Strong evidence — answer directly and cite it.
+    Found,
+    /// Related material exists, but nothing that clearly answers the query.
+    /// Say so and show what *is* known nearby.
+    Uncertain,
+    /// Nothing relevant is stored. Say that plainly.
+    NotStored,
+}
+
+/// Fused-score floor above which a signal counts as strong evidence.
+pub const GROUNDING_STRONG_SCORE: f32 = 0.35;
+
+/// What kind of surface is driving this engine.
+///
+/// Decides whether interaction *timing* carries information. On an
+/// interactive surface a five-second gap before the next query plausibly
+/// means the user read something; inside an agentic host it means the model
+/// emitted its next tool call. Conflating the two is what made the old
+/// reward model punish normal agent behaviour.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostKind {
+    /// Desktop app / CLI — clicks and dwell are real user actions.
+    Interactive,
+    /// MCP server inside an agentic host — only explicit feedback counts.
+    Agentic,
+}
+
+/// Floor on the *fused* ComposedIndex score for a signal to be returned.
+/// Tuned against the LoCoMo anchor set; GEPA-mutable policy parameter.
+pub const SIGNAL_MIN_SIM: f32 = 0.15;
+
+/// Permissive cosine floor used only for *candidate generation*, before
+/// lexical fusion. Deliberately low: an exact-token match that dense cosine
+/// scores poorly must still reach the BM25 stage to be rescued.
+pub const SIGNAL_CANDIDATE_MIN_SIM: f32 = 0.02;
+
+/// Default candidate pool width, as a multiple of the requested top_k.
+pub const SIGNAL_CANDIDATE_MULTIPLIER: usize = 4;
+
+/// The GEPA policy type applied to this engine.
+pub use tm_gepa::RetrievalPolicy as RetrievalPolicyConfig;
+
+/// Half-life for the `recency` space over raw captures.
+pub const RECENCY_HALF_LIFE_DAYS: f32 = 30.0;
+
+/// Neutral-high confidence assigned to raw captures, which carry no
+/// per-row governance score of their own.
+pub const SIGNAL_BASE_CONFIDENCE: f32 = 0.7;
+
+/// Classify how well a result is grounded.
+///
+/// Strong evidence means either a high-scoring raw memory or a graph hit
+/// backed by at least one supporting signal. "Related entities but no
+/// signal above the floor" is exactly the `Uncertain` case — the system
+/// knows about the topic but not the answer.
+fn classify_grounding(signal_hits: &[SignalHit], entity_count: usize) -> Grounding {
+    let best = signal_hits
+        .iter()
+        .map(|h| h.score)
+        .fold(0.0f32, f32::max);
+    if best >= GROUNDING_STRONG_SCORE {
+        Grounding::Found
+    } else if !signal_hits.is_empty() || entity_count > 0 {
+        Grounding::Uncertain
+    } else {
+        Grounding::NotStored
+    }
+}
+
+/// Collapse a per-sub-query signal map into a single best-first ranking.
+fn rank_signal_hits(map: HashMap<i64, SignalHit>) -> Vec<SignalHit> {
+    let mut hits: Vec<SignalHit> = map.into_values().collect();
+    hits.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    hits
+}
 
 /// Recent query embedding cache for relevance gating and recommendations.
 struct RecentQueryCache {
@@ -274,6 +364,24 @@ pub struct RetrievalEngine {
     /// [`ViewFilter::rejects_triple`] and dropped if the view rejects
     /// them. Set via [`set_view_filter`].
     view_filter: Option<ViewFilter>,
+    /// Q3.2 — memory-routing gate. Fires before LinUCB arm selection.
+    router: MemoryRouter,
+    /// Whether the routing gate is active. Defaults to false for backward
+    /// compat; the MCP layer enables it via `set_router_enabled(true)`.
+    router_enabled: bool,
+    /// Query rewriter — expands queries into variants for higher recall.
+    rewriter: QueryRewriter,
+    /// Q3.10 — composed multi-space index. Owns how the dense (`text`),
+    /// sparse (`lexical`), `recency`, and `confidence` spaces combine into
+    /// a single ranking score. Its verb weights are the artifact the GEPA
+    /// loop mutates.
+    composed_index: ComposedIndex,
+    /// GEPA-tunable floor on the fused signal score.
+    signal_min_score: f32,
+    /// GEPA-tunable candidate pool width, as a multiple of top_k.
+    candidate_multiplier: usize,
+    /// Whether interaction timing is meaningful on this surface.
+    host_kind: HostKind,
 }
 
 #[derive(Debug)]
@@ -309,6 +417,9 @@ pub struct RetrievalResult {
     /// Populated by `compute_related_entities`; surfaced as "Related:" in CLI
     /// and `related_entities` in MCP responses. See TM-UX-001.
     pub related_entities: Vec<RelatedEntity>,
+    /// Whether this result is well enough grounded to answer from. See
+    /// [`Grounding`].
+    pub grounding: Grounding,
 }
 
 impl RetrievalEngine {
@@ -349,13 +460,30 @@ impl RetrievalEngine {
         let bandit = UcbBandit::load(&bandit_path);
         let linucb = LinUcbBandit::load(&linucb_path);
 
+        // Q4.4/Q4.14 — load the active GEPA policy from disk, if one has
+        // been promoted. Without this the optimisation loop's output could
+        // never reach a running instance: the tuned weights would live only
+        // in the benchmark process that produced them. A missing or
+        // unparseable file falls back to the compiled-in defaults rather
+        // than failing to open the engine.
+        let policy_path = parent.join("policy.json");
+        let loaded_policy = std::fs::read_to_string(&policy_path)
+            .ok()
+            .and_then(|raw| match serde_json::from_str::<RetrievalPolicyConfig>(&raw) {
+                Ok(p) => Some(p),
+                Err(e) => {
+                    info!("[retrieval] ignoring unparseable policy.json: {e}");
+                    None
+                }
+            });
+
         // Try to auto-open procedure and trajectory stores from sibling files
         let proc_path = parent.join("procedures.jsonl");
         let procedure_store = ProcedureStore::open(&proc_path).ok();
         let traj_path = parent.join("trajectories.jsonl");
         let trajectory_store = TrajectoryStore::open(&traj_path).ok();
 
-        Ok(Self {
+        let mut engine = Self {
             graph,
             trace_store,
             embedder,
@@ -372,7 +500,23 @@ impl RetrievalEngine {
             prefetch: PrefetchCache::new(),
             cross_context: false,
             view_filter: None,
-        })
+            router: MemoryRouter::default(),
+            router_enabled: false,
+            rewriter: QueryRewriter::new(4),
+            composed_index: ComposedIndex::default_hybrid(),
+            signal_min_score: SIGNAL_MIN_SIM,
+            candidate_multiplier: SIGNAL_CANDIDATE_MULTIPLIER,
+            // Conservative default: assume timing means nothing until a
+            // surface declares itself interactive. A wrong "Interactive"
+            // corrupts the bandit; a wrong "Agentic" merely forgoes a
+            // weak signal.
+            host_kind: HostKind::Agentic,
+        };
+        if let Some(policy) = loaded_policy {
+            info!("[retrieval] applying promoted GEPA policy from policy.json");
+            engine.apply_policy(&policy);
+        }
+        Ok(engine)
     }
 
     /// Toggle cross-context retrieval. When `true`, ignores the active
@@ -591,6 +735,22 @@ impl RetrievalEngine {
     pub fn query(&mut self, text: &str) -> Result<RetrievalResult> {
         let start = Instant::now();
 
+        // ── Phase: query expansion ──
+        // Generate multi-variant queries for simple/bandit cases.
+        // Expanded variants are merged via query_decomposed (RRA fusion).
+        let expansion_plan = self.planner.plan(text);
+        let is_simple = matches!(
+            expansion_plan.action,
+            PlanAction::DirectLookup | PlanAction::BanditRetrieval
+        );
+        if is_simple {
+            let variants = self.rewriter.expand(text);
+            if variants.len() > 1 {
+                let sub_queries: Vec<String> = variants.into_iter().map(|v| v.query).collect();
+                return self.query_decomposed(text, &sub_queries, &expansion_plan, start);
+            }
+        }
+
         // ── Phase: plan ──
         let phase_start = Instant::now();
         let plan = self.planner.plan(text);
@@ -615,6 +775,36 @@ impl RetrievalEngine {
         let embed_start = Instant::now();
         let query_embedding = self.embedder.embed(text);
         let blended_embedding = self.blend_with_context(&query_embedding);
+
+        // ── Phase: routing gate (Q3.2) ──
+        // Fires before LinUCB arm selection. If the gate says skip,
+        // return an empty result immediately without hitting the DB.
+        let router_ctx = RouterContext {
+            host_id: None,          // populated by MCP layer via set_host_id()
+            working_memory_hit: false,
+            recent_miss_rate: 0.0,  // populated from feedback signals in Q4
+            is_command: false,
+        };
+        if self.router_enabled && !self.router.should_retrieve(text, &router_ctx) {
+            return Ok(RetrievalResult {
+                query_id: Uuid::new_v4(),
+                arm: u8::MAX,  // sentinel: not a bandit arm
+                entities: vec![],
+                triples: vec![],
+                traces: vec![],
+                related_entities: vec![],
+                signal_hits: vec![],
+                grounding: Grounding::NotStored,
+                procedures: vec![],
+                phases: vec![],
+                causal_trace: CausalTrace::new(text, usize::MAX, "router-skip"),
+                reasoning_narrative: "routing gate: retrieval skipped".to_string(),
+                plan: Some(plan),
+                low_confidence: false,
+                suggested_queries: vec![],
+                latency_ms: start.elapsed().as_millis() as u32,
+            });
+        }
 
         // ── Phase: arm_select ──
         let arm_start = Instant::now();
@@ -717,21 +907,8 @@ impl RetrievalEngine {
         // moment it lands, without waiting for consolidation.
         let ss_start = Instant::now();
         let signal_top_k = (params.top_k / 2).max(3);
-        let raw_signal_hits = self
-            .graph
-            .search_signals(&blended_embedding, signal_top_k, 0.2)
-            .unwrap_or_default();
-        let raw_hit_count = raw_signal_hits.len();
-        ws.signal_hits = raw_signal_hits
-            .into_iter()
-            .map(|(sig, score)| SignalHit {
-                signal_id: sig.id,
-                text: sig.raw_text,
-                source: sig.source,
-                score,
-                created_at: sig.created_at,
-            })
-            .collect();
+        ws.signal_hits = self.search_signal_hits(text, &blended_embedding, signal_top_k);
+        let raw_hit_count = ws.signal_hits.len();
         ws.record_phase(
             "signal_search",
             vs_count,
@@ -1144,6 +1321,7 @@ impl RetrievalEngine {
             5,  // max related
         );
 
+        let ws_grounding = classify_grounding(&ws.signal_hits, ws.entities.len());
         Ok(RetrievalResult {
             query_id,
             arm: ws.arm,
@@ -1158,6 +1336,7 @@ impl RetrievalEngine {
             procedures: ws.procedures,
             phases: ws.phases,
             reasoning_narrative,
+            grounding: ws_grounding,
             signal_hits: ws.signal_hits,
             related_entities,
         })
@@ -1183,11 +1362,26 @@ impl RetrievalEngine {
         let mut seen_entity_ids: HashSet<Uuid> = HashSet::new();
         let mut seen_triple_ids: HashSet<Uuid> = HashSet::new();
         let mut causal = CausalTrace::new(original_text, 0, "decomposed");
+        // Hybrid raw-text recall, fused across sub-queries. Keyed by
+        // signal_id so a capture matched by several variants is kept once,
+        // at its best score.
+        let mut signal_by_id: HashMap<i64, SignalHit> = HashMap::new();
 
         for sub_q in sub_queries {
             // Use a narrow retrieval for each sub-query (arm 0 for speed)
             let sub_embedding = self.embedder.embed(sub_q);
             let sub_params = UcbBandit::params_for_arm(1); // medium arm per sub-query
+
+            for hit in self.search_signal_hits(sub_q, &sub_embedding, sub_params.top_k) {
+                signal_by_id
+                    .entry(hit.signal_id)
+                    .and_modify(|e| {
+                        if hit.score > e.score {
+                            e.score = hit.score;
+                        }
+                    })
+                    .or_insert(hit);
+            }
 
             if let Ok(candidates) = self.graph.search_vectors(&sub_embedding, sub_params.top_k) {
                 for (rank, (id, score)) in candidates.iter().enumerate() {
@@ -1312,7 +1506,11 @@ impl RetrievalEngine {
                 decision: format!("{} sub-queries merged", sub_queries.len()),
             }],
             reasoning_narrative,
-            signal_hits: Vec::new(),
+            grounding: {
+                let hits = rank_signal_hits(signal_by_id.clone());
+                classify_grounding(&hits, entity_count)
+            },
+            signal_hits: rank_signal_hits(signal_by_id),
             related_entities,
         })
     }
@@ -1543,6 +1741,7 @@ impl RetrievalEngine {
             5,
         );
 
+        let final_entities_len = final_entities.len();
         Ok(RetrievalResult {
             query_id,
             arm: 0,
@@ -1557,7 +1756,14 @@ impl RetrievalEngine {
             procedures: self.match_procedures(original_text),
             phases,
             reasoning_narrative,
-            signal_hits: Vec::new(),
+            // Temporal queries ("when did I…") are exactly the case where the
+            // raw sentence carries the answer and the entity name does not.
+            grounding: {
+                let hits =
+                    self.search_signal_hits(original_text, &temporal_query_embedding, 8);
+                classify_grounding(&hits, final_entities_len)
+            },
+            signal_hits: self.search_signal_hits(original_text, &temporal_query_embedding, 8),
             related_entities,
         })
     }
@@ -1571,6 +1777,142 @@ impl RetrievalEngine {
     /// cache. See TM-UX-001 Phase C.
     pub fn refresh_graph(&self) -> Result<()> {
         self.graph.reload_maps()
+    }
+
+    /// Declare what kind of surface is driving this engine. See
+    /// [`HostKind`]. Defaults to [`HostKind::Agentic`].
+    pub fn set_host_kind(&mut self, kind: HostKind) {
+        self.host_kind = kind;
+    }
+
+    pub fn host_kind(&self) -> HostKind {
+        self.host_kind
+    }
+
+    /// Apply a GEPA-produced retrieval policy to the live query path.
+    ///
+    /// This is what makes the optimisation loop meaningful: the artifact
+    /// the loop mutates has to be the same one retrieval reads. Sets the
+    /// `recall` verb's fusion weights on the `ComposedIndex` plus the two
+    /// scalar knobs the signal path consults.
+    pub fn apply_policy(&mut self, policy: &RetrievalPolicyConfig) {
+        let pairs: Vec<(&str, f32)> = policy
+            .space_weights
+            .iter()
+            .map(|(k, v)| (k.as_str(), *v))
+            .collect();
+        let mut weights = tm_vector::default_verb_weights();
+        // Replace only the `recall` vector; the other verbs keep their
+        // defaults until the loop is extended to score them too.
+        if let Some(slot) = weights.iter_mut().find(|w| w.verb == "recall") {
+            *slot = tm_vector::VerbWeights::new("recall", &pairs);
+        }
+        self.composed_index.set_verb_weights(weights);
+        self.signal_min_score = policy.min_score;
+        self.candidate_multiplier = policy.candidate_multiplier.max(1);
+    }
+
+    /// The policy currently in force.
+    pub fn current_policy(&self) -> RetrievalPolicyConfig {
+        let mut space_weights = std::collections::BTreeMap::new();
+        for vw in self.composed_index.verb_weights() {
+            if vw.verb == "recall" {
+                for (k, v) in &vw.weights {
+                    space_weights.insert(k.clone(), *v);
+                }
+            }
+        }
+        RetrievalPolicyConfig {
+            space_weights,
+            min_score: self.signal_min_score,
+            candidate_multiplier: self.candidate_multiplier,
+            // Answer-selection weights live in the answer layer, not the
+            // engine; report the policy defaults so a round-trip through
+            // current_policy() stays a valid policy.
+            ..RetrievalPolicyConfig::default()
+        }
+    }
+
+    /// Hybrid signal search — raw captured text that has not yet been
+    /// consolidated into graph entities.
+    ///
+    /// Extracted so every retrieval path can call it. The planner-routed
+    /// paths (`query_decomposed`, `query_temporal`) previously returned
+    /// `signal_hits: Vec::new()` unconditionally, which meant any query the
+    /// planner classified as decomposed or temporal could only ever surface
+    /// *entity names* — never the sentence the user actually wrote. Query
+    /// expansion routes most simple queries through `query_decomposed`, so
+    /// in practice that disabled raw-text recall for the majority of
+    /// queries.
+    /// Hybrid dense + sparse ranking (Q3.10 — `ComposedIndex` on the live
+    /// query path).
+    ///
+    /// Candidates are generated at a *permissive* cosine floor and then
+    /// re-ranked by fusing four spaces through `ComposedIndex`: dense cosine
+    /// (`text`), BM25 (`lexical`), time decay (`recency`), and governance
+    /// confidence. Generating wide and ranking narrow is what lets the
+    /// lexical space rescue an exact-token match that dense cosine buried —
+    /// filtering at `SIGNAL_MIN_SIM` *before* fusion would discard those
+    /// candidates before BM25 ever saw them.
+    fn search_signal_hits(&self, query_text: &str, embedding: &[f32], top_k: usize) -> Vec<SignalHit> {
+        // Wide candidate generation: 4x the requested depth (floored at 32)
+        // at a permissive similarity cut.
+        let candidate_k = (top_k * self.candidate_multiplier).max(32);
+        let raw = self
+            .graph
+            .search_signals(embedding, candidate_k, SIGNAL_CANDIDATE_MIN_SIM)
+            .unwrap_or_default();
+        if raw.is_empty() {
+            return Vec::new();
+        }
+
+        let docs: Vec<String> = raw.iter().map(|(s, _)| s.raw_text.clone()).collect();
+        let bm25 = Bm25Index::build(&docs);
+        let lexical_scores = bm25.normalised_scores(query_text);
+
+        let now = chrono::Utc::now();
+        let mut scored: Vec<(f32, SignalHit)> = raw
+            .into_iter()
+            .enumerate()
+            .map(|(i, (sig, cosine))| {
+                let age_days =
+                    (now - sig.created_at).num_seconds() as f32 / 86_400.0;
+                let recency = 2f32.powf(-age_days / RECENCY_HALF_LIFE_DAYS);
+
+                let mut spaces: HashMap<String, f32> = HashMap::new();
+                spaces.insert("text".to_string(), cosine.clamp(0.0, 1.0));
+                spaces.insert("lexical".to_string(), lexical_scores[i]);
+                spaces.insert("recency".to_string(), recency);
+                // Raw captures carry no per-row governance score; they were
+                // admitted by the ingest gate, so treat them as neutral-high
+                // rather than fabricating a confidence.
+                spaces.insert("confidence".to_string(), SIGNAL_BASE_CONFIDENCE);
+
+                let fused = self.composed_index.score_precomputed(&spaces, Some("recall"));
+                (
+                    fused,
+                    SignalHit {
+                        signal_id: sig.id,
+                        text: sig.raw_text,
+                        source: sig.source,
+                        score: fused,
+                        created_at: sig.created_at,
+                    },
+                )
+            })
+            .filter(|(fused, _)| *fused >= self.signal_min_score)
+            .collect();
+
+        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        scored.truncate(top_k);
+
+        let mut hits: Vec<SignalHit> = scored.into_iter().map(|(_, h)| h).collect();
+        hits.retain(|h| {
+            self.graph
+                .signal_in_active_scope(h.signal_id, self.cross_context)
+                .unwrap_or(true)
+        });
+        hits
     }
 
     /// Return per-arm `(pull_count, average_reward)` statistics from the bandit.
@@ -1611,55 +1953,72 @@ impl RetrievalEngine {
         let _ = self.graph.log_access(entity_id, "clicked", None);
     }
 
-    /// Finalize a pending deferred reward using simplified outcome-aligned signal.
+    /// Finalize a pending deferred reward.
     ///
-    /// R1 papers consistently show that simpler, outcome-aligned rewards outperform
-    /// complex composite proxies (Memory-R1, Graph-R1, GraphRAG-R1).
+    /// **Only registers a reward when there is actual evidence.** An
+    /// un-evidenced query leaves the bandit posterior untouched.
     ///
-    /// Signal mapping:
-    ///   - User clicked a result          → 0.7  (positive engagement)
-    ///   - Dwelled >10s without re-query  → 0.5  (probably useful)
-    ///   - Re-queried within 5s           → 0.1  (results were poor)
-    ///   - Otherwise                      → 0.3  (ambiguous)
+    /// The previous implementation always registered something, deriving a
+    /// value from click / dwell / re-query timing. Those are interactive-UI
+    /// signals and they are meaningless on the surface that ships: an MCP
+    /// host issues consecutive tool calls in well under five seconds as
+    /// normal behaviour, which the old rule read as "re-queried within 5s →
+    /// results were poor → 0.1". The bandit was therefore receiving close to
+    /// the worst possible reward for almost every query — not merely a noisy
+    /// signal but an actively wrong one, since the arm explored *least*
+    /// ends up looking best.
     ///
-    /// Legacy composite: 0.2*base + 0.4*click + 0.2*dwell + 0.2*(1-requery)
+    /// Evidence sources, in precedence order:
+    ///   1. Explicit feedback rows (`helpful` / `not_related`) written by
+    ///      `memory_feedback` — always trusted, on any host.
+    ///   2. Interactive engagement (click / dwell / re-query) — only on
+    ///      [`HostKind::Interactive`], where those actions are real.
+    ///   3. Nothing → no update.
     fn finalize_pending_reward(&mut self) {
         let pending = match self.pending_reward.take() {
             Some(p) => p,
             None => return,
         };
 
-        let elapsed = pending.created_at_mono.elapsed();
-        let rapid_requery = pending.requeried || elapsed < Duration::from_secs(5);
-
-        let relevance_reward = if pending.clicks > 0 {
-            0.7
-        } else if rapid_requery {
-            0.1
-        } else if elapsed > Duration::from_secs(10) {
-            0.5
-        } else {
-            0.3
-        };
-
-        // Sprint C-0.7 — close the negative-feedback loop. Any
-        // `negative_signals` rows the user filed against this query
-        // (via `tracemind not-related <query_id> <result_id>`) reduce
-        // the reward the bandit sees, so arms that pull in foreign /
-        // irrelevant context for this active scope get penalised.
-        let neg_weight = self
+        let neg = self
             .graph
             .negative_weight_for_query(pending.query_id)
             .unwrap_or(0.0) as f64;
-        // Sprint D / F-1 — symmetric positive channel. `tracemind helpful
-        // <query_id> <result_id>` writes a `positive_signals` row that
-        // adds to the reward, so arms that pull in *genuinely* useful
-        // results get reinforced (not just penalised for misses).
-        let pos_weight = self
+        let pos = self
             .graph
             .positive_weight_for_query(pending.query_id)
             .unwrap_or(0.0) as f64;
-        let reward = (relevance_reward + pos_weight - neg_weight).clamp(0.0, 1.0);
+        let has_explicit = pos > 0.0 || neg > 0.0;
+
+        let elapsed = pending.created_at_mono.elapsed();
+        let interactive = self.host_kind == HostKind::Interactive;
+        // A click is real evidence on any host, but only an interactive
+        // surface can produce one.
+        let has_engagement = interactive && (pending.clicks > 0 || pending.requeried);
+
+        if !has_explicit && !has_engagement {
+            // No evidence. Registering a fabricated constant here would bias
+            // the posterior toward whichever arm is pulled most often, which
+            // is exactly backwards for an explore/exploit controller.
+            return;
+        }
+
+        let relevance_reward = if pending.clicks > 0 {
+            0.7
+        } else if interactive && pending.requeried {
+            0.1
+        } else if interactive && elapsed > Duration::from_secs(10) {
+            0.5
+        } else {
+            // Explicit-feedback-only case: start neutral and let the
+            // positive/negative weights below decide the direction.
+            0.5
+        };
+
+        // Sprint C-0.7 / D / F-1 — explicit feedback moves the reward in
+        // both directions: `not_related` rows penalise an arm that pulled in
+        // foreign context, `helpful` rows reinforce one that did not.
+        let reward = (relevance_reward + pos - neg).clamp(0.0, 1.0);
 
         self.bandit.register_reward(pending.arm, reward);
         self.bandit.save(&self.bandit_path);
@@ -2153,6 +2512,131 @@ impl Drop for RetrievalEngine {
 mod tests {
     use super::*;
 
+    /// A GEPA-promoted `policy.json` must actually change the running
+    /// engine's configuration. Without this link the optimisation loop's
+    /// output lives only in the process that produced it, and every claim
+    /// about self-improvement is unbacked.
+    #[test]
+    fn open_applies_promoted_policy_from_disk() {
+        let dir = std::env::temp_dir().join(format!("tm_pol_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("test.db").to_str().unwrap().to_string();
+        let traces = dir.join("traces.jsonl").to_str().unwrap().to_string();
+
+        std::fs::write(
+            dir.join("policy.json"),
+            r#"{"space_weights":{"text":1.0,"lexical":0.0,"recency":0.0,"confidence":0.0},
+                "min_score":0.77,"candidate_multiplier":9,
+                "coverage_weight":0.0,"fit_weight":0.0,"generic_coverage_boost":1.0}"#,
+        )
+        .unwrap();
+
+        let engine = RetrievalEngine::open(&db, &traces, true).unwrap();
+        let active = engine.current_policy();
+        assert_eq!(active.candidate_multiplier, 9, "policy.json was not applied");
+        assert!((active.min_score - 0.77).abs() < 1e-5, "min_score = {}", active.min_score);
+        let w = active.normalised_weights();
+        assert!(w["text"] > 0.99, "text weight = {}", w["text"]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A corrupt policy file must not stop the engine from opening — the
+    /// product has to keep working on compiled-in defaults.
+    #[test]
+    fn open_falls_back_when_policy_is_corrupt() {
+        let dir = std::env::temp_dir().join(format!("tm_polbad_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("test.db").to_str().unwrap().to_string();
+        let traces = dir.join("traces.jsonl").to_str().unwrap().to_string();
+        std::fs::write(dir.join("policy.json"), "{ not json").unwrap();
+
+        let engine = RetrievalEngine::open(&db, &traces, true)
+            .expect("engine must open despite a corrupt policy file");
+        let active = engine.current_policy();
+        assert_eq!(
+            active.candidate_multiplier,
+            SIGNAL_CANDIDATE_MULTIPLIER,
+            "should have fallen back to defaults"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn scratch_engine(host: HostKind) -> (RetrievalEngine, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("tm_rew_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("test.db").to_str().unwrap().to_string();
+        let traces = dir.join("traces.jsonl").to_str().unwrap().to_string();
+        let mut engine = RetrievalEngine::open(&db, &traces, true).unwrap();
+        engine.set_host_kind(host);
+        (engine, dir)
+    }
+
+    fn total_pulls(engine: &RetrievalEngine) -> u64 {
+        engine.bandit_stats().iter().map(|(p, _)| *p).sum()
+    }
+
+    /// The defect this replaces: an agentic host issues its next tool call
+    /// in well under five seconds, which the old model scored 0.1 — the
+    /// worst possible reward — for essentially every query. With no
+    /// evidence the posterior must simply not move.
+    #[test]
+    fn agentic_host_without_feedback_does_not_update_the_bandit() {
+        let (mut engine, dir) = scratch_engine(HostKind::Agentic);
+        let before = total_pulls(&engine);
+        engine.query("anything at all").unwrap();
+        // Second query immediately after — the pattern the old rule punished.
+        engine.query("anything at all again").unwrap();
+        assert_eq!(
+            total_pulls(&engine),
+            before,
+            "an un-evidenced agentic query must leave the bandit untouched"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Explicit feedback is trusted on any host, including agentic ones.
+    #[test]
+    fn explicit_feedback_updates_the_bandit_on_an_agentic_host() {
+        let (mut engine, dir) = scratch_engine(HostKind::Agentic);
+        let before = total_pulls(&engine);
+        let result = engine.query("something worth rating").unwrap();
+        engine
+            .graph()
+            .write_positive_signal(result.query_id, "result-1", "helpful", None, 0.3)
+            .unwrap();
+        // The next query finalizes the previous one's reward.
+        engine.query("a later query").unwrap();
+        assert!(
+            total_pulls(&engine) > before,
+            "explicit feedback must reach the bandit"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Interactive surfaces keep their engagement signals.
+    #[test]
+    fn interactive_click_updates_the_bandit() {
+        let (mut engine, dir) = scratch_engine(HostKind::Interactive);
+        let before = total_pulls(&engine);
+        engine.query("clicked query").unwrap();
+        engine.register_click(uuid::Uuid::new_v4());
+        engine.query("next query").unwrap();
+        assert!(
+            total_pulls(&engine) > before,
+            "a click is real evidence on an interactive surface"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn default_host_kind_is_agentic() {
+        let (engine, dir) = scratch_engine(HostKind::Agentic);
+        assert_eq!(engine.host_kind(), HostKind::Agentic);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn query_returns_ok_and_updates_bandit() {
         let dir = std::env::temp_dir().join(format!("tm_ret_{}", uuid::Uuid::new_v4()));
@@ -2180,23 +2664,40 @@ mod tests {
             prefetch: PrefetchCache::new(),
             cross_context: false,
             view_filter: None,
+            router: MemoryRouter::default(),
+            router_enabled: false,
+            rewriter: QueryRewriter::new(4),
+            composed_index: ComposedIndex::default_hybrid(),
+            signal_min_score: SIGNAL_MIN_SIM,
+            candidate_multiplier: SIGNAL_CANDIDATE_MULTIPLIER,
+            // Conservative default: assume timing means nothing until a
+            // surface declares itself interactive. A wrong "Interactive"
+            // corrupts the bandit; a wrong "Agentic" merely forgoes a
+            // weak signal.
+            host_kind: HostKind::Agentic,
         };
 
         let result = engine.query("hello world").unwrap();
         assert!(result.latency_ms < 5000);
 
-        // With deferred rewards, the first query creates a pending reward.
-        // A second query finalizes the first one's reward.
+        // Deferred rewards are *evidence-gated*: a second query finalizes
+        // the first one's pending reward, but with no feedback and no
+        // interactive engagement there is nothing to learn from, so the
+        // posterior must not move. (This test previously asserted the
+        // opposite — that every query updates the bandit — which is the
+        // behaviour that made an agentic host register 0.1 for everything.)
         let _result2 = engine.query("test query").unwrap();
-        let stats = engine.bandit_stats();
-        let total: u64 = stats.iter().map(|(c, _)| c).sum();
-        assert_eq!(total, 1); // first query's reward now finalized
+        let unevidenced: u64 = engine.bandit_stats().iter().map(|(c, _)| c).sum();
+        assert_eq!(unevidenced, 0, "un-evidenced queries must not train the bandit");
 
-        // Finalize the second query's pending reward too
+        // Supply real evidence and the update lands.
+        engine.set_host_kind(HostKind::Interactive);
+        let result3 = engine.query("third query").unwrap();
+        assert!(!result3.query_id.is_nil());
+        engine.register_click(uuid::Uuid::new_v4());
         engine.finalize_pending_reward();
-        let stats2 = engine.bandit_stats();
-        let total2: u64 = stats2.iter().map(|(c, _)| c).sum();
-        assert_eq!(total2, 2);
+        let evidenced: u64 = engine.bandit_stats().iter().map(|(c, _)| c).sum();
+        assert_eq!(evidenced, 1, "a click must train the bandit");
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -2226,6 +2727,17 @@ mod tests {
             prefetch: PrefetchCache::new(),
             cross_context: false,
             view_filter: None,
+            router: MemoryRouter::default(),
+            router_enabled: false,
+            rewriter: QueryRewriter::new(4),
+            composed_index: ComposedIndex::default_hybrid(),
+            signal_min_score: SIGNAL_MIN_SIM,
+            candidate_multiplier: SIGNAL_CANDIDATE_MULTIPLIER,
+            // Conservative default: assume timing means nothing until a
+            // surface declares itself interactive. A wrong "Interactive"
+            // corrupts the bandit; a wrong "Agentic" merely forgoes a
+            // weak signal.
+            host_kind: HostKind::Agentic,
         };
 
         // Prime an entry for "hello world" — even on an empty graph
@@ -2383,6 +2895,17 @@ mod tests {
             prefetch: PrefetchCache::new(),
             cross_context: false,
             view_filter: None,
+            router: MemoryRouter::default(),
+            router_enabled: false,
+            rewriter: QueryRewriter::new(4),
+            composed_index: ComposedIndex::default_hybrid(),
+            signal_min_score: SIGNAL_MIN_SIM,
+            candidate_multiplier: SIGNAL_CANDIDATE_MULTIPLIER,
+            // Conservative default: assume timing means nothing until a
+            // surface declares itself interactive. A wrong "Interactive"
+            // corrupts the bandit; a wrong "Agentic" merely forgoes a
+            // weak signal.
+            host_kind: HostKind::Agentic,
         };
 
         let now = chrono::Utc::now();
@@ -2480,6 +3003,17 @@ mod tests {
             prefetch: PrefetchCache::new(),
             cross_context: false,
             view_filter: None,
+            router: MemoryRouter::default(),
+            router_enabled: false,
+            rewriter: QueryRewriter::new(4),
+            composed_index: ComposedIndex::default_hybrid(),
+            signal_min_score: SIGNAL_MIN_SIM,
+            candidate_multiplier: SIGNAL_CANDIDATE_MULTIPLIER,
+            // Conservative default: assume timing means nothing until a
+            // surface declares itself interactive. A wrong "Interactive"
+            // corrupts the bandit; a wrong "Agentic" merely forgoes a
+            // weak signal.
+            host_kind: HostKind::Agentic,
         };
 
         // Seed at least one entity so the query produces real candidates.
@@ -2556,6 +3090,17 @@ mod tests {
             prefetch: PrefetchCache::new(),
             cross_context: false,
             view_filter: None,
+            router: MemoryRouter::default(),
+            router_enabled: false,
+            rewriter: QueryRewriter::new(4),
+            composed_index: ComposedIndex::default_hybrid(),
+            signal_min_score: SIGNAL_MIN_SIM,
+            candidate_multiplier: SIGNAL_CANDIDATE_MULTIPLIER,
+            // Conservative default: assume timing means nothing until a
+            // surface declares itself interactive. A wrong "Interactive"
+            // corrupts the bandit; a wrong "Agentic" merely forgoes a
+            // weak signal.
+            host_kind: HostKind::Agentic,
         };
 
         let now = chrono::Utc::now();
@@ -2624,6 +3169,17 @@ mod tests {
             prefetch: PrefetchCache::new(),
             cross_context: true,
             view_filter: None,
+            router: MemoryRouter::default(),
+            router_enabled: false,
+            rewriter: QueryRewriter::new(4),
+            composed_index: ComposedIndex::default_hybrid(),
+            signal_min_score: SIGNAL_MIN_SIM,
+            candidate_multiplier: SIGNAL_CANDIDATE_MULTIPLIER,
+            // Conservative default: assume timing means nothing until a
+            // surface declares itself interactive. A wrong "Interactive"
+            // corrupts the bandit; a wrong "Agentic" merely forgoes a
+            // weak signal.
+            host_kind: HostKind::Agentic,
         };
 
         let now = chrono::Utc::now();

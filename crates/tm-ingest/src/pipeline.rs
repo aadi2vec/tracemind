@@ -51,6 +51,9 @@ pub struct IngestResult {
     pub memory_ops: Vec<(String, MemoryOp)>,
     /// True if the selective ingestion gate rejected this input.
     pub skip_gate: bool,
+    /// The retraction beat: contradictions this store introduced against
+    /// previously-recorded facts. Empty when nothing was reversed.
+    pub contradictions: Vec<tm_graph::StoreContradiction>,
 }
 
 /// Result of the fast-path ingestion (embed-first, extract-later).
@@ -261,6 +264,7 @@ impl IngestPipeline {
                 content_hash,
                 memory_ops: vec![],
                 skip_gate: true,
+                contradictions: Vec::new(),
             });
         }
 
@@ -431,6 +435,15 @@ impl IngestPipeline {
         // 6. Extract typed triples via pattern matching, then fill with co-occurrence.
         let triples = self.extractor.extract_triples(text, &entities);
 
+        // 6b. The retraction beat (holistic review §5 P1.4). Detect
+        //     contradictions *before* routing the new triples into the
+        //     graph, while the previously-stored value is still the only one
+        //     on record for that (subject, functional-predicate). This is the
+        //     wedge behaviour surfaced automatically on every store — the
+        //     host no longer needs to call a separate tool with UUIDs it does
+        //     not have.
+        let contradictions = self.graph.detect_store_contradictions(&triples);
+
         // 7. LM-9 confidence routing — accept high-confidence triples
         //    immediately, queue mid-confidence ones in the pending pool,
         //    drop the rest. Keep `triples` populated with the accepted
@@ -449,6 +462,22 @@ impl IngestPipeline {
         }
         let triples = accepted_triples;
 
+        // 7a. Close the valid-time interval of every fact the retraction beat
+        //     just reversed. The old fact stopped being true when this store
+        //     happened, so its `valid_to` is set to now — an as-of query
+        //     before this instant still returns the old value, after it does
+        //     not. This is what makes supersession correct rather than a
+        //     message (holistic review §5 P1.5). Soft-fail: a temporal write
+        //     must never lose the graph write that already committed.
+        if !contradictions.is_empty() {
+            let now = chrono::Utc::now();
+            for c in &contradictions {
+                if let Err(e) = self.graph.supersede_triple(c.old_triple_id, now) {
+                    tracing::debug!("[ingest] supersede_triple failed: {e}");
+                }
+            }
+        }
+
         // 7b. LM-5b — derive + persist auto-tags. Hashtags from raw text
         // + entity-type label per entity. Cluster-label tags layer in
         // later from the consolidator once CLU-6 backfills cluster_id.
@@ -460,6 +489,34 @@ impl IngestPipeline {
             combined.sort();
             combined.dedup();
             let _ = self.graph.upsert_entity_tags(ent.id, &combined, "auto");
+        }
+
+        // 7c. Persist the raw text as a searchable signal.
+        //
+        // Without this, everything ingested through the slow path (CLI
+        // `tracemind ingest`, MCP `memory_store`) is recallable only as
+        // *entity names* — the sentence the user actually wrote is lost to
+        // retrieval, because `search_signals` reads `captured_signals` and
+        // only `ingest_fast` (the capture daemon) was writing there. That
+        // made "what did I say about X" unanswerable for every non-daemon
+        // ingest. Tier 3 (Normal) matches what `ingest_fast` assigns to
+        // ordinary prose. Failures are non-fatal: the entity/triple graph
+        // is already committed and must not be rolled back over a signal
+        // row.
+        let hash64 = seahash::hash(text.as_bytes());
+        if !self.graph.signal_exists(hash64) {
+            let signal_embedding = self.embedder.embed(text);
+            if let Err(e) = self.graph.insert_signal_with_embedding(
+                "ingest",
+                text,
+                hash64,
+                session_id,
+                &signal_embedding,
+                None,
+                SignalPriority::Normal.tier(),
+            ) {
+                tracing::debug!("[ingest] signal persist failed: {e}");
+            }
         }
 
         // 8. Build trace record with full provenance.
@@ -477,6 +534,7 @@ impl IngestPipeline {
             content_hash,
             memory_ops,
             skip_gate: false,
+            contradictions,
         })
     }
     // -----------------------------------------------------------------------
@@ -2240,11 +2298,20 @@ mod tests {
         // Store the same topic multiple times. Novel content is classified as
         // Priority (tier 2) by the classifier, so the normal consolidate() pass
         // (tier-union) and consolidate_priority() should both find these signals.
+        // Assert each store succeeded rather than discarding the result.
+        // The original `let _ = ...` swallowed failures, so when one of the
+        // three signals did not land the test failed later at the aggregate
+        // count with no indication of which call went wrong.
         for _ in 0..3 {
-            let _ = pipeline.ingest_fast(
-                &format!("{} — version {}", s, Uuid::new_v4()),
-                "test",
-                Uuid::new_v4(),
+            let txt = format!("{} — version {}", s, Uuid::new_v4());
+            let r = pipeline
+                .ingest_fast(&txt, "test", Uuid::new_v4())
+                .expect("ingest_fast should succeed");
+            assert!(
+                r.skipped.is_none(),
+                "signal was skipped: {:?} (tier {:?})",
+                r.skipped,
+                r.priority
             );
         }
         // Use min_cluster_size=1 so even singleton priority signals promote —
@@ -2255,7 +2322,7 @@ mod tests {
         let stats = pipeline
             .consolidate(50, 1, 0.0)
             .expect("consolidate should succeed");
-        assert!(stats.signals_scanned >= 3, "should have scanned stored signals");
+        assert!(stats.signals_scanned >= 3, "should have scanned stored signals (got {})", stats.signals_scanned);
         assert!(
             stats.clusters_formed >= 1,
             "should have formed at least one cluster (got {})",

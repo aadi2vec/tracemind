@@ -93,3 +93,22 @@ pub fn short_answer_request(question: &str, grounding: Vec<GroundingChunk>) -> A
         .with_grounding(grounding)
         .with_max_tokens(256)
 }
+
+/// Build the answer request, attaching the topics the system *does* know
+/// about so an empty result becomes a useful abstention rather than an
+/// empty string. See `tm_answer::extractive::abstain`.
+pub fn short_answer_request_with_context(
+    question: &str,
+    result: &tm_retrieval::RetrievalResult,
+    grounding: Vec<GroundingChunk>,
+) -> AnswerRequest {
+    let mut req = short_answer_request(question, grounding);
+    req.nearby_topics = result
+        .related_entities
+        .iter()
+        .map(|r| r.name.clone())
+        .chain(result.entities.iter().map(|e| e.name.clone()))
+        .take(5)
+        .collect();
+    req
+}

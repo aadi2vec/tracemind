@@ -8,3 +8,14 @@ tm-types = { workspace = true }
 tracing = { workspace = true }
 seahash = { workspace = true }
 fastembed = { workspace = true }
+dirs = "5"
+uuid = { workspace = true }
+chrono = { workspace = true }
+
+# BGE-M3 ONNX loading — versions pinned to match what fastembed pulls transitively.
+# ort's ndarray feature is already enabled by fastembed; we re-declare here so
+# rustc sees our crate as a direct user of those features.
+ort = { version = "=2.0.0-rc.10", features = ["ndarray", "std"] }
+ndarray = "0.16"
+tokenizers = { version = "0.22", default-features = false, features = ["onig"] }
+hf-hub = "0.4"
