@@ -2,7 +2,7 @@
 
 **Reframed 2026-05-11 against the seed bar.** Every priority below is judged by one question: *does this get me closer to a user on camera saying "I won't go back"?* That sentence is the only thing that unlocks a seed check. Engine depth, three-product fan-out, and architectural elegance are graded *only* by whether they shorten the distance to that moment.
 
-> **Canonical strategy doc:** [`docs/PROJECT_2026.md`](PROJECT_2026.md). This task list operationalises that plan. When they conflict, fix both.
+> **Canonical strategy doc:** [`docs/CHARTER-H2-2026.md`](CHARTER-H2-2026.md) (H2 2026, supersedes prior `PROJECT_2026.md` — see `consolidated-history-tracker-2026-07-23.md` §1 for the lineage). This task list operationalises that plan. When they conflict, fix both.
 
 Legend: `[x]` done, `[-]` in progress / partial, `[ ]` not started.
 
