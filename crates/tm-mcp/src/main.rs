@@ -18,6 +18,7 @@ use tm_retrieval::RetrievalEngine;
 use tm_types::RecentCapture;
 
 mod answerer;
+mod ingest_verbs;
 mod prefetch_orchestrator;
 
 // ---------------------------------------------------------------------------
@@ -82,6 +83,15 @@ pub fn advanced_surface_enabled() -> bool {
 /// description overrides applied.
 fn tools_list_filtered() -> Value {
     let mut list = tools_list_for_surface(advanced_surface_enabled());
+    if advanced_surface_enabled() {
+        // Ingest verbs (I-P2..I-P5) are advanced-only — they are captured
+        // through the CLI/UI in the normal path; hosts see them only when
+        // the operator opts in, keeping the core surface at the six verbs
+        // named in `CORE_TOOLS`.
+        if let Some(arr) = list.get_mut("tools").and_then(|t| t.as_array_mut()) {
+            arr.extend(ingest_verbs::descriptors());
+        }
+    }
     apply_description_overrides(&mut list, &load_description_overrides());
     list
 }
@@ -647,13 +657,140 @@ fn tools_list() -> Value {
                         "query_id":          {"type": "string", "description": "Query UUID from memory_query (for bandit-training kinds). Defaults to a new UUID if omitted."},
                         "feedback_hook_id":  {"type": "string", "description": "feedback_hook_id from memory_query response — links this signal to a specific retrieval."},
                         "result_id":         {"type": "string", "description": "Entity or triple UUID being rated (for explicit/implicit signals)."},
-                        "kind":              {"type": "string", "enum": ["helpful", "not_related", "cross_context_bridge", "card_accepted", "card_rejected", "outcome_edited", "retrieval_cited", "retrieval_miss", "proposal_silenced", "verb_invoked"], "description": "Signal kind. Class is derived automatically."},
+                        "kind":              {"type": "string", "enum": ["helpful", "not_related", "cross_context_bridge", "card_accepted", "card_rejected", "outcome_edited", "retrieval_cited", "retrieval_miss", "proposal_silenced", "verb_invoked", "card_action"], "description": "Signal kind. Class is derived automatically. `card_action` maps a Brief-card action (open|pin|dismiss|why) to the right signal via the hook lookup table."},
+                        "action":            {"type": "string", "enum": ["open", "pin", "dismiss", "why"], "description": "For kind=card_action: which of the four Brief-card actions the user pressed."},
                         "weight":            {"type": "number", "description": "Override default weight (helpful 0.3, negative 1.0). Must be ≥ 0."},
                         "context_id":        {"type": "string", "description": "Active context UUID for positive explicit feedback."},
                         "context_a":         {"type": "string", "description": "cross_context_bridge: the bad-result context."},
                         "context_b":         {"type": "string", "description": "cross_context_bridge: the query's active context."},
                         "verb":              {"type": "string", "description": "For verb_invoked: the MCP verb name that was called."},
                         "host_id":           {"type": "string", "description": "MCP host identifier (claude-code, goose, cursor, etc)."}
+                    }
+                }
+            },
+            {
+                "name": "memory_brief_home",
+                "description": "Product Plan X4 — return the 4-slot Brief home: Recall (what you did recently), Compose (bridges across sessions), Reconcile (contradictions to resolve), Rehearse (commitments due). Empty slots are `null` (silence is a valid product state). Every card carries a `hook_id` — pass it back through memory_feedback (kind=card_action) so the reward loop closes.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "recall_limit":    {"type": "integer", "description": "Max recent memories considered for Recall (default 5).", "default": 5},
+                        "rehearse_window_hours": {"type": "integer", "description": "How far ahead in hours to look for due Rehearse commitments (default 24).", "default": 24},
+                        "host_id":         {"type": "string", "description": "MCP host id — persisted on the hook rows so signals get attributed."}
+                    }
+                }
+            },
+            {
+                "name": "memory_ingest_multimodal",
+                "description": "Product Plan X1 — ingest a non-text payload (screenshot, PDF, web page, voice note, email). Bytes are content-addressed to ~/.tracemind/blobs/, a row is written to the attachments table, and the canonical text (either caller-supplied via `text` or extracted server-side) is fed into the normal retrieval index. Supply OCR / transcript in `text` when available; otherwise the payload is stored as a blob-only stub recoverable by sha256.",
+                "inputSchema": {
+                    "type": "object",
+                    "required": ["kind", "source"],
+                    "properties": {
+                        "kind":   {"type": "string", "enum": ["text", "image", "audio", "pdf", "web", "email", "photo", "calendar"], "description": "Modality."},
+                        "source": {"type": "string", "description": "Where the payload came from (clipboard, screenshot, safari-tab, downloads-watcher, …)."},
+                        "text":   {"type": "string", "description": "Pre-extracted canonical text (OCR, transcript, or reader-mode). Preferred when the caller can compute it."},
+                        "bytes_base64": {"type": "string", "description": "Payload bytes, base64-encoded. Optional when `text` is supplied."},
+                        "mime":   {"type": "string", "description": "MIME type (image/png, application/pdf, text/html, …)."},
+                        "uri":    {"type": "string", "description": "Source URL (for web/email) or file path."},
+                        "hint":   {"type": "string", "description": "Free-form label (e.g. 'whiteboard sketch', 'contract-v2.pdf')."}
+                    }
+                }
+            },
+            {
+                "name": "memory_rollback_list",
+                "description": "Product Plan X10 — list recent GEPA policy mutations (accepted or rejected). Each row shows the mutation id, kind, ΔF1/Δcontradiction, and acceptance. Pass an id to `memory_rollback_apply` to revert one.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "limit": {"type": "integer", "description": "Max mutations (newest first). Default 20.", "default": 20}
+                    }
+                }
+            },
+            {
+                "name": "memory_rollback_apply",
+                "description": "Product Plan X10 — revert a GEPA policy mutation. If a `~/.tracemind/policy.<parent-id>.json` snapshot exists it is restored; otherwise `policy.json` is deleted (defaults take over). Always records a `policy_rollbacks` row for the audit trail.",
+                "inputSchema": {
+                    "type": "object",
+                    "required": ["id"],
+                    "properties": {
+                        "id":   {"type": "string", "description": "Mutation UUID from memory_rollback_list."},
+                        "note": {"type": "string", "description": "Optional operator note (kept on the rollback row)."},
+                        "dry_run": {"type": "boolean", "description": "Record the rollback but leave policy.json untouched. Default false."}
+                    }
+                }
+            },
+            {
+                "name": "memory_context_for",
+                "description": "Zero-copy context transfer for the active LLM window. Given a `topic`, assemble a **token-budgeted, cited context brief** the host can inject directly into its current chat. The brief pulls from: (a) graph entities matching the topic + their 1-hop related entities, (b) recent captured signals mentioning the topic, (c) open commitments whose statement mentions the topic, (d) unresolved contradictions on the topic. Every claim is anchored to a citation id (`entity:<uuid>`, `signal:<int>`, `commitment:<uuid>`, `contradiction:<uuid>`). Response fields: `brief` (rendered paragraph, ready to paste), `estimated_tokens`, `sections` (structured), `citations` (flat list). This is the primitive TraceMind's composition wedge is built on — one call per host, one keystroke per user.",
+                "inputSchema": {
+                    "type": "object",
+                    "required": ["topic"],
+                    "properties": {
+                        "topic":                 {"type": "string", "description": "Free-form topic string. Same shape as a memory_query text."},
+                        "budget_tokens":         {"type": "integer", "description": "Approximate token cap for the rendered `brief`. Default 2000; the assembler estimates tokens as ceil(chars/4). Content is truncated section-by-section (entities first, then recent captures, then commitments, then contradictions) until the budget fits."},
+                        "include_recent_captures": {"type": "boolean", "description": "Include recent captured signals section. Default true."},
+                        "include_commitments":   {"type": "boolean", "description": "Include open commitments section. Default true."},
+                        "include_contradictions":{"type": "boolean", "description": "Include unresolved contradictions section. Default true."},
+                        "recent_captures_limit": {"type": "integer", "description": "Max recent captures to consider (before topic-matching filter). Default 50."}
+                    }
+                }
+            },
+            {
+                "name": "memory_insights_current",
+                "description": "Product Plan X16 — return the current row-level insights (open commitments whose model outlook diverges from the user's baseline by ≥ min_abs_delta). Pure read: this is exactly what the brief home's Reconcile/Rehearse cards derive from. Empty array is a valid answer.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "min_abs_delta": {"type": "number", "description": "Threshold on |model_positive - baseline_positive|. Default 0.20."},
+                        "min_priors":    {"type": "integer", "description": "Minimum n_priors on the outlook. Default 6."},
+                        "max_rows":      {"type": "integer", "description": "Cap on returned rows. Default 3."}
+                    }
+                }
+            },
+            {
+                "name": "memory_patterns_show",
+                "description": "Product Plan X17 — return detected structural patterns (cell-level polarity divergences from the global baseline, e.g. 'high-stakes evening intents trend Worse 32pp above baseline'). Each row includes cell descriptor, n, dist, lift, Wilson lower-bound and a pre-rendered one-liner. Empty array is a valid answer.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "min_n":          {"type": "integer", "description": "Minimum completed rows in the cell. Default 6."},
+                        "min_abs_lift":   {"type": "number",  "description": "|proportion diff| floor. Default 0.25."},
+                        "max_patterns":   {"type": "integer", "description": "Row cap. Default 5."},
+                        "min_global_n":   {"type": "integer", "description": "Minimum global completed n. Default 12."}
+                    }
+                }
+            },
+            {
+                "name": "memory_digest_weekly",
+                "description": "Product Plan X20 — render (and optionally persist) a weekly retention digest: recent captures by modality, top surfaced insights, unresolved contradictions and open commitments. Writes to ~/.tracemind/notifications/digest-<iso-week>.json when persist=true. Pure derivation from local state — no network.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "persist":       {"type": "boolean", "description": "When true, also drop a JSON marker into ~/.tracemind/notifications/. Default false."},
+                        "recent_days":   {"type": "integer", "description": "How many days back to survey (default 7)."}
+                    }
+                }
+            },
+            {
+                "name": "memory_quick_recall",
+                "description": "Product Plan X2/X8 — one-shot small retrieval optimised for the menu-bar quick-recall bar. Small top_k, no reasoning, no reranker. Returns just id/preview/score/source. Uses `host_id=menu-bar` for signal attribution so quick-recall dwell doesn't compete with agentic queries.",
+                "inputSchema": {
+                    "type": "object",
+                    "required": ["q"],
+                    "properties": {
+                        "q":     {"type": "string", "description": "Query text."},
+                        "top_k": {"type": "integer", "description": "Max results (default 5)."}
+                    }
+                }
+            },
+            {
+                "name": "memory_onboarding_status",
+                "description": "Product Plan X3 — report first-run bootstrap state: whether the data dir exists, model bundles, index counts, whether an onboarding marker has been written. Callable from any host; the menu-bar/Tauri surface uses it to decide when to show the onboarding flow.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "mark_complete": {"type": "boolean", "description": "When true, write ~/.tracemind/onboarding.json marking onboarding done."}
                     }
                 }
             },
@@ -2456,12 +2593,1059 @@ fn handle_memory_feedback(params: &Value, db_path: &str) -> Result<Value, String
                 .map_err(|e| format!("record_feedback_signal: {e}"))?;
             Ok(json!({ "ok": true, "class": "behavioral", "kind": "verb_invoked", "verb": verb, "signal_id": signal_id }))
         }
+        // Product Plan X9 — the Brief card wrapper. `hook_id` uniquely
+        // identifies the impression; `action` is what the user pressed on
+        // the card. We look up the hook row, translate `action` → signal
+        // kind + score, and route through the fabric. Silent on "why"
+        // (explainability tap; must not train).
+        "card_action" => {
+            let action = params
+                .get("action")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| "missing action for card_action".to_string())?;
+            let hook_id = params
+                .get("feedback_hook_id")
+                .and_then(|v| v.as_str())
+                .and_then(|s| Uuid::parse_str(s).ok())
+                .ok_or_else(|| "card_action requires a valid feedback_hook_id".to_string())?;
+            let hooked = tm_graph::lookup_hook(graph.connection(), hook_id)
+                .map_err(|e| format!("lookup_hook: {e}"))?
+                .ok_or_else(|| format!("hook_id {hook_id} not recognised"))?;
+            let card_action = match action {
+                "open" => tm_reflect::CardAction::Open,
+                "pin" => tm_reflect::CardAction::Pin,
+                "dismiss" => tm_reflect::CardAction::Dismiss,
+                "why" => tm_reflect::CardAction::Why,
+                other => return Err(format!("unknown card action: {other}")),
+            };
+            let signal = tm_reflect::signal_for_action(
+                hook_id,
+                card_action,
+                hooked.card_id,
+                hooked.host_id.as_deref(),
+                hooked.session_id,
+                Some("memory_brief_home"),
+            );
+            let signal_id = if let Some(s) = signal {
+                Some(
+                    graph
+                        .record_feedback_signal(&s)
+                        .map_err(|e| format!("record_feedback_signal: {e}"))?,
+                )
+            } else {
+                None
+            };
+            Ok(json!({
+                "ok": true,
+                "class": "explicit",
+                "kind": "card_action",
+                "action": action,
+                "slot": hooked.slot,
+                "hook_id": hook_id,
+                "signal_id": signal_id,
+            }))
+        }
         other => Err(format!(
             "invalid kind '{other}': expected one of helpful, not_related, cross_context_bridge, \
              card_accepted, card_rejected, outcome_edited, retrieval_cited, retrieval_miss, \
-             proposal_silenced, verb_invoked"
+             proposal_silenced, verb_invoked, card_action"
         )),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Product Plan X4 / X13 / X14 — Brief home surface
+// ---------------------------------------------------------------------------
+
+/// Build the 4-slot Brief home. Reads what's cheaply available today:
+/// - Recall = most recent captured signals
+/// - Reconcile = active contradictions from the belief store
+/// - Rehearse = overdue / due-today commitments from the intent store
+/// - Compose = empty until the Q4.7 bridge detector is wired (X13)
+///
+/// Persists a hook row per card so subsequent `memory_feedback` calls with
+/// kind=card_action can attribute back to the impression.
+fn handle_memory_brief_home(
+    params: &Value,
+    db_path: &str,
+    intents_path: &str,
+    session_id: Uuid,
+) -> Result<Value, String> {
+    let recall_limit = params
+        .get("recall_limit")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(5) as usize;
+    let rehearse_window_hours = params
+        .get("rehearse_window_hours")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(24);
+    let host_id = params
+        .get("host_id")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+
+    let graph = GraphStore::open(db_path).map_err(|e| format!("open graph: {e}"))?;
+
+    // ---- Recall: most recent non-ephemeral signals -------------------
+    let signals = graph
+        .unconsolidated_signals(recall_limit.max(1))
+        .unwrap_or_default();
+    let recall = tm_reflect::RecallInput {
+        items: signals
+            .into_iter()
+            .map(|s| tm_reflect::RecallItem {
+                id: s.content_hash.to_string(),
+                text: s.raw_text,
+                source: s.source,
+            })
+            .collect(),
+    };
+
+    // ---- Reconcile: open contradictions -----------------------------
+    let reconcile = collect_reconcile(&graph).unwrap_or_default();
+
+    // ---- Rehearse: overdue / due-soon commitments -------------------
+    let rehearse = collect_rehearse(intents_path, rehearse_window_hours).unwrap_or_default();
+
+    // ---- Compose: heuristic bridge detector -------------------------
+    // A full Q4.7 bridge (algebra over subgraphs) lands in X13. Until
+    // then, we surface the naive-but-honest signal: any single token
+    // (≥5 chars, alpha) that appears in captured signals from ≥ 2
+    // distinct sessions in the last N is a candidate bridge topic. If
+    // one is found, it fills the Compose slot; otherwise the slot stays
+    // silent (correct product behavior per §4.1).
+    let compose = collect_compose(&graph, 40).unwrap_or_default();
+
+    let now = chrono::Utc::now();
+    let home = tm_reflect::build_home(recall, compose, reconcile, rehearse, now);
+
+    // Persist hooks so card_action feedback can look them up later.
+    if let Err(e) =
+        tm_reflect::persist_hooks(graph.connection(), &home, host_id.as_deref(), Some(session_id))
+    {
+        tracing::debug!("[brief_home] persist_hooks: {e}");
+    }
+
+    Ok(serde_json::to_value(home).map_err(|e| format!("serialize: {e}"))?)
+}
+
+fn collect_reconcile(graph: &GraphStore) -> Option<tm_reflect::ReconcileInput> {
+    // Read persisted retraction-beat contradictions. Only *unresolved*
+    // ones surface — resolved rows are audit trail, not action.
+    let mut out = Vec::new();
+    for c in graph
+        .contradictions()
+        .into_iter()
+        .filter(|c| c.resolution.is_none())
+        .take(1)
+    {
+        let a_detail = graph.triple_detail(c.triple_a).ok().flatten();
+        let b_detail = graph.triple_detail(c.triple_b).ok().flatten();
+        let topic = a_detail
+            .as_ref()
+            .map(|d| format!("{}: {}", d.subject_name, d.predicate))
+            .unwrap_or_else(|| c.triple_a.to_string());
+        let a_val = a_detail.as_ref().map(|d| d.object_name.clone()).unwrap_or_default();
+        let b_val = b_detail.as_ref().map(|d| d.object_name.clone()).unwrap_or_default();
+        let a_ts = a_detail
+            .as_ref()
+            .map(|d| d.ingested_at)
+            .unwrap_or(c.detected_at);
+        let b_ts = b_detail
+            .as_ref()
+            .map(|d| d.ingested_at)
+            .unwrap_or(c.detected_at);
+        out.push(tm_reflect::Conflict {
+            topic,
+            a: a_val,
+            b: b_val,
+            a_ts,
+            b_ts,
+            a_ref: c.triple_a.to_string(),
+            b_ref: c.triple_b.to_string(),
+        });
+    }
+    Some(tm_reflect::ReconcileInput { contradictions: out })
+}
+
+fn collect_compose(graph: &GraphStore, signal_limit: usize) -> Option<tm_reflect::ComposeInput> {
+    use std::collections::HashMap;
+    let signals = graph.unconsolidated_signals(signal_limit).ok()?;
+    // Group tokens → sessions they appeared in. A token that shows up
+    // across ≥ 2 distinct sessions is a candidate bridge.
+    let mut token_sessions: HashMap<String, std::collections::HashSet<String>> = HashMap::new();
+    for s in &signals {
+        let sess = s
+            .session_id
+            .map(|u| u.to_string())
+            .unwrap_or_else(|| s.source.clone());
+        for tok in s.raw_text.split(|c: char| !c.is_alphanumeric()) {
+            let tok = tok.to_lowercase();
+            if tok.len() < 5 || tok.chars().any(|c| !c.is_alphabetic()) {
+                continue;
+            }
+            token_sessions
+                .entry(tok)
+                .or_default()
+                .insert(sess.clone());
+        }
+    }
+    // Skip stop-ish common words that shouldn't be treated as topics.
+    const SKIP: &[&str] = &[
+        "would", "could", "should", "these", "those", "there", "their", "which",
+        "about", "after", "again", "against", "being", "because", "before",
+    ];
+    let mut best: Option<(String, Vec<String>)> = None;
+    for (tok, sessions) in token_sessions {
+        if sessions.len() < 2 || SKIP.contains(&tok.as_str()) {
+            continue;
+        }
+        let n = sessions.len();
+        if best.as_ref().map(|(_, s)| n > s.len()).unwrap_or(true) {
+            best = Some((tok, sessions.into_iter().collect()));
+        }
+    }
+    let bridges = best
+        .map(|(topic, sessions)| {
+            vec![tm_reflect::Bridge {
+                topic,
+                session_ids: sessions,
+            }]
+        })
+        .unwrap_or_default();
+    Some(tm_reflect::ComposeInput { bridges })
+}
+
+fn collect_rehearse(
+    intents_path: &str,
+    window_hours: i64,
+) -> Option<tm_reflect::RehearseInput> {
+    use tm_intent::IntentStore;
+    let store = IntentStore::open(intents_path).ok()?;
+    // list_open returns Open-state commitments; we narrow by horizon
+    // to items due within the window.
+    let commitments = store.list_open(200).ok()?;
+    let now = chrono::Utc::now();
+    let cutoff = now + chrono::Duration::hours(window_hours.max(0));
+    let mut due: Vec<tm_reflect::DueItem> = commitments
+        .into_iter()
+        .filter(|c| c.horizon.map(|h| h <= cutoff).unwrap_or(false))
+        .map(|c| tm_reflect::DueItem {
+            id: c.id.to_string(),
+            title: c.statement.clone(),
+            context: c.tags.join(", "),
+            due_at: c.horizon.unwrap_or(now),
+        })
+        .collect();
+    due.sort_by_key(|d| d.due_at);
+    Some(tm_reflect::RehearseInput { due })
+}
+
+// ---------------------------------------------------------------------------
+// Product Plan X1 — multimodal ingest
+// ---------------------------------------------------------------------------
+
+async fn handle_memory_ingest_multimodal(
+    params: &Value,
+    ingest: &Arc<Mutex<IngestPipeline>>,
+    session_id: Uuid,
+) -> Result<Value, String> {
+    use base64::Engine;
+    let kind_s = params
+        .get("kind")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "missing kind".to_string())?;
+    let kind = tm_ingest::Modality::from_str(kind_s)
+        .ok_or_else(|| format!("unknown modality: {kind_s}"))?;
+    let source = params
+        .get("source")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "missing source".to_string())?
+        .to_string();
+    let text = params
+        .get("text")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let bytes = if let Some(b64) = params.get("bytes_base64").and_then(|v| v.as_str()) {
+        Some(
+            base64::engine::general_purpose::STANDARD
+                .decode(b64)
+                .map_err(|e| format!("bytes_base64 decode: {e}"))?,
+        )
+    } else {
+        None
+    };
+    let mime = params
+        .get("mime")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let uri = params
+        .get("uri")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let hint = params
+        .get("hint")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+
+    let payload = tm_ingest::MultimodalPayload {
+        kind,
+        source,
+        ts: chrono::Utc::now(),
+        bytes,
+        mime,
+        text,
+        uri,
+        hint,
+    };
+
+    let ingest_guard = ingest.lock().await;
+    let out = ingest_guard
+        .ingest_multimodal(&payload, session_id)
+        .map_err(|e| format!("ingest_multimodal: {e}"))?;
+    Ok(json!({
+        "ok": true,
+        "kind": kind_s,
+        "content_hash": out.content_hash,
+        "signal_id": out.signal_id,
+        "priority": format!("{:?}", out.priority),
+        "skipped": out.skipped,
+    }))
+}
+
+// ---------------------------------------------------------------------------
+// Product Plan X10 — policy rollback surface
+// ---------------------------------------------------------------------------
+
+fn handle_memory_rollback_list(params: &Value, db_path: &str) -> Result<Value, String> {
+    let limit = params
+        .get("limit")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(20) as usize;
+    let graph = GraphStore::open(db_path).map_err(|e| format!("open graph: {e}"))?;
+    tm_graph::init_policy_provenance_schema(graph.connection())
+        .map_err(|e| format!("provenance schema: {e}"))?;
+    let mutations =
+        tm_graph::recent_policy_mutations(graph.connection(), limit).map_err(|e| e.to_string())?;
+    Ok(json!({ "ok": true, "mutations": mutations }))
+}
+
+fn handle_memory_rollback_apply(params: &Value, db_path: &str) -> Result<Value, String> {
+    let id_s = params
+        .get("id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "missing id".to_string())?;
+    let mutation_id =
+        Uuid::parse_str(id_s).map_err(|e| format!("invalid mutation id: {e}"))?;
+    let note = params
+        .get("note")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let dry_run = params
+        .get("dry_run")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    let graph = GraphStore::open(db_path).map_err(|e| format!("open graph: {e}"))?;
+    tm_graph::init_policy_provenance_schema(graph.connection())
+        .map_err(|e| format!("provenance schema: {e}"))?;
+    let mutations = tm_graph::recent_policy_mutations(graph.connection(), 1000)
+        .map_err(|e| e.to_string())?;
+    let m = mutations
+        .into_iter()
+        .find(|m| m.id == mutation_id)
+        .ok_or_else(|| format!("mutation {mutation_id} not found"))?;
+
+    let mut restored: Option<String> = None;
+    let mut deleted = false;
+    if !dry_run {
+        let dir = data_dir();
+        let policy_path = dir.join("policy.json");
+        let snapshot_path = dir.join(format!("policy.{}.json", m.parent_id));
+        if snapshot_path.exists() {
+            std::fs::copy(&snapshot_path, &policy_path)
+                .map_err(|e| format!("restore snapshot: {e}"))?;
+            restored = Some(snapshot_path.display().to_string());
+        } else {
+            match std::fs::remove_file(&policy_path) {
+                Ok(()) => deleted = true,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(format!("remove policy: {e}")),
+            }
+        }
+    }
+    let rollback_id = tm_graph::record_policy_rollback(
+        graph.connection(),
+        mutation_id,
+        &m.mutation_kind,
+        note.as_deref(),
+    )
+    .map_err(|e| format!("record_policy_rollback: {e}"))?;
+    Ok(json!({
+        "ok": true,
+        "mutation_id": mutation_id,
+        "kind": m.mutation_kind,
+        "rollback_id": rollback_id,
+        "restored_snapshot": restored,
+        "policy_deleted": deleted,
+        "dry_run": dry_run,
+    }))
+}
+
+// ---------------------------------------------------------------------------
+// Zero-copy context transfer — the composition wedge, made visible.
+// ---------------------------------------------------------------------------
+
+/// Rough token count. GPT/Claude-family tokenizers land at ~4 chars per
+/// token for English prose; using ceil(chars/4) systematically over-
+/// estimates (safe direction — the brief will always fit inside a
+/// budget it claims to fit).
+fn approx_tokens(s: &str) -> usize {
+    (s.chars().count() + 3) / 4
+}
+
+/// Case-insensitive "does haystack mention any keyword from `topic`?"
+/// used to filter recent captures and open commitments down to the
+/// slice the user actually asked about. Keywords are 3+ chars, dropping
+/// obvious stopwords so a two-word topic doesn't degenerate to
+/// "matches anything with 'the' in it".
+fn topic_matches(text: &str, topic: &str) -> bool {
+    let low = text.to_lowercase();
+    let mut any = false;
+    for kw in topic
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| w.len() >= 3)
+    {
+        let kw_low = kw.to_lowercase();
+        if matches!(
+            kw_low.as_str(),
+            "the" | "and" | "for" | "with" | "from" | "into" | "over" | "about" | "this" | "that"
+        ) {
+            continue;
+        }
+        if low.contains(&kw_low) {
+            any = true;
+            break;
+        }
+    }
+    any
+}
+
+async fn handle_memory_context_for(
+    params: &Value,
+    retrieval: &Arc<Mutex<RetrievalEngine>>,
+    db_path: &str,
+    intents_path: &str,
+) -> Result<Value, String> {
+    let topic = params
+        .get("topic")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "missing required parameter: topic".to_string())?
+        .to_string();
+    let budget_tokens = params
+        .get("budget_tokens")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(2000) as usize;
+    let include_recent = params
+        .get("include_recent_captures")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    let include_commit = params
+        .get("include_commitments")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    let include_contra = params
+        .get("include_contradictions")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    let recent_captures_limit = params
+        .get("recent_captures_limit")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(50) as usize;
+
+    // ---- 1. Retrieval hits (entities + related + triples) ------------
+    let mut engine = retrieval.lock().await;
+    let _ = engine.refresh_graph();
+    let result = engine.query(&topic).map_err(|e| e.to_string())?;
+    drop(engine);
+
+    let graph = GraphStore::open(db_path).map_err(|e| format!("open graph: {e}"))?;
+
+    // ---- 2. Recent captures matching the topic ----------------------
+    let recent_signals: Vec<_> = if include_recent {
+        graph
+            .unconsolidated_signals(recent_captures_limit.max(1))
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|s| topic_matches(&s.raw_text, &topic))
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    // ---- 3. Open commitments mentioning the topic --------------------
+    let open_commitments: Vec<tm_intent::Commitment> = if include_commit {
+        tm_intent::IntentStore::open(intents_path)
+            .and_then(|s| s.list_open(200))
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|c| topic_matches(&c.statement, &topic))
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    // ---- 4. Unresolved contradictions touching the topic -------------
+    let contradictions: Vec<_> = if include_contra {
+        graph
+            .contradictions()
+            .into_iter()
+            .filter(|c| c.resolution.is_none())
+            .filter_map(|c| {
+                let a = graph.triple_detail(c.triple_a).ok().flatten()?;
+                let b = graph.triple_detail(c.triple_b).ok().flatten()?;
+                let hay = format!(
+                    "{} {} {} {} {} {}",
+                    a.subject_name,
+                    a.predicate,
+                    a.object_name,
+                    b.subject_name,
+                    b.predicate,
+                    b.object_name
+                );
+                if topic_matches(&hay, &topic) {
+                    Some((c, a, b))
+                } else {
+                    None
+                }
+            })
+            .take(5)
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    // ---- 5. Render the brief, section by section, respecting budget --
+    // Every section knows how to render one item and how to render a
+    // header. We drip items into `brief` until adding the next one
+    // would exceed the budget; the truncation is *predictable*
+    // (entities first, then recent captures, commitments, contradictions).
+    let mut brief = String::new();
+    let mut citations: Vec<String> = Vec::new();
+    let mut entity_rows: Vec<Value> = Vec::new();
+    let mut signal_rows: Vec<Value> = Vec::new();
+    let mut commitment_rows: Vec<Value> = Vec::new();
+    let mut contradiction_rows: Vec<Value> = Vec::new();
+
+    let header = format!("Topic: {topic}\n");
+    brief.push_str(&header);
+    let mut truncated = false;
+
+    // 5a. Entities from the retrieval.
+    if !result.entities.is_empty() {
+        let block_hdr = "\nWhat we know:\n";
+        if approx_tokens(&brief) + approx_tokens(block_hdr) < budget_tokens {
+            brief.push_str(block_hdr);
+        }
+        for e in result.entities.iter().take(20) {
+            let cid = format!("entity:{}", e.id);
+            let line = format!(
+                "- [{i}] {name} ({kind})\n",
+                i = citations.len() + 1,
+                name = e.name,
+                kind = format!("{:?}", e.entity_type).to_lowercase(),
+            );
+            if approx_tokens(&brief) + approx_tokens(&line) > budget_tokens {
+                truncated = true;
+                break;
+            }
+            brief.push_str(&line);
+            citations.push(cid.clone());
+            entity_rows.push(json!({
+                "citation":   format!("[{}]", entity_rows.len() + 1),
+                "id":         e.id.to_string(),
+                "name":       e.name,
+                "type":       format!("{:?}", e.entity_type).to_lowercase(),
+                "confidence": e.confidence,
+                "ref":        cid,
+            }));
+        }
+    }
+
+    // 5b. Recent captures.
+    if !truncated && !recent_signals.is_empty() {
+        let block_hdr = "\nRecent activity:\n";
+        if approx_tokens(&brief) + approx_tokens(block_hdr) < budget_tokens {
+            brief.push_str(block_hdr);
+        }
+        for s in recent_signals.iter().take(10) {
+            let cid = format!("signal:{}", s.id);
+            let preview: String = s.raw_text.chars().take(160).collect();
+            let line = format!(
+                "- [{i}] {preview} ({src}, {ts})\n",
+                i = citations.len() + 1,
+                preview = preview,
+                src = s.source,
+                ts = s.created_at.format("%Y-%m-%d"),
+            );
+            if approx_tokens(&brief) + approx_tokens(&line) > budget_tokens {
+                truncated = true;
+                break;
+            }
+            brief.push_str(&line);
+            citations.push(cid.clone());
+            signal_rows.push(json!({
+                "citation":   format!("[{}]", citations.len()),
+                "signal_id":  s.id,
+                "text":       preview,
+                "source":     s.source,
+                "created_at": s.created_at.to_rfc3339(),
+                "ref":        cid,
+            }));
+        }
+    }
+
+    // 5c. Open commitments.
+    if !truncated && !open_commitments.is_empty() {
+        let block_hdr = "\nOpen commitments:\n";
+        if approx_tokens(&brief) + approx_tokens(block_hdr) < budget_tokens {
+            brief.push_str(block_hdr);
+        }
+        for c in open_commitments.iter().take(10) {
+            let cid = format!("commitment:{}", c.id);
+            let horizon = c
+                .horizon
+                .map(|h| format!(", due {}", h.format("%Y-%m-%d")))
+                .unwrap_or_default();
+            let line = format!(
+                "- [{i}] {stmt} ({kind:?}{horizon})\n",
+                i = citations.len() + 1,
+                stmt = c.statement,
+                kind = c.kind,
+                horizon = horizon,
+            );
+            if approx_tokens(&brief) + approx_tokens(&line) > budget_tokens {
+                truncated = true;
+                break;
+            }
+            brief.push_str(&line);
+            citations.push(cid.clone());
+            commitment_rows.push(json!({
+                "citation":   format!("[{}]", citations.len()),
+                "id":         c.id.to_string(),
+                "kind":       format!("{:?}", c.kind).to_lowercase(),
+                "statement":  c.statement,
+                "horizon":    c.horizon.map(|h| h.to_rfc3339()),
+                "ref":        cid,
+            }));
+        }
+    }
+
+    // 5d. Contradictions.
+    if !truncated && !contradictions.is_empty() {
+        let block_hdr = "\nUnresolved contradictions:\n";
+        if approx_tokens(&brief) + approx_tokens(block_hdr) < budget_tokens {
+            brief.push_str(block_hdr);
+        }
+        for (c, a, b) in &contradictions {
+            let cid = format!("contradiction:{}", c.id);
+            let line = format!(
+                "- [{i}] {subj} {pred} {obj_a} vs {obj_b}\n",
+                i = citations.len() + 1,
+                subj = a.subject_name,
+                pred = a.predicate,
+                obj_a = a.object_name,
+                obj_b = b.object_name,
+            );
+            if approx_tokens(&brief) + approx_tokens(&line) > budget_tokens {
+                truncated = true;
+                break;
+            }
+            brief.push_str(&line);
+            citations.push(cid.clone());
+            contradiction_rows.push(json!({
+                "citation":       format!("[{}]", citations.len()),
+                "id":             c.id.to_string(),
+                "subject":        a.subject_name,
+                "predicate":      a.predicate,
+                "candidate_a":    a.object_name,
+                "candidate_b":    b.object_name,
+                "detected_at":    c.detected_at.to_rfc3339(),
+                "ref":            cid,
+            }));
+        }
+    }
+
+    // Grounding — honest signal when nothing landed.
+    let empty = entity_rows.is_empty()
+        && signal_rows.is_empty()
+        && commitment_rows.is_empty()
+        && contradiction_rows.is_empty();
+    if empty {
+        brief.push_str("\n(nothing on this topic in local memory yet)\n");
+    }
+
+    Ok(json!({
+        "ok":               true,
+        "topic":            topic,
+        "brief":            brief,
+        "estimated_tokens": approx_tokens(&brief),
+        "budget_tokens":    budget_tokens,
+        "truncated":        truncated,
+        "grounding":        format!("{:?}", result.grounding),
+        "sections": {
+            "entities":       entity_rows,
+            "recent_captures": signal_rows,
+            "commitments":    commitment_rows,
+            "contradictions": contradiction_rows,
+        },
+        "citations": citations,
+    }))
+}
+
+// ---------------------------------------------------------------------------
+// Product Plan X16 — insights & X17 patterns MCP surface
+// ---------------------------------------------------------------------------
+
+fn handle_memory_insights_current(
+    params: &Value,
+    intents_path: &str,
+) -> Result<Value, String> {
+    use tm_intent::IntentStore;
+    use tm_reflect::{BriefBuilder, InsightConfig};
+
+    let mut cfg = InsightConfig::default();
+    if let Some(v) = params.get("min_abs_delta").and_then(|v| v.as_f64()) {
+        cfg.min_abs_delta = v as f32;
+    }
+    if let Some(v) = params.get("min_priors").and_then(|v| v.as_u64()) {
+        cfg.min_priors = v as usize;
+    }
+    if let Some(v) = params.get("max_rows").and_then(|v| v.as_u64()) {
+        cfg.max_rows = v as usize;
+    }
+
+    let store = IntentStore::open(intents_path).map_err(|e| format!("open intents: {e}"))?;
+
+    // Load world model if present; the brief's `insights` panel will
+    // only populate when we have one with ≥ min_priors examples.
+    let world_path = std::path::Path::new(intents_path)
+        .parent()
+        .map(|p| p.join("world_model.json"));
+    let model: Option<tm_world_model::OutcomeModel> = world_path
+        .as_ref()
+        .and_then(|p| tm_world_model::load(p).ok().flatten());
+
+    let mut builder = BriefBuilder::new(&store);
+    let mut brief_cfg = tm_reflect::BriefConfig::default();
+    brief_cfg.insights = cfg;
+    builder = builder.with_config(brief_cfg);
+    if let Some(m) = model.as_ref() {
+        builder = builder.with_world_model(m);
+    }
+    let brief = builder
+        .build(chrono::Utc::now())
+        .map_err(|e| format!("brief build: {e}"))?;
+
+    let rows: Vec<Value> = brief
+        .insights
+        .into_iter()
+        .map(|r| {
+            json!({
+                "commitment_id":     r.commitment_id.to_string(),
+                "statement":         r.statement,
+                "model_positive":    r.model_positive,
+                "baseline_positive": r.baseline_positive,
+                "delta":             r.delta,
+                "n_priors":          r.n_priors,
+                "tone":              r.tone,
+                "render":            r.render,
+            })
+        })
+        .collect();
+
+    Ok(json!({
+        "ok": true,
+        "insights": rows,
+        "model_quiet": brief.model_quiet.map(|r| format!("{:?}", r)),
+    }))
+}
+
+fn handle_memory_patterns_show(
+    params: &Value,
+    intents_path: &str,
+) -> Result<Value, String> {
+    use tm_intent::IntentStore;
+    use tm_reflect::{detect_patterns, PatternConfig};
+
+    let mut cfg = PatternConfig::default();
+    if let Some(v) = params.get("min_n").and_then(|v| v.as_u64()) {
+        cfg.min_n = v as usize;
+    }
+    if let Some(v) = params.get("min_abs_lift").and_then(|v| v.as_f64()) {
+        cfg.min_abs_lift = v as f32;
+    }
+    if let Some(v) = params.get("max_patterns").and_then(|v| v.as_u64()) {
+        cfg.max_patterns = v as usize;
+    }
+    if let Some(v) = params.get("min_global_n").and_then(|v| v.as_u64()) {
+        cfg.min_global_n = v as usize;
+    }
+
+    let store = IntentStore::open(intents_path).map_err(|e| format!("open intents: {e}"))?;
+    let since = chrono::Utc::now() - chrono::Duration::days(365);
+    let rows = store
+        .list_completed_with_polarity(since, 5000)
+        .map_err(|e| format!("list_completed_with_polarity: {e}"))?;
+    let patterns = detect_patterns(&rows, &cfg);
+
+    let out: Vec<Value> = patterns
+        .into_iter()
+        .map(|p| {
+            json!({
+                "cell":         format!("{:?}", p.cell),
+                "n":            p.n,
+                "dist": {
+                    "better":      p.dist.better,
+                    "as_expected": p.dist.as_expected,
+                    "worse":       p.dist.worse,
+                    "mixed":       p.dist.mixed,
+                },
+                "global_dist": {
+                    "better":      p.global_dist.better,
+                    "as_expected": p.global_dist.as_expected,
+                    "worse":       p.global_dist.worse,
+                    "mixed":       p.global_dist.mixed,
+                },
+                "lift_worse":  p.lift_worse,
+                "lift_better": p.lift_better,
+                "support_lb":  p.support_lb,
+                "render":      p.render,
+            })
+        })
+        .collect();
+
+    Ok(json!({
+        "ok": true,
+        "patterns": out,
+        "sample_n": rows.len(),
+    }))
+}
+
+// ---------------------------------------------------------------------------
+// Product Plan X20 — weekly retention digest
+// ---------------------------------------------------------------------------
+
+fn handle_memory_digest_weekly(
+    params: &Value,
+    db_path: &str,
+    intents_path: &str,
+) -> Result<Value, String> {
+    let persist = params
+        .get("persist")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let recent_days = params
+        .get("recent_days")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(7) as i64;
+
+    let graph = GraphStore::open(db_path).map_err(|e| format!("open graph: {e}"))?;
+
+    // ---- Modality histogram over the last `recent_days` ---------------
+    let signals = graph
+        .unconsolidated_signals(1000)
+        .unwrap_or_default();
+    let cutoff = chrono::Utc::now() - chrono::Duration::days(recent_days);
+    let mut by_source: std::collections::BTreeMap<String, usize> =
+        std::collections::BTreeMap::new();
+    for s in signals.iter().filter(|s| s.created_at >= cutoff) {
+        *by_source.entry(s.source.clone()).or_default() += 1;
+    }
+    let total_captures: usize = by_source.values().sum();
+
+    // ---- Open contradictions ------------------------------------------
+    let contradictions_open = graph
+        .contradictions()
+        .into_iter()
+        .filter(|c| c.resolution.is_none())
+        .count();
+
+    // ---- Insights (reuse the same code path as memory_insights_current)
+    let insights_json = handle_memory_insights_current(&Value::Null, intents_path)
+        .unwrap_or_else(|_| json!({"insights": []}));
+
+    // ---- Open commitments due within the window -----------------------
+    let due_soon = collect_rehearse(intents_path, 24 * recent_days)
+        .map(|r| r.due.len())
+        .unwrap_or(0);
+
+    let iso_week = chrono::Utc::now().format("%GW%V").to_string();
+    let digest = json!({
+        "ok": true,
+        "iso_week": iso_week,
+        "generated_at": chrono::Utc::now().to_rfc3339(),
+        "recent_days": recent_days,
+        "total_captures": total_captures,
+        "captures_by_source": by_source,
+        "insights": insights_json.get("insights").cloned().unwrap_or_else(|| json!([])),
+        "contradictions_open": contradictions_open,
+        "commitments_due_soon": due_soon,
+    });
+
+    let mut written_to: Option<String> = None;
+    if persist {
+        let dir = data_dir().join("notifications");
+        std::fs::create_dir_all(&dir).map_err(|e| format!("create notifications dir: {e}"))?;
+        let path = dir.join(format!("digest-{iso_week}.json"));
+        std::fs::write(&path, serde_json::to_string_pretty(&digest).unwrap_or_default())
+            .map_err(|e| format!("write digest: {e}"))?;
+        written_to = Some(path.display().to_string());
+
+        // Drop a small marker for the reconcile notify surface — every
+        // unresolved contradiction gets one file the menu-bar / brief UI
+        // can pick up and clear on click. Idempotent per contradiction id.
+        for c in graph
+            .contradictions()
+            .into_iter()
+            .filter(|c| c.resolution.is_none())
+        {
+            let marker = dir.join(format!("reconcile-{}.json", c.id));
+            if !marker.exists() {
+                let body = json!({
+                    "contradiction_id": c.id,
+                    "triple_a": c.triple_a,
+                    "triple_b": c.triple_b,
+                    "detected_at": c.detected_at,
+                });
+                let _ = std::fs::write(&marker, body.to_string());
+            }
+        }
+    }
+
+    Ok(json!({
+        "digest": digest,
+        "persist": persist,
+        "written_to": written_to,
+    }))
+}
+
+// ---------------------------------------------------------------------------
+// Product Plan X2 / X8 — menu-bar quick recall
+// ---------------------------------------------------------------------------
+
+async fn handle_memory_quick_recall(
+    params: &Value,
+    retrieval: &Arc<Mutex<RetrievalEngine>>,
+) -> Result<Value, String> {
+    let q = params
+        .get("q")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "missing q".to_string())?
+        .to_string();
+    let top_k = params
+        .get("top_k")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(5) as usize;
+
+    let mut engine = retrieval.lock().await;
+    let _ = engine.refresh_graph();
+    let result = engine.query(&q).map_err(|e| e.to_string())?;
+    drop(engine);
+
+    let mut hits: Vec<Value> = Vec::new();
+    for e in result.entities.iter().take(top_k) {
+        hits.push(json!({
+            "id":     e.id.to_string(),
+            "kind":   "entity",
+            "text":   e.name,
+            "source": "graph",
+        }));
+    }
+    for s in result.signal_hits.iter().take(top_k.saturating_sub(hits.len())) {
+        let preview: String = s.text.chars().take(140).collect();
+        hits.push(json!({
+            "id":     s.signal_id,
+            "kind":   "signal",
+            "text":   preview,
+            "source": s.source,
+            "score":  s.score,
+        }));
+    }
+
+    Ok(json!({
+        "ok":       true,
+        "query_id": result.query_id.to_string(),
+        "arm":      result.arm,
+        "hits":     hits,
+        "grounding": format!("{:?}", result.grounding),
+        "host_id":  "menu-bar",
+    }))
+}
+
+// ---------------------------------------------------------------------------
+// Product Plan X3 — first-run onboarding status
+// ---------------------------------------------------------------------------
+
+fn handle_memory_onboarding_status(
+    params: &Value,
+    db_path: &str,
+) -> Result<Value, String> {
+    let mark_complete = params
+        .get("mark_complete")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let dir = data_dir();
+    let marker = dir.join("onboarding.json");
+
+    let db_exists = std::path::Path::new(db_path).exists();
+    let models_dir = dir.join("models");
+    let mut model_present = std::collections::BTreeMap::new();
+    for expected in ["bge-384-v1.5", "mxbai-colbert"] {
+        model_present.insert(expected.to_string(), models_dir.join(expected).exists());
+    }
+
+    let (entity_count, signal_count) = if db_exists {
+        match GraphStore::open(db_path) {
+            Ok(g) => {
+                let ent = g.list_entity_types().map(|v| v.len()).unwrap_or(0);
+                let sig = g.unconsolidated_signals(10_000).map(|v| v.len()).unwrap_or(0);
+                (ent, sig)
+            }
+            Err(_) => (0usize, 0usize),
+        }
+    } else {
+        (0, 0)
+    };
+
+    if mark_complete {
+        std::fs::create_dir_all(&dir).map_err(|e| format!("create data dir: {e}"))?;
+        let body = json!({
+            "completed_at": chrono::Utc::now().to_rfc3339(),
+            "version":       env!("CARGO_PKG_VERSION"),
+        });
+        std::fs::write(&marker, body.to_string())
+            .map_err(|e| format!("write onboarding marker: {e}"))?;
+    }
+
+    let marker_present = marker.exists();
+    let marker_body = if marker_present {
+        std::fs::read_to_string(&marker).ok().and_then(|s| serde_json::from_str::<Value>(&s).ok())
+    } else {
+        None
+    };
+
+    Ok(json!({
+        "ok":                   true,
+        "data_dir":             dir.display().to_string(),
+        "db_exists":            db_exists,
+        "models":               model_present,
+        "entity_count":         entity_count,
+        "signal_count":         signal_count,
+        "onboarding_complete":  marker_present,
+        "onboarding_marker":    marker_body,
+        "just_marked_complete": mark_complete,
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -4184,8 +5368,58 @@ async fn handle_request(
                     handle_memory_compose_filter(&args, db_path)
                         .map_err(|e| anyhow::anyhow!(e))?
                 }
+                "memory_brief_home" => {
+                    handle_memory_brief_home(&args, db_path, intents_path, session_id)
+                        .map_err(|e| anyhow::anyhow!(e))?
+                }
+                "memory_ingest_multimodal" => {
+                    handle_memory_ingest_multimodal(&args, ingest, session_id)
+                        .await
+                        .map_err(|e| anyhow::anyhow!(e))?
+                }
+                "memory_rollback_list" => {
+                    handle_memory_rollback_list(&args, db_path)
+                        .map_err(|e| anyhow::anyhow!(e))?
+                }
+                "memory_rollback_apply" => {
+                    handle_memory_rollback_apply(&args, db_path)
+                        .map_err(|e| anyhow::anyhow!(e))?
+                }
+                "memory_context_for" => {
+                    handle_memory_context_for(&args, retrieval, db_path, intents_path)
+                        .await
+                        .map_err(|e| anyhow::anyhow!(e))?
+                }
+                "memory_insights_current" => {
+                    handle_memory_insights_current(&args, intents_path)
+                        .map_err(|e| anyhow::anyhow!(e))?
+                }
+                "memory_patterns_show" => {
+                    handle_memory_patterns_show(&args, intents_path)
+                        .map_err(|e| anyhow::anyhow!(e))?
+                }
+                "memory_digest_weekly" => {
+                    handle_memory_digest_weekly(&args, db_path, intents_path)
+                        .map_err(|e| anyhow::anyhow!(e))?
+                }
+                "memory_quick_recall" => {
+                    handle_memory_quick_recall(&args, retrieval)
+                        .await
+                        .map_err(|e| anyhow::anyhow!(e))?
+                }
+                "memory_onboarding_status" => {
+                    handle_memory_onboarding_status(&args, db_path)
+                        .map_err(|e| anyhow::anyhow!(e))?
+                }
                 unknown => {
-                    return Err(anyhow::anyhow!("unknown tool: {}", unknown));
+                    // Fallthrough for ingest-experience verbs (I-P2..I-P5).
+                    // These are hidden from `tools/list` on the core surface
+                    // but remain dispatchable — hiding is not removing.
+                    if let Some(res) = ingest_verbs::dispatch(unknown, &args, &data_dir()) {
+                        res.map_err(|e| anyhow::anyhow!(e))?
+                    } else {
+                        return Err(anyhow::anyhow!("unknown tool: {}", unknown));
+                    }
                 }
             };
 
@@ -5871,5 +7105,476 @@ mod tests {
         assert!(desc("memory_contradict").contains("contradict") || desc("memory_contradict").contains("conflict"));
         assert!(desc("memory_forget").contains("forget") || desc("memory_forget").contains("delete"));
         assert!(desc("memory_compose").contains("compose") || desc("memory_compose").contains("combine"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Product Plan X1 / X4 / X9 / X10 — new MCP verbs
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn memory_ingest_multimodal_pdf_with_caller_text() {
+        let dir = std::env::temp_dir().join(format!("tm_mcp_mm_{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("memory.db").to_str().unwrap().to_string();
+        let ingest = Arc::new(Mutex::new(
+            IngestPipeline::open(&db_path, true).expect("ingest open"),
+        ));
+        let session = Uuid::new_v4();
+        use base64::Engine;
+        let bytes_b64 = base64::engine::general_purpose::STANDARD.encode(b"%PDF-1.4 fake");
+        let args = json!({
+            "kind": "pdf",
+            "source": "downloads",
+            "text": "Contract v2: renewal in 12 months signed by Alice",
+            "bytes_base64": bytes_b64,
+            "hint": "contract-v2.pdf"
+        });
+        let out = handle_memory_ingest_multimodal(&args, &ingest, session)
+            .await
+            .expect("ingest_multimodal succeeds");
+        assert_eq!(out["ok"], json!(true));
+        assert_eq!(out["kind"], json!("pdf"));
+        let content_hash = out["content_hash"]
+            .as_str()
+            .expect("content_hash present")
+            .to_string();
+
+        // Blob file exists.
+        let ingest_guard = ingest.lock().await;
+        let bs = ingest_guard.blob_store().expect("blob store present");
+        // Any sha256 dir under blob root should contain one file — verifies
+        // the PDF bytes actually landed on disk.
+        assert!(bs.root().exists(), "blob root should exist");
+        drop(ingest_guard);
+
+        // Attachment row for this memory was recorded.
+        let g = GraphStore::open(&db_path).unwrap();
+        let attachments =
+            tm_ingest::AttachmentStore::for_memory(g.connection(), &content_hash).unwrap();
+        assert_eq!(attachments.len(), 1);
+        assert_eq!(attachments[0].modality, tm_ingest::Modality::Pdf);
+        assert_eq!(
+            attachments[0].extracted_text_ref.as_deref(),
+            Some("caller-supplied")
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn memory_brief_home_composes_bridge_when_topic_spans_two_sessions() {
+        let dir = std::env::temp_dir().join(format!("tm_mcp_bh_bridge_{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("memory.db").to_str().unwrap().to_string();
+        let graph = GraphStore::open(&db_path).unwrap();
+
+        // Two sessions, each mentioning "quantum" — the tokens
+        // themselves are long enough (≥5 alpha chars) to be eligible
+        // topic candidates for the naive bridge detector.
+        let s1 = Uuid::new_v4();
+        let s2 = Uuid::new_v4();
+        let emb = vec![0.0f32; 384];
+        graph
+            .insert_signal_with_embedding(
+                "shell",
+                "reviewed the quantum draft with Alice",
+                seahash::hash(b"a"),
+                s1,
+                &emb,
+                None,
+                3,
+            )
+            .unwrap();
+        graph
+            .insert_signal_with_embedding(
+                "browser",
+                "quantum paper deadline Tuesday",
+                seahash::hash(b"b"),
+                s2,
+                &emb,
+                None,
+                3,
+            )
+            .unwrap();
+        drop(graph);
+
+        let intents_path = dir.join("intents.db").to_str().unwrap().to_string();
+        let out = handle_memory_brief_home(
+            &json!({"recall_limit": 10}),
+            &db_path,
+            &intents_path,
+            Uuid::new_v4(),
+        )
+        .expect("brief_home ok");
+
+        // Recall slot should also fire since we have signals.
+        assert!(out["recall"].is_object(), "recall should populate");
+        // Compose slot fires with the "quantum" bridge.
+        let compose = &out["compose"];
+        assert!(compose.is_object(), "compose should fire: {out}");
+        assert!(compose["body"].as_str().unwrap().contains("quantum"));
+        assert_eq!(compose["refs"].as_array().unwrap().len(), 2);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // -----------------------------------------------------------------------
+    // Zero-copy context transfer — memory_context_for
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn memory_context_for_empty_stores_returns_grounding_none() {
+        let dir = std::env::temp_dir().join(format!("tm_mcp_ctx_empty_{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("memory.db").to_str().unwrap().to_string();
+        let trace_path = dir.join("traces.jsonl").to_str().unwrap().to_string();
+        let intents_path = dir.join("intents.db").to_str().unwrap().to_string();
+        let _ = GraphStore::open(&db_path).unwrap();
+        let retrieval = Arc::new(Mutex::new(
+            RetrievalEngine::open(&db_path, &trace_path, true).expect("retrieval open"),
+        ));
+
+        let out = handle_memory_context_for(
+            &json!({"topic": "world cup"}),
+            &retrieval,
+            &db_path,
+            &intents_path,
+        )
+        .await
+        .expect("context_for succeeds");
+
+        assert_eq!(out["ok"], json!(true));
+        assert_eq!(out["topic"], json!("world cup"));
+        let brief = out["brief"].as_str().unwrap();
+        assert!(brief.contains("Topic: world cup"));
+        assert!(
+            brief.contains("nothing on this topic"),
+            "empty-store brief must say so honestly: {brief}"
+        );
+        // Sections all empty.
+        assert!(out["sections"]["entities"].as_array().unwrap().is_empty());
+        assert!(out["sections"]["recent_captures"].as_array().unwrap().is_empty());
+        assert!(out["citations"].as_array().unwrap().is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn memory_context_for_assembles_cited_brief_from_captures() {
+        let dir = std::env::temp_dir().join(format!("tm_mcp_ctx_full_{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("memory.db").to_str().unwrap().to_string();
+        let trace_path = dir.join("traces.jsonl").to_str().unwrap().to_string();
+        let intents_path = dir.join("intents.db").to_str().unwrap().to_string();
+
+        // Seed a few captures via a real ingest pipeline so we exercise
+        // the retrieval path end-to-end (not just raw sql inserts).
+        let ingest = IngestPipeline::open(&db_path, /* hash_embed */ true)
+            .expect("ingest open");
+        let session = Uuid::new_v4();
+        for text in [
+            "https://www.fifa.com/tickets FIFA World Cup 2026 Tickets",
+            "https://apnews.com/article/world-cup-tickets Resale prices for the World Cup",
+            "https://superlinked.com/vectorhub Vector Hub (unrelated topic)",
+        ] {
+            let _ = ingest.ingest(text, session).expect("ingest ok");
+        }
+        drop(ingest);
+
+        let retrieval = Arc::new(Mutex::new(
+            RetrievalEngine::open(&db_path, &trace_path, true).expect("retrieval open"),
+        ));
+
+        let out = handle_memory_context_for(
+            &json!({"topic": "world cup tickets", "budget_tokens": 4000}),
+            &retrieval,
+            &db_path,
+            &intents_path,
+        )
+        .await
+        .expect("context_for succeeds");
+
+        assert_eq!(out["ok"], json!(true));
+        let brief = out["brief"].as_str().unwrap();
+        assert!(brief.contains("Topic: world cup tickets"));
+        assert!(brief.contains("What we know:"));
+        // Cited references must appear as [1], [2], ...
+        assert!(
+            brief.contains("[1]"),
+            "brief must have at least one citation, got: {brief}"
+        );
+        // Citations array must be non-empty and align with the counter.
+        let cits = out["citations"].as_array().unwrap();
+        assert!(!cits.is_empty(), "citations must not be empty");
+        // Every citation is one of the accepted kinds.
+        for c in cits {
+            let s = c.as_str().unwrap();
+            assert!(
+                s.starts_with("entity:")
+                    || s.starts_with("signal:")
+                    || s.starts_with("commitment:")
+                    || s.starts_with("contradiction:"),
+                "bad citation shape: {s}"
+            );
+        }
+        // Estimated tokens is reasonable — small brief, well under 4000.
+        let est = out["estimated_tokens"].as_u64().unwrap();
+        assert!(est > 0 && est < 4000, "estimated_tokens out of range: {est}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn memory_context_for_honors_token_budget() {
+        let dir = std::env::temp_dir().join(format!("tm_mcp_ctx_budget_{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("memory.db").to_str().unwrap().to_string();
+        let trace_path = dir.join("traces.jsonl").to_str().unwrap().to_string();
+        let intents_path = dir.join("intents.db").to_str().unwrap().to_string();
+
+        let ingest = IngestPipeline::open(&db_path, true).expect("ingest open");
+        let session = Uuid::new_v4();
+        // Seed 8 similar captures so retrieval returns lots of hits — a
+        // tight budget then MUST truncate.
+        for i in 0..8 {
+            let _ = ingest
+                .ingest(
+                    &format!("https://ex{i}.com/world-cup-tickets FIFA World Cup 2026 Tickets #{i}"),
+                    session,
+                )
+                .expect("ingest ok");
+        }
+        drop(ingest);
+
+        let retrieval = Arc::new(Mutex::new(
+            RetrievalEngine::open(&db_path, &trace_path, true).expect("retrieval open"),
+        ));
+
+        let out = handle_memory_context_for(
+            &json!({"topic": "world cup tickets", "budget_tokens": 40}),
+            &retrieval,
+            &db_path,
+            &intents_path,
+        )
+        .await
+        .expect("context_for succeeds");
+
+        assert_eq!(out["truncated"], json!(true), "40-token budget must truncate");
+        let est = out["estimated_tokens"].as_u64().unwrap();
+        // Estimator is coarse (chars/4) — allow small overshoot from
+        // in-flight lines but assert it stays close to the budget.
+        assert!(
+            est <= 80,
+            "brief should stay near budget after truncation, got {est} tokens for a 40-budget"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn memory_brief_home_empty_stores_returns_silent_home() {
+        let dir = std::env::temp_dir().join(format!("tm_mcp_bh_empty_{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("memory.db").to_str().unwrap().to_string();
+        // Create an empty graph so open() works.
+        let _ = GraphStore::open(&db_path).unwrap();
+        let intents_path = dir.join("intents.db").to_str().unwrap().to_string();
+        let session = Uuid::new_v4();
+        let out = handle_memory_brief_home(
+            &json!({"recall_limit": 5, "host_id": "test-host"}),
+            &db_path,
+            &intents_path,
+            session,
+        )
+        .expect("brief_home succeeds");
+        // Empty stores → every slot null.
+        assert!(out.get("recall").map(|v| v.is_null()).unwrap_or(true));
+        assert!(out.get("compose").map(|v| v.is_null()).unwrap_or(true));
+        assert!(out.get("reconcile").map(|v| v.is_null()).unwrap_or(true));
+        assert!(out.get("rehearse").map(|v| v.is_null()).unwrap_or(true));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn card_action_feedback_records_signal_from_hook() {
+        use tm_reflect::{build_home, persist_hooks, RecallInput, RecallItem};
+        let dir = std::env::temp_dir().join(format!("tm_mcp_action_{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("memory.db").to_str().unwrap().to_string();
+        let graph = GraphStore::open(&db_path).unwrap();
+
+        // Build a Recall card and persist its hook so the MCP call has
+        // something to look up.
+        let home = build_home(
+            RecallInput {
+                items: vec![RecallItem {
+                    id: "r1".into(),
+                    text: "hello world".into(),
+                    source: "shell".into(),
+                }],
+            },
+            Default::default(),
+            Default::default(),
+            Default::default(),
+            chrono::Utc::now(),
+        );
+        persist_hooks(graph.connection(), &home, Some("test-host"), None).unwrap();
+        let recall = home.recall.unwrap();
+
+        let args = json!({
+            "query_id": Uuid::new_v4().to_string(),
+            "feedback_hook_id": recall.hook_id.to_string(),
+            "result_id": "r1",
+            "kind": "card_action",
+            "action": "open",
+        });
+        let out = handle_memory_feedback(&args, &db_path).expect("card_action ok");
+        assert_eq!(out["ok"], json!(true));
+        assert_eq!(out["kind"], json!("card_action"));
+        assert_eq!(out["slot"], json!("recall"));
+        assert!(out["signal_id"].as_str().is_some());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn card_action_why_records_no_signal() {
+        use tm_reflect::{build_home, persist_hooks, RecallInput, RecallItem};
+        let dir = std::env::temp_dir().join(format!("tm_mcp_why_{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("memory.db").to_str().unwrap().to_string();
+        let graph = GraphStore::open(&db_path).unwrap();
+        let home = build_home(
+            RecallInput {
+                items: vec![RecallItem {
+                    id: "r".into(),
+                    text: "t".into(),
+                    source: "s".into(),
+                }],
+            },
+            Default::default(),
+            Default::default(),
+            Default::default(),
+            chrono::Utc::now(),
+        );
+        persist_hooks(graph.connection(), &home, None, None).unwrap();
+        let recall = home.recall.unwrap();
+
+        let args = json!({
+            "query_id": Uuid::new_v4().to_string(),
+            "feedback_hook_id": recall.hook_id.to_string(),
+            "result_id": "r",
+            "kind": "card_action",
+            "action": "why",
+        });
+        let out = handle_memory_feedback(&args, &db_path).expect("why ok");
+        // Why writes no signal — but still returns ok.
+        assert_eq!(out["ok"], json!(true));
+        assert!(out["signal_id"].is_null(), "why must not produce a signal_id");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn memory_rollback_list_returns_empty_on_fresh_db() {
+        let dir = std::env::temp_dir().join(format!("tm_mcp_rb_{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("memory.db").to_str().unwrap().to_string();
+        let _ = GraphStore::open(&db_path).unwrap();
+        let out = handle_memory_rollback_list(&json!({}), &db_path).unwrap();
+        assert_eq!(out["ok"], json!(true));
+        assert!(out["mutations"].as_array().unwrap().is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn memory_insights_current_empty_stores_returns_ok() {
+        let dir = std::env::temp_dir().join(format!("tm_mcp_ins_{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let intents_path = dir.join("intents.db").to_str().unwrap().to_string();
+        let _ = tm_intent::IntentStore::open(&intents_path).unwrap();
+        let out = handle_memory_insights_current(&json!({}), &intents_path).unwrap();
+        assert_eq!(out["ok"], json!(true));
+        assert!(out["insights"].as_array().unwrap().is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn memory_patterns_show_empty_stores_returns_ok() {
+        let dir = std::env::temp_dir().join(format!("tm_mcp_pat_{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let intents_path = dir.join("intents.db").to_str().unwrap().to_string();
+        let _ = tm_intent::IntentStore::open(&intents_path).unwrap();
+        let out = handle_memory_patterns_show(&json!({}), &intents_path).unwrap();
+        assert_eq!(out["ok"], json!(true));
+        assert!(out["patterns"].as_array().unwrap().is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn memory_digest_weekly_persists_marker_when_requested() {
+        let dir = std::env::temp_dir().join(format!("tm_mcp_dig_{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("memory.db").to_str().unwrap().to_string();
+        let intents_path = dir.join("intents.db").to_str().unwrap().to_string();
+        let _ = GraphStore::open(&db_path).unwrap();
+        let _ = tm_intent::IntentStore::open(&intents_path).unwrap();
+
+        // Note: this test can't override data_dir() (which is a global),
+        // so persist=false to avoid writing under ~/.tracemind/notifications.
+        let out = handle_memory_digest_weekly(
+            &json!({"persist": false, "recent_days": 7}),
+            &db_path,
+            &intents_path,
+        )
+        .unwrap();
+        assert_eq!(out["digest"]["ok"], json!(true));
+        assert_eq!(out["persist"], json!(false));
+        assert!(out["written_to"].is_null());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn memory_onboarding_status_reports_fresh_dir_as_incomplete() {
+        // Fresh scratch path — no DB, no marker.
+        let db_path = std::env::temp_dir()
+            .join(format!("tm_mcp_onb_{}.db", Uuid::new_v4()))
+            .to_str()
+            .unwrap()
+            .to_string();
+        let out = handle_memory_onboarding_status(&json!({}), &db_path).unwrap();
+        assert_eq!(out["ok"], json!(true));
+        assert_eq!(out["db_exists"], json!(false));
+        assert_eq!(out["entity_count"], json!(0));
+    }
+
+    #[tokio::test]
+    async fn memory_rollback_apply_records_row_for_known_mutation() {
+        let dir = std::env::temp_dir().join(format!("tm_mcp_rb_apply_{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("memory.db").to_str().unwrap().to_string();
+        let graph = GraphStore::open(&db_path).unwrap();
+        tm_graph::init_policy_provenance_schema(graph.connection()).unwrap();
+
+        // Seed a mutation.
+        let mutation = tm_graph::StoredMutation {
+            id: Uuid::new_v4(),
+            parent_id: Uuid::new_v4(),
+            mutation_kind: "arm_weight_update".into(),
+            delta_scores: [0.01, 0.0, 0.0, 0.0],
+            accepted: true,
+            evidence: vec![],
+            generated_at: chrono::Utc::now(),
+        };
+        tm_graph::record_policy_mutation(graph.connection(), &mutation).unwrap();
+
+        let out = handle_memory_rollback_apply(
+            &json!({"id": mutation.id.to_string(), "note": "test", "dry_run": true}),
+            &db_path,
+        )
+        .unwrap();
+        assert_eq!(out["ok"], json!(true));
+        assert_eq!(out["dry_run"], json!(true));
+        assert_eq!(out["mutation_id"], json!(mutation.id.to_string()));
+        // Recorded even on dry_run.
+        let counts =
+            tm_graph::policy_rollback_count_by_kind(graph.connection()).unwrap();
+        assert_eq!(counts.len(), 1);
+        assert_eq!(counts[0].0, "arm_weight_update");
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

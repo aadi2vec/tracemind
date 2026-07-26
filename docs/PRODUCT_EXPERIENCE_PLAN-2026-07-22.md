@@ -271,3 +271,50 @@ Two plans, one team. They compete for LOC. Rough split:
 ## 10. Success signal for this plan (single number)
 
 **Week-4 retention among installers ≥ 40%** with **≥ 5 modalities ingesting**. If both hit, TraceMind is a product. If either misses, we've built infrastructure and called it product. The rest of the metrics in §6 exist to explain *why* week-4 retention did or didn't hit.
+
+---
+
+## 11. Implementation status (2026-07-24)
+
+Second pass: every plan item now has a landing site — backend + MCP + a CLI hook (or a file-drop watcher) that a native surface can replace later. UI shells (Tauri Brief, menu-bar tray, onboarding UI) remain the last mile; each is one MCP call away from a real screen.
+
+| # | Item | Status | Where it landed | Test count |
+|---|------|--------|-----------------|-----------:|
+| **X1** | Multimodal payload plumbing | **shipped** | `tm-ingest/src/multimodal.rs` (payload / router / blob store / attachments table) + `IngestPipeline::ingest_multimodal` | 15 |
+| **X2** | Menu-bar app skeleton | **shipped (backend + CLI hook)** | `memory_quick_recall` MCP verb + `tracemind quick-recall` CLI (launcher target). Tauri tray shell behind `menu-bar` feature — still needs native shim. | 4 |
+| **X3** | Onboarding rewrite | **shipped (backend + CLI hook)** | `memory_onboarding_status` MCP verb + `tracemind onboard [--dry-run] [--json]` CLI writes `~/.tracemind/onboarding.json`. Tauri UI still TSX. | 1 |
+| **X4** | Brief home 4-slot | **shipped (backend)** | `tm-reflect/src/brief_home.rs` (`build_home`, 4 actions, deterministic ids). UI still TSX. | 13 |
+| **X5** | M1 screenshots | **shipped (poll-based)** | `ScreenshotSource` in `tm-capture/src/modalities.rs` polls `~/Desktop` for PNG. `macos-screencapture` feature reserved for ScreenCaptureKit + Vision OCR. | 1 |
+| **X6** | M2 web-page capture | **shipped (server side)** | `WebPreprocessor` in `tm-ingest/src/multimodal.rs` — HTML strip, blob-stored, URL prepended. Browser-extension push endpoint TBD. | 2 |
+| **X7** | ImageEmbedSpace | **shipped (aHash placeholder)** | `ImageEmbedSpace` + `ahash64` in `tm-vector/src/space.rs`. Real CLIP behind `clip-image-embed` feature. | 6 |
+| **X8** | Quick recall bar | **shipped (backend + CLI hook)** | `memory_quick_recall` MCP verb + `tracemind quick-recall <q>` CLI (launcher target: Raycast/Alfred/system hotkey). Native tray UI still deferred. | (covered by X2) |
+| **X9** | Card feedback UI wiring | **shipped (backend)** | `feedback_hooks` table in `tm-graph/src/feedback_hooks.rs`, `persist_hooks` + `signal_for_action` in `tm-reflect/src/brief_home.rs`, `kind=card_action` in `memory_feedback` MCP verb. | 6 |
+| **X10** | Rollback UI (backend) | **shipped** | `tracemind rollback list|show|apply` CLI + `memory_rollback_list` / `memory_rollback_apply` MCP verbs. Tauri UI still TSX. | 4 |
+| **X11** | M3 PDF ingestion | **shipped** | `PdfPreprocessor` in `tm-ingest/src/multimodal.rs` + `PdfWatcherSource` polls `~/Downloads` and extracts via `pdf-extract` (panic-safe). | 2 |
+| **X12** | M4 voice notes | **shipped (poll-based)** | `VoiceNoteSource` polls `~/.tracemind/voice` for wav/m4a/mp3; real whisper.cpp transcription behind `whisper-cpp` feature. | 1 |
+| **X13** | Compose card wiring | **shipped (heuristic)** | `collect_compose` in `tm-mcp/src/main.rs` — naive-but-honest cross-session token bridge. Q4.7 algebra upgrade is a later PR. | 1 |
+| **X14** | Reconcile card wiring | **shipped** | `collect_reconcile` reads open `ContradictionView`s from the belief store, joins with `triple_detail` for topic + values. | (covered by X4) |
+| **X15** | M5 email | **shipped (poll-based)** | `EmailInboxSource` watches `~/.tracemind/email` for `.eml` (parsed via `mail-parser`); real IMAP behind `imap-email` feature. | 1 |
+| **X16** | Insight/pattern cards | **shipped (backend)** | `memory_insights_current` MCP verb re-uses the same `InsightConfig` the brief consumes. | 1 |
+| **X17** | "Your patterns" settings | **shipped (backend)** | `memory_patterns_show` MCP verb over `tm-reflect::detect_patterns`. Tauri surface TBD. | 1 |
+| **X18** | M6 Photos + EXIF | **shipped (poll-based)** | `PhotoLibrarySource` reads `~/Pictures` via `kamadak-exif` — composes `filename @ DateTimeOriginal [GPS] (Model)` text. Native PhotoKit behind `exif-photo`. | 1 |
+| **X19** | M7 Calendar | **shipped (poll-based)** | `CalendarSource` reads `.ics` via `ical` — composes `Title @ DTSTART — DTEND; LOCATION; DESCRIPTION`. EventKit behind `apple-eventkit`. | 1 |
+| **X20** | Retention hooks | **shipped** | `tracemind digest [--persist]` CLI + `memory_digest_weekly` MCP verb write `~/.tracemind/notifications/digest-<iso-week>.json` and per-contradiction reconcile markers. Email delivery TBD. | 1 |
+
+### What that adds up to
+
+- **Every X-item now has landing infrastructure.** All 20 items are either shipped (backend + MCP + CLI hook where applicable) or shipped-poll-based (a pure-Rust file-watcher stand-in that a later feature-gated native path can replace). Nothing in the plan is still marked *not started*.
+- **Native OS shells (Tauri Brief home, menu-bar tray widget, real ScreenCaptureKit / Vision OCR / whisper.cpp / IMAP / EventKit / PhotoKit) are the last mile.** They call the verbs already shipped — the fastest way to close them is to build against `memory_brief_home`, `memory_ingest_multimodal`, `memory_feedback kind=card_action`, `memory_quick_recall`, `memory_insights_current`, `memory_patterns_show`, `memory_onboarding_status`, `memory_digest_weekly`. Each maps 1-to-1 to a card / slot / row / notification.
+- **Every modality source runs today via file-drop conventions.** Screenshots on `~/Desktop`, voice notes in `~/.tracemind/voice`, PDFs in `~/Downloads`, web pins in `~/.tracemind/web-pins`, emails in `~/.tracemind/email`, photos in `~/Pictures`, `.ics` events in `~/.tracemind/calendar`. Users on any OS can drop a file and the daemon picks it up. Feature flags for the native APIs sit unused until we need them.
+
+### Tests shipped this pass
+
+**46** tests in `tm-mcp` (+4 new: `memory_insights_current`, `memory_patterns_show`, `memory_digest_weekly`, `memory_onboarding_status`), **13** in `tm-reflect::brief_home`, **15** in `tm-ingest::multimodal` + `tm-ingest::pipeline`, **3** in `tm-graph::feedback_hooks`, **8** in `tm-capture::modalities`, **6** in `tm-vector::space::image_embed_tests` (X7). All green.
+
+### What is *not* claimed
+
+- No user has touched any of this. The plan's single success signal (§10) — week-4 retention ≥ 40% with ≥5 modalities ingesting — remains untested. Everything above is *unblocking* infrastructure, not evidence the wedge works.
+- The compose slot is heuristic (naive token overlap across sessions). X13's real Q4.7 algebra bridge is a follow-on.
+- ImageEmbedSpace uses a 64-bit aHash placeholder; real CLIP is behind `clip-image-embed`.
+- Menu-bar / tray widget still needs Tauri v2 tray + GlobalShortcut wiring. The `tracemind quick-recall` CLI is the launcher target that closes X2/X8 without a native shell.
+- Rollback CLI works end-to-end but has been exercised only by tests and one manual seed — no GEPA-emitted mutation has been reversed through it yet.

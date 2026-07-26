@@ -15,6 +15,7 @@ tm-episodic = { workspace = true }
 tm-graph = { workspace = true }
 tm-reason = { workspace = true }
 tm-controller = { workspace = true }
+tm-governance = { workspace = true }
 tm-rerank = { path = "../tm-rerank" }
 tm-answer = { workspace = true }
 tm-intent = { workspace = true }
@@ -31,6 +32,11 @@ tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
 seahash = { workspace = true }
 rusqlite = { workspace = true }
+# Product Plan X1 — base64 decoding for `memory_ingest_multimodal` payloads.
+base64 = "0.22"
+
+[dev-dependencies]
+tempfile = "3"
 
 [features]
 default = []

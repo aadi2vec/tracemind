@@ -17,6 +17,7 @@ use tm_graph::GraphStore;
 use tm_ingest::{IngestPipeline, TripleJob, TripleWorker, TripleWorkerHandle, WorkerDb};
 use tm_retrieval::RetrievalEngine;
 
+mod ingestion_review;
 mod sprint_commands;
 mod wme_commands;
 
@@ -5903,6 +5904,15 @@ fn main() {
             // ─── WME-5 — verb-first working-memory cards ──────────
             wme_commands::cmd_wme_cards,
             wme_commands::cmd_wme_feedback,
+            // ─── I5/I7 — Ingestion Review view ────────────────────
+            ingestion_review::cmd_ingestion_review_recent,
+            ingestion_review::cmd_ingestion_discard,
+            ingestion_review::cmd_ingestion_refine,
+            // ─── I6/I9 — three-mode selector ──────────────────────
+            ingestion_review::cmd_mode_current,
+            ingestion_review::cmd_mode_enter_focus,
+            ingestion_review::cmd_mode_enter_private,
+            ingestion_review::cmd_mode_end,
         ])
         .setup(move |app| {
             let handle = app.handle().clone();

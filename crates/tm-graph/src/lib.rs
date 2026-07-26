@@ -8,6 +8,7 @@ pub mod deny_list;
 pub mod entity_resolve;
 pub mod event_graph;
 pub mod feedback_fabric;
+pub mod feedback_hooks;
 pub mod graph_sprint;
 pub mod labeler;
 pub mod maintenance;
@@ -19,6 +20,7 @@ pub mod ontology_types;
 pub mod pending_relations;
 pub mod policy_provenance;
 pub mod portable_export;
+pub mod propagate_delete_impl;
 pub mod head_to_head;
 pub mod salience;
 pub mod session_scope;
@@ -86,6 +88,13 @@ pub use feedback_fabric::{
     signals_for_hook,
     recent_signals_by_class,
     verb_affinity,
+};
+pub use feedback_hooks::{
+    init_schema as init_feedback_hooks_schema,
+    lookup_hook,
+    recent_hooks,
+    record_hook,
+    HookedCard,
 };
 pub use contradiction_rate::{
     ensure_temporal_columns,

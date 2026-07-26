@@ -4,6 +4,10 @@ version.workspace = true
 edition.workspace = true
 authors.workspace = true
 
+[lib]
+name = "tm_capture"
+path = "src/lib.rs"
+
 [[bin]]
 name = "tracemind-capture"
 path = "src/main.rs"
@@ -23,6 +27,35 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
 seahash = { workspace = true }
+# Product Plan X2/X5/X8/X12 modality source scaffolding.
+async-trait = "0.1"
+# Real modality watchers (X5/X11/X12/X15/X18/X19). All pure Rust; no cmake.
+walkdir = "2"
+# Ambient browser-history capture — reads Chrome/Safari history SQLite DBs
+# directly (read-only, via a temp copy). Bundled SQLite, no cmake.
+rusqlite = { workspace = true }
+tempfile = "3"
+kamadak-exif = "0.6"
+mail-parser = "0.9"
+ical = { version = "0.11", default-features = false, features = ["ical"] }
+pdf-extract = "0.9"
+
+[features]
+default = []
+# Real macOS ScreenCaptureKit + Vision-framework hookup (X5).
+macos-screencapture = []
+# Real whisper.cpp voice transcription (X12).
+whisper-cpp = []
+# Real IMAP client (X15).
+imap-email = []
+# Real EventKit calendar hookup (X19).
+apple-eventkit = []
+# Real Photos + EXIF (X18).
+exif-photo = []
+# Real CLIP image embedding for the ImageEmbedSpace (X7).
+clip-image-embed = []
+# Menu-bar Tauri tray + quick recall bar (X2 / X8).
+menu-bar = []
 
 [dev-dependencies]
 tempfile = "3"

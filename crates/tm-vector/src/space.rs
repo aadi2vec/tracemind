@@ -144,6 +144,175 @@ impl Space for EntityTypeSpace {
     }
 }
 
+/// Product Plan X7 — Image embedding space.
+///
+/// Scores how similar a query's image (or a caller-supplied image
+/// signature) is to a stored memory's image. Real CLIP embeddings land
+/// behind `feature = "clip-image-embed"`; the default build uses a
+/// 64-bit perceptual hash (aHash-style) — coarse but honest, and
+/// enough to make "find the whiteboard photo" work while a heavier
+/// model is being staged.
+///
+/// The Space itself is metadata-only — the actual bit-signature lives
+/// on the attachment row. Callers pass the query's signature in
+/// through [`Self::with_query_signature`] and the score is `1 - hamming
+/// / 64` (already normalised into [0, 1]).
+pub struct ImageEmbedSpace {
+    /// The image aHash of the current query, if any. When `None` the
+    /// space is a neutral 0.5 — retrieval falls through to the other
+    /// spaces.
+    pub query_signature: Option<u64>,
+}
+
+impl Default for ImageEmbedSpace {
+    fn default() -> Self {
+        Self {
+            query_signature: None,
+        }
+    }
+}
+
+impl ImageEmbedSpace {
+    pub fn with_query_signature(sig: u64) -> Self {
+        Self {
+            query_signature: Some(sig),
+        }
+    }
+}
+
+impl Space for ImageEmbedSpace {
+    fn name(&self) -> &str {
+        "image_embed"
+    }
+
+    fn score(&self, _query: &str, _id: Uuid, meta: &MemoryMeta) -> f32 {
+        let Some(q) = self.query_signature else {
+            return 0.5;
+        };
+        // Convention: for image-modality memories, `source` is prefixed
+        // by "img_sig:<64-bit hex>" — this Space is a metadata-driven
+        // pass-through. Non-image memories return 0.
+        let Some(src) = meta.source.as_ref() else {
+            return 0.0;
+        };
+        let Some(hex) = src.strip_prefix("img_sig:") else {
+            return 0.0;
+        };
+        let Ok(m) = u64::from_str_radix(hex.trim(), 16) else {
+            return 0.0;
+        };
+        let hamming = (q ^ m).count_ones() as f32;
+        1.0 - (hamming / 64.0)
+    }
+
+    fn dim(&self) -> usize {
+        64
+    }
+}
+
+/// Compute a very simple 64-bit perceptual-hash signature over raw
+/// bytes — deterministic, fast, and dependency-free. Real image aHash
+/// downsamples to 8×8 grayscale first; we approximate by folding the
+/// byte stream so equivalent images with identical byte content share
+/// signatures, and small edits produce small Hamming distances. Good
+/// enough for a placeholder; the CLIP feature swaps in real vectors.
+pub fn ahash64(bytes: &[u8]) -> u64 {
+    if bytes.is_empty() {
+        return 0;
+    }
+    // Split into 64 buckets, average each, threshold above the mean.
+    let mut buckets = [0u64; 64];
+    let mut counts = [0u64; 64];
+    let n = bytes.len();
+    for (i, b) in bytes.iter().enumerate() {
+        let bucket = (i * 64) / n.max(1);
+        let b_i = bucket.min(63);
+        buckets[b_i] = buckets[b_i].wrapping_add(*b as u64);
+        counts[b_i] = counts[b_i].saturating_add(1);
+    }
+    let mut avgs = [0f64; 64];
+    let mut mean = 0f64;
+    for i in 0..64 {
+        avgs[i] = if counts[i] > 0 {
+            buckets[i] as f64 / counts[i] as f64
+        } else {
+            0.0
+        };
+        mean += avgs[i];
+    }
+    mean /= 64.0;
+    let mut sig = 0u64;
+    for (i, a) in avgs.iter().enumerate() {
+        if *a > mean {
+            sig |= 1u64 << i;
+        }
+    }
+    sig
+}
+
+#[cfg(test)]
+mod image_embed_tests {
+    use super::*;
+
+    fn meta_with_source(src: Option<String>) -> MemoryMeta {
+        MemoryMeta {
+            id: Uuid::new_v4(),
+            created_at: Utc::now(),
+            last_accessed_at: None,
+            confidence: 1.0,
+            entity_kind: None,
+            source: src,
+            session_id: None,
+            host_id: None,
+        }
+    }
+
+    #[test]
+    fn ahash64_deterministic() {
+        assert_eq!(ahash64(b"hello world"), ahash64(b"hello world"));
+        assert_eq!(ahash64(&[]), 0);
+    }
+
+    #[test]
+    fn similar_bytes_have_small_hamming_distance() {
+        let a = ahash64(b"the quick brown fox jumps over the lazy dog");
+        let b = ahash64(b"the quick brown fox jumps over the lazy dog!");
+        let hd = (a ^ b).count_ones();
+        assert!(hd < 28, "similar strings should stay below random (32/64), got hd={hd}");
+    }
+
+    #[test]
+    fn image_embed_missing_query_signature_returns_neutral() {
+        let space = ImageEmbedSpace::default();
+        let m = meta_with_source(Some("img_sig:0000000000000000".into()));
+        assert!((space.score("q", Uuid::new_v4(), &m) - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn image_embed_non_image_source_returns_zero() {
+        let space = ImageEmbedSpace::with_query_signature(0xdeadbeef);
+        let m = meta_with_source(Some("plaintext".into()));
+        assert_eq!(space.score("q", Uuid::new_v4(), &m), 0.0);
+    }
+
+    #[test]
+    fn image_embed_identical_signature_is_perfect() {
+        let sig: u64 = 0xdeadbeefdeadbeef;
+        let space = ImageEmbedSpace::with_query_signature(sig);
+        let src = format!("img_sig:{:016x}", sig);
+        let m = meta_with_source(Some(src));
+        assert!((space.score("q", Uuid::new_v4(), &m) - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn image_embed_opposite_signature_is_zero() {
+        let sig: u64 = 0x0000000000000000;
+        let space = ImageEmbedSpace::with_query_signature(sig);
+        let m = meta_with_source(Some("img_sig:ffffffffffffffff".into()));
+        assert_eq!(space.score("q", Uuid::new_v4(), &m), 0.0);
+    }
+}
+
 /// Host/session scoping space: 1.0 if memory matches active session/host, else 0.0.
 pub struct HostSessionSpace {
     pub active_session_id: Option<Uuid>,

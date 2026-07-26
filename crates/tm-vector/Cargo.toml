@@ -11,6 +11,8 @@ fastembed = { workspace = true }
 dirs = "5"
 uuid = { workspace = true }
 chrono = { workspace = true }
+# I-P1 PropagateDelete — shared SQLite handle to memory.db for row-level cleanup.
+rusqlite = { workspace = true }
 
 # BGE-M3 ONNX loading — versions pinned to match what fastembed pulls transitively.
 # ort's ndarray feature is already enabled by fastembed; we re-declare here so

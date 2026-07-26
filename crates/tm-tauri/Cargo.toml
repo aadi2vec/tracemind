@@ -40,6 +40,9 @@ tauri-build = { version = "2", features = [] }
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
+[dev-dependencies]
+tempfile = "3"
+
 [features]
 # Tauri 2 only embeds `frontendDist` into the binary when the `custom-protocol`
 # feature is on. Without it, even `cargo build --release` produces a binary

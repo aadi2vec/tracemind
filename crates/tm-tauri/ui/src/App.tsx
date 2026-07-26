@@ -1,9 +1,11 @@
 import { useEffect, useState } from "react";
+import HomeView from "./views/HomeView";
 import BriefView from "./views/BriefView";
 import Dashboard from "./views/Dashboard";
 import QueryView from "./views/QueryView";
 import TracesView from "./views/TracesView";
 import IngestView from "./views/IngestView";
+import IngestionReviewView from "./views/IngestionReviewView";
 import GraphView from "./views/GraphView";
 import ContextSwitcher from "./views/ContextSwitcher";
 import SettingsView, { readDevMode } from "./views/SettingsView";
@@ -23,10 +25,12 @@ import LedgerView from "./views/LedgerView";
 import { getUsageStats } from "./api";
 
 type View =
+  | "home"
   | "brief"
   | "dashboard"
   | "query"
   | "ingest"
+  | "review"
   | "traces"
   | "graph"
   | "garden"
@@ -57,12 +61,15 @@ type NavItem = { id: View; label: string; icon: string };
 // → splice context for the next AI window (Composer) → search the
 // graph (Query) → visualize (Graph) → write (Ingest) → tune
 // (Settings). Composer is the wedge per `tracemind_composition_layer`.
+// 2026-07-24 — nav collapsed to the sellable four. Home is the daily
+// surface; Ask searches memory; Review triages captures; Settings tunes.
+// Everything else moves under Dev mode. The prior surfaces (Brief,
+// Composer, Graph, etc.) still exist and are one keystroke away for
+// power users, but a first-time visitor sees a clean four-item shell.
 const PRIMARY_NAV_ITEMS: NavItem[] = [
-  { id: "brief", label: "Brief", icon: "brief" },
-  { id: "composer", label: "Composer", icon: "graph" },
-  { id: "query", label: "Query", icon: "search" },
-  { id: "graph", label: "Graph", icon: "graph" },
-  { id: "ingest", label: "Ingest", icon: "plus" },
+  { id: "home", label: "Home", icon: "brief" },
+  { id: "query", label: "Ask", icon: "search" },
+  { id: "review", label: "Review", icon: "list" },
   { id: "settings", label: "Settings", icon: "settings" },
 ];
 
@@ -71,6 +78,10 @@ const PRIMARY_NAV_ITEMS: NavItem[] = [
 // path. Inspector stays at the end of the advanced list per its
 // existing convention.
 const ADVANCED_NAV_ITEMS: NavItem[] = [
+  { id: "brief", label: "Brief", icon: "brief" },
+  { id: "composer", label: "Composer", icon: "graph" },
+  { id: "graph", label: "Graph", icon: "graph" },
+  { id: "ingest", label: "Ingest", icon: "plus" },
   { id: "dashboard", label: "Dashboard", icon: "grid" },
   { id: "threads", label: "Threads", icon: "timeline" },
   { id: "views", label: "Views", icon: "views" },
@@ -192,7 +203,7 @@ function NavIcon({ type }: { type: string }) {
 }
 
 export default function App() {
-  const [view, setView] = useState<View>("brief");
+  const [view, setView] = useState<View>("home");
   const [firstRunChecked, setFirstRunChecked] = useState(false);
   const [devMode, setDevMode] = useState<boolean>(() => readDevMode());
 
@@ -219,13 +230,13 @@ export default function App() {
     : PRIMARY_NAV_ITEMS;
 
   // If dev mode is turned off while the user is on a hidden surface,
-  // route them back to Brief — otherwise the sidebar wouldn't show
+  // route them back to Home — otherwise the sidebar wouldn't show
   // their current view and they'd be stranded.
   useEffect(() => {
     if (devMode) return;
     const visible = new Set<View>(PRIMARY_NAV_ITEMS.map((n) => n.id));
     visible.add("onboarding");
-    if (!visible.has(view)) setView("brief");
+    if (!visible.has(view)) setView("home");
   }, [devMode, view]);
 
   // UI-8 — route first-run users to onboarding. We detect "first run"
@@ -238,7 +249,7 @@ export default function App() {
         }
       })
       .catch(() => {
-        /* fall through to brief — DP-3 failures shouldn't block UI */
+        /* fall through to home — DP-3 failures shouldn't block UI */
       })
       .finally(() => setFirstRunChecked(true));
   }, []);
@@ -270,7 +281,7 @@ export default function App() {
   if (view === "onboarding") {
     return (
       <div className="h-screen overflow-y-auto bg-tm-bg p-6">
-        <OnboardingView onComplete={() => setView("brief")} />
+        <OnboardingView onComplete={() => setView("home")} />
       </div>
     );
   }
@@ -315,10 +326,17 @@ export default function App() {
 
       {/* Main content */}
       <main className="flex-1 overflow-y-auto bg-tm-bg p-6">
+        {view === "home" && (
+          <HomeView
+            onOpenAsk={() => setView("query")}
+            onOpenReview={() => setView("review")}
+          />
+        )}
         {view === "brief" && <BriefView onOpenLedger={() => setView("ledger")} />}
         {view === "dashboard" && <Dashboard />}
         {view === "query" && <QueryView />}
         {view === "ingest" && <IngestView />}
+        {view === "review" && <IngestionReviewView />}
         {view === "graph" && <GraphView />}
         {view === "garden" && <MemoryGardenView />}
         {view === "context" && <ContextDashboardView />}

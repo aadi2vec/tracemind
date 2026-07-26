@@ -1,5 +1,6 @@
 pub mod bandit;
 pub mod planner;
+pub mod propagate_delete_impl;
 pub mod query_rewriter;
 pub mod router;
 pub mod scheduler;

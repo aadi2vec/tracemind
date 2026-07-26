@@ -20,6 +20,7 @@ tm-answer = { workspace = true }
 tm-intent = { workspace = true }
 tm-reflect = { workspace = true }
 tm-world-model = { workspace = true }
+tm-capture = { path = "../tm-capture" }
 chrono = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -43,3 +44,6 @@ default = []
 # Enable Tier-1 local LLM answers (Qwen 2.5 1.5B Q4 GGUF, ~900 MB first-run download).
 local-llm = ["tm-answer/local-llm"]
 local-llm-metal = ["tm-answer/local-llm-metal"]
+# Enable macOS Vision-framework OCR for screenshot capture (X5).
+# Requires Xcode Command Line Tools on the build machine (`xcode-select --install`).
+macos-screencapture = ["tm-capture/macos-screencapture"]

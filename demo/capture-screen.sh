@@ -19,7 +19,9 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-TM="${ROOT}/target/release/tracemind --hash-embed"
+# Real BGE-small ONNX embeddings — the demo must show real semantic
+# retrieval, never the deterministic-but-meaningless --hash-embed path.
+TM="${ROOT}/target/release/tracemind"
 OCR="${ROOT}/demo/ocr.swift"
 
 if [[ ! -x "${ROOT}/target/release/tracemind" ]]; then

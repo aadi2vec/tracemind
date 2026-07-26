@@ -17,6 +17,9 @@ uuid = { workspace = true }
 thiserror = { workspace = true }
 rusqlite = { workspace = true }
 tm-types = { workspace = true }
+# X4 — deterministic card ids (same slot+title+refs → same uuid so
+# de-dup works across brief regenerations).
+sha2 = "0.10"
 
 [dev-dependencies]
 tempfile = "3"

@@ -26,12 +26,14 @@
 //! actions go through the existing `IntentStore` mutators.
 
 pub mod brief;
+pub mod brief_home;
 pub mod curator;
 pub mod insights;
 pub mod matcher;
 pub mod ontology_proposer;
 pub mod outcome_prompt;
 pub mod pattern;
+pub mod propagate_delete_impl;
 pub mod reflexion;
 pub mod working_memory;
 
@@ -39,6 +41,11 @@ pub use brief::{
     BriefBuilder, BriefConfig, BriefError, CandidateBriefRow, CommitmentBriefRow,
     CommitmentOutlook, DailyBrief, InsightGateConfig, ModelQuietReason, OverdueClass,
     OutcomeProposalBriefRow, PatternBriefRow, ResolvedBriefRow,
+};
+pub use brief_home::{
+    build_home, persist_hooks, signal_for_action, Bridge, BriefCard, BriefHome, BriefSlot,
+    CardAction, ComposeInput, Conflict, DueItem, RecallInput, RecallItem, ReconcileInput,
+    RehearseInput,
 };
 pub use insights::{detect_insights, BaselineRate, InsightBriefRow, InsightConfig};
 pub use matcher::{propose_outcomes, MatcherConfig, OutcomeProposal};

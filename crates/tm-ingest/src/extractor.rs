@@ -106,4 +106,117 @@ mod tests {
     fn heuristic_extractor_name() {
         assert_eq!(HeuristicExtractor.name(), "heuristic");
     }
+
+    #[test]
+    fn browser_history_capture_yields_url_plus_host_organization() {
+        // Regression for the 2026-07-25 quality report: browser-history
+        // captures were producing junk entities ("Tickets" → Person,
+        // "2026" → Concept, "Visit" → Person) and no host-level
+        // Organization node. After the quality pass:
+        //  - raw URL stays typed Url
+        //  - the URL's registrable domain (`fifa.com`) surfaces as
+        //    an Organization entity — the graph node users think of
+        //    when they say "the FIFA site"
+        //  - "2026" / "Tickets" / "Visit" no longer show up
+        use tm_types::EntityType;
+        let text = "https://www.fifa.com/tickets FIFA World Cup 2026 Tickets";
+        let ents = extract_entities(text);
+        let names: Vec<(&str, &EntityType)> =
+            ents.iter().map(|e| (e.name.as_str(), &e.entity_type)).collect();
+
+        // Must contain the URL as Url.
+        assert!(
+            names.iter().any(|(n, t)| *n == "https://www.fifa.com/tickets"
+                && **t == EntityType::Url),
+            "expected raw URL as Url, got {names:?}"
+        );
+        // Must contain the host as Organization.
+        assert!(
+            names.iter().any(|(n, t)| *n == "fifa.com" && **t == EntityType::Organization),
+            "expected fifa.com as Organization, got {names:?}"
+        );
+        // Must NOT contain the year or generic English words as entities.
+        for junk in ["2026", "Tickets", "Visit", "Home", "Login", "Buy"] {
+            assert!(
+                !names.iter().any(|(n, _)| n.eq_ignore_ascii_case(junk)),
+                "junk entity {junk:?} slipped through: {names:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn url_and_host_are_not_collapsed_by_names_look_like_same_entity() {
+        // Regression for the 2026-07-25 demo bug: `apnews.com` is a
+        // substring of `https://apnews.com/…`, so the substring branch
+        // of `names_look_like_same_entity` returned true and the
+        // pipeline's `decide_memory_op` then emitted an Update that
+        // pushed the URL row back into `kept_entities`. Result: two
+        // URL entries and no Organization. The URL-vs-host asymmetry
+        // guard fixes this.
+        use crate::pipeline::names_look_like_same_entity_public;
+        assert!(
+            !names_look_like_same_entity_public(
+                "apnews.com",
+                "https://apnews.com/article/world-cup-2026-tickets"
+            ),
+            "URL and host must be distinct entities"
+        );
+        assert!(
+            !names_look_like_same_entity_public(
+                "https://fifa.com/tickets",
+                "fifa.com"
+            ),
+            "URL and host must be distinct entities (order-independent)"
+        );
+        // Sanity: legitimate same-entity substring pairs still match.
+        assert!(names_look_like_same_entity_public(
+            "TraceMind",
+            "TraceMind's"
+        ));
+        assert!(names_look_like_same_entity_public("fifa.com", "fifa.com"));
+    }
+
+    #[test]
+    #[ignore = "diagnostic — dumps GLiNER output for a URL-first text"]
+    fn debug_gliner_output_for_url() {
+        use crate::gliner::GlinerExtractor;
+        let Some(g) = GlinerExtractor::auto_download_default() else {
+            eprintln!("GLiNER model unavailable — skip");
+            return;
+        };
+        let text = "https://apnews.com/article/world-cup-2026-tickets Ticket resale prices";
+        let ents = g.extract_entities(text);
+        for (i, e) in ents.iter().enumerate() {
+            eprintln!("  #{i}  [{:?}] {}", e.entity_type, e.name);
+        }
+    }
+
+    #[test]
+    fn url_host_extraction_handles_common_shapes() {
+        use crate::pipeline::extract_registrable_domain;
+        assert_eq!(
+            extract_registrable_domain("https://www.fifa.com/tickets"),
+            Some("fifa.com".into())
+        );
+        assert_eq!(
+            extract_registrable_domain("http://buy.fifa.com/en"),
+            Some("buy.fifa.com".into())
+        );
+        assert_eq!(
+            extract_registrable_domain("www.fifa.com/tickets"),
+            Some("fifa.com".into())
+        );
+        assert_eq!(
+            extract_registrable_domain("https://Example.COM/PATH"),
+            Some("example.com".into())
+        );
+        assert_eq!(
+            extract_registrable_domain("https://example.com:8080/x"),
+            Some("example.com".into())
+        );
+        // Not a URL
+        assert_eq!(extract_registrable_domain("plain-text"), None);
+        // Host has no dot — reject (never a domain).
+        assert_eq!(extract_registrable_domain("http://localhost/x"), None);
+    }
 }

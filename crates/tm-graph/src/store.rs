@@ -3633,6 +3633,31 @@ impl GraphStore {
         }
         Ok(results)
     }
+
+    // ─── I-P1 propagate-delete helpers ─────────────────────────────────
+    //
+    // These exist so `impl PropagateDelete for GraphStore` (in
+    // `propagate_delete_impl.rs`) can drop rows without reaching into the
+    // private uuid → skg-id map. They are intentionally narrow — the trait
+    // impl is the only intended caller.
+
+    /// Underlying rusqlite connection. Alias for [`GraphStore::connection`]
+    /// with a name that documents the intent for the propagate-delete path.
+    pub fn raw_connection(&self) -> &rusqlite::Connection {
+        self.connection()
+    }
+
+    /// Look up the skg row id for a TraceMind entity uuid, if the entity
+    /// is currently registered.
+    pub fn skg_id_for(&self, entity_id: Uuid) -> Option<i64> {
+        self.entity_map.borrow().get(&entity_id).copied()
+    }
+
+    /// Drop the uuid → skg-id mapping for an entity that has been deleted.
+    /// Safe to call for unknown uuids.
+    pub fn forget_entity_id_mapping(&self, entity_id: Uuid) {
+        self.entity_map.borrow_mut().remove(&entity_id);
+    }
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────────

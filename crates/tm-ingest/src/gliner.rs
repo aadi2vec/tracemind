@@ -416,11 +416,40 @@ impl GlinerExtractor {
         let words = split_words(text);
         let hits = self.predict_spans(text)?;
         let mut seen: HashSet<String> = HashSet::new();
-        let mut out = Vec::with_capacity(hits.len());
+        let mut out: Vec<Entity> = Vec::with_capacity(hits.len() + 4);
+
+        // Deterministic URL + host pre-pass. GLiNER's DEFAULT_LABELS
+        // do not include "url", so raw URLs get typed as `organization`
+        // (a captured `https://www.fifa.com/tickets` becomes an ORG).
+        // Run the same is_url / registrable-domain extraction the
+        // heuristic path uses, then dedupe below by lowercase name so
+        // GLiNER's own hits don't re-emit the same span.
+        for tok in text.split_whitespace() {
+            let cleaned = tok.trim_matches(|c: char| !c.is_alphanumeric() && c != '/' && c != ':' && c != '.' && c != '-' && c != '_' && c != '~' && c != '?' && c != '=' && c != '&' && c != '%' && c != '#');
+            if crate::pipeline::is_url_public(cleaned) {
+                let key = cleaned.to_lowercase();
+                if seen.insert(key) {
+                    out.push(Entity::new(cleaned, EntityType::Url, 0.9));
+                }
+                if let Some(host) = crate::pipeline::extract_registrable_domain(cleaned) {
+                    let host_key = host.to_lowercase();
+                    if seen.insert(host_key) {
+                        out.push(Entity::new(&host, EntityType::Organization, 0.8));
+                    }
+                }
+            }
+        }
+
         for h in hits {
             let name = words[h.start_word..=h.end_word].join(" ");
             let name = trim_trailing_punct(&name).to_string();
             if name.is_empty() {
+                continue;
+            }
+            // If GLiNER is trying to re-emit a URL text as Organization
+            // (its default failure mode), the URL-first pass above
+            // already handled it — drop the duplicate.
+            if crate::pipeline::is_url_public(&name) {
                 continue;
             }
             let key = name.to_lowercase();

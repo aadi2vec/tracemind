@@ -21,6 +21,9 @@ use tm_types::capture_permissions::{CapturePermissions, CaptureSource};
 use tm_types::RecentCapture;
 
 mod browser_capture;
+mod browser_history;
+mod modalities;
+mod vision_ocr;
 
 /// TM-NLP-004 helper: open an IngestPipeline and attach the real GLiNER
 /// NER extractor when the model is available on disk / over the network.
@@ -106,9 +109,14 @@ impl CaptureConfig {
                     .and_then(|v| v.parse().ok())
                     .unwrap_or(30), // default: every 30 seconds (Tier-2)
             ),
-            hash_embed: std::env::var("TM_HASH_EMBED")
-                .map(|v| v == "1")
-                .unwrap_or(false),
+            // Honor BOTH the `--hash-embed` CLI flag (matching the
+            // `tracemind` binary) and the `TM_HASH_EMBED=1` env var.
+            // Mixing embedders between the daemon (ingest) and the CLI
+            // (query) silently breaks retrieval — the vectors live in
+            // different spaces — so the flag must be spelled the same way
+            // everywhere.
+            hash_embed: std::env::args().any(|a| a == "--hash-embed")
+                || std::env::var("TM_HASH_EMBED").map(|v| v == "1").unwrap_or(false),
         }
     }
 }
@@ -613,5 +621,107 @@ async fn main() {
         ),
         priority_consolidation_loop(&config),
         consolidation_loop(&config),
+        multimodal_loop(&config),
     );
+}
+
+/// Product Plan X1/X5/X11/X12/X15/X18/X19 — poll every registered
+/// modality source and route new payloads through `ingest_multimodal`.
+/// Interval is deliberately slow (default 30s) — most modalities are
+/// low-frequency (screenshots, saved PDFs) and file-watching is cheap
+/// enough that missing a beat is fine.
+async fn multimodal_loop(config: &CaptureConfig) {
+    let interval = Duration::from_secs(
+        std::env::var("TM_MODALITY_INTERVAL_S")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(30),
+    );
+    // Data dir is the parent of memory.db.
+    let data_dir = PathBuf::from(&config.db_path)
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("."));
+    let pipeline = match open_pipeline_with_ner(&config.db_path, config.hash_embed) {
+        Ok(p) => p,
+        Err(e) => {
+            warn!("[multimodal] cannot open ingest pipeline: {e}; loop off");
+            return;
+        }
+    };
+    // CAP-1 — fail closed. Only sources the user explicitly enabled in
+    // capture_permissions.toml are polled; every modality here (Notes,
+    // Calendar, Mail, Photos, PDFs, …) is high-sensitivity and starts
+    // disabled. A malformed/unreadable permissions file yields zero
+    // sources, matching clipboard/shell/browser behaviour.
+    let perms = match CapturePermissions::load_or_default(&config.permissions_path) {
+        Ok(p) => p,
+        Err(e) => {
+            warn!(
+                "[multimodal] failed to load permissions ({}); failing closed — no sources will start: {e}",
+                config.permissions_path.display()
+            );
+            return;
+        }
+    };
+    let mut registry = modalities::ModalityRegistry::with_enabled(data_dir.clone(), &perms);
+    if registry.is_empty() {
+        info!("[multimodal] no modality sources enabled in permissions — loop will not start");
+        return;
+    }
+    info!(
+        "[multimodal] {} source(s) enabled ({:?}), tick={}s",
+        registry.len(),
+        registry.names(),
+        interval.as_secs()
+    );
+    // Mirror accepted captures into the `recent.jsonl` ring buffer so
+    // `tracemind recent` surfaces ambient modality captures alongside
+    // clipboard/shell — otherwise the daemon's most product-visible work
+    // (Notes, Mail, Calendar) would be invisible in the audit surface.
+    let recent = match RecentStore::open(recent_path(&config.db_path)) {
+        Ok(r) => Some(r),
+        Err(e) => {
+            warn!("[multimodal] failed to open recent store: {e}");
+            None
+        }
+    };
+    loop {
+        time::sleep(interval).await;
+        let payloads = registry.tick().await;
+        for payload in payloads {
+            let session = Uuid::new_v4();
+            match pipeline.ingest_multimodal(&payload, session) {
+                Ok(res) => {
+                    debug!(
+                        target: "tm_modality",
+                        kind = payload.kind.as_str(),
+                        source = %payload.source,
+                        skipped = ?res.skipped,
+                        content_hash = %res.content_hash,
+                        "ingested"
+                    );
+                    if let Some(store) = &recent {
+                        // Prefer the canonical/extracted text; fall back to
+                        // the caller hint (note title, email subject) and
+                        // finally a modality stub so the ring buffer row is
+                        // never blank.
+                        let display = payload
+                            .text
+                            .clone()
+                            .or_else(|| payload.hint.clone())
+                            .unwrap_or_else(|| format!("[{} capture]", payload.kind.as_str()));
+                        record_capture(store, &payload.source, &display, &res);
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        "[multimodal] ingest_multimodal({}, {}) failed: {e}",
+                        payload.kind.as_str(),
+                        payload.source
+                    );
+                }
+            }
+        }
+    }
 }

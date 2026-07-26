@@ -1,4 +1,5 @@
 pub mod procedure_store;
+pub mod propagate_delete_impl;
 pub mod recent_store;
 pub mod tier_store;
 pub mod trace_store;

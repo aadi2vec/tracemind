@@ -261,6 +261,15 @@ enum Commands {
         #[command(subcommand)]
         action: PolicyAction,
     },
+    /// List, inspect, and reverse GEPA policy mutations (Product Plan X10).
+    ///
+    /// Every promoted policy mutation records a row in `policy_mutations`;
+    /// `rollback apply <id>` reverses one and logs it to `policy_rollbacks`
+    /// so Pillar 7's safety rail is countable, not just declarative.
+    Rollback {
+        #[command(subcommand)]
+        action: RollbackAction,
+    },
     /// Show the most recent capture events from the ring buffer
     /// (what the capture daemon / MCP server just ingested).
     Recent {
@@ -275,6 +284,81 @@ enum Commands {
     Models {
         #[command(subcommand)]
         action: ModelsAction,
+    },
+    /// Report which capture sources are reachable right now — Chrome
+    /// / Safari history DBs, Full Disk Access, etc. Prints an
+    /// actionable one-liner per source so a user can tell at a glance
+    /// what's blocked and how to fix it. macOS Safari requires Full
+    /// Disk Access; this is the CLI that tells you so.
+    ///
+    /// With `--ocr <path>`, also runs the macOS Vision-framework OCR
+    /// shim on the given PNG and prints the extracted text — useful
+    /// for demoing screenshot capture without spinning the daemon.
+    CaptureDoctor {
+        #[arg(long)]
+        json: bool,
+        /// Optional: run Vision OCR on this PNG and print the text.
+        #[arg(long)]
+        ocr: Option<std::path::PathBuf>,
+    },
+    /// Product Plan X3 — first-run onboarding bootstrap. Prints an
+    /// onboarding status report (data dir, model presence, index size)
+    /// and, unless `--dry-run`, writes `~/.tracemind/onboarding.json`
+    /// so the menu-bar / Tauri surface knows not to re-run the flow.
+    Onboard {
+        /// Print status only; do not write the completion marker.
+        #[arg(long)]
+        dry_run: bool,
+        /// Emit JSON instead of a human summary.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Assemble a token-budgeted, cited context brief on a topic and
+    /// print it — ready to paste into any LLM chat. This is the CLI
+    /// mirror of the `memory_context_for` MCP verb: same topic-scoped
+    /// merge of entities, recent captures, open commitments, and
+    /// unresolved contradictions, same [1]/[2]/[3] citation scheme.
+    ContextFor {
+        /// Topic to assemble context on.
+        topic: String,
+        /// Approximate token cap for the rendered brief (default 2000).
+        #[arg(long, default_value = "2000")]
+        budget_tokens: usize,
+        /// Emit JSON (all sections + citations) instead of the paste-ready brief.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Product Plan X2 / X8 — one-shot small retrieval optimised for
+    /// launcher / menu-bar quick-recall bindings. Uses the standard
+    /// RetrievalEngine but requests small top_k and prints only
+    /// id/preview/source/score. Intended as the target of a global
+    /// keyboard shortcut (Raycast / Alfred / system hotkey → Terminal).
+    QuickRecall {
+        /// Query text.
+        q: String,
+        /// Max results (default 5).
+        #[arg(long, default_value = "5")]
+        top_k: usize,
+        /// Emit JSON instead of a human summary.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Product Plan X20 — render the weekly retention digest (recent
+    /// captures by modality, unresolved contradictions, insights, due
+    /// commitments). With `--persist`, drops a JSON marker into
+    /// `~/.tracemind/notifications/` plus per-contradiction reconcile
+    /// notes for the menu-bar surface.
+    Digest {
+        /// Persist digest + reconcile notify markers under
+        /// `~/.tracemind/notifications/`.
+        #[arg(long)]
+        persist: bool,
+        /// How many days back to survey (default 7).
+        #[arg(long, default_value = "7")]
+        recent_days: i64,
+        /// Emit JSON instead of a human summary.
+        #[arg(long)]
+        json: bool,
     },
     /// Scan local storage and run on-demand cleanups (vacuum, prune
     /// ephemeral signals, truncate the trace log). All actions are
@@ -1106,6 +1190,38 @@ enum PolicyAction {
     Reset,
 }
 
+#[derive(clap::Subcommand, Debug)]
+enum RollbackAction {
+    /// Show the most recent policy mutations.
+    List {
+        #[arg(long, default_value = "20")]
+        limit: usize,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Print full details for a mutation.
+    Show {
+        /// Mutation UUID from `rollback list`.
+        id: String,
+    },
+    /// Revert a mutation: writes a `policy_rollbacks` row and either
+    /// deletes `policy.json` (defaulting future queries back to the
+    /// compiled-in defaults) or, when `--to-parent-snapshot` is given
+    /// and one exists at `~/.tracemind/policy.<parent-id>.json`,
+    /// restores that snapshot instead.
+    Apply {
+        /// Mutation UUID to revert.
+        id: String,
+        /// Optional free-text note for the audit trail.
+        #[arg(long)]
+        note: Option<String>,
+        /// Skip actually deleting/replacing policy.json; only record the
+        /// rollback event. Useful for dry-runs.
+        #[arg(long)]
+        dry_run: bool,
+    },
+}
+
 #[derive(clap::Subcommand)]
 enum ProcAction {
     /// Add a new procedure (steps as "action1;action2;action3")
@@ -1917,6 +2033,166 @@ fn main() {
                 }
             }
         }
+
+        Commands::Rollback { action } => {
+            let db_path = dir.join("memory.db");
+            let graph = match tm_graph::GraphStore::open(db_path.to_str().unwrap()) {
+                Ok(g) => g,
+                Err(e) => {
+                    eprintln!("cannot open {}: {e}", db_path.display());
+                    std::process::exit(1);
+                }
+            };
+            // Idempotent — the writes above install it too, but the
+            // read path must never assume the schema exists.
+            if let Err(e) = tm_graph::init_policy_provenance_schema(graph.connection()) {
+                eprintln!("policy_provenance schema: {e}");
+                std::process::exit(1);
+            }
+            match action {
+                RollbackAction::List { limit, json } => {
+                    let mutations = match tm_graph::recent_policy_mutations(
+                        graph.connection(),
+                        limit,
+                    ) {
+                        Ok(m) => m,
+                        Err(e) => {
+                            eprintln!("list failed: {e}");
+                            std::process::exit(1);
+                        }
+                    };
+                    if json {
+                        let out = serde_json::to_string_pretty(&mutations)
+                            .unwrap_or_else(|_| "[]".into());
+                        println!("{out}");
+                    } else if mutations.is_empty() {
+                        println!("no policy mutations recorded yet");
+                    } else {
+                        println!(
+                            "{:<38} {:<20} {:>8} {:>8} {:>4} {}",
+                            "id", "kind", "ΔF1", "Δcon", "acc", "at"
+                        );
+                        for m in mutations {
+                            println!(
+                                "{:<38} {:<20} {:>+8.3} {:>+8.3} {:>4} {}",
+                                m.id,
+                                m.mutation_kind,
+                                m.delta_scores[0],
+                                m.delta_scores[2],
+                                if m.accepted { "yes" } else { "no" },
+                                m.generated_at.format("%Y-%m-%d %H:%M"),
+                            );
+                        }
+                    }
+                }
+                RollbackAction::Show { id } => {
+                    let target = match uuid::Uuid::parse_str(&id) {
+                        Ok(u) => u,
+                        Err(_) => {
+                            eprintln!("not a UUID: {id}");
+                            std::process::exit(1);
+                        }
+                    };
+                    let mutations = match tm_graph::recent_policy_mutations(
+                        graph.connection(),
+                        1000,
+                    ) {
+                        Ok(m) => m,
+                        Err(e) => {
+                            eprintln!("show failed: {e}");
+                            std::process::exit(1);
+                        }
+                    };
+                    match mutations.into_iter().find(|m| m.id == target) {
+                        Some(m) => {
+                            let s = serde_json::to_string_pretty(&m).unwrap();
+                            println!("{s}");
+                        }
+                        None => {
+                            eprintln!("mutation {target} not found");
+                            std::process::exit(1);
+                        }
+                    }
+                }
+                RollbackAction::Apply { id, note, dry_run } => {
+                    let target = match uuid::Uuid::parse_str(&id) {
+                        Ok(u) => u,
+                        Err(_) => {
+                            eprintln!("not a UUID: {id}");
+                            std::process::exit(1);
+                        }
+                    };
+                    let mutations = match tm_graph::recent_policy_mutations(
+                        graph.connection(),
+                        1000,
+                    ) {
+                        Ok(m) => m,
+                        Err(e) => {
+                            eprintln!("lookup failed: {e}");
+                            std::process::exit(1);
+                        }
+                    };
+                    let m = match mutations.into_iter().find(|m| m.id == target) {
+                        Some(m) => m,
+                        None => {
+                            eprintln!("mutation {target} not found");
+                            std::process::exit(1);
+                        }
+                    };
+                    let policy_path = dir.join("policy.json");
+                    let snapshot_path = dir.join(format!("policy.{}.json", m.parent_id));
+                    if !dry_run {
+                        if snapshot_path.exists() {
+                            if let Err(e) = std::fs::copy(&snapshot_path, &policy_path) {
+                                eprintln!(
+                                    "failed to restore snapshot {}: {e}",
+                                    snapshot_path.display()
+                                );
+                                std::process::exit(1);
+                            }
+                            println!(
+                                "restored parent snapshot {} → {}",
+                                snapshot_path.display(),
+                                policy_path.display()
+                            );
+                        } else {
+                            match std::fs::remove_file(&policy_path) {
+                                Ok(()) => println!(
+                                    "deleted {}; queries fall back to compiled-in defaults",
+                                    policy_path.display()
+                                ),
+                                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                                    println!("policy.json already absent (using defaults)")
+                                }
+                                Err(e) => {
+                                    eprintln!(
+                                        "failed to remove {}: {e}",
+                                        policy_path.display()
+                                    );
+                                    std::process::exit(1);
+                                }
+                            }
+                        }
+                    } else {
+                        println!("dry-run: would revert to {} (or defaults)", snapshot_path.display());
+                    }
+                    if let Err(e) = tm_graph::record_policy_rollback(
+                        graph.connection(),
+                        target,
+                        &m.mutation_kind,
+                        note.as_deref(),
+                    ) {
+                        eprintln!("rollback recorded but policy_rollbacks insert failed: {e}");
+                        std::process::exit(1);
+                    }
+                    println!(
+                        "recorded rollback for mutation {} (kind={})",
+                        target, m.mutation_kind
+                    );
+                }
+            }
+        }
+
         Commands::Status => {
             let bandit = UcbBandit::load(&bandit_path);
             let stats = bandit.arm_stats();
@@ -1978,6 +2254,21 @@ fn main() {
         }
         Commands::Storage { action } => {
             cmd_storage(&dir, action);
+        }
+        Commands::Onboard { dry_run, json } => {
+            cmd_onboard(&dir, dry_run, json);
+        }
+        Commands::CaptureDoctor { json, ocr } => {
+            cmd_capture_doctor(json, ocr);
+        }
+        Commands::ContextFor { topic, budget_tokens, json } => {
+            cmd_context_for(&dir, topic, budget_tokens, json, cli.hash_embed);
+        }
+        Commands::QuickRecall { q, top_k, json } => {
+            cmd_quick_recall(&dir, q, top_k, json, cli.hash_embed);
+        }
+        Commands::Digest { persist, recent_days, json } => {
+            cmd_digest(&dir, persist, recent_days, json);
         }
         Commands::Commit {
             kind,
@@ -3846,6 +4137,361 @@ fn cmd_models(action: ModelsAction) {
                 }
             }
         }
+    }
+}
+
+/// `tracemind onboard` — Product Plan X3 first-run bootstrap.
+///
+/// Prints a status summary (data dir, model presence, index size) and,
+/// unless `--dry-run`, writes `~/.tracemind/onboarding.json` so the
+/// menu-bar / Tauri surface knows not to re-run the onboarding flow.
+fn cmd_onboard(dir: &PathBuf, dry_run: bool, json: bool) {
+    let _ = std::fs::create_dir_all(dir);
+    let db_path = dir.join("memory.db");
+    let models_dir = dir.join("models");
+    let marker = dir.join("onboarding.json");
+
+    let db_exists = db_path.exists();
+    let mut models: std::collections::BTreeMap<&str, bool> =
+        std::collections::BTreeMap::new();
+    for expected in ["bge-384-v1.5", "mxbai-colbert", "gliner-multi"] {
+        models.insert(expected, models_dir.join(expected).exists());
+    }
+
+    let (entity_count, signal_count) = if db_exists {
+        match tm_graph::GraphStore::open(db_path.to_str().unwrap_or_default()) {
+            Ok(g) => {
+                let ent = g.list_entity_types().map(|v| v.len()).unwrap_or(0);
+                let sig = g.unconsolidated_signals(10_000).map(|v| v.len()).unwrap_or(0);
+                (ent, sig)
+            }
+            Err(_) => (0usize, 0usize),
+        }
+    } else {
+        (0usize, 0usize)
+    };
+
+    if !dry_run {
+        let body = serde_json::json!({
+            "completed_at": chrono::Utc::now().to_rfc3339(),
+            "version":       env!("CARGO_PKG_VERSION"),
+        });
+        if let Err(e) = std::fs::write(&marker, body.to_string()) {
+            eprintln!("could not write onboarding marker: {e}");
+        }
+    }
+
+    if json {
+        let out = serde_json::json!({
+            "data_dir":            dir.display().to_string(),
+            "db_exists":           db_exists,
+            "models":              models,
+            "entity_count":        entity_count,
+            "signal_count":        signal_count,
+            "onboarding_complete": marker.exists(),
+            "dry_run":             dry_run,
+        });
+        println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
+        return;
+    }
+
+    println!("TraceMind onboarding");
+    println!("  data dir: {}", dir.display());
+    println!("  memory.db: {}", if db_exists { "present" } else { "not yet" });
+    for (name, ok) in &models {
+        println!("  model {:22}: {}", name, if *ok { "present" } else { "missing (will download on first use)" });
+    }
+    println!("  entities in graph: {entity_count}");
+    println!("  unconsolidated signals: {signal_count}");
+    println!(
+        "  onboarding marker: {}{}",
+        if marker.exists() { "written" } else { "not written" },
+        if dry_run { " (dry run)" } else { "" }
+    );
+}
+
+/// `tracemind capture doctor` — probe each capture source and report
+/// reachability. Today this covers browser-history (Chrome + Safari);
+/// Safari on macOS is the common blocker — its `~/Library/Safari/
+/// History.db` is TCC-protected and requires Full Disk Access.
+fn cmd_capture_doctor(json: bool, ocr_target: Option<std::path::PathBuf>) {
+    // --ocr short-circuit: run OCR on the given path and print the
+    // extracted text. Bypasses the reachability probe so the demo
+    // shows the OCR output cleanly.
+    if let Some(path) = ocr_target {
+        match tm_capture::vision_ocr::ocr_png_file(&path) {
+            Some(text) => {
+                if json {
+                    let out = serde_json::json!({
+                        "path": path.display().to_string(),
+                        "ocr":  text,
+                    });
+                    println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
+                } else {
+                    println!("OCR({}):", path.display());
+                    println!("{}", text);
+                }
+            }
+            None => {
+                if json {
+                    let out = serde_json::json!({
+                        "path": path.display().to_string(),
+                        "ocr":  serde_json::Value::Null,
+                        "note": "no text extracted (OCR unavailable, file missing, or empty image)",
+                    });
+                    println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
+                } else {
+                    eprintln!(
+                        "OCR({}): no text (unavailable, missing, or empty)",
+                        path.display()
+                    );
+                }
+            }
+        }
+        return;
+    }
+
+    let home = std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let rows = tm_capture::browser_history::probe_browsers(&home);
+    let ocr_ok = tm_capture::vision_ocr::ocr_available();
+
+    if json {
+        let mut out: Vec<_> = rows
+            .iter()
+            .map(|(b, r)| {
+                serde_json::json!({
+                    "source": b.key(),
+                    "reachable": r.is_reachable(),
+                    "permission_denied": r.is_permission_denied(),
+                    "message": r.describe(*b),
+                })
+            })
+            .collect();
+        out.push(serde_json::json!({
+            "source": "screenshot-ocr",
+            "reachable": ocr_ok,
+            "permission_denied": false,
+            "message": if ocr_ok {
+                "screenshot-ocr: macOS Vision OCR available".to_string()
+            } else {
+                "screenshot-ocr: unavailable (build with --features macos-screencapture on macOS + Xcode CLI Tools)".to_string()
+            },
+        }));
+        println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
+        return;
+    }
+
+    println!("Capture doctor");
+    for (b, r) in &rows {
+        let mark = if r.is_reachable() {
+            "OK"
+        } else if r.is_permission_denied() {
+            "PERM"
+        } else {
+            "--"
+        };
+        println!("  [{mark:>4}] {}", r.describe(*b));
+    }
+    let ocr_mark = if ocr_ok { "OK" } else { "--" };
+    let ocr_msg = if ocr_ok {
+        "screenshot-ocr: macOS Vision OCR available"
+    } else {
+        "screenshot-ocr: unavailable (build with --features macos-screencapture on macOS + Xcode CLI Tools)"
+    };
+    println!("  [{ocr_mark:>4}] {ocr_msg}");
+    if rows.iter().any(|(_, r)| r.is_permission_denied()) {
+        println!();
+        println!(
+            "To grant Full Disk Access on macOS: open System Settings → \
+             Privacy & Security → Full Disk Access, click +, add \
+             `tracemind-capture` (and `tracemind` if you also run the \
+             CLI probe under launchd), then restart the daemon."
+        );
+    }
+}
+
+/// `tracemind quick-recall` — Product Plan X2 / X8 launcher target.
+///
+/// Small top_k, no answer generation, no reranker — just id/preview/
+/// source. Meant to be bound to a global keyboard shortcut (Raycast,
+/// Alfred, macOS Services) that pipes a search string into the CLI and
+/// shows the hits inline. `~/.tracemind/notifications/reconcile-*.json`
+/// markers are produced by `tracemind digest --persist` — a
+/// menu-bar / status-bar app can watch that directory to badge unread
+/// reconcile items without any live connection to the retrieval engine.
+fn cmd_quick_recall(dir: &PathBuf, q: String, top_k: usize, json: bool, hash_embed: bool) {
+    let db_path = dir.join("memory.db").to_str().unwrap().to_string();
+    let trace_path = dir.join("traces.jsonl").to_str().unwrap().to_string();
+    let mut engine = match RetrievalEngine::open(&db_path, &trace_path, hash_embed) {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("could not open retrieval engine: {e}");
+            return;
+        }
+    };
+    let result = match engine.query(&q) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("query failed: {e}");
+            return;
+        }
+    };
+
+    let mut hits: Vec<serde_json::Value> = Vec::new();
+    for e in result.entities.iter().take(top_k) {
+        hits.push(serde_json::json!({
+            "id":     e.id.to_string(),
+            "kind":   "entity",
+            "text":   e.name,
+            "source": "graph",
+        }));
+    }
+    for s in result.signal_hits.iter().take(top_k.saturating_sub(hits.len())) {
+        let preview: String = s.text.chars().take(140).collect();
+        hits.push(serde_json::json!({
+            "id":     s.signal_id,
+            "kind":   "signal",
+            "text":   preview,
+            "source": s.source,
+            "score":  s.score,
+        }));
+    }
+
+    if json {
+        let out = serde_json::json!({
+            "query_id":  result.query_id.to_string(),
+            "arm":       result.arm,
+            "grounding": format!("{:?}", result.grounding),
+            "host_id":   "menu-bar",
+            "hits":      hits,
+        });
+        println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
+        return;
+    }
+
+    if hits.is_empty() {
+        println!("(nothing recalled for '{q}')");
+        return;
+    }
+    for (i, h) in hits.iter().enumerate() {
+        let text = h.get("text").and_then(|v| v.as_str()).unwrap_or("");
+        let source = h.get("source").and_then(|v| v.as_str()).unwrap_or("");
+        println!("  {:>2}. [{}] {}", i + 1, source, text);
+    }
+}
+
+/// `tracemind digest` — Product Plan X20 weekly retention digest.
+///
+/// Renders the same shape as the `memory_digest_weekly` MCP verb, then
+/// optionally persists it (+ per-contradiction reconcile markers) to
+/// `~/.tracemind/notifications/`.
+fn cmd_digest(dir: &PathBuf, persist: bool, recent_days: i64, json: bool) {
+    let db_path = dir.join("memory.db");
+    let intents_path = dir.join("intents.db");
+
+    let graph = match tm_graph::GraphStore::open(db_path.to_str().unwrap_or_default()) {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("could not open graph: {e}");
+            return;
+        }
+    };
+
+    let signals = graph.unconsolidated_signals(1000).unwrap_or_default();
+    let cutoff = chrono::Utc::now() - chrono::Duration::days(recent_days);
+    let mut by_source: std::collections::BTreeMap<String, usize> =
+        std::collections::BTreeMap::new();
+    for s in signals.iter().filter(|s| s.created_at >= cutoff) {
+        *by_source.entry(s.source.clone()).or_default() += 1;
+    }
+    let total_captures: usize = by_source.values().sum();
+
+    let contradictions_open = graph
+        .contradictions()
+        .into_iter()
+        .filter(|c| c.resolution.is_none())
+        .count();
+
+    let due_soon = if let Ok(store) = tm_intent::IntentStore::open(intents_path.to_str().unwrap_or_default()) {
+        let now = chrono::Utc::now();
+        let cutoff = now + chrono::Duration::hours(24 * recent_days);
+        store.list_open(500).ok().map(|rows| {
+            rows.into_iter()
+                .filter(|c| c.horizon.map(|h| h <= cutoff).unwrap_or(false))
+                .count()
+        }).unwrap_or(0)
+    } else {
+        0
+    };
+
+    let iso_week = chrono::Utc::now().format("%GW%V").to_string();
+    let digest = serde_json::json!({
+        "iso_week":              iso_week,
+        "generated_at":          chrono::Utc::now().to_rfc3339(),
+        "recent_days":           recent_days,
+        "total_captures":        total_captures,
+        "captures_by_source":    by_source,
+        "contradictions_open":   contradictions_open,
+        "commitments_due_soon":  due_soon,
+    });
+
+    let mut written_to: Option<String> = None;
+    if persist {
+        let notif_dir = dir.join("notifications");
+        if let Err(e) = std::fs::create_dir_all(&notif_dir) {
+            eprintln!("could not create notifications dir: {e}");
+            return;
+        }
+        let path = notif_dir.join(format!("digest-{iso_week}.json"));
+        let body = serde_json::to_string_pretty(&digest).unwrap_or_default();
+        if let Err(e) = std::fs::write(&path, body) {
+            eprintln!("could not write digest: {e}");
+            return;
+        }
+        written_to = Some(path.display().to_string());
+
+        for c in graph
+            .contradictions()
+            .into_iter()
+            .filter(|c| c.resolution.is_none())
+        {
+            let marker = notif_dir.join(format!("reconcile-{}.json", c.id));
+            if !marker.exists() {
+                let body = serde_json::json!({
+                    "contradiction_id": c.id,
+                    "triple_a":         c.triple_a,
+                    "triple_b":         c.triple_b,
+                    "detected_at":      c.detected_at,
+                });
+                let _ = std::fs::write(&marker, body.to_string());
+            }
+        }
+    }
+
+    if json {
+        let out = serde_json::json!({
+            "digest":     digest,
+            "persist":    persist,
+            "written_to": written_to,
+        });
+        println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
+        return;
+    }
+
+    println!("TraceMind weekly digest ({iso_week})");
+    println!("  survey window: last {recent_days} days");
+    println!("  total captures: {total_captures}");
+    for (src, n) in &by_source {
+        println!("    {:30} {}", src, n);
+    }
+    println!("  unresolved contradictions: {contradictions_open}");
+    println!("  commitments due in window: {due_soon}");
+    if let Some(p) = written_to {
+        println!("  digest persisted: {p}");
+    } else if persist {
+        println!("  digest persist requested but nothing written");
     }
 }
 

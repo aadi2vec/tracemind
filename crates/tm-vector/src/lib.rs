@@ -4,9 +4,11 @@ pub mod space;
 pub mod composed_index;
 pub mod lexical;
 pub mod matryoshka;
+pub mod propagate_delete_impl;
 
 pub use embed::{Embedder, EmbedModel};
 pub use lexical::{tokenize, Bm25Index};
+pub use propagate_delete_impl::{VectorStore, MEMORY_DB_FILE};
 pub use bge_m3::BgeM3DenseModel;
 pub use space::{
     Space, MemoryMeta, TextSpace, RecencySpace, ConfidenceSpace,

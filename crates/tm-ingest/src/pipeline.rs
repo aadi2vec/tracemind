@@ -1,7 +1,7 @@
 use seahash;
 use uuid::Uuid;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use tm_types::{Entity, EntityType, MemoryOp, Predicate, Result, Trace, TraceEventType, Triple};
 use tm_graph::{context::ActiveContext, CapturedSignal, GraphStore};
@@ -9,6 +9,7 @@ use tm_vector::{Embedder, EmbedModel};
 use tm_governance::GovernanceFilter;
 
 use crate::extractor::{EntityExtractor, HeuristicExtractor};
+use crate::multimodal::{AttachmentRow, AttachmentStore, ModalityRouter, MultimodalPayload};
 use crate::rate_limit::RateLimiter;
 use crate::tags::tags_for_memory;
 
@@ -28,6 +29,11 @@ pub struct IngestPipeline {
     /// indexing angle; failure must not break ingest). The fast path
     /// calls [`tm_cluster::Clusterer::assign`] after embed.
     clusterer: Option<tm_cluster::Clusterer>,
+    /// X1 — multimodal preprocessor + blob storage rooted at the same
+    /// data directory as `memory.db`. `None` when the pipeline was
+    /// opened against `:memory:` (unit tests). `ingest_multimodal`
+    /// requires it and returns an error if absent.
+    router: Option<ModalityRouter>,
 }
 
 #[derive(Debug)]
@@ -150,6 +156,32 @@ impl IngestPipeline {
             }
         };
 
+        // X1 — install attachments schema + open blob root when we have a
+        // real on-disk data directory. `:memory:` skips both so unit tests
+        // don't create stray blob directories.
+        let router = if db_path == ":memory:" {
+            None
+        } else if let Some(parent) = Path::new(db_path).parent() {
+            let data_dir: PathBuf = if parent.as_os_str().is_empty() {
+                PathBuf::from(".")
+            } else {
+                parent.to_path_buf()
+            };
+            match AttachmentStore::init_schema(graph.connection()) {
+                Ok(_) => {}
+                Err(e) => tracing::warn!("[ingest] attachments schema: {e}"),
+            }
+            match ModalityRouter::open(&data_dir) {
+                Ok(r) => Some(r),
+                Err(e) => {
+                    tracing::warn!("[ingest] blob store open failed: {e}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         Ok(Self {
             graph,
             embedder,
@@ -157,7 +189,103 @@ impl IngestPipeline {
             extractor: Box::new(HeuristicExtractor),
             rate_limiter: RateLimiter::from_env(),
             clusterer,
+            router,
         })
+    }
+
+    /// X1 — install a router explicitly (used by tests / callers that
+    /// bring their own blob root). Also installs the attachments schema
+    /// on the graph connection if it's not there yet.
+    pub fn with_router(mut self, router: ModalityRouter) -> Self {
+        let _ = AttachmentStore::init_schema(self.graph.connection());
+        self.router = Some(router);
+        self
+    }
+
+    /// Route `payload` through its modality preprocessor, persist the blob
+    /// (if any), write an attachments row, and run the canonical text
+    /// through `ingest_fast`. Returns the same shape as `ingest_fast` for
+    /// callers that don't need the attachment id.
+    ///
+    /// Errors out if the pipeline was opened against `:memory:` (no data
+    /// directory to root blobs at).
+    ///
+    /// **PII-first ordering** — the canonical text is preflighted through
+    /// `governance.check` *before* the blob is persisted. Without that,
+    /// a payload rejected by PII detection would leave orphaned bytes in
+    /// `~/.tracemind/blobs/` with no attachment row to find them by
+    /// (a compliance leak — the user has no way to `tracemind forget`
+    /// content they were never told was captured).
+    pub fn ingest_multimodal(
+        &self,
+        payload: &MultimodalPayload,
+        session_id: Uuid,
+    ) -> Result<FastIngestResult> {
+        let router = self.router.as_ref().ok_or_else(|| {
+            tm_types::TraceMindError::Storage(
+                "ingest_multimodal requires an on-disk data directory (opened :memory:?)"
+                    .to_string(),
+            )
+        })?;
+
+        // Preflight the canonical text through governance BEFORE we
+        // route (which persists the blob). This is a light double-check
+        // — `ingest_fast` will run governance again — but it prevents
+        // the compliance leak described above. Caller-supplied text is
+        // available on the payload for non-text modalities that need
+        // extraction; when neither is present, the preprocessor's stub
+        // ("[[PDF …: N bytes]]") is inherently PII-free so the check
+        // passes trivially and the blob is stored for later re-ingest.
+        if let Some(caller_text) = payload.text.as_deref() {
+            self.governance.check(caller_text, 1.0)?;
+        }
+
+        let pre = router.route(payload)?;
+        // Second gate: the preprocessor may derive text (`WebPreprocessor`
+        // strips HTML → visible text) that the caller never inspected.
+        // Rerun governance on the *derived* canonical text and roll
+        // back the just-written blob if it fails — same compliance
+        // rationale as above.
+        if let Err(e) = self.governance.check(&pre.canonical_text, 1.0) {
+            if let Some(sha) = pre.blob_sha256.as_deref() {
+                if let Some(path) = router.blobs().path_for(sha) {
+                    let _ = std::fs::remove_file(&path);
+                }
+            }
+            return Err(e);
+        }
+        let fast = self.ingest_fast(&pre.canonical_text, &payload.source, session_id)?;
+
+        // Persist the attachment row keyed by the fast-path content_hash,
+        // so callers can look attachments up via the memory they ingest.
+        if pre.blob_sha256.is_some() || matches!(payload.kind, crate::multimodal::Modality::Calendar) {
+            let row = AttachmentRow {
+                id: Uuid::new_v4(),
+                memory_content_hash: fast.content_hash.clone(),
+                modality: payload.kind,
+                sha256: pre.blob_sha256.clone().unwrap_or_default(),
+                mime: pre.mime.clone(),
+                bytes_len: pre.bytes_len as i64,
+                extracted_text_ref: if pre.used_caller_text {
+                    Some("caller-supplied".to_string())
+                } else {
+                    None
+                },
+                source: payload.source.clone(),
+                uri: payload.uri.clone(),
+                created_at: payload.ts,
+            };
+            if let Err(e) = AttachmentStore::insert(self.graph.connection(), &row) {
+                tracing::debug!("[ingest_multimodal] attachment insert failed: {e}");
+            }
+        }
+        Ok(fast)
+    }
+
+    /// Borrow the blob store (read side) — used by MCP verbs that surface
+    /// attachment previews / raw bytes.
+    pub fn blob_store(&self) -> Option<&crate::multimodal::BlobStore> {
+        self.router.as_ref().map(|r| r.blobs())
     }
 
     /// Borrow the clusterer (if available). Used by the WME L1 topic
@@ -1042,6 +1170,12 @@ pub fn entity_fingerprint(name: &str) -> String {
     s
 }
 
+/// Public re-export for cross-module regression tests.
+#[cfg(test)]
+pub(crate) fn names_look_like_same_entity_public(a: &str, b: &str) -> bool {
+    names_look_like_same_entity(a, b)
+}
+
 fn names_look_like_same_entity(a: &str, b: &str) -> bool {
     let al = a.trim().to_lowercase();
     let bl = b.trim().to_lowercase();
@@ -1050,6 +1184,18 @@ fn names_look_like_same_entity(a: &str, b: &str) -> bool {
     }
     if al == bl {
         return true;
+    }
+    // A URL and its host are intentionally distinct graph nodes
+    // (extract_entities emits both as of 2026-07-25). The substring
+    // heuristic below would otherwise collapse `apnews.com` into
+    // `https://apnews.com/…` because the host is a substring of the
+    // URL — losing the Organization entity and duplicating the URL.
+    // Any pair where exactly one side is URL-shaped is NOT the same
+    // entity, regardless of substring overlap.
+    let a_is_url = is_url(&al) || is_url(a);
+    let b_is_url = is_url(&bl) || is_url(b);
+    if a_is_url != b_is_url {
+        return false;
     }
     // Sub-string match only counts if the shorter one is at least 4 chars —
     // otherwise "I" / "US" style short names would swallow everything.
@@ -1153,6 +1299,18 @@ const SKIP_WORDS: &[&str] = &[
     // fallback was promoting to entities.
     "terms", "plus", "matched", "single", "fancy", "sounds", "ideas",
     "amounts", "total", "natively", "ranked", "ordered",
+    // Browser-history quality pass (2026-07-25): common page titles /
+    // navigation nouns that the Person heuristic was misclassifying
+    // ("Tickets" → Person from "FIFA World Cup Tickets"; "Visit" →
+    // Person from "Visit https://…"). These are English nouns/verbs
+    // that live on approximately every marketing page; letting them
+    // through pollutes the people facets on browsing capture.
+    "tickets", "ticket", "visit", "visited", "visits", "home", "about",
+    "contact", "login", "log", "signin", "sign", "buy", "shop", "cart",
+    "search", "menu", "page", "news", "blog", "post", "posts",
+    "product", "products", "service", "services", "support", "help",
+    "download", "downloads", "subscribe", "unsubscribe", "settings",
+    "profile", "account", "dashboard", "welcome", "official", "world",
 ];
 
 /// Classic two-row Levenshtein edit distance (stdlib only).
@@ -1296,7 +1454,22 @@ pub(crate) fn extract_entities(text: &str) -> Vec<Entity> {
     let mut seen_names: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut entities: Vec<Entity> = Vec::new();
 
-    let words: Vec<&str> = text.split_whitespace().collect();
+    // Build the flat word list, but remember which flat indices begin a new
+    // line. Title-Case runs must not cross a line break: a markdown heading
+    // like "# Standup" followed by a body line starting "Jane owns ..." must
+    // not merge into a single "Standup Jane" Person entity.
+    let mut words: Vec<&str> = Vec::new();
+    let mut line_start: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    for line in text.lines() {
+        let mut first = true;
+        for w in line.split_whitespace() {
+            if first {
+                line_start.insert(words.len());
+                first = false;
+            }
+            words.push(w);
+        }
+    }
 
     // --- Pass 1: multi-word entities (scan for consecutive Title Case runs) ---
     let mut i = 0;
@@ -1309,6 +1482,23 @@ pub(crate) fn extract_entities(text: &str) -> Vec<Entity> {
                 let etype = if is_url(token) { EntityType::Url } else { EntityType::File };
                 seen_names.insert(token.to_string());
                 entities.push(Entity::new(token, etype, 0.8));
+
+                // Browser-history quality: alongside the raw URL, emit its
+                // registrable domain as an Organization. Without this a
+                // capture of `https://www.fifa.com/tickets` only lands one
+                // entity ("https://www.fifa.com/tickets") — a query for
+                // "FIFA" can't hit the graph edge on the entity name
+                // (BGE-embedding still recalls the URL, but the graph link
+                // is missing). Emitting `fifa.com` as an Org means the
+                // *site's organization* becomes a first-class node.
+                if is_url(token) {
+                    if let Some(host) = extract_registrable_domain(token) {
+                        if !seen_names.contains(&host) {
+                            seen_names.insert(host.clone());
+                            entities.push(Entity::new(&host, EntityType::Organization, 0.7));
+                        }
+                    }
+                }
             }
             i += 1;
             continue;
@@ -1319,6 +1509,11 @@ pub(crate) fn extract_entities(text: &str) -> Vec<Entity> {
             let start = i;
             let mut end = i + 1;
             while end < words.len() {
+                // A Title-Case run must not cross a line break (see comment
+                // above where `line_start` is built).
+                if line_start.contains(&end) {
+                    break;
+                }
                 // Bug-fix 2026-05-11: trailing punctuation on the previous raw
                 // word (comma, semicolon, period) signals a list / clause
                 // boundary — don't merge "Alice, Bob" into "Alice Bob".
@@ -1389,6 +1584,41 @@ fn is_url(token: &str) -> bool {
     token.starts_with("http://") || token.starts_with("https://") || token.starts_with("www.")
 }
 
+/// Public wrapper around `is_url` for sibling modules (`gliner`) that
+/// need the same URL detection as the heuristic extractor. Same
+/// prefixes; same behaviour.
+pub(crate) fn is_url_public(token: &str) -> bool {
+    is_url(token)
+}
+
+/// Best-effort registrable domain from a URL token. Strips scheme,
+/// then any `www.` prefix, then the path. Returns lowercase
+/// `host.tld` (or `sub.host.tld` when the host has more than two
+/// labels). Returns `None` when the input isn't shaped like a URL
+/// or the host has no `.`. Deliberately does NOT consult the Public
+/// Suffix List — pulling that in for one heuristic isn't worth the
+/// dep — so `.co.uk` will surface as `example.co.uk`, which is still
+/// the right graph node (matches user intuition of "the site").
+pub(crate) fn extract_registrable_domain(url: &str) -> Option<String> {
+    let after_scheme = url
+        .strip_prefix("http://")
+        .or_else(|| url.strip_prefix("https://"))
+        .unwrap_or(url);
+    let no_www = after_scheme.strip_prefix("www.").unwrap_or(after_scheme);
+    let host_end = no_www
+        .find(|c: char| c == '/' || c == '?' || c == '#' || c == ':')
+        .unwrap_or(no_www.len());
+    let host = &no_www[..host_end];
+    if host.is_empty() || !host.contains('.') {
+        return None;
+    }
+    // Guard against absurd hosts / IPs; keep it a plain domain.
+    if host.chars().any(|c| c.is_whitespace()) {
+        return None;
+    }
+    Some(host.to_ascii_lowercase())
+}
+
 fn is_file(token: &str) -> bool {
     for ext in FILE_EXTENSIONS {
         if token.ends_with(ext) {
@@ -1442,6 +1672,13 @@ pub fn classify_multi_word(name: &str) -> EntityType {
 
 /// Return the `EntityType` for a single `token`, or `None` if it should be skipped.
 pub fn classify_token(token: &str) -> Option<EntityType> {
+    // 0. Bare numbers (years, versions, page counts) — noise, not entities.
+    //    Pre-fix, "2026" from "FIFA World Cup 2026 Tickets" got promoted to
+    //    Concept via the length-≥4 fallback, cluttering every browsing capture.
+    if !token.is_empty() && token.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+
     // 1. URL
     if is_url(token) {
         return Some(EntityType::Url);
@@ -1824,6 +2061,10 @@ mod tests {
             // Cluster substrate is optional and skipped in unit tests
             // (it requires a real on-disk SQLite path).
             clusterer: None,
+            // Multimodal router is skipped in unit tests (no on-disk
+            // data dir to root blobs at). Tests that need multimodal
+            // ingest install it explicitly via `with_router`.
+            router: None,
         }
     }
 
@@ -1952,6 +2193,23 @@ mod tests {
         let acme = entities.iter().find(|e| e.name.contains("Acme"));
         assert!(acme.is_some(), "expected Acme Corp entity; got: {:?}", names);
         assert_eq!(acme.unwrap().entity_type, EntityType::Organization);
+    }
+
+    #[test]
+    fn test_title_case_run_does_not_cross_newline() {
+        // Regression: a markdown heading must not merge with the first
+        // Title-Case word of the next line ("# Standup\n\nJane owns ...").
+        let text = "# Standup\n\nJane owns the pricing rollout.";
+        let entities = extract_entities(text);
+        let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
+        assert!(
+            !names.iter().any(|n| n.contains("Standup") && n.contains("Jane")),
+            "heading word must not merge with body name; got: {:?}", names
+        );
+        assert!(
+            names.iter().any(|n| *n == "Jane"),
+            "expected standalone 'Jane' entity; got: {:?}", names
+        );
     }
 
     #[test]
@@ -2426,5 +2684,138 @@ mod tests {
         let a = vec![1.0f32, 0.0];
         let b = vec![0.0f32, 1.0];
         assert!(cosine_sim(&a, &b).abs() < 1e-6);
+    }
+
+    // ---- X1: ingest_multimodal end-to-end -------------------------------
+
+    fn on_disk_pipeline() -> (tempfile::TempDir, IngestPipeline) {
+        let td = tempfile::TempDir::new().unwrap();
+        let db_path = td.path().join("memory.db");
+        let mut p = IngestPipeline::open(db_path.to_str().unwrap(), true).unwrap();
+        p = p.with_rate_limiter(RateLimiter::unlimited());
+        (td, p)
+    }
+
+    #[test]
+    fn ingest_multimodal_requires_on_disk_dir() {
+        let p = in_memory_pipeline();
+        let payload = crate::multimodal::MultimodalPayload::text(
+            "some content about rust and memory",
+            "test",
+        );
+        let err = p.ingest_multimodal(&payload, Uuid::new_v4()).unwrap_err();
+        assert!(format!("{err:?}").contains("on-disk"));
+    }
+
+    #[test]
+    fn ingest_multimodal_web_persists_attachment() {
+        let (_td, p) = on_disk_pipeline();
+        let html = "<html><body><h1>Rust</h1><p>The Rust language enables safety.</p></body></html>";
+        let payload = crate::multimodal::MultimodalPayload::web(
+            "https://example.com/rust",
+            html,
+            "safari-tab",
+        );
+        let session = Uuid::new_v4();
+        let out = p.ingest_multimodal(&payload, session).unwrap();
+        assert!(out.skipped.is_none(), "web ingest should not be skipped: {out:?}");
+
+        let attachments = crate::multimodal::AttachmentStore::for_memory(
+            p.graph.connection(),
+            &out.content_hash,
+        )
+        .unwrap();
+        assert_eq!(attachments.len(), 1);
+        assert_eq!(attachments[0].modality, crate::multimodal::Modality::Web);
+        assert_eq!(attachments[0].uri.as_deref(), Some("https://example.com/rust"));
+        assert_eq!(attachments[0].bytes_len as usize, html.len());
+        // Blob file must actually exist on disk.
+        let bs = p.blob_store().unwrap();
+        assert!(bs.exists(&attachments[0].sha256));
+    }
+
+    #[test]
+    fn ingest_multimodal_rejects_pii_before_writing_blob() {
+        // Compliance regression: pre-fix, a PII-bearing PDF payload
+        // wrote bytes to `~/.tracemind/blobs/` and only then hit the
+        // governance check inside `ingest_fast`. The rejected payload
+        // left an orphan blob on disk with no attachment row — the
+        // user could not `tracemind forget` content they were never
+        // told was captured.
+        let (_td, p) = on_disk_pipeline();
+        let mut payload = crate::multimodal::MultimodalPayload::pdf(
+            b"%PDF-1.4 body".to_vec(),
+            "downloads",
+        );
+        // A caller-supplied text with an email address — governance
+        // MUST refuse.
+        payload.text = Some("Please reach me at alice@example.com".into());
+        let session = Uuid::new_v4();
+        let err = p.ingest_multimodal(&payload, session);
+        assert!(err.is_err(), "PII payload must be rejected");
+
+        // Blob root must have zero blobs written for this payload.
+        let bs = p.blob_store().unwrap();
+        let sha = crate::multimodal::BlobStore::sha256(b"%PDF-1.4 body");
+        assert!(!bs.exists(&sha), "blob must not exist after PII rejection");
+
+        // And no attachment row was persisted.
+        let attachments = crate::multimodal::AttachmentStore::recent(
+            p.graph.connection(),
+            100,
+        )
+        .unwrap();
+        assert!(
+            attachments.is_empty(),
+            "no attachment row should be written for rejected payload"
+        );
+    }
+
+    #[test]
+    fn ingest_multimodal_rejects_pii_derived_by_preprocessor() {
+        // Second layer: caller supplied no `text`, but the preprocessor
+        // (`WebPreprocessor::strip_html`) derives visible text from
+        // the HTML body. That derived text also goes through
+        // governance; if it contains PII, the just-written blob must
+        // be rolled back.
+        let (_td, p) = on_disk_pipeline();
+        let html = "<html><body><p>Contact ops@example.com for details</p></body></html>";
+        let payload = crate::multimodal::MultimodalPayload::web(
+            "https://ex.com/x",
+            html,
+            "safari",
+        );
+        let session = Uuid::new_v4();
+        let err = p.ingest_multimodal(&payload, session);
+        assert!(err.is_err(), "derived-PII payload must be rejected");
+
+        let bs = p.blob_store().unwrap();
+        let sha = crate::multimodal::BlobStore::sha256(html.as_bytes());
+        assert!(!bs.exists(&sha), "derived-PII blob must be rolled back");
+    }
+
+    #[test]
+    fn ingest_multimodal_pdf_with_caller_text() {
+        let (_td, p) = on_disk_pipeline();
+        let mut payload = crate::multimodal::MultimodalPayload::pdf(
+            b"%PDF-1.4 header bytes here".to_vec(),
+            "downloads",
+        );
+        payload.text = Some(
+            "Contract v2 signed by Alice on March 4. Renewal in 12 months."
+                .to_string(),
+        );
+        payload.hint = Some("contract-v2.pdf".into());
+        let session = Uuid::new_v4();
+        let out = p.ingest_multimodal(&payload, session).unwrap();
+        assert!(out.skipped.is_none());
+        let attachments = crate::multimodal::AttachmentStore::for_memory(
+            p.graph.connection(),
+            &out.content_hash,
+        )
+        .unwrap();
+        assert_eq!(attachments.len(), 1);
+        assert_eq!(attachments[0].modality, crate::multimodal::Modality::Pdf);
+        assert_eq!(attachments[0].extracted_text_ref.as_deref(), Some("caller-supplied"));
     }
 }

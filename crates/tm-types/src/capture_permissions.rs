@@ -49,6 +49,15 @@ pub enum CaptureSource {
     Browser,
     Audio,
     Calendar,
+    /// PDFs dropped into a watched folder (default `~/Downloads`). Text
+    /// is extracted on-device; the raw file never leaves the machine.
+    Pdf,
+    /// Email captured from a watched `.eml` drop folder (X15). High
+    /// sensitivity — off by default.
+    Email,
+    /// Photo library EXIF (X18) — filename, capture time, GPS. High
+    /// sensitivity — off by default.
+    Photo,
 }
 
 impl CaptureSource {
@@ -63,6 +72,9 @@ impl CaptureSource {
             CaptureSource::Browser => "browser",
             CaptureSource::Audio => "audio",
             CaptureSource::Calendar => "calendar",
+            CaptureSource::Pdf => "pdf",
+            CaptureSource::Email => "email",
+            CaptureSource::Photo => "photo",
         }
     }
 
@@ -77,6 +89,9 @@ impl CaptureSource {
             "browser" | "web" => Some(CaptureSource::Browser),
             "audio" | "mic" => Some(CaptureSource::Audio),
             "calendar" | "cal" => Some(CaptureSource::Calendar),
+            "pdf" | "document" | "doc" => Some(CaptureSource::Pdf),
+            "email" | "mail" => Some(CaptureSource::Email),
+            "photo" | "photos" | "photolibrary" => Some(CaptureSource::Photo),
             _ => None,
         }
     }
@@ -84,7 +99,7 @@ impl CaptureSource {
     /// All known sources, in the order the CLI prints them. Stable
     /// order means `tracemind capture list` output is diffable
     /// between runs.
-    pub fn all() -> [CaptureSource; 7] {
+    pub fn all() -> [CaptureSource; 10] {
         [
             CaptureSource::Clipboard,
             CaptureSource::Shell,
@@ -93,6 +108,9 @@ impl CaptureSource {
             CaptureSource::Browser,
             CaptureSource::Audio,
             CaptureSource::Calendar,
+            CaptureSource::Pdf,
+            CaptureSource::Email,
+            CaptureSource::Photo,
         ]
     }
 
@@ -120,6 +138,9 @@ impl CaptureSource {
             CaptureSource::Browser => "browser bookmarklet / extension (page url, title, selection)",
             CaptureSource::Audio => "microphone via opt-in hotkey (Whisper-tiny, on-device)",
             CaptureSource::Calendar => "macOS EventKit / Google Calendar (read-only, oauth)",
+            CaptureSource::Pdf => "PDFs in a watched folder (~/Downloads; text extracted on-device)",
+            CaptureSource::Email => "email from a watched .eml drop folder (subject + body, stays local)",
+            CaptureSource::Photo => "photo library EXIF (filename, capture time, GPS; image stays local)",
         }
     }
 }

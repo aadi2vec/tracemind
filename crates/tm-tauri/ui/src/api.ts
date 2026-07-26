@@ -1,4 +1,4 @@
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "./_invoke";
 
 // Types matching Rust IPC responses
 
@@ -62,6 +62,8 @@ export interface QueryResponse {
 export interface TraceInfo {
   id: string;
   event_type: string;
+  /** Ambient capture origin ("notes" | "safari" | "calendar" | "email" | …), null for manual. */
+  source?: string | null;
   raw_text: string;
   entities_count: number;
   triples_count: number;
@@ -1470,4 +1472,90 @@ export async function commitmentCreate(
   return invoke("cmd_commitment_create", {
     req: { text, due_at: dueAt ?? null },
   });
+}
+
+// ─── I5/I7 — Ingestion Review view ──────────────────────────────────────
+// docs/INGESTION_EXPERIENCE_PLAN-2026-07-22.md §3.3
+
+export interface ReceiptRow {
+  capture_id: string;
+  at: string;
+  source: string;
+  app_context: string | null;
+  modality: string;
+  size_bytes: number;
+  user_intent: string | null;
+  why_captured: string;
+  discarded: boolean;
+}
+
+export interface RefineResult {
+  new_trace_id: string;
+  entities_extracted: number;
+  refined_from: string;
+}
+
+export async function ingestionReviewRecent(
+  limit?: number,
+  includeDiscarded?: boolean,
+): Promise<ReceiptRow[]> {
+  return invoke("cmd_ingestion_review_recent", {
+    limit: limit ?? null,
+    includeDiscarded: includeDiscarded ?? null,
+  });
+}
+
+export async function ingestionDiscard(
+  captureId: string,
+  reason?: string,
+): Promise<void> {
+  return invoke("cmd_ingestion_discard", {
+    captureId,
+    reason: reason ?? null,
+  });
+}
+
+export async function ingestionRefine(
+  captureId: string,
+  newText: string,
+): Promise<RefineResult> {
+  return invoke("cmd_ingestion_refine", { captureId, newText });
+}
+
+// ─── I6/I9 — three-mode selector ────────────────────────────────────────
+
+export interface SessionRow {
+  id: string;
+  mode: string;
+  name: string;
+  started_at: string;
+  duration_secs: number;
+  ended_at: string | null;
+}
+
+export interface ModeStatus {
+  mode: string;
+  session: SessionRow | null;
+}
+
+export async function modeCurrent(): Promise<ModeStatus> {
+  return invoke("cmd_mode_current");
+}
+
+export async function modeEnterFocus(
+  intent: string,
+  durationSecs?: number,
+): Promise<ModeStatus> {
+  return invoke("cmd_mode_enter_focus", {
+    intent,
+    durationSecs: durationSecs ?? null,
+  });
+}
+
+export async function modeEnterPrivate(durationSecs?: number): Promise<ModeStatus> {
+  return invoke("cmd_mode_enter_private", { durationSecs: durationSecs ?? null });
+}
+
+export async function modeEnd(): Promise<ModeStatus> {
+  return invoke("cmd_mode_end");
 }

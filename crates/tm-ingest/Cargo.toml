@@ -8,6 +8,10 @@ tm-types = { workspace = true }
 tm-graph = { workspace = true }
 tm-vector = { workspace = true }  # for Embedder only
 tm-governance = { workspace = true }
+# I-P1 Propagator: coordinates PropagateDelete across derived-data crates.
+tm-episodic = { workspace = true }
+tm-reflect = { workspace = true }
+tm-controller = { workspace = true }
 # CLU-4 — hot-path hook into the HDBSCAN substrate. Failure to open the
 # clusterer is non-fatal (Option<Clusterer> at runtime), but the dep is
 # always linked so the assign call stays a single inline branch.
@@ -19,6 +23,11 @@ chrono = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 seahash = { workspace = true }
+rusqlite = { workspace = true }
+# X1 — blob content addressing for multimodal payloads. sha2 is pure Rust,
+# small (~40 KB), and already indirectly pulled by hf-hub — this makes the
+# dep explicit rather than transitive.
+sha2 = "0.10"
 
 # TM-NLP-004 — real GLiNER inference.
 # Mandatory (no feature flag): ort is already transitively present via tm-rerank.
