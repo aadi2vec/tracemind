@@ -136,6 +136,15 @@ run "$BIN quick-recall 'reflective prompt' --top-k 3"
 read_beat
 
 # ------------------------------------------------------------------
+# 4b. Context brief — zero-copy transfer to any LLM window.
+# ------------------------------------------------------------------
+shot "Context for any LLM (composition wedge)" \
+     "One keystroke bindable in Claude Code / Cursor / Goose / Windsurf — a token-budgeted, cited brief for whatever topic you're about to ask about. Same primitive on the MCP verb (memory_context_for). Runs on the local graph, no network."
+
+run "$BIN context-for 'fifa world cup tickets' --budget-tokens 400"
+read_beat
+
+# ------------------------------------------------------------------
 # 5. Weekly retention digest.
 # ------------------------------------------------------------------
 shot "Weekly retention digest" \

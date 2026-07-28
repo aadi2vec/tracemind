@@ -4312,6 +4312,292 @@ fn cmd_capture_doctor(json: bool, ocr_target: Option<std::path::PathBuf>) {
     }
 }
 
+/// `tracemind context-for` — CLI mirror of the `memory_context_for`
+/// MCP verb. Zero-copy context transfer to the active LLM window:
+/// assemble a token-budgeted, cited brief on `topic` (entities,
+/// recent captures, open commitments, unresolved contradictions) and
+/// print it. Pipe it into any chat. Same section order and `[i]`
+/// citation scheme as the MCP handler.
+fn cmd_context_for(
+    dir: &PathBuf,
+    topic: String,
+    budget_tokens: usize,
+    json: bool,
+    hash_embed: bool,
+) {
+    let db_path = dir.join("memory.db").to_str().unwrap().to_string();
+    let trace_path = dir.join("traces.jsonl").to_str().unwrap().to_string();
+    let intents_path = dir.join("intents.db").to_str().unwrap().to_string();
+
+    let mut engine = match RetrievalEngine::open(&db_path, &trace_path, hash_embed) {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("could not open retrieval engine: {e}");
+            return;
+        }
+    };
+    let _ = engine.refresh_graph();
+    let result = match engine.query(&topic) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("query failed: {e}");
+            return;
+        }
+    };
+
+    let graph = match GraphStore::open(&db_path) {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("could not open graph: {e}");
+            return;
+        }
+    };
+
+    let recent_signals: Vec<_> = graph
+        .unconsolidated_signals(50)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|s| context_topic_matches(&s.raw_text, &topic))
+        .collect();
+
+    let open_commitments: Vec<tm_intent::Commitment> =
+        tm_intent::IntentStore::open(&intents_path)
+            .and_then(|s| s.list_open(200))
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|c| context_topic_matches(&c.statement, &topic))
+            .collect();
+
+    let contradictions: Vec<_> = graph
+        .contradictions()
+        .into_iter()
+        .filter(|c| c.resolution.is_none())
+        .filter_map(|c| {
+            let a = graph.triple_detail(c.triple_a).ok().flatten()?;
+            let b = graph.triple_detail(c.triple_b).ok().flatten()?;
+            let hay = format!(
+                "{} {} {} {} {} {}",
+                a.subject_name,
+                a.predicate,
+                a.object_name,
+                b.subject_name,
+                b.predicate,
+                b.object_name
+            );
+            if context_topic_matches(&hay, &topic) {
+                Some((c, a, b))
+            } else {
+                None
+            }
+        })
+        .take(5)
+        .collect();
+
+    let mut brief = String::new();
+    let mut citations: Vec<String> = Vec::new();
+    let mut entity_rows: Vec<serde_json::Value> = Vec::new();
+    let mut signal_rows: Vec<serde_json::Value> = Vec::new();
+    let mut commitment_rows: Vec<serde_json::Value> = Vec::new();
+    let mut contradiction_rows: Vec<serde_json::Value> = Vec::new();
+
+    brief.push_str(&format!("Topic: {topic}\n"));
+    let mut truncated = false;
+
+    if !result.entities.is_empty() {
+        let hdr = "\nWhat we know:\n";
+        if context_approx_tokens(&brief) + context_approx_tokens(hdr) < budget_tokens {
+            brief.push_str(hdr);
+        }
+        for e in result.entities.iter().take(20) {
+            let cid = format!("entity:{}", e.id);
+            let line = format!(
+                "- [{i}] {name} ({kind})\n",
+                i = citations.len() + 1,
+                name = e.name,
+                kind = format!("{:?}", e.entity_type).to_lowercase(),
+            );
+            if context_approx_tokens(&brief) + context_approx_tokens(&line) > budget_tokens {
+                truncated = true;
+                break;
+            }
+            brief.push_str(&line);
+            citations.push(cid.clone());
+            entity_rows.push(serde_json::json!({
+                "citation":   format!("[{}]", citations.len()),
+                "id":         e.id.to_string(),
+                "name":       e.name,
+                "type":       format!("{:?}", e.entity_type).to_lowercase(),
+                "confidence": e.confidence,
+                "ref":        cid,
+            }));
+        }
+    }
+
+    if !truncated && !recent_signals.is_empty() {
+        let hdr = "\nRecent activity:\n";
+        if context_approx_tokens(&brief) + context_approx_tokens(hdr) < budget_tokens {
+            brief.push_str(hdr);
+        }
+        for s in recent_signals.iter().take(10) {
+            let cid = format!("signal:{}", s.id);
+            let preview: String = s.raw_text.chars().take(160).collect();
+            let line = format!(
+                "- [{i}] {preview} ({src}, {ts})\n",
+                i = citations.len() + 1,
+                preview = preview,
+                src = s.source,
+                ts = s.created_at.format("%Y-%m-%d"),
+            );
+            if context_approx_tokens(&brief) + context_approx_tokens(&line) > budget_tokens {
+                truncated = true;
+                break;
+            }
+            brief.push_str(&line);
+            citations.push(cid.clone());
+            signal_rows.push(serde_json::json!({
+                "citation":   format!("[{}]", citations.len()),
+                "signal_id":  s.id,
+                "text":       preview,
+                "source":     s.source,
+                "created_at": s.created_at.to_rfc3339(),
+                "ref":        cid,
+            }));
+        }
+    }
+
+    if !truncated && !open_commitments.is_empty() {
+        let hdr = "\nOpen commitments:\n";
+        if context_approx_tokens(&brief) + context_approx_tokens(hdr) < budget_tokens {
+            brief.push_str(hdr);
+        }
+        for c in open_commitments.iter().take(10) {
+            let cid = format!("commitment:{}", c.id);
+            let horizon = c
+                .horizon
+                .map(|h| format!(", due {}", h.format("%Y-%m-%d")))
+                .unwrap_or_default();
+            let line = format!(
+                "- [{i}] {stmt} ({kind:?}{horizon})\n",
+                i = citations.len() + 1,
+                stmt = c.statement,
+                kind = c.kind,
+                horizon = horizon,
+            );
+            if context_approx_tokens(&brief) + context_approx_tokens(&line) > budget_tokens {
+                truncated = true;
+                break;
+            }
+            brief.push_str(&line);
+            citations.push(cid.clone());
+            commitment_rows.push(serde_json::json!({
+                "citation":  format!("[{}]", citations.len()),
+                "id":        c.id.to_string(),
+                "kind":      format!("{:?}", c.kind).to_lowercase(),
+                "statement": c.statement,
+                "horizon":   c.horizon.map(|h| h.to_rfc3339()),
+                "ref":       cid,
+            }));
+        }
+    }
+
+    if !truncated && !contradictions.is_empty() {
+        let hdr = "\nUnresolved contradictions:\n";
+        if context_approx_tokens(&brief) + context_approx_tokens(hdr) < budget_tokens {
+            brief.push_str(hdr);
+        }
+        for (c, a, b) in &contradictions {
+            let cid = format!("contradiction:{}", c.id);
+            let line = format!(
+                "- [{i}] {subj} {pred} {obj_a} vs {obj_b}\n",
+                i = citations.len() + 1,
+                subj = a.subject_name,
+                pred = a.predicate,
+                obj_a = a.object_name,
+                obj_b = b.object_name,
+            );
+            if context_approx_tokens(&brief) + context_approx_tokens(&line) > budget_tokens {
+                truncated = true;
+                break;
+            }
+            brief.push_str(&line);
+            citations.push(cid.clone());
+            contradiction_rows.push(serde_json::json!({
+                "citation":    format!("[{}]", citations.len()),
+                "id":          c.id.to_string(),
+                "subject":     a.subject_name,
+                "predicate":   a.predicate,
+                "candidate_a": a.object_name,
+                "candidate_b": b.object_name,
+                "detected_at": c.detected_at.to_rfc3339(),
+                "ref":         cid,
+            }));
+        }
+    }
+
+    let empty = entity_rows.is_empty()
+        && signal_rows.is_empty()
+        && commitment_rows.is_empty()
+        && contradiction_rows.is_empty();
+    if empty {
+        brief.push_str("\n(nothing on this topic in local memory yet)\n");
+    }
+
+    if json {
+        let out = serde_json::json!({
+            "ok":               true,
+            "topic":            topic,
+            "brief":            brief,
+            "estimated_tokens": context_approx_tokens(&brief),
+            "budget_tokens":    budget_tokens,
+            "truncated":        truncated,
+            "grounding":        format!("{:?}", result.grounding),
+            "sections": {
+                "entities":       entity_rows,
+                "recent_captures": signal_rows,
+                "commitments":    commitment_rows,
+                "contradictions": contradiction_rows,
+            },
+            "citations": citations,
+        });
+        println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
+    } else {
+        print!("{brief}");
+        if truncated {
+            eprintln!("(truncated to fit {budget_tokens}-token budget)");
+        }
+    }
+}
+
+/// Ceil(chars/4) — matches [`tm_mcp::approx_tokens`]. Systematically
+/// over-estimates so the brief always fits inside the budget it claims.
+fn context_approx_tokens(s: &str) -> usize {
+    (s.chars().count() + 3) / 4
+}
+
+/// Case-insensitive keyword-in-text filter — matches
+/// [`tm_mcp::topic_matches`]. Filters recent captures / commitments /
+/// contradictions to the slice of local memory the user actually asked
+/// about.
+fn context_topic_matches(text: &str, topic: &str) -> bool {
+    let low = text.to_lowercase();
+    for kw in topic
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| w.len() >= 3)
+    {
+        let kw_low = kw.to_lowercase();
+        if matches!(
+            kw_low.as_str(),
+            "the" | "and" | "for" | "with" | "from" | "into" | "over" | "about" | "this" | "that"
+        ) {
+            continue;
+        }
+        if low.contains(&kw_low) {
+            return true;
+        }
+    }
+    false
+}
+
 /// `tracemind quick-recall` — Product Plan X2 / X8 launcher target.
 ///
 /// Small top_k, no answer generation, no reranker — just id/preview/

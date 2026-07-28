@@ -2,11 +2,14 @@ import { lazy, Suspense, useEffect, useState } from "react";
 import {
   CapturePermissionRow,
   CleanupReport,
+  DemoTourState,
   ForgetSourceResult,
   LlmStatus,
   StorageStats,
   UsageStats,
   cleanEphemeralStorage,
+  demoTourGet,
+  demoTourSet,
   downloadLlm,
   forgetCaptureSource,
   getLlmStatus,
@@ -90,6 +93,7 @@ export default function SettingsView() {
   const [forgotMsg, setForgotMsg] = useState<string | null>(null);
   const [sharePayload, setSharePayload] = useState<string | null>(null);
   const [devMode, setDevMode] = useState<boolean>(() => readDevMode());
+  const [tour, setTour] = useState<DemoTourState | null>(null);
   const [schemaOpen, setSchemaOpen] = useState(false);
   const [llm, setLlm] = useState<LlmStatus | null>(null);
   const [storage, setStorage] = useState<StorageStats | null>(null);
@@ -229,6 +233,9 @@ export default function SettingsView() {
       .then(setLlm)
       .catch(() => setLlm(null));
     reloadStorage();
+    demoTourGet()
+      .then(setTour)
+      .catch(() => setTour(null));
   }, []);
 
   async function toggle(source: string, next: boolean) {
@@ -497,6 +504,40 @@ export default function SettingsView() {
             }}
           />
         </div>
+
+        {/* Auto-tour — nested under dev mode because it only does anything
+            when the advanced surfaces are in the sidebar. Used to record the
+            GUI walkthrough; also a quick way to see every surface at once. */}
+        {devMode && (
+          <div className="flex items-start justify-between gap-4 mt-5 pt-5 border-t border-tm-border">
+            <div>
+              <h4 className="text-sm font-medium text-tm-text">Auto-tour surfaces</h4>
+              <p className="text-xs text-tm-muted mt-1 max-w-xl">
+                Cycles through every sidebar surface on a timer
+                {tour ? ` (${tour.dwell_secs || 6}s each)` : ""}, then stops.
+                Built for recording the GUI walkthrough without clicking.
+                Restart the app to replay.
+              </p>
+            </div>
+            <ToggleSwitch
+              checked={tour?.enabled ?? false}
+              onChange={(next) => {
+                const dwell = tour?.dwell_secs || 6;
+                setTour({ enabled: next, dwell_secs: dwell });
+                demoTourSet(next, dwell)
+                  .then((t) => {
+                    window.dispatchEvent(
+                      new CustomEvent("tm:demo-tour-changed", { detail: t }),
+                    );
+                  })
+                  .catch(() => {
+                    /* revert on failure — backend is the source of truth */
+                    setTour({ enabled: !next, dwell_secs: dwell });
+                  });
+              }}
+            />
+          </div>
+        )}
       </section>
 
       {/* ONT-2 — Ontology proposals (statistical Object Type proposals

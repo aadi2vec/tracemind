@@ -22,7 +22,14 @@ import EventGraphView from "./views/EventGraphView";
 import LedgerView from "./views/LedgerView";
 // OntologyView demoted 2026-05-13 — now imported only from SettingsView
 // behind the Schema sub-panel (power users). Not in primary nav.
-import { getUsageStats } from "./api";
+import {
+  getUsageStats,
+  demoTourGet,
+  demoTourBegin,
+  demoTourEnd,
+  demoTourMark,
+  type DemoTourState,
+} from "./api";
 
 type View =
   | "home"
@@ -206,6 +213,10 @@ export default function App() {
   const [view, setView] = useState<View>("home");
   const [firstRunChecked, setFirstRunChecked] = useState(false);
   const [devMode, setDevMode] = useState<boolean>(() => readDevMode());
+  const [tour, setTour] = useState<{ on: boolean; dwellMs: number }>({
+    on: false,
+    dwellMs: 6000,
+  });
 
   // SettingsView fires `tm:dev-mode-changed` whenever the toggle flips —
   // we update local state so the sidebar shows/hides the Inspector entry
@@ -218,9 +229,16 @@ export default function App() {
     return () => window.removeEventListener("tm:dev-mode-changed", handler);
   }, []);
 
+  // An active tour implies dev mode: there is nothing to tour unless the
+  // advanced surfaces are in the sidebar. This is also what makes the tour
+  // reachable headlessly — dev mode lives in localStorage, which a
+  // recording harness outside the webview cannot write, whereas the tour
+  // flag is backend-persisted.
+  const advancedVisible = devMode || tour.on;
+
   // In normal mode: 6 primary items. In dev mode: primary items +
   // advanced surfaces + Inspector, with Settings always last.
-  const navItems = devMode
+  const navItems = advancedVisible
     ? [
         ...PRIMARY_NAV_ITEMS.slice(0, -1), // everything except Settings
         ...ADVANCED_NAV_ITEMS,
@@ -233,11 +251,11 @@ export default function App() {
   // route them back to Home — otherwise the sidebar wouldn't show
   // their current view and they'd be stranded.
   useEffect(() => {
-    if (devMode) return;
+    if (advancedVisible) return;
     const visible = new Set<View>(PRIMARY_NAV_ITEMS.map((n) => n.id));
     visible.add("onboarding");
     if (!visible.has(view)) setView("home");
-  }, [devMode, view]);
+  }, [advancedVisible, view]);
 
   // UI-8 — route first-run users to onboarding. We detect "first run"
   // as having no usage history yet (first_seen is null).
@@ -269,6 +287,61 @@ export default function App() {
     window.addEventListener("tm:next-action", handler);
     return () => window.removeEventListener("tm:next-action", handler);
   }, []);
+
+  // Demo tour — walk every surface on a timer so the GUI walkthrough can be
+  // recorded without a human clicking the sidebar 18 times. Read from the
+  // backend (not localStorage) so a recording harness can enable it by
+  // writing $TM_DATA_DIR/demo_tour.json; see Rust `DemoTourState`.
+  useEffect(() => {
+    const apply = (t: DemoTourState) =>
+      setTour({ on: t.enabled, dwellMs: (t.dwell_secs || 6) * 1000 });
+    demoTourGet()
+      .then(apply)
+      .catch(() => {
+        /* file absent / older backend → tour stays off */
+      });
+    const handler = (e: Event) => {
+      const d = (e as CustomEvent).detail as DemoTourState | undefined;
+      if (d) apply(d);
+    };
+    window.addEventListener("tm:demo-tour-changed", handler);
+    return () => window.removeEventListener("tm:demo-tour-changed", handler);
+  }, []);
+
+  // The walk itself. `navItems` is intentionally not a dependency — it's a
+  // fresh array each render, and it's fully derived from `advancedVisible`,
+  // which is.
+  useEffect(() => {
+    if (!tour.on || !advancedVisible || !firstRunChecked) return;
+    const order: View[] = navItems.map((n) => n.id);
+    let i = 0;
+    setView(order[0]);
+
+    // Fullscreen for the duration, so a recording harness captures exactly the
+    // app — no desktop, no dock, and crucially none of the user's own files.
+    // Driven through a Rust command rather than `@tauri-apps/api/window`,
+    // which the Tauri v2 capability system denies here (no `capabilities/`).
+    demoTourBegin().catch(() => {
+      /* fullscreen is a nicety — the tour still walks without it */
+    });
+    demoTourMark(order[0]).catch(() => {});
+
+    const timer = setInterval(() => {
+      i += 1;
+      if (i >= order.length) {
+        clearInterval(timer);
+        demoTourEnd().catch(() => {});
+        return;
+      }
+      setView(order[i]);
+      demoTourMark(order[i]).catch(() => {});
+    }, tour.dwellMs);
+    return () => {
+      clearInterval(timer);
+      demoTourEnd().catch(() => {});
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tour.on, tour.dwellMs, advancedVisible, firstRunChecked]);
 
   if (!firstRunChecked) {
     return (

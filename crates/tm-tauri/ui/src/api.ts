@@ -1559,3 +1559,42 @@ export async function modeEnterPrivate(durationSecs?: number): Promise<ModeStatu
 export async function modeEnd(): Promise<ModeStatus> {
   return invoke("cmd_mode_end");
 }
+
+// ─── Demo tour — dev-only surface auto-advance ──────────────────────────
+// Backend-persisted (not localStorage like tm:dev_mode) so a recording
+// harness can enable it by writing $TM_DATA_DIR/demo_tour.json. See the
+// Rust `DemoTourState` doc comment.
+
+export interface DemoTourState {
+  enabled: boolean;
+  dwell_secs: number;
+}
+
+export async function demoTourGet(): Promise<DemoTourState> {
+  return invoke("cmd_demo_tour_get");
+}
+
+export async function demoTourSet(
+  enabled: boolean,
+  dwellSecs?: number,
+): Promise<DemoTourState> {
+  return invoke("cmd_demo_tour_set", { enabled, dwellSecs: dwellSecs ?? null });
+}
+
+// Fullscreen is driven from Rust, not `@tauri-apps/api/window`: the JS window
+// API is gated by the Tauri v2 capability system and this app ships no
+// `capabilities/` directory, so the JS call is denied at runtime and fails
+// silently. Commands are always callable.
+export async function demoTourBegin(): Promise<void> {
+  return invoke("cmd_demo_tour_begin");
+}
+
+export async function demoTourEnd(): Promise<void> {
+  return invoke("cmd_demo_tour_end");
+}
+
+/** Record the surface now on screen so a recording harness can name frames
+ *  from ground truth rather than from its own drifting clock. */
+export async function demoTourMark(view: string): Promise<void> {
+  return invoke("cmd_demo_tour_mark", { view });
+}

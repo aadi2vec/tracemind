@@ -67,9 +67,9 @@ TM_DATA_DIR=/tmp/tm-test ./target/release/tracemind ingest "test"
 
 ## Architecture
 
-**TraceMind** is a local-only memory OS. All data lives in `~/.tracemind/` — no cloud, no telemetry. 17-crate Rust workspace; ships as a CLI, MCP server, capture daemon, and Tauri desktop app.
+**TraceMind** is a local-only memory OS. All data lives in `~/.tracemind/` — no cloud, no telemetry. 30-crate Rust workspace; ships as a CLI, MCP server, capture daemon, and Tauri desktop app.
 
-### Crate map (17 crates)
+### Crate map (30 crates)
 
 ```
 binaries/integration ─ tm-cli, tm-mcp, tm-capture, tm-tauri
@@ -87,12 +87,23 @@ self-improvement ──────── tm-gepa (RetrievalPolicy + per-instanc
                           │          archive + executing verifier gate +
                           │          reflective mutation + merge + Curator)
                           │
+intent / world ────────── tm-intent (Commitment → Outcome state machine)
+                          tm-world-model (f_outcome predictor over resolutions)
+                          tm-pgm (probabilistic graphical model layer)
+                          │
+knowledge structure ───── tm-temporal (time-indexed belief validity)
+                          tm-tms (JTMS truth maintenance; retraction beat)
+                          tm-cluster (HDBSCAN + Louvain communities)
+                          tm-reflect (cluster signatures → ontology proposals)
+                          │
 storage ───────────────── tm-graph (SQLite, KG-R1 4-action traversal)
                           tm-vector (BGE-small ONNX 384d + BM25 lexical;
                           │          ComposedIndex fuses the two)
                           tm-episodic (TraceStore, TrajectoryStore, ProcedureStore, RecentStore)
                           │
-benchmarks (standalone) ─ tm-bench, tm-bench-locomo
+benchmarks (standalone) ─ tm-bench, tm-bench-locomo, tm-bench-mcp,
+                          tm-bench-context, tm-bench-longmem,
+                          tm-bench-memory, tm-bench-triples
                           │
 core types ────────────── tm-types  (zero I/O; everyone depends on this)
 ```

@@ -1,0 +1,160 @@
+
+[1m[36m▸ The problem[0m
+[2mYou're mid-thread in Claude Code, need to reference last week's browsing / decisions / open commitments on a topic. Today: paste-hunt across tabs. Wedge: one MCP verb, memory_context_for(topic), returns a cited paragraph you can inject in the current chat.[0m
+
+[1m[36m▸ Seed a realistic local memory[0m
+[2mSimulated week of browsing on 'World Cup 2026', one Commitment ('will buy Group Stage tickets'), plus a triple that will contradict a later belief so the retraction beat has something to say.[0m
+
+[2m$ tracemind ingest "https://www.fifa.com/tickets FIFA World Cup 2026 Tickets"[0m
+Ingested: "https://www.fifa.com/tickets FIFA World Cup 2026 Tickets"
+  Trace:    5d26b21f-e1c3-4631-a277-3f4874f0ea3a
+  Entities: 4
+    [Url] https://www.fifa.com/tickets
+    [Organization] fifa.com
+    [Event] FIFA World Cup 2026
+
+[2m$ tracemind ingest "https://apnews.com/article/world-cup-2026-tickets Ticket resale prices for the 2026 World Cup"[0m
+Ingested: "https://apnews.com/article/world-cup-2026-tickets Ticket resale prices for the 2..."
+  Trace:    4b35760b-d3cc-4e29-acb3-9fa5b2b77736
+  Entities: 3
+    [Url] https://apnews.com/article/world-cup-2026-tickets
+    [Organization] apnews.com
+    [Event] World Cup
+
+[2m$ tracemind ingest "https://en.wikipedia.org/wiki/2026_FIFA_World_Cup 2026 FIFA World Cup — Wikipedia"[0m
+Ingested: "https://en.wikipedia.org/wiki/2026_FIFA_World_Cup 2026 FIFA World Cup — Wikipe..."
+  Trace:    6812e6c5-9e7c-400c-9e84-6afe7f574d57
+  Entities: 3
+    [Url] https://en.wikipedia.org/wiki/2026_FIFA_World_Cup
+    [Organization] en.wikipedia.org
+    [Event] FIFA World Cup
+
+[2m$ tracemind ingest "https://arxiv.org/abs/2312.10997 GEPA Reflective Prompt Evolution"[0m
+Ingested: "https://arxiv.org/abs/2312.10997 GEPA Reflective Prompt Evolution"
+  Trace:    a96a670e-8956-47f6-8470-38d59ce12288
+  Entities: 3
+    [Url] https://arxiv.org/abs/2312.10997
+    [Organization] arxiv.org
+    [Organization] GEPA
+
+[2m$ tracemind ingest "The 2026 FIFA World Cup final will be in New Jersey"[0m
+Ingested: "The 2026 FIFA World Cup final will be in New Jersey"
+  Trace:    ac727009-ee90-4d5a-9fa3-95bb21047eaf
+  Entities: 2
+    [Event] FIFA World Cup
+    [Location] New Jersey
+  + 0 co-occurrence triples
+
+[2m$ tracemind ingest "The 2026 FIFA World Cup final will be in Los Angeles"[0m
+Ingested: "The 2026 FIFA World Cup final will be in Los Angeles"
+  Trace:    88a3e6db-e625-4d12-b0c6-e0b8cbe1bddd
+  Entities: 2
+    [Event] FIFA World Cup
+    [Location] Los Angeles
+  + 0 co-occurrence triples
+
+[33m$ ./target/release/tracemind commit --kind intent 'buy Group Stage tickets before the price surge' --stakes high --horizon 2026-08-15T00:00:00Z --no-preflight[0m
+commitment 655e7c1d-0752-4b43-9908-1bd94fa4439d (intent)
+  state:     open
+  statement: buy Group Stage tickets before the price surge
+  horizon:   2026-08-15T00:00:00+00:00
+
+[1m[36m▸ One command, one brief[0m
+[2mThis is the CLI mirror of memory_context_for. Same section order (What we know → Recent activity → Open commitments → Unresolved contradictions), same [i] citations. Bindable to any keystroke in any MCP host.[0m
+
+[33m$ ./target/release/tracemind context-for 'world cup tickets' --budget-tokens 500[0m
+Topic: world cup tickets
+
+What we know:
+- [1] Tickets (custom("product"))
+- [2] FIFA World Cup 2026 (event)
+- [3] https://www.fifa.com/tickets (url)
+- [4] fifa.com (organization)
+- [5] World Cup (event)
+
+Recent activity:
+- [6] https://www.fifa.com/tickets FIFA World Cup 2026 Tickets (ingest, 2026-07-27)
+- [7] https://apnews.com/article/world-cup-2026-tickets Ticket resale prices for the 2026 World Cup (ingest, 2026-07-27)
+- [8] https://en.wikipedia.org/wiki/2026_FIFA_World_Cup 2026 FIFA World Cup — Wikipedia (ingest, 2026-07-27)
+- [9] The 2026 FIFA World Cup final will be in New Jersey (ingest, 2026-07-27)
+- [10] The 2026 FIFA World Cup final will be in Los Angeles (ingest, 2026-07-27)
+
+Open commitments:
+- [11] buy Group Stage tickets before the price surge (Intent, due 2026-08-15)
+
+[1m[36m▸ Budget-aware truncation[0m
+[2mEvery host has a different context budget. Same command with a tight cap drops less-important sections and warns you it truncated — the brief always fits inside the budget it claims.[0m
+
+[33m$ ./target/release/tracemind context-for 'world cup tickets' --budget-tokens 80[0m
+Topic: world cup tickets
+
+What we know:
+- [1] Tickets (custom("product"))
+- [2] FIFA World Cup 2026 (event)
+- [3] https://www.fifa.com/tickets (url)
+- [4] fifa.com (organization)
+- [5] World Cup (event)
+
+Recent activity:
+- [6] https://www.fifa.com/tickets FIFA World Cup 2026 Tickets (ingest, 2026-07-27)
+
+[1m[36m▸ JSON payload — what the MCP host actually receives[0m
+[2mSame call with --json returns entities/recent_captures/commitments/contradictions sections + ordered citations + grounding label. Local-only: no network, no telemetry, everything stays on this laptop.[0m
+
+[33m$ ./target/release/tracemind context-for 'world cup tickets' --budget-tokens 500 --json | head -40[0m
+{
+  "brief": "Topic: world cup tickets\n\nWhat we know:\n- [1] Tickets (custom(\"product\"))\n- [2] FIFA World Cup 2026 (event)\n- [3] https://www.fifa.com/tickets (url)\n- [4] fifa.com (organization)\n- [5] World Cup (event)\n\nRecent activity:\n- [6] https://www.fifa.com/tickets FIFA World Cup 2026 Tickets (ingest, 2026-07-27)\n- [7] https://apnews.com/article/world-cup-2026-tickets Ticket resale prices for the 2026 World Cup (ingest, 2026-07-27)\n- [8] https://en.wikipedia.org/wiki/2026_FIFA_World_Cup 2026 FIFA World Cup — Wikipedia (ingest, 2026-07-27)\n- [9] The 2026 FIFA World Cup final will be in New Jersey (ingest, 2026-07-27)\n- [10] The 2026 FIFA World Cup final will be in Los Angeles (ingest, 2026-07-27)\n\nOpen commitments:\n- [11] buy Group Stage tickets before the price surge (Intent, due 2026-08-15)\n",
+  "budget_tokens": 500,
+  "citations": [
+    "entity:19581e5e-e576-40f6-9a24-1285fc240a92",
+    "entity:ef81ce0f-4dc5-431b-a546-da4f43b2ae1a",
+    "entity:38128a85-562c-47b9-8b97-e0b2a573731e",
+    "entity:ede153ca-47c8-4af5-87f9-8170b86ffbcd",
+    "entity:b23bd5d9-e73c-4825-ad60-31035d8b7fd8",
+    "signal:1",
+    "signal:2",
+    "signal:3",
+    "signal:5",
+    "signal:6",
+    "commitment:655e7c1d-0752-4b43-9908-1bd94fa4439d"
+  ],
+  "estimated_tokens": 199,
+  "grounding": "Found",
+  "ok": true,
+  "sections": {
+    "commitments": [
+      {
+        "citation": "[11]",
+        "horizon": "2026-08-15T00:00:00+00:00",
+        "id": "655e7c1d-0752-4b43-9908-1bd94fa4439d",
+        "kind": "intent",
+        "ref": "commitment:655e7c1d-0752-4b43-9908-1bd94fa4439d",
+        "statement": "buy Group Stage tickets before the price surge"
+      }
+    ],
+    "contradictions": [],
+    "entities": [
+      {
+        "citation": "[1]",
+        "confidence": 0.4335209131240845,
+        "id": "19581e5e-e576-40f6-9a24-1285fc240a92",
+        "name": "Tickets",
+        "ref": "entity:19581e5e-e576-40f6-9a24-1285fc240a92",
+        "type": "custom(\"product\")"
+      },
+
+[1m[36m▸ Grounding is honest[0m
+[2mAsk for a topic memory doesn't know about — the brief says so, the host can abstain instead of hallucinating.[0m
+
+[33m$ ./target/release/tracemind context-for 'quantum accordion practice' --budget-tokens 200[0m
+Topic: quantum accordion practice
+
+What we know:
+- [1] https://arxiv.org/abs/2312.10997 (url)
+- [2] arxiv.org (organization)
+- [3] https://www.fifa.com/tickets (url)
+- [4] GEPA (organization)
+- [5] https://apnews.com/article/world-cup-2026-tickets (url)
+
+[1m[36m▸ Wrap[0m
+[2mOne primitive — memory_context_for(topic, budget) — turns any MCP host into a context-aware surface for your local memory. No copy-paste, no chrome, no cloud. That is the composition wedge.[0m

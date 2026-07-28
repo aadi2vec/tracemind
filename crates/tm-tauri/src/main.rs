@@ -3504,6 +3504,101 @@ fn save_thread_views(
     std::fs::write(&path, bytes).map_err(|e| e.to_string())
 }
 
+/// Demo tour — dev-only auto-advance through every surface. Exists so the
+/// GUI walkthrough can be recorded without a human (or an Accessibility-
+/// permitted AppleScript) clicking the sidebar 18 times.
+///
+/// Deliberately backend-persisted rather than localStorage-backed like
+/// `tm:dev_mode`: a recording harness has no way to reach WKWebView
+/// localStorage from outside the app, but it can write a file —
+///
+///     echo '{"enabled":true,"dwell_secs":6}' > "$TM_DATA_DIR/demo_tour.json"
+///
+/// The Settings toggle remains the user-facing control; the file is the
+/// headless seam. Off unless explicitly enabled, and the frontend gates it
+/// behind Developer mode on top of this.
+#[derive(Serialize, Deserialize, Clone, Default)]
+struct DemoTourState {
+    enabled: bool,
+    /// Seconds each surface stays on screen. 0 / absent → frontend default.
+    #[serde(default)]
+    dwell_secs: u32,
+}
+
+fn demo_tour_path(state: &AppState) -> PathBuf {
+    data_dir(state).join("demo_tour.json")
+}
+
+#[tauri::command]
+fn cmd_demo_tour_get(state: State<AppState>) -> Result<DemoTourState, String> {
+    let path = demo_tour_path(&state);
+    if !path.exists() {
+        return Ok(DemoTourState::default());
+    }
+    let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
+    if bytes.is_empty() {
+        return Ok(DemoTourState::default());
+    }
+    serde_json::from_slice(&bytes).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn cmd_demo_tour_set(
+    enabled: bool,
+    dwell_secs: Option<u32>,
+    state: State<AppState>,
+) -> Result<DemoTourState, String> {
+    let next = DemoTourState {
+        enabled,
+        dwell_secs: dwell_secs.unwrap_or(0),
+    };
+    let path = demo_tour_path(&state);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let bytes = serde_json::to_vec_pretty(&next).map_err(|e| e.to_string())?;
+    std::fs::write(&path, bytes).map_err(|e| e.to_string())?;
+    Ok(next)
+}
+
+/// Put the window fullscreen for the tour, and take it back afterwards.
+///
+/// Done from Rust deliberately. The JS `setFullscreen` in `@tauri-apps/api`
+/// is gated by the Tauri v2 capability system (`core:window:allow-set-fullscreen`),
+/// and this app ships no `capabilities/` directory — so the JS call is denied
+/// at runtime and fails silently. Commands, by contrast, are always callable
+/// from the frontend, so this route needs no new permission surface.
+#[tauri::command]
+fn cmd_demo_tour_begin(window: tauri::Window) -> Result<(), String> {
+    window.set_fullscreen(true).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn cmd_demo_tour_end(window: tauri::Window) -> Result<(), String> {
+    window.set_fullscreen(false).map_err(|e| e.to_string())
+}
+
+/// Record which surface the tour is showing, so a recording harness can name
+/// its frames from ground truth instead of guessing from elapsed time. The
+/// harness's own clock drifts against the frontend timer; this removes the
+/// guesswork entirely.
+#[tauri::command]
+fn cmd_demo_tour_mark(view: String, state: State<AppState>) -> Result<(), String> {
+    use std::io::Write;
+    let path = data_dir(&state).join("demo_tour_marks.jsonl");
+    let line = format!(
+        "{{\"view\":\"{}\",\"at\":\"{}\"}}\n",
+        view.replace('"', ""),
+        chrono::Utc::now().to_rfc3339()
+    );
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .map_err(|e| e.to_string())?;
+    f.write_all(line.as_bytes()).map_err(|e| e.to_string())
+}
+
 /// LM-11e — persist the active splice for `thread_id`.
 #[tauri::command]
 fn cmd_thread_view_save(
@@ -5851,6 +5946,11 @@ fn main() {
             cmd_entity_drawer,
             cmd_resolve_transclusion,
             cmd_thread_view_save,
+            cmd_demo_tour_get,
+            cmd_demo_tour_set,
+            cmd_demo_tour_begin,
+            cmd_demo_tour_end,
+            cmd_demo_tour_mark,
             cmd_thread_view_load,
             cmd_thread_view_clear,
             cmd_thread_views_list,
