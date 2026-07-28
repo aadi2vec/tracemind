@@ -1,0 +1,222 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TraceMind — local AI memory that shows its work</title>
+<meta name="description" content="A local memory layer for Claude Code, Cursor, and any MCP host. Remembers what you tell it, tells you when new facts contradict old ones. Runs entirely on your laptop.">
+<meta property="og:title" content="TraceMind — local AI memory that shows its work">
+<meta property="og:description" content="The memory that tells you when it changed its mind. Runs entirely on your laptop.">
+<style>
+  :root{
+    --bg:#fbfaf8; --fg:#1a1917; --muted:#6b6862; --line:#e4e0d8;
+    --card:#fff; --accent:#b4441f; --code-bg:#f4f1ec; --warn:#8a5a00;
+    --mono:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,monospace;
+  }
+  @media (prefers-color-scheme:dark){
+    :root{
+      --bg:#141311; --fg:#eceae6; --muted:#9a958c; --line:#2c2a26;
+      --card:#1c1b18; --accent:#e8734a; --code-bg:#1c1b18; --warn:#e0a838;
+    }
+  }
+  *{box-sizing:border-box}
+  body{
+    margin:0; background:var(--bg); color:var(--fg);
+    font:16px/1.65 ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",Inter,sans-serif;
+    -webkit-font-smoothing:antialiased;
+  }
+  .wrap{max-width:720px;margin:0 auto;padding:0 24px}
+  h1,h2,h3{line-height:1.2;letter-spacing:-.02em;font-weight:600}
+  h1{font-size:clamp(2rem,5.5vw,3.1rem);margin:0 0 20px}
+  h2{font-size:clamp(1.35rem,3vw,1.7rem);margin:0 0 16px}
+  h3{font-size:1.05rem;margin:0 0 8px}
+  p{margin:0 0 18px}
+  a{color:var(--accent)}
+  .lede{font-size:1.15rem;color:var(--muted);margin-bottom:32px}
+  section{padding:56px 0;border-top:1px solid var(--line)}
+  header{padding:88px 0 64px}
+  .cta{
+    display:inline-flex;align-items:center;gap:8px;background:var(--accent);
+    color:#fff;text-decoration:none;padding:13px 22px;border-radius:8px;
+    font-weight:550;font-size:.97rem;
+  }
+  .cta:hover{filter:brightness(1.08)}
+  .fine{font-size:.85rem;color:var(--muted);margin-top:16px}
+  pre{
+    background:var(--code-bg);border:1px solid var(--line);border-radius:10px;
+    padding:18px;overflow-x:auto;font-family:var(--mono);font-size:.85rem;
+    line-height:1.6;margin:0 0 18px;
+  }
+  .retract{color:var(--warn)}
+  table{width:100%;border-collapse:collapse;font-size:.92rem;margin-bottom:18px;display:block;overflow-x:auto}
+  td{padding:9px 0;border-bottom:1px solid var(--line);vertical-align:top}
+  td:first-child{color:var(--muted);padding-right:20px;white-space:nowrap}
+  .note{
+    border-left:3px solid var(--line);padding:2px 0 2px 16px;
+    color:var(--muted);font-size:.92rem;margin:0 0 18px;
+  }
+  details{border-bottom:1px solid var(--line);padding:14px 0}
+  summary{cursor:pointer;font-weight:550;list-style:none}
+  summary::-webkit-details-marker{display:none}
+  summary::before{content:"+ ";color:var(--muted)}
+  details[open] summary::before{content:"− "}
+  details p{margin:12px 0 0;color:var(--muted)}
+  footer{padding:48px 0 72px;color:var(--muted);font-size:.87rem;border-top:1px solid var(--line)}
+  .eyebrow{font-size:.8rem;text-transform:uppercase;letter-spacing:.09em;color:var(--muted);margin-bottom:14px}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <div class="eyebrow">Local memory for AI assistants</div>
+  <h1>The memory that tells you when it changed its mind.</h1>
+  <p class="lede">
+    TraceMind is a local memory layer for the AI assistants you already use.
+    It remembers what you tell it, notices when new facts contradict old ones,
+    and says so — instead of silently overwriting. Everything runs on your laptop.
+  </p>
+  <a class="cta" href="#access">Request early access</a>
+  <p class="fine">Free while in early access · macOS · no account, no cloud</p>
+</header>
+
+<section>
+  <h2>Every AI window starts from zero</h2>
+  <p>
+    You explain your project to Claude Code. Then again to Cursor. Then again
+    tomorrow. The assistants got smarter; the amnesia didn't change.
+  </p>
+  <p>
+    The tools that fix this want your data in their cloud — fine for a demo,
+    wrong for the thing that ends up holding your meeting notes, your
+    half-formed decisions, and your clipboard.
+  </p>
+</section>
+
+<section>
+  <h2>What it does</h2>
+  <h3>One verb, every host</h3>
+  <p>
+    Bind <code>memory_context_for</code> to a keystroke in Claude Code, Cursor,
+    Goose, or anything else that speaks MCP. Ask about a topic, get back a
+    token-budgeted, cited brief of what you already know.
+  </p>
+  <h3>It ingests what you actually do</h3>
+  <p>
+    Text, URLs, files, clipboard, shell history — into a knowledge graph with an
+    audit trail you can inspect, entry by entry.
+  </p>
+  <h3>Every claim is cited</h3>
+  <p>
+    Every ingest and every query gets a UUID in an immutable log. When it tells
+    you something, you can see where it came from.
+  </p>
+</section>
+
+<section>
+  <h2>The part that's different</h2>
+  <p><strong>Most memory systems store documents. TraceMind maintains beliefs.</strong></p>
+  <p>
+    Tell it the World Cup final is in New Jersey. Later, tell it the final is in
+    Los Angeles. A document store keeps both and hands you whichever ranks
+    higher. TraceMind notices the two can't both be true, retracts the one it no
+    longer holds, and shows you:
+  </p>
+<pre>$ tracemind ingest "FIFA World Cup 2026 final located in Los Angeles"
+
+<span class="retract">⚠ Retraction: "final located in New Jersey"
+    superseded by "final located in Los Angeles"
+    → reconcile?</span></pre>
+  <p>
+    That's a truth-maintenance layer doing belief revision in the open. You see
+    your memory change its mind, and you get to overrule it.
+  </p>
+  <p>
+    <strong>Why it matters:</strong> you only hand a memory system your real
+    context — the messy, ambient, valuable stuff — once you trust it not to
+    quietly drift. Most systems ask for that trust. This one shows its work.
+  </p>
+</section>
+
+<section>
+  <h2>Local means local</h2>
+  <p>
+    Not a setting. Not "encrypted sync." There is <strong>no network call in the
+    request path</strong> — verify it with a packet monitor.
+  </p>
+  <p>
+    Everything lives in <code>~/.tracemind/</code>: one SQLite file and a JSONL
+    audit trail. <code>rm -rf</code> it and it's gone. That's the whole contract.
+  </p>
+  <p>
+    The constraint is the point. Because nothing leaves the machine, TraceMind
+    can watch your clipboard and shell history — inputs no cloud vendor can
+    reasonably ask for.
+  </p>
+  <p>
+    <strong>Export anytime.</strong> <code>tracemind export</code> writes your
+    whole graph as Obsidian-compatible markdown with <code>[[wikilinks]]</code>.
+    No lock-in.
+  </p>
+</section>
+
+<section>
+  <h2>Under the hood</h2>
+  <table>
+    <tr><td>Embeddings</td><td>BGE-small-en-v1.5, 384-dim ONNX, on-device</td></tr>
+    <tr><td>Reranking</td><td>ColBERT (mxbai-edge-colbert), always on</td></tr>
+    <tr><td>Store</td><td>SQLite knowledge graph + vector index</td></tr>
+    <tr><td>Belief revision</td><td>JTMS truth-maintenance layer</td></tr>
+    <tr><td>Answers</td><td>extractive → local Qwen 2.5 1.5B → Apple Foundation Models</td></tr>
+    <tr><td>Integration</td><td>MCP over JSON-RPC — any MCP host</td></tr>
+    <tr><td>Retrieval</td><td>50.32 F1 on held-out LoCoMo-style conversations</td></tr>
+    <tr><td>Codebase</td><td>101,501 lines of Rust, 30 crates, 1,240 tests</td></tr>
+  </table>
+  <p class="note">
+    On that F1: it's measured on conversations the retrieval policy was never
+    tuned against. An earlier number of 75.49 was withdrawn after it turned out
+    to have been tuned on its own test set.
+  </p>
+</section>
+
+<section id="access">
+  <h2>Looking for 5 people who live in Claude Code</h2>
+  <p>
+    TraceMind is early. It works, it's tested, and almost nobody has used it yet
+    — which is exactly why I want a handful of people who'll tell me where it
+    breaks.
+  </p>
+  <p>
+    <strong>What you get:</strong> the build, direct access to me, and whatever
+    you ask for prioritized.<br>
+    <strong>What I ask:</strong> use it for two weeks and tell me the truth.
+  </p>
+  <!-- TODO: point action= at Formspree/Buttondown before publishing -->
+  <a class="cta" href="mailto:aadityasri2000@gmail.com?subject=TraceMind%20early%20access">Request access</a>
+  <p class="fine">Solo founder. macOS first. Windows/Linux if there's demand.</p>
+</section>
+
+<section>
+  <h2>Questions</h2>
+  <details><summary>Is this a note-taking app?</summary>
+    <p>No. There's nothing to file and no folders. It watches what you already do and gives it back when an AI assistant needs it.</p></details>
+  <details><summary>Does it work with ChatGPT?</summary>
+    <p>Any MCP-capable host. Claude Code and Cursor are best supported today.</p></details>
+  <details><summary>What does it cost?</summary>
+    <p>Free during early access. Later a personal subscription. No plan will require your data leaving your machine.</p></details>
+  <details><summary>How is this different from Mem0 / Zep / Letta?</summary>
+    <p>Those are memory layers sold to developers building AI products — cloud APIs in the serving path. TraceMind is for the person <em>using</em> AI assistants, running on their own machine. Closest in spirit is Zep's temporal knowledge graph; the difference is that TraceMind surfaces belief revision to <em>you</em> as an event you can act on, rather than resolving it silently inside retrieval.</p></details>
+  <details><summary>Is it open source?</summary>
+    <p>Not yet. The audit trail and export exist so you're never locked in regardless.</p></details>
+  <details><summary>Who's building it?</summary>
+    <p>One person, since March 2026.</p></details>
+</section>
+
+<footer>
+  TraceMind · local-only memory for AI assistants · built by Aaditya Srivathsan<br>
+  No analytics on this page.
+</footer>
+
+</div>
+</body>
+</html>
